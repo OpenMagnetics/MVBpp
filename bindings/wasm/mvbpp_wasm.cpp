@@ -21,6 +21,8 @@
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -34,17 +36,8 @@ using json = nlohmann::json;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // JS-throw helper + guard template.
-//
-// All registered embind entry points are wrapped through `guard<&fn>::call` so
-// any C++ exception thrown inside is converted to a JS Error with the original
-// message preserved. Without this, exceptions cross the WASM/JS boundary as a
-// bare numeric pointer that is unreadable from JS unless the runtime was built
-// with -sEXPORT_EXCEPTION_HANDLING_HELPERS=1 (which would in turn require
-// rebuilding OCCT with -fwasm-exceptions to keep the EH ABI consistent).
 // ─────────────────────────────────────────────────────────────────────────────
 [[noreturn]] inline void throw_js_error(const std::string& msg) {
-    // EM_ASM-thrown JS errors propagate up through WASM and surface in the
-    // calling JS context as a regular Error. Control does not return.
     EM_ASM({ throw new Error(UTF8ToString($0)); }, msg.c_str());
     __builtin_unreachable();
 }
@@ -65,7 +58,7 @@ struct guard<Fn> {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal helpers
+// Common helpers (shared logic with Python bindings)
 // ─────────────────────────────────────────────────────────────────────────────
 namespace {
 
@@ -77,20 +70,36 @@ val makeUint8Array(const std::string& data) {
     return out;
 }
 
-TopoDS_Shape applyUniformScale(const TopoDS_Shape& s, double scale) {
-    if (s.IsNull() || scale == 1.0) return s;
-    gp_Trsf t;
-    t.SetScale(gp_Pnt(0, 0, 0), scale);
-    return BRepBuilderAPI_Transform(s, t).Shape();
+std::string upper(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return s;
 }
 
-std::vector<TopoDS_Shape> applyUniformScale(const std::vector<TopoDS_Shape>& shapes,
-                                             double scale) {
-    if (scale == 1.0) return shapes;
-    std::vector<TopoDS_Shape> out;
-    out.reserve(shapes.size());
-    for (const auto& s : shapes) out.push_back(applyUniformScale(s, scale));
-    return out;
+void apply_scale(std::vector<mvb::NamedShape>& named, double scale) {
+    if (scale == 1.0) return;
+    gp_Trsf trsf;
+    trsf.SetScale(gp_Pnt(0, 0, 0), scale);
+    for (auto& ns : named) {
+        if (ns.shape.IsNull()) continue;
+        ns.shape = BRepBuilderAPI_Transform(ns.shape, trsf).Shape();
+    }
+}
+
+std::string slurp_file(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) throw std::runtime_error("mvbpp: failed to read " + p.string());
+    return std::string{std::istreambuf_iterator<char>(f),
+                       std::istreambuf_iterator<char>()};
+}
+
+void write_bytes(const std::filesystem::path& path, const std::string& data) {
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("mvbpp: cannot write to " + path.string());
+    f.write(data.data(), static_cast<std::streamsize>(data.size()));
 }
 
 OpenMagnetics::Magnetic parseEnriched(const std::string& json_str) {
@@ -100,37 +109,32 @@ OpenMagnetics::Magnetic parseEnriched(const std::string& json_str) {
     } catch (const std::exception& e) {
         throw std::runtime_error(std::string("parseEnriched: json::parse failed: ") + e.what());
     }
-    // Skip expensive autocomplete if geometricalDescription is already present
-    // (pre-enriched by the JS MKF worker before calling MVB++).
     bool alreadyEnriched =
         j.contains("core") &&
         j.at("core").contains("geometricalDescription") &&
         !j.at("core").at("geometricalDescription").is_null();
     if (alreadyEnriched) {
-        using json = nlohmann::json;
         json coreJson = j.at("core");
         json coilJson = j.contains("coil") ? j.at("coil") : json::object();
-        OpenMagnetics::Core core;
         try {
-            core = OpenMagnetics::Core(coreJson);
-        } catch (const std::exception& e) {
-            throw std::runtime_error(std::string("parseEnriched[fast]: Core ctor failed: ") + e.what());
-        }
-        // Validate that the core has usable geometrical data
-        if (core.get_geometrical_description().has_value() &&
-            !core.get_geometrical_description()->empty()) {
-            OpenMagnetics::Coil coil;
-            try {
-                coil = OpenMagnetics::Coil(coilJson, false);
-            } catch (const std::exception& e) {
-                throw std::runtime_error(std::string("parseEnriched[fast]: Coil ctor failed: ") + e.what());
+            OpenMagnetics::Core core(coreJson);
+            if (core.get_geometrical_description().has_value() &&
+                !core.get_geometrical_description()->empty()) {
+                OpenMagnetics::Coil coil(coilJson, false);
+                OpenMagnetics::Magnetic om;
+                om.set_core(core);
+                om.set_coil(coil);
+                return om;
             }
-            OpenMagnetics::Magnetic om;
-            om.set_core(core);
-            om.set_coil(coil);
-            return om;
+        } catch (const std::exception& e) {
+            // Fast path failed (e.g. Coil JSON has minor schema variance,
+            // or Core ctor is stricter than what's in the fixture). Fall
+            // through to the full MKF autocomplete pipeline below — it's
+            // slower but tolerates more JSON shapes.
+            std::fprintf(stderr,
+                "[mvbpp] parseEnriched: fast path failed (%s); "
+                "falling back to magnetic_autocomplete_safe\n", e.what());
         }
-        throw std::runtime_error("parseEnriched[fast]: core had geometricalDescription but it was empty/unusable");
     }
     try {
         return mvb::magnetic_autocomplete_safe(j);
@@ -139,383 +143,565 @@ OpenMagnetics::Magnetic parseEnriched(const std::string& json_str) {
     }
 }
 
-mvb::SectionPlane parsePlane(const std::string& plane) {
-    if (plane == "XY" || plane == "xy") return mvb::SectionPlane::XY;
-    if (plane == "XZ" || plane == "xz") return mvb::SectionPlane::XZ;
-    if (plane == "YZ" || plane == "yz") return mvb::SectionPlane::YZ;
-    throw std::runtime_error("mvbpp_wasm: unknown plane '" + plane + "'");
+std::string encode_to_bytes(const std::vector<mvb::NamedShape>& named,
+                            const std::string& format) {
+    std::string fmt = format;
+    std::transform(fmt.begin(), fmt.end(), fmt.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (fmt == "stl") {
+        std::vector<TopoDS_Shape> shapes;
+        shapes.reserve(named.size());
+        for (const auto& ns : named) shapes.push_back(ns.shape);
+        std::string data = mvb::exportSTLToBytes(shapes);
+        if (data.empty()) throw std::runtime_error("mvbpp: STL export produced empty output");
+        return data;
+    }
+    if (fmt == "step") {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<uint64_t> dist;
+        auto tmp = std::filesystem::temp_directory_path() /
+                   ("mvbpp_" + std::to_string(dist(gen)) + ".step");
+        struct Cleanup {
+            std::filesystem::path p;
+            ~Cleanup() { std::error_code ec; std::filesystem::remove(p, ec); }
+        } cleanup{tmp};
+        if (!mvb::exportSTEP(named, tmp.string())) {
+            throw std::runtime_error("mvbpp: exportSTEP failed");
+        }
+        return slurp_file(tmp);
+    }
+    throw std::runtime_error("mvbpp: unsupported format '" + format +
+                             "' (expected 'step' or 'stl')");
 }
 
-// ── Core (just the iron) ────────────────────────────────────────────────────
-std::vector<TopoDS_Shape> buildCoreShapes(const std::string& magnetic_json,
-                                           double scale,
-                                           int corePolygonSegments) {
-    auto mag = parseEnriched(magnetic_json);
-    mvb::MagneticBuilder builder;
-    auto shapes = builder.buildCore(mag.get_core(), corePolygonSegments);
-    return applyUniformScale(shapes, scale);
-}
-
-// ── Full assembly named shapes ──────────────────────────────────────────────
-std::vector<mvb::NamedShape> buildAssemblyNamed(const std::string& magnetic_json,
-                                                 bool includeBobbin,
-                                                 int symmetryPlanes,
-                                                 int wirePolygonSegments,
-                                                 int corePolygonSegments,
-                                                 double scale) {
-    auto mag = parseEnriched(magnetic_json);
-    mvb::MagneticBuilder builder;
-    auto named = builder.buildAllNamed(mag, includeBobbin, symmetryPlanes,
-                                        wirePolygonSegments, corePolygonSegments);
-    if (scale != 1.0) {
-        for (auto& ns : named) ns.shape = applyUniformScale(ns.shape, scale);
-    }
-    return named;
-}
-
-std::vector<TopoDS_Shape> toShapes(const std::vector<mvb::NamedShape>& named) {
-    std::vector<TopoDS_Shape> out;
-    out.reserve(named.size());
-    for (const auto& ns : named) out.push_back(ns.shape);
-    return out;
-}
-
-// ── Assembly component filter ──────────────────────────────────────────────
-// Builds the full assembly, then returns only the requested components.
-// `components` is a bitmask: 1=CORE, 2=BOBBIN, 4=TURNS. 0 or 7 = all.
-std::vector<TopoDS_Shape> buildAssemblyFiltered(const std::string& magnetic_json,
-                                                 int components,
-                                                 int symmetryPlanes,
-                                                 int wirePolygonSegments,
-                                                 int corePolygonSegments,
-                                                 double scale) {
-    if (components == 0) components = 0b111;
-    const bool wantCore   = components & 0b001;
-    const bool wantBobbin = components & 0b010;
-    const bool wantTurns  = components & 0b100;
-
-    auto mag = parseEnriched(magnetic_json);
-    mvb::MagneticBuilder builder;
-
-    std::vector<TopoDS_Shape> out;
-    if (wantCore) {
-        auto core = builder.buildCoreNamed(mag.get_core(), corePolygonSegments);
-        for (const auto& ns : core) out.push_back(ns.shape);
-    }
-    if (wantBobbin) {
-        auto b = builder.buildBobbinNamed(mag.get_coil(), mag.get_core());
-        if (!b.shape.IsNull()) out.push_back(b.shape);
-    }
-    if (wantTurns) {
-        auto turns = builder.buildTurnsNamed(mag.get_coil(), mag.get_core(),
-                                              wirePolygonSegments);
-        for (const auto& ns : turns) out.push_back(ns.shape);
+// Apply the full delivery pipeline: scale → symmetry → 2D cut → side filter → encode
+std::string deliver(std::vector<mvb::NamedShape> named,
+                    const std::string& mode,
+                    const std::string& plane,
+                    double offset,
+                    const std::string& format,
+                    double scale,
+                    const std::string& symmetry,
+                    const std::string& side) {
+    std::string m = upper(mode);
+    if (m != "2D" && m != "3D") {
+        throw std::runtime_error("mvbpp: mode must be '3D' or '2D' (got '" + mode + "')");
     }
 
-    // Symmetry cut applied after filtering so the cut respects the full bbox.
-    if (symmetryPlanes > 0) {
-        std::vector<mvb::NamedShape> ns;
-        ns.reserve(out.size());
-        for (const auto& s : out) ns.emplace_back(s, std::string{});
-        auto sym = mvb::analyze_symmetry(ns);
-        if (!sym.valid_planes.empty()) {
-            const int n = std::min(symmetryPlanes, (int)sym.valid_planes.size());
-            std::vector<std::pair<mvb::SymmetryPlane, mvb::SymmetryHalf>> cuts;
-            for (int i = 0; i < n; ++i) cuts.emplace_back(sym.valid_planes[i], mvb::SymmetryHalf::Positive);
-            auto bbox = mvb::aggregate_bbox(ns);
-            auto cut = mvb::cut_to_region(ns, cuts, bbox);
-            out.clear();
-            out.reserve(cut.size());
-            for (const auto& cn : cut) out.push_back(cn.shape);
+    apply_scale(named, scale);
+
+    int nSym = mvb::parse_symmetry_spec(symmetry);
+    if (nSym > 0) {
+        named = mvb::apply_symmetry(named, nSym);
+        if (named.empty()) {
+            throw std::runtime_error(
+                "mvbpp: symmetry='" + symmetry +
+                "' removed all geometry (no valid planes detected)");
         }
     }
 
-    return applyUniformScale(out, scale);
+    std::string fmt = format;
+    std::transform(fmt.begin(), fmt.end(), fmt.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (m == "2D") {
+        if (fmt == "stl") {
+            throw std::runtime_error(
+                "mvbpp: mode='2D' requires format='step' (STL is not valid for "
+                "planar faces; use STEP for ElmerFEM/Gmsh 2D meshing).");
+        }
+        named = mvb::SectionBuilder::cut2DFaces(named,
+                                                  mvb::parseSectionPlane(plane),
+                                                  offset);
+        if (named.empty()) {
+            throw std::runtime_error(
+                "mvbpp: 2D section produced no faces (plane=" + plane +
+                ", offset=" + std::to_string(offset) + ")");
+        }
+    }
+
+    auto axisSign = mvb::parse_side_spec(side);
+    named = mvb::filter_by_side(named, axisSign);
+    if (named.empty()) {
+        throw std::runtime_error(
+            "mvbpp: side='" + side + "' filtered out all geometry");
+    }
+
+    return encode_to_bytes(named, fmt);
+}
+
+// ── Per-function builders ───────────────────────────────────────────────────
+
+std::vector<mvb::NamedShape> build_core(const std::string& json_str, int polygonSegments) {
+    nlohmann::json j;
+    try { j = json::parse(json_str); }
+    catch (const std::exception& e) {
+        throw std::runtime_error(std::string("drawCore: json::parse failed: ") + e.what());
+    }
+
+    // Accept either a Magnetic (has "core" key) or a MagneticCore directly.
+    // In both cases enrich (if needed) so we always get a populated
+    // geometricalDescription before calling buildCoreNamed.
+    bool isMagnetic = j.contains("core");
+    if (!isMagnetic) {
+        // Wrap the core into a minimal magnetic so MKF autocomplete runs.
+        nlohmann::json wrap;
+        wrap["core"] = j;
+        wrap["coil"] = json{
+            {"bobbin", "Dummy"},
+            {"functionalDescription", json::array()},
+        };
+        j = std::move(wrap);
+    }
+
+    auto enriched = parseEnriched(j.dump());
+    const auto& core = enriched.get_core();
+    mvb::MagneticBuilder b;
+    return b.buildCoreNamed(core, polygonSegments);
+}
+
+std::vector<mvb::NamedShape> build_spacer(const std::string& json_str, int /*polygonSegments*/) {
+    auto enriched = parseEnriched(json_str);
+    const auto& core = enriched.get_core();
+    auto gdOpt = core.get_geometrical_description();
+    if (!gdOpt || gdOpt->empty()) {
+        throw std::runtime_error("drawSpacer: core has no geometricalDescription");
+    }
+    auto shapes = mvb::SpacerBuilder::buildSpacers(*gdOpt);
+    std::vector<mvb::NamedShape> out;
+    out.reserve(shapes.size());
+    int i = 0;
+    for (auto& s : shapes) {
+        if (s.IsNull()) continue;
+        out.push_back(mvb::NamedShape{ std::move(s), "Spacer_" + std::to_string(i++) });
+    }
+    return out;
+}
+
+std::vector<mvb::NamedShape> build_board(const std::string& json_str, int /*polygonSegments*/) {
+    auto enriched = parseEnriched(json_str);
+    const auto& coilOm = enriched.get_coil();
+    // OpenMagnetics::Coil derives from MAS::Coil — pass directly.
+    auto shape = mvb::FR4Builder::buildFR4Board(coilOm);
+    std::vector<mvb::NamedShape> out;
+    if (!shape.IsNull()) out.push_back(mvb::NamedShape{ std::move(shape), "FR4Board" });
+    return out;
+}
+
+std::vector<mvb::NamedShape> build_core_piece(const std::string& json_str, int polygonSegments) {
+    auto j = json::parse(json_str);
+    auto shape = j.get<MAS::CoreShape>();
+    mvb::MagneticBuilder b;
+    return {b.buildCorePieceNamed(shape, polygonSegments)};
+}
+
+std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int /*polygonSegments*/) {
+    auto j = json::parse(json_str);
+    auto bobbin = j.get<MAS::Bobbin>();
+    mvb::MagneticBuilder b;
+    return {b.buildBobbinNamedFromBobbin(bobbin, /*axisIsY=*/true)};
+}
+
+std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygonSegments) {
+    auto j = json::parse(json_str);
+    mvb::MagneticBuilder b;
+    if (j.is_array()) {
+        // Standalone path: each Turn must carry its own dimensions and
+        // cross_sectional_shape. Throws for toroidal turns (which need
+        // bobbin context); callers should hand a full magnetic instead.
+        auto turns = j.get<std::vector<MAS::Turn>>();
+        return b.buildTurnsNamedFromTurns(turns, polygonSegments);
+    }
+    if (j.is_object() && (j.contains("coil") || j.contains("core"))) {
+        // Magnetic JSON: enrich + use bobbin-aware overload so toroidal
+        // and concentric turns both work uniformly.
+        auto enriched = parseEnriched(json_str);
+        return b.buildTurnsNamed(enriched.get_coil(), enriched.get_core(),
+                                  polygonSegments);
+    }
+    throw std::runtime_error(
+        "drawTurns: input must be a JSON array of MAS::Turn objects, or a "
+        "Magnetic JSON with coil + core (required for toroidal turns).");
+}
+
+std::vector<mvb::NamedShape> build_winding(const std::string& json_str,
+                                            const std::string& windingName,
+                                            int polygonSegments) {
+    auto j = json::parse(json_str);
+    auto coil = j.get<MAS::Coil>();
+    auto turnsOpt = coil.get_turns_description();
+    if (!turnsOpt || turnsOpt->empty()) {
+        throw std::runtime_error("drawWinding: Coil.turnsDescription is empty or missing");
+    }
+    std::string target = windingName;
+    std::transform(target.begin(), target.end(), target.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::vector<MAS::Turn> filtered;
+    for (const auto& t : *turnsOpt) {
+        std::string w = t.get_winding();
+        std::transform(w.begin(), w.end(), w.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (w == target) filtered.push_back(t);
+    }
+    if (filtered.empty()) {
+        throw std::runtime_error("drawWinding: no turns match windingName='" + windingName + "'");
+    }
+    mvb::MagneticBuilder b;
+    return b.buildTurnsNamedFromTurns(filtered, polygonSegments);
+}
+
+std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments) {
+    auto j = json::parse(json_str);
+    auto magnetic = j.get<MAS::Magnetic>();
+    mvb::MagneticBuilder b;
+    return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                            polygonSegments, polygonSegments);
+}
+
+std::string draw_view_impl(const std::string& json_str,
+                            bool dimensions,
+                            const std::string& plane,
+                            double offset,
+                            double widthPx,
+                            const std::string& format) {
+    std::string fmt = format;
+    std::transform(fmt.begin(), fmt.end(), fmt.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (fmt != "svg") {
+        throw std::runtime_error("drawView: only format='svg' is supported (got '" + format + "')");
+    }
+
+    auto j = json::parse(json_str);
+
+    OpenMagnetics::Magnetic magnetic;
+    bool is_magnetic = j.contains("coil") || j.contains("core") ||
+                       j.contains("magnetizing_inductance");
+    if (is_magnetic) {
+        magnetic = parseEnriched(json_str);
+    } else if (j.contains("functionalDescription") || j.contains("functional_description")) {
+        json wrap;
+        wrap["core"] = j;
+        wrap["coil"] = json{
+            {"bobbin", "Dummy"},
+            {"functionalDescription", json::array()}
+        };
+        magnetic = mvb::magnetic_autocomplete_safe(wrap);
+    } else {
+        throw std::runtime_error(
+            "drawView: input JSON does not look like a MAS::Magnetic or "
+            "MAS::MagneticCore (no functionalDescription / coil / core keys)");
+    }
+
+    return mvb::SectionDrawing::drawView(magnetic, plane, offset,
+                                          dimensions, widthPx);
 }
 
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Exposed functions
+// Embind entry points — free functions so guard<&fn> works
 // ─────────────────────────────────────────────────────────────────────────────
 namespace {
 
-// ── STEP assembly export (to Uint8Array) ────────────────────────────────────
-val buildMagneticSTEP(const std::string& magnetic_json,
-                      bool includeBobbin,
-                      double scale,
-                      int symmetryPlanes,
-                      int wirePolygonSegments,
-                      int corePolygonSegments)
-{
-    auto named = buildAssemblyNamed(magnetic_json, includeBobbin, symmetryPlanes,
-                                     wirePolygonSegments, corePolygonSegments, scale);
-    // Use random suffix to avoid race conditions with concurrent calls.
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<uint64_t> dist;
-    std::string tmpName = "mvbpp_" + std::to_string(dist(gen)) + ".step";
-    auto tmp = std::filesystem::temp_directory_path() / tmpName;
-    mvb::exportSTEP(named, tmp.string());
-    std::ifstream f(tmp, std::ios::binary);
-    if (!f) { std::filesystem::remove(tmp); throw std::runtime_error("buildMagneticSTEP: failed to read temp file"); }
-    std::string data((std::istreambuf_iterator<char>(f)),
-                      std::istreambuf_iterator<char>());
-    std::filesystem::remove(tmp);
+// drawCore
+val _drawCore(const std::string& json_str,
+              const std::string& mode,
+              const std::string& plane,
+              double offset,
+              const std::string& format,
+              double scale,
+              int polygonSegments,
+              const std::string& symmetry,
+              const std::string& side) {
+    auto named = build_core(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
     return makeUint8Array(data);
 }
 
-// ── STL assembly export ─────────────────────────────────────────────────────
-val buildMagneticSTL(const std::string& magnetic_json,
-                     bool includeBobbin,
-                     double scale,
-                     int symmetryPlanes,
-                     int wirePolygonSegments,
-                     int corePolygonSegments,
-                     double stlToleranceMm,
-                     double stlAngularTolerance,
-                     bool stlBinary)
-{
-    auto named = buildAssemblyNamed(magnetic_json, includeBobbin, symmetryPlanes,
-                                     wirePolygonSegments, corePolygonSegments, scale);
-    auto shapes = toShapes(named);
-    std::string data = mvb::exportSTLToBytes(shapes, stlToleranceMm,
-                                               stlAngularTolerance, stlBinary);
-    return makeUint8Array(data);
+std::string _drawCoreToPath(const std::string& json_str,
+                            const std::string& path,
+                            const std::string& mode,
+                            const std::string& plane,
+                            double offset,
+                            const std::string& format,
+                            double scale,
+                            int polygonSegments,
+                            const std::string& symmetry,
+                            const std::string& side) {
+    auto named = build_core(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    write_bytes(path, data);
+    return path;
 }
 
-// ── Core-only STL (from full magnetic JSON) ─────────────────────────────────
-val buildCoreSTL(const std::string& magnetic_json,
-                 double scale,
-                 int corePolygonSegments,
-                 double stlToleranceMm,
-                 double stlAngularTolerance,
-                 bool stlBinary)
-{
-    auto shapes = buildCoreShapes(magnetic_json, scale, corePolygonSegments);
-    std::string data = mvb::exportSTLToBytes(shapes, stlToleranceMm,
-                                               stlAngularTolerance, stlBinary);
-    return makeUint8Array(data);
-}
-
-// ── Spacers STL (from full magnetic JSON) ───────────────────────────────────
-val buildSpacersSTL(const std::string& magnetic_json,
-                    double scale,
-                    double stlToleranceMm,
-                    double stlAngularTolerance,
-                    bool stlBinary)
-{
-    auto mag = parseEnriched(magnetic_json);
-    auto geoOpt = mag.get_core().get_geometrical_description();
-    if (!geoOpt) return makeUint8Array("");
-    auto spacers = mvb::SpacerBuilder::buildSpacers(*geoOpt);
-    auto scaled = applyUniformScale(spacers, scale);
-    std::string data = mvb::exportSTLToBytes(scaled, stlToleranceMm,
-                                               stlAngularTolerance, stlBinary);
-    return makeUint8Array(data);
-}
-
-// ── Bobbin STL ──────────────────────────────────────────────────────────────
-val buildBobbinSTL(const std::string& magnetic_json,
+// drawCorePiece
+val _drawCorePiece(const std::string& json_str,
+                   const std::string& mode,
+                   const std::string& plane,
+                   double offset,
+                   const std::string& format,
                    double scale,
-                   double stlToleranceMm,
-                   double stlAngularTolerance,
-                   bool stlBinary)
-{
-    auto mag = parseEnriched(magnetic_json);
-    mvb::MagneticBuilder builder;
-    TopoDS_Shape bobbin = builder.buildBobbin(mag.get_coil(), mag.get_core());
-    std::vector<TopoDS_Shape> shapes;
-    if (!bobbin.IsNull()) shapes.push_back(applyUniformScale(bobbin, scale));
-    std::string data = mvb::exportSTLToBytes(shapes, stlToleranceMm,
-                                               stlAngularTolerance, stlBinary);
+                   int polygonSegments,
+                   const std::string& symmetry,
+                   const std::string& side) {
+    auto named = build_core_piece(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
     return makeUint8Array(data);
 }
 
-// ── Turns STL ───────────────────────────────────────────────────────────────
-val buildTurnsSTL(const std::string& magnetic_json,
-                  double scale,
-                  int wirePolygonSegments,
-                  double stlToleranceMm,
-                  double stlAngularTolerance,
-                  bool stlBinary)
-{
-    auto mag = parseEnriched(magnetic_json);
-    mvb::MagneticBuilder builder;
-    auto turns = builder.buildTurns(mag.get_coil(), mag.get_core(), wirePolygonSegments);
-    auto scaled = applyUniformScale(turns, scale);
-    std::string data = mvb::exportSTLToBytes(scaled, stlToleranceMm,
-                                               stlAngularTolerance, stlBinary);
-    return makeUint8Array(data);
-}
-
-// ── FR4 board STL ───────────────────────────────────────────────────────────
-val buildFR4BoardSTL(const std::string& magnetic_json,
-                     double scale,
-                     double borderToWireDistance,
-                     double coreToLayerDistance,
-                     double stlToleranceMm,
-                     double stlAngularTolerance,
-                     bool stlBinary)
-{
-    auto mag = parseEnriched(magnetic_json);
-    TopoDS_Shape board = mvb::FR4Builder::buildFR4Board(
-        mag.get_coil(), borderToWireDistance, coreToLayerDistance);
-    std::vector<TopoDS_Shape> shapes;
-    if (!board.IsNull()) shapes.push_back(applyUniformScale(board, scale));
-    std::string data = mvb::exportSTLToBytes(shapes, stlToleranceMm,
-                                               stlAngularTolerance, stlBinary);
-    return makeUint8Array(data);
-}
-
-// ── Symmetry planes ─────────────────────────────────────────────────────────
-std::vector<std::string> getSymmetryPlanes(const std::string& magnetic_json) {
-    auto mag = parseEnriched(magnetic_json);
-    mvb::MagneticBuilder builder;
-    auto shapes = builder.buildAllNamed(mag, /*includeBobbin=*/false, /*symmetryPlanes=*/0);
-    auto sym = mvb::analyze_symmetry(shapes);
-    std::vector<std::string> out;
-    for (auto p : sym.valid_planes) out.emplace_back(mvb::to_string(p));
-    return out;
-}
-
-// ── Supported families ──────────────────────────────────────────────────────
-std::vector<std::string> getSupportedFamilies() {
-    return mvb::get_supported_families();
-}
-
-// ── Dimensioned 2D drawings (full + piece) ──────────────────────────────────
-std::string drawDimensionedFrontView(const std::string& magnetic_json,
-                                      double width_px,
-                                      double label_font_px,
-                                      const std::string& projection_color,
-                                      const std::string& dimension_color) {
-    auto mag = parseEnriched(magnetic_json);
-    return mvb::SectionDrawing::drawDimensionedFrontView(
-        mag, width_px, label_font_px, projection_color, dimension_color);
-}
-
-std::string drawDimensionedTopView(const std::string& magnetic_json,
-                                    double width_px,
-                                    double label_font_px,
-                                    const std::string& projection_color,
-                                    const std::string& dimension_color) {
-    auto mag = parseEnriched(magnetic_json);
-    return mvb::SectionDrawing::drawDimensionedTopView(
-        mag, width_px, label_font_px, projection_color, dimension_color);
-}
-
-// Gap-only front view: shows gap dimensions without core shape labels.
-std::string drawCoreGappingTechnicalDrawing(const std::string& magnetic_json,
-                                             double width_px,
-                                             double label_font_px,
-                                             const std::string& projection_color,
-                                             const std::string& dimension_color) {
-    auto mag = parseEnriched(magnetic_json);
-    return mvb::SectionDrawing::drawCoreGappingTechnicalDrawing(
-        mag, width_px, label_font_px, projection_color, dimension_color);
-}
-
-// ── 2D projections & cutaway sections ───────────────────────────────────────
-std::string drawCoreProjection(const std::string& magnetic_json,
-                                const std::string& plane,
-                                int corePolygonSegments,
-                                double width_px,
-                                double stroke_width,
-                                const std::string& stroke_color) {
-    auto shapes = buildCoreShapes(magnetic_json, /*scale=*/1.0, corePolygonSegments);
-    return mvb::ProjectionDrawing::drawProjection(shapes, parsePlane(plane),
-                                                    width_px, /*margin_px=*/40.0,
-                                                    stroke_width, stroke_color);
-}
-
-std::string drawCoreCrossSection(const std::string& magnetic_json,
-                                  const std::string& plane,
-                                  double section_offset,
-                                  int corePolygonSegments,
-                                  double width_px,
-                                  double stroke_width,
-                                  const std::string& stroke_color) {
-    auto shapes = buildCoreShapes(magnetic_json, /*scale=*/1.0, corePolygonSegments);
-    return mvb::ProjectionDrawing::drawCutawaySection(shapes, parsePlane(plane),
-                                                       section_offset, width_px,
-                                                       /*margin_px=*/40.0,
-                                                       stroke_width, stroke_color);
-}
-
-// Single-piece views (0-indexed against geometricalDescription's HALF_SET/TOROIDAL list).
-TopoDS_Shape pickPiece(const std::string& magnetic_json, int pieceIndex,
-                        int corePolygonSegments) {
-    auto shapes = buildCoreShapes(magnetic_json, 1.0, corePolygonSegments);
-    if (pieceIndex < 0 || pieceIndex >= (int)shapes.size()) {
-        throw std::runtime_error("pickPiece: index out of range");
-    }
-    return shapes[pieceIndex];
-}
-
-std::string drawPieceProjection(const std::string& magnetic_json,
-                                 int pieceIndex,
+std::string _drawCorePieceToPath(const std::string& json_str,
+                                 const std::string& path,
+                                 const std::string& mode,
                                  const std::string& plane,
-                                 int corePolygonSegments,
-                                 double width_px,
-                                 double stroke_width,
-                                 const std::string& stroke_color) {
-    auto shape = pickPiece(magnetic_json, pieceIndex, corePolygonSegments);
-    return mvb::ProjectionDrawing::drawProjection(shape, parsePlane(plane),
-                                                    width_px, /*margin_px=*/40.0,
-                                                    stroke_width, stroke_color);
+                                 double offset,
+                                 const std::string& format,
+                                 double scale,
+                                 int polygonSegments,
+                                 const std::string& symmetry,
+                                 const std::string& side) {
+    auto named = build_core_piece(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    write_bytes(path, data);
+    return path;
 }
 
-std::string drawPieceCrossSection(const std::string& magnetic_json,
-                                   int pieceIndex,
-                                   const std::string& plane,
-                                   double section_offset,
-                                   int corePolygonSegments,
-                                   double width_px,
-                                   double stroke_width,
-                                   const std::string& stroke_color) {
-    auto shape = pickPiece(magnetic_json, pieceIndex, corePolygonSegments);
-    return mvb::ProjectionDrawing::drawCutawaySection(shape, parsePlane(plane),
-                                                       section_offset, width_px,
-                                                       /*margin_px=*/40.0,
-                                                       stroke_width, stroke_color);
+// drawBobbin
+val _drawBobbin(const std::string& json_str,
+                const std::string& mode,
+                const std::string& plane,
+                double offset,
+                const std::string& format,
+                double scale,
+                int polygonSegments,
+                const std::string& symmetry,
+                const std::string& side) {
+    auto named = build_bobbin(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    return makeUint8Array(data);
 }
 
-// Full assembly projection (component bitmask: 1=core, 2=bobbin, 4=turns).
-std::string drawAssemblyProjection(const std::string& magnetic_json,
-                                    const std::string& plane,
-                                    int components,
-                                    int symmetryPlanes,
-                                    int wirePolygonSegments,
-                                    int corePolygonSegments,
-                                    double width_px,
-                                    double stroke_width,
-                                    const std::string& stroke_color) {
-    auto shapes = buildAssemblyFiltered(magnetic_json, components, symmetryPlanes,
-                                         wirePolygonSegments, corePolygonSegments,
-                                         /*scale=*/1.0);
-    return mvb::ProjectionDrawing::drawProjection(shapes, parsePlane(plane),
-                                                    width_px, /*margin_px=*/40.0,
-                                                    stroke_width, stroke_color);
+std::string _drawBobbinToPath(const std::string& json_str,
+                              const std::string& path,
+                              const std::string& mode,
+                              const std::string& plane,
+                              double offset,
+                              const std::string& format,
+                              double scale,
+                              int polygonSegments,
+                              const std::string& symmetry,
+                              const std::string& side) {
+    auto named = build_bobbin(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    write_bytes(path, data);
+    return path;
 }
 
-std::string drawAssemblyCrossSection(const std::string& magnetic_json,
-                                      const std::string& plane,
-                                      double section_offset,
-                                      int components,
-                                      int symmetryPlanes,
-                                      int wirePolygonSegments,
-                                      int corePolygonSegments,
-                                      double width_px,
-                                      double stroke_width,
-                                      const std::string& stroke_color) {
-    auto shapes = buildAssemblyFiltered(magnetic_json, components, symmetryPlanes,
-                                         wirePolygonSegments, corePolygonSegments,
-                                         /*scale=*/1.0);
-    return mvb::ProjectionDrawing::drawCutawaySection(shapes, parsePlane(plane),
-                                                       section_offset, width_px,
-                                                       /*margin_px=*/40.0,
-                                                       stroke_width, stroke_color);
+// drawTurns
+val _drawTurns(const std::string& json_str,
+               const std::string& mode,
+               const std::string& plane,
+               double offset,
+               const std::string& format,
+               double scale,
+               int polygonSegments,
+               const std::string& symmetry,
+               const std::string& side) {
+    auto named = build_turns(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    return makeUint8Array(data);
+}
+
+std::string _drawTurnsToPath(const std::string& json_str,
+                             const std::string& path,
+                             const std::string& mode,
+                             const std::string& plane,
+                             double offset,
+                             const std::string& format,
+                             double scale,
+                             int polygonSegments,
+                             const std::string& symmetry,
+                             const std::string& side) {
+    auto named = build_turns(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    write_bytes(path, data);
+    return path;
+}
+
+// drawWinding
+val _drawWinding(const std::string& json_str,
+                 const std::string& windingName,
+                 const std::string& mode,
+                 const std::string& plane,
+                 double offset,
+                 const std::string& format,
+                 double scale,
+                 int polygonSegments,
+                 const std::string& symmetry,
+                 const std::string& side) {
+    auto named = build_winding(json_str, windingName, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    return makeUint8Array(data);
+}
+
+std::string _drawWindingToPath(const std::string& json_str,
+                               const std::string& windingName,
+                               const std::string& path,
+                               const std::string& mode,
+                               const std::string& plane,
+                               double offset,
+                               const std::string& format,
+                               double scale,
+                               int polygonSegments,
+                               const std::string& symmetry,
+                               const std::string& side) {
+    auto named = build_winding(json_str, windingName, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    write_bytes(path, data);
+    return path;
+}
+
+// drawSpacer (takes a Magnetic JSON, builds spacer boxes from
+// core.geometricalDescription entries of type SPACER)
+val _drawSpacer(const std::string& json_str,
+                const std::string& mode,
+                const std::string& plane,
+                double offset,
+                const std::string& format,
+                double scale,
+                int polygonSegments,
+                const std::string& symmetry,
+                const std::string& side) {
+    auto named = build_spacer(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    return makeUint8Array(data);
+}
+
+std::string _drawSpacerToPath(const std::string& json_str,
+                              const std::string& path,
+                              const std::string& mode,
+                              const std::string& plane,
+                              double offset,
+                              const std::string& format,
+                              double scale,
+                              int polygonSegments,
+                              const std::string& symmetry,
+                              const std::string& side) {
+    auto named = build_spacer(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    write_bytes(path, data);
+    return path;
+}
+
+// drawBoard (takes a Magnetic JSON, builds the FR4 PCB plate for planar
+// transformer coils — empty when the coil is not PRINTED.)
+val _drawBoard(const std::string& json_str,
+               const std::string& mode,
+               const std::string& plane,
+               double offset,
+               const std::string& format,
+               double scale,
+               int polygonSegments,
+               const std::string& symmetry,
+               const std::string& side) {
+    auto named = build_board(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    return makeUint8Array(data);
+}
+
+std::string _drawBoardToPath(const std::string& json_str,
+                             const std::string& path,
+                             const std::string& mode,
+                             const std::string& plane,
+                             double offset,
+                             const std::string& format,
+                             double scale,
+                             int polygonSegments,
+                             const std::string& symmetry,
+                             const std::string& side) {
+    auto named = build_board(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    write_bytes(path, data);
+    return path;
+}
+
+// drawMagnetic
+val _drawMagnetic(const std::string& json_str,
+                  const std::string& mode,
+                  const std::string& plane,
+                  double offset,
+                  const std::string& format,
+                  double scale,
+                  int polygonSegments,
+                  const std::string& symmetry,
+                  const std::string& side) {
+    auto named = build_magnetic(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    return makeUint8Array(data);
+}
+
+std::string _drawMagneticToPath(const std::string& json_str,
+                                const std::string& path,
+                                const std::string& mode,
+                                const std::string& plane,
+                                double offset,
+                                const std::string& format,
+                                double scale,
+                                int polygonSegments,
+                                const std::string& symmetry,
+                                const std::string& side) {
+    auto named = build_magnetic(json_str, polygonSegments);
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    write_bytes(path, data);
+    return path;
+}
+
+// drawView
+std::string _drawView(const std::string& json_str,
+                      bool dimensions,
+                      const std::string& plane,
+                      double offset,
+                      double widthPx,
+                      const std::string& format) {
+    return draw_view_impl(json_str, dimensions, plane, offset, widthPx, format);
+}
+
+std::string _drawViewToPath(const std::string& json_str,
+                            const std::string& path,
+                            bool dimensions,
+                            const std::string& plane,
+                            double offset,
+                            double widthPx,
+                            const std::string& format) {
+    auto svg = draw_view_impl(json_str, dimensions, plane, offset, widthPx, format);
+    write_bytes(path, svg);
+    return path;
+}
+
+// Test helper
+std::string _enrichMagnetic(const std::string& json_str) {
+    auto j = nlohmann::json::parse(json_str);
+    auto enriched = mvb::magnetic_autocomplete_safe(j);
+    nlohmann::json out;
+    OpenMagnetics::to_json(out, enriched);
+    return out.dump();
 }
 
 } // namespace
@@ -527,34 +713,29 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
 
     register_vector<std::string>("VectorString");
 
-    // 3D export (STL + STEP) — everything that mvbWorker.js used to
-    // delegate to replicad+MVB.js is covered here.
-    function("buildMagneticSTL",  &guard<&buildMagneticSTL>::call);
-    function("buildMagneticSTEP", &guard<&buildMagneticSTEP>::call);
-    function("buildCoreSTL",      &guard<&buildCoreSTL>::call);
-    function("buildSpacersSTL",   &guard<&buildSpacersSTL>::call);
-    function("buildBobbinSTL",    &guard<&buildBobbinSTL>::call);
-    function("buildTurnsSTL",     &guard<&buildTurnsSTL>::call);
-    function("buildFR4BoardSTL",  &guard<&buildFR4BoardSTL>::call);
+    // 7-function unified API
+    function("drawCore",            &guard<&_drawCore>::call);
+    function("drawCoreToPath",      &guard<&_drawCoreToPath>::call);
+    function("drawCorePiece",       &guard<&_drawCorePiece>::call);
+    function("drawCorePieceToPath", &guard<&_drawCorePieceToPath>::call);
+    function("drawBobbin",          &guard<&_drawBobbin>::call);
+    function("drawBobbinToPath",    &guard<&_drawBobbinToPath>::call);
+    function("drawTurns",           &guard<&_drawTurns>::call);
+    function("drawTurnsToPath",     &guard<&_drawTurnsToPath>::call);
+    function("drawWinding",         &guard<&_drawWinding>::call);
+    function("drawWindingToPath",   &guard<&_drawWindingToPath>::call);
+    function("drawSpacer",          &guard<&_drawSpacer>::call);
+    function("drawSpacerToPath",    &guard<&_drawSpacerToPath>::call);
+    function("drawBoard",           &guard<&_drawBoard>::call);
+    function("drawBoardToPath",     &guard<&_drawBoardToPath>::call);
+    function("drawMagnetic",        &guard<&_drawMagnetic>::call);
+    function("drawMagneticToPath",  &guard<&_drawMagneticToPath>::call);
+    function("drawView",            &guard<&_drawView>::call);
+    function("drawViewToPath",      &guard<&_drawViewToPath>::call);
+
+    // Test helper
+    function("_enrichMagnetic",     &guard<&_enrichMagnetic>::call);
 
     // Metadata
-    function("getSymmetryPlanes",    &guard<&getSymmetryPlanes>::call);
-    function("getSupportedFamilies", &guard<&getSupportedFamilies>::call);
-
-    // 2D drawings — dimensioned (Python MVB technical-drawing surface)
-    function("drawDimensionedFrontView",        &guard<&drawDimensionedFrontView>::call);
-    function("drawDimensionedTopView",          &guard<&drawDimensionedTopView>::call);
-    function("drawCoreGappingTechnicalDrawing", &guard<&drawCoreGappingTechnicalDrawing>::call);
-
-    // 2D projections — wire-frame outline seen looking along the plane normal
-    function("drawCoreProjection",      &guard<&drawCoreProjection>::call);
-    function("drawPieceProjection",     &guard<&drawPieceProjection>::call);
-    function("drawAssemblyProjection",  &guard<&drawAssemblyProjection>::call);
-
-    // 2D cutaway sections — project the half past the section plane, so the
-    // drawing shows the cut surface AND everything beyond it, as seen
-    // looking from the plane normal.
-    function("drawCoreCrossSection",     &guard<&drawCoreCrossSection>::call);
-    function("drawPieceCrossSection",    &guard<&drawPieceCrossSection>::call);
-    function("drawAssemblyCrossSection", &guard<&drawAssemblyCrossSection>::call);
+    function("getSupportedFamilies", &guard<&mvb::get_supported_families>::call);
 }
