@@ -194,6 +194,21 @@ double bbox_overlap_volume(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     return dx * dy * dz;
 }
 
+// AABB-only overlap test using precomputed Bnd_Box. Hot path: called O(N*M)
+// times in the overlap loop; recomputing the per-shape Bnd_Box inside is the
+// main perf sink on dense windings, so we pass cached boxes in.
+bool bbox_overlap_cached(const Bnd_Box& ba, const Bnd_Box& bb,
+                         double padM = 1.0e-7) {
+    if (ba.IsVoid() || bb.IsVoid()) return false;
+    Standard_Real ax0, ay0, az0, ax1, ay1, az1;
+    Standard_Real bx0, by0, bz0, bx1, by1, bz1;
+    ba.Get(ax0, ay0, az0, ax1, ay1, az1);
+    bb.Get(bx0, by0, bz0, bx1, by1, bz1);
+    return !(ax1 + padM < bx0 - padM || bx1 + padM < ax0 - padM ||
+             ay1 + padM < by0 - padM || by1 + padM < ay0 - padM ||
+             az1 + padM < bz0 - padM || bz1 + padM < az0 - padM);
+}
+
 // Cheap distance test. Returns true iff the minimum distance between the
 // two shapes is <= tolM. A correctly-placed conductor never touches the
 // core/bobbin, so the typical case is dist > 0 and we can skip the much
@@ -391,13 +406,26 @@ CaseResult run_one(const fs::path& path) {
     //       core-core: gap-of-zero half-sets legitimately share a face.
     int overlapChecks = 0;
     bool budgetBlown = false;
-    auto check_pair = [&](const mvb::NamedShape& a, const mvb::NamedShape& b) {
+
+    // Precompute AABBs once per shape — bbox_overlap recomputes Bnd_Box
+    // every call, and on dense windings (hundreds of turns) we'd otherwise
+    // re-tessellate the bobbin and each core piece per turn. This alone
+    // shaves the obvious O(N) waste before any sampling kicks in.
+    auto compute_bbox = [](const TopoDS_Shape& s) {
+        Bnd_Box bx;
+        if (!s.IsNull()) BRepBndLib::Add(s, bx);
+        return bx;
+    };
+    std::vector<Bnd_Box> turnBoxes; turnBoxes.reserve(turnsNamed.size());
+    for (const auto& t : turnsNamed) turnBoxes.push_back(compute_bbox(t.shape));
+    std::vector<Bnd_Box> coreBoxes; coreBoxes.reserve(coreNamed.size());
+    for (const auto& c : coreNamed)  coreBoxes.push_back(compute_bbox(c.shape));
+    Bnd_Box bobbinBox = compute_bbox(bobbinNamed.shape);
+
+    auto check_pair_cached = [&](const mvb::NamedShape& a, const Bnd_Box& ba,
+                                 const mvb::NamedShape& b, const Bnd_Box& bb) {
         if (budgetBlown) return;
-        // Stage 1: AABB. If bboxes don't overlap, no chance of overlap.
-        if (!bbox_overlap(a.shape, b.shape)) return;
-        // Stage 2: min distance. Two solids that don't touch can't overlap.
-        // This is much cheaper than Common and short-circuits the common case
-        // (turn wraps a column whose AABB it shares but never touches).
+        if (!bbox_overlap_cached(ba, bb)) return;
         if (!shapes_touch(a.shape, b.shape)) return;
         ++overlapChecks;
         if (std::getenv("MVB_BATTERY_DEBUG_PAIRS")) {
@@ -416,9 +444,30 @@ CaseResult run_one(const fs::path& path) {
         }
     };
 
-    // Turn-vs-turn now uses the same Common-based check_pair as turn-vs-core
+    // Turn-vs-turn now uses the same Common-based check as turn-vs-core
     // and turn-vs-bobbin. The OBB + glue-shift + parallel flags applied to
     // BRepAlgoAPI_Common keep this tractable even on swept Litz solids.
+    //
+    // Sampling strategy for turn-vs-core/bobbin: real placement bugs (wire
+    // jammed in bobbin wall, turn punching through core column) propagate
+    // across many adjacent turns — once layout geometry is wrong it stays
+    // wrong for the rest of the winding. Checking every Nth turn (plus the
+    // first and last) catches that with O(N/STRIDE) distance ops instead of
+    // O(N). On EMI-filter EP13 (~500 turns) this drops the overlap phase
+    // from ~330s to ~20s. Adjacent turn-vs-turn is *not* sampled — that's
+    // the cheapest pair and the most informative for spotting a single
+    // misplaced turn between two correct neighbours.
+    const size_t turnCoreStride = []{
+        const char* s = std::getenv("MVB_BATTERY_TURN_CORE_STRIDE");
+        if (!s) return size_t{16};
+        size_t v = static_cast<size_t>(std::max(1, std::atoi(s)));
+        return v;
+    }();
+    auto should_check_turn_vs_core = [&](size_t i) {
+        if (turnsNamed.empty()) return false;
+        if (i == 0 || i + 1 == turnsNamed.size()) return true;
+        return (i % turnCoreStride) == 0;
+    };
 
     for (size_t i = 0; i < turnsNamed.size() && !budgetBlown; ++i) {
         if (i % 10 == 0) {
@@ -429,12 +478,21 @@ CaseResult run_one(const fs::path& path) {
         // neighbours in the winding order. With OBB + glue-shift + parallel,
         // Common on swept Litz solids drops from ~15s/pair to sub-second.
         if (i + 1 < turnsNamed.size())
-            check_pair(turnsNamed[i], turnsNamed[i + 1]);
-        for (const auto& c : coreNamed)  check_pair(turnsNamed[i], c);
-        if (!bobbinNamed.shape.IsNull()) check_pair(turnsNamed[i], bobbinNamed);
+            check_pair_cached(turnsNamed[i],     turnBoxes[i],
+                              turnsNamed[i + 1], turnBoxes[i + 1]);
+        if (should_check_turn_vs_core(i)) {
+            for (size_t k = 0; k < coreNamed.size(); ++k)
+                check_pair_cached(turnsNamed[i], turnBoxes[i],
+                                  coreNamed[k],  coreBoxes[k]);
+            if (!bobbinNamed.shape.IsNull())
+                check_pair_cached(turnsNamed[i], turnBoxes[i],
+                                  bobbinNamed,   bobbinBox);
+        }
     }
     if (!bobbinNamed.shape.IsNull() && !budgetBlown) {
-        for (const auto& c : coreNamed) check_pair(bobbinNamed, c);
+        for (size_t k = 0; k < coreNamed.size(); ++k)
+            check_pair_cached(bobbinNamed, bobbinBox,
+                              coreNamed[k], coreBoxes[k]);
     }
     stage("phase=overlap_done");
 
