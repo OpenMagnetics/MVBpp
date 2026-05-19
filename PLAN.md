@@ -55,7 +55,7 @@ bindings/wasm/       — Emscripten module + JS tests
 | `[shapes]`         | pass (882 ran, 8 excluded, 0 failed)  | Excluded: 4 `ui` + 3 `pqi` + 1 `ut` (intentional, mirrors MVB Python) |
 | `[get_families]`   | pass                                  |                                            |
 | `[symmetry]`       | pass (8/8)                            | Can be slow on complex shapes              |
-| `[battery]`        | slow (>15min, scans 25+ MAS examples through MKF) | Preexisting perf issue, not a correctness regression |
+| `[battery]`        | 17/25 simple pass; overlap phase now ~free (was the dominant cost) | Remaining failures: 4× toroidal `Bobbin has no SOLID`, 3× bobbin-vs-core overlap ≈ 1 mm³, 1× build-budget exceedance |
 | `[topview]`        | pass (toroidal 2D)                    |                                            |
 | `[json]`           | pass                                  |                                            |
 | `[gapping][additive]`     | pass (448 ran, 0 failed)       |                                            |
@@ -64,14 +64,17 @@ bindings/wasm/       — Emscripten module + JS tests
 
 ### Open items
 
-1. **`[symmetry]` / `[battery]` performance**
-   - `[battery]` test scans 25+ MAS examples through MKF and can exceed 15 minutes; blocks CI parallelism
-   - `[symmetry]` boolean ops on PQ3230 + distributed gapping can exceed 2 minutes
+1. **`[battery]` real failures** (correctness, not perf)
+   - 4× `Bobbin has no SOLID` on toroidal designs (`05_pfc_inductor_t4020_hf60`, `07_cmc_t2515_w800`, `12_boost_inductor_t5026_26`, `18_stacked_inductor_e7033_n27`) — toroidal bobbin builder produces empty shape
+   - 3× bobbin-vs-core overlap ≈ 1e-6 m³ above 1e-7 tolerance (`03_buck_inductor_pq3230_n95`, `09_planar_xfmr_er2510_3c94`, `14_dab_xfmr_pm8770_n97`) — bobbin geometry intersects core wall
+   - 1× build-budget exceedance on `13_current_sense_er95_n87` (22.8 s vs 20 s cap during `buildAllNamed`)
+
+2. **`[symmetry]` performance**
+   - Boolean ops on PQ3230 + distributed gapping can exceed 2 minutes
    - Consider face-based gap rendering or cached cut shapes
 
-2. **README / docs**
+3. **README / docs**
    - README is light on the binding APIs, DrawConfig fields, and section/symmetry spec syntax
-   - AGENTS.md is mostly up to date but has stale claims (e.g. WASM tests broken — they pass)
 
 ### Design decisions
 
