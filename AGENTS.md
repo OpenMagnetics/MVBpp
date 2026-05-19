@@ -123,8 +123,12 @@ Boolean operations on complex shapes (PQ3230, distributed gapping) can take >2mi
 ./mvb_tests "[assembly]"    # fast, ~30s
 ```
 
-### WASM tests are broken
-`bindings/wasm/tests/test_mvbpp.js` calls API functions (`drawMagneticToBuffer`, `DrawConfig`) that don't exist in the C++ embind registration. The actual WASM API exposes `buildMagneticSTEP` and `buildMagneticSTL`. These tests need a full rewrite to match the C++ bindings.
+### WASM build/test
+```bash
+cd bindings/wasm && npm run build   # requires emsdk: source ~/emsdk/emsdk_env.sh
+node tests/test_mvbpp.js            # 27 tests, all pass
+```
+The embind surface is the `draw*` family: `drawMagnetic`, `drawCore`, `drawCorePiece`, `drawBobbin`, `drawTurns`, `drawWinding`, `drawSpacer`, `drawBoard`, `drawView`, plus `*ToPath` variants and the test helper `_enrichMagnetic`. All take the trailing 9-arg config pack `(mode, plane, offset, format, scale, polygonSegments, symmetry, side)` documented in `bindings/wasm/mvbpp_wasm.cpp`.
 
 ## Test data
 
@@ -137,8 +141,7 @@ Test data must conform to MAS 1.0 schema. Run `python3 MAS/scripts/migrate-to-1.
 
 ## Current status
 
-- Phases 1-3 done (infrastructure, core shapes, bobbin matching)
-- Phase 4 partially done (turns — some geometries crash OCCT's MakePipe)
-- 12/12 fast tests pass; symmetry and gapping tests can timeout on complex shapes
-- WASM tests are completely broken (API mismatch) and need a rewrite
-- See `PLAN.md` for detailed status and blockers
+- Core shapes, bobbin, turns, sections/projections, symmetry, spacers, FR4 all implemented
+- C++ tests: `[step]/[stl]/[assembly]/[shapes]/[json]/[topview]/[symmetry]/[gapping]` all pass; `[battery]` is slow (>15min) but functional
+- Python (pybind11) and WASM (Emscripten) bindings: all tests pass
+- See `PLAN.md` for detailed status and open performance/docs items

@@ -69,18 +69,19 @@ bindings/wasm/       — Emscripten module + JS tests
    - `[symmetry]` boolean ops on PQ3230 + distributed gapping can exceed 2 minutes
    - Consider face-based gap rendering or cached cut shapes
 
-2. **WASM JavaScript tests are stale**
-   - `bindings/wasm/tests/test_mvbpp.js` calls `drawMagneticToBuffer` / `DrawConfig` which are not in the current embind registration
-   - Actual exposed API: `buildMagneticSTEP`, `buildMagneticSTL`, `drawCore`, `drawTurns`, `drawSpacer`, `drawBoard`, `parseEnriched`
-   - Tests need to be rewritten against the current API
-
-3. **MKF bobbin dimension divergence**
-   - `magnetic_autocomplete` produces flange dimensions that differ from Python `StandardBobbin` defaults when the input has no explicit bobbin
-   - Currently MVB++ follows MKF values; document as intended behaviour or wire through a "Python-compatible defaults" switch
-
-4. **README / docs**
+2. **README / docs**
    - README is light on the binding APIs, DrawConfig fields, and section/symmetry spec syntax
-   - AGENTS.md is the up-to-date reference for build + gotchas; user docs lag behind
+   - AGENTS.md is mostly up to date but has stale claims (e.g. WASM tests broken — they pass)
+
+### Design decisions
+
+- **MKF-always for bobbin defaults.** When MAS input has no explicit bobbin,
+  MVB++ follows the dimensions produced by `magnetic_autocomplete` (MKF),
+  even when those differ from Python `StandardBobbin` defaults. Rationale:
+  MKF is the single source of truth for derived magnetic data; mirroring
+  Python defaults would fork the geometry model and require keeping a
+  second defaults table in sync forever. Callers that need Python-MVB
+  parity should pre-fill the bobbin in their MAS JSON.
 
 ### Maintenance gotchas (see AGENTS.md for full list)
 - `LD_LIBRARY_PATH=build/occt-install/lib` required for the test binary
