@@ -305,6 +305,11 @@ std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
 template<typename CoilT>
 TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& core,
                                     int polygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) {
+    // Toroidal cores have no bobbin: the winding is wound directly on the
+    // core. MKF still emits a CoreBobbinProcessedDescription with whatever
+    // column dims it can infer, so without this guard we'd build a phantom
+    // rectangular bobbin around a ring core and overlap it with everything.
+    if (isCoreToroidal(core)) return TopoDS_Shape();
     auto bobbinPd = getBobbinProcessed(coil);
     patchBobbinDimensions(bobbinPd, core);
     if (bobbinPd.get_column_width().value_or(0.0) <= 0.0) return TopoDS_Shape();
