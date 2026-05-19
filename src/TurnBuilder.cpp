@@ -11,6 +11,8 @@
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
+#include <BOPAlgo_GlueEnum.hxx>
+#include <TopTools_ListOfShape.hxx>
 #include <BRep_Builder.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
@@ -765,6 +767,72 @@ TopoDS_Shape TurnBuilder::buildTurn(const MAS::Turn& turn,
 
 void TurnBuilder::clearCache() {
     s_toroidalTurnCache.clear();
+}
+
+TopoDS_Shape TurnBuilder::buildFromTurnAlone(const MAS::Turn& turn,
+                                              int wirePolygonSegments) {
+    // Validate required Turn fields explicitly — no silent fallbacks.
+    const auto& coords = turn.get_coordinates();
+    if (coords.size() < 2) {
+        throw std::runtime_error(
+            "TurnBuilder::buildFromTurnAlone: Turn '" + turn.get_name()
+            + "' must have at least 2 coordinates");
+    }
+    auto dimsOpt = turn.get_dimensions();
+    if (!dimsOpt || dimsOpt->size() < 2) {
+        throw std::runtime_error(
+            "TurnBuilder::buildFromTurnAlone: Turn '" + turn.get_name()
+            + "' must carry dimensions [width, height] in standalone mode");
+    }
+    auto crossOpt = turn.get_cross_sectional_shape();
+    if (!crossOpt) {
+        throw std::runtime_error(
+            "TurnBuilder::buildFromTurnAlone: Turn '" + turn.get_name()
+            + "' must carry crossSectionalShape (ROUND/RECTANGULAR/OVAL) in standalone mode");
+    }
+
+    // Synthesize a minimal Wire matching the cross-section, so we can reuse
+    // the well-tested buildTurn() pipeline. Dimensions on the Turn already
+    // take precedence inside get_wire_dimensions().
+    MAS::Wire wire;
+    if (*crossOpt == MAS::TurnCrossSectionalShape::RECTANGULAR ||
+        *crossOpt == MAS::TurnCrossSectionalShape::OVAL) {
+        wire.set_type(MAS::WireType::RECTANGULAR);
+        MAS::DimensionWithTolerance w; w.set_nominal((*dimsOpt)[0]);
+        MAS::DimensionWithTolerance h; h.set_nominal((*dimsOpt)[1]);
+        wire.set_outer_width(std::optional<MAS::DimensionWithTolerance>(w));
+        wire.set_outer_height(std::optional<MAS::DimensionWithTolerance>(h));
+        wire.set_conducting_width(std::optional<MAS::DimensionWithTolerance>(w));
+        wire.set_conducting_height(std::optional<MAS::DimensionWithTolerance>(h));
+    } else {
+        wire.set_type(MAS::WireType::ROUND);
+        MAS::DimensionWithTolerance d; d.set_nominal((*dimsOpt)[0]);
+        wire.set_outer_diameter(std::optional<MAS::DimensionWithTolerance>(d));
+        wire.set_conducting_diameter(std::optional<MAS::DimensionWithTolerance>(d));
+    }
+
+    bool isToroidal = turn.get_additional_coordinates().has_value()
+                       && !turn.get_additional_coordinates()->empty();
+
+    if (isToroidal) {
+        throw std::runtime_error(
+            "TurnBuilder::buildFromTurnAlone: toroidal turn '" + turn.get_name()
+            + "' (additional_coordinates set) needs full bobbin context "
+              "(column_depth, winding_window). Use drawWinding or drawMagnetic "
+              "with a full Magnetic JSON instead of standalone drawTurns.");
+    }
+
+    // Concentric round-column turn: bobbin's column_shape is the only field
+    // buildTurn consults for ROUND, and turn.coordinates[0] becomes the
+    // turn radius — exactly what we want.
+    MAS::CoreBobbinProcessedDescription bobbin;
+    bobbin.set_column_shape(MAS::ColumnShape::ROUND);
+    bobbin.set_column_depth(0.0);
+    bobbin.set_column_thickness(0.0);
+    bobbin.set_wall_thickness(0.0);
+    bobbin.set_winding_windows(std::vector<MAS::WindingWindowElement>{});
+
+    return buildTurn(turn, wire, bobbin, /*isToroidal=*/false, wirePolygonSegments);
 }
 
 } // namespace mvb
