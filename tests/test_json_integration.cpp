@@ -51,7 +51,9 @@ TEST_CASE("Build complete magnetic from concentric_rectangular_column_one_turn.j
     }
 
     REQUIRE(!corePieces.empty());
-    REQUIRE(!bobbinNamed.shape.IsNull());
+    // bobbinNamed.shape may legitimately be null: this fixture has
+    // column_thickness=0 and wall_thickness=0, which means MAS declares no
+    // bobbin material. Per the no-fallback policy we don't synthesise one.
     REQUIRE(!turnPieces.empty());
 
     int solids = 0;
@@ -62,7 +64,7 @@ TEST_CASE("Build complete magnetic from concentric_rectangular_column_one_turn.j
         totalVolume += props.Mass();
         for (TopExp_Explorer exp(ns.shape, TopAbs_SOLID); exp.More(); exp.Next()) ++solids;
     }
-    {
+    if (!bobbinNamed.shape.IsNull()) {
         GProp_GProps props;
         BRepGProp::VolumeProperties(bobbinNamed.shape, props);
         totalVolume += props.Mass();
@@ -76,7 +78,7 @@ TEST_CASE("Build complete magnetic from concentric_rectangular_column_one_turn.j
     }
 
     REQUIRE(totalVolume > 0.0);
-    REQUIRE(solids >= 3); // core + bobbin + turns
+    REQUIRE(solids >= 3); // at minimum: 2 core halves + 1 turn
 }
 
 // Simulate what Core2DVisualizer.vue passes to drawDimensionedFrontView:

@@ -77,13 +77,18 @@ static void patchBobbinDimensions(MAS::CoreBobbinProcessedDescription& bobbinPd,
     // Fall back to the core's central column dimensions, using MKF's convention:
     // column_width = core_column_width / 2 + wall_thickness
     // (this is the outer radius of the bobbin body tube).
+    //
+    // No silent default for wall_thickness: if MKF/MAS leaves it unset (NaN
+    // or negative), we honour that as "no wall" and let the caller decide
+    // — per the no-fallback policy, fabricating a 0.5 mm wall here would
+    // hide whatever the upstream actually wanted.
     if (colWidth <= 0.0) {
         auto corePd = core.get_processed_description();
         if (corePd && !corePd->get_columns().empty()) {
             const auto& centralCol = corePd->get_columns()[0];
             double wallThickness = bobbinPd.get_wall_thickness();
-            if (wallThickness <= 0.0 || std::isnan(wallThickness)) {
-                wallThickness = 0.0005;
+            if (std::isnan(wallThickness) || wallThickness < 0.0) {
+                wallThickness = 0.0;
             }
             if (centralCol.get_width() > 0.0) {
                 bobbinPd.set_column_width(centralCol.get_width() / 2.0 + wallThickness);
@@ -315,6 +320,16 @@ TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& c
     if (bobbinPd.get_column_width().value_or(0.0) <= 0.0) return TopoDS_Shape();
     double flangeThickness = bobbinPd.get_wall_thickness();
     if (flangeThickness < 0.0 || std::isnan(flangeThickness)) flangeThickness = 0.0;
+    // If MAS/MKF reports both the column-wall thickness and the flange (wall)
+    // thickness as zero, there is no bobbin material to render. This is what
+    // we see on many MAS examples (PQ3230 buck, ER25/15 planar, E70/33
+    // stacked) where MKF emits a CoreBobbinProcessedDescription that is
+    // really just a column footprint, not a real bobbin. Building anyway
+    // produces a degenerate solid that overlaps the core column (round path,
+    // innerR == outerR) or an empty body (rect path, hole == outer).
+    double columnThickness = bobbinPd.get_column_thickness();
+    if (std::isnan(columnThickness) || columnThickness < 0.0) columnThickness = 0.0;
+    if (flangeThickness == 0.0 && columnThickness == 0.0) return TopoDS_Shape();
     return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments);
 }
 

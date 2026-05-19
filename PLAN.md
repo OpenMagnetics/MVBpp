@@ -55,7 +55,7 @@ bindings/wasm/       — Emscripten module + JS tests
 | `[shapes]`         | pass (882 ran, 8 excluded, 0 failed)  | Excluded: 4 `ui` + 3 `pqi` + 1 `ut` (intentional, mirrors MVB Python) |
 | `[get_families]`   | pass                                  |                                            |
 | `[symmetry]`       | pass (8/8)                            | Can be slow on complex shapes              |
-| `[battery]`        | 17/25 simple pass; overlap phase now ~free (was the dominant cost) | Remaining failures: 4× toroidal `Bobbin has no SOLID`, 3× bobbin-vs-core overlap ≈ 1 mm³, 1× build-budget exceedance |
+| `[battery]`        | 24/25 simple pass; overlap phase now ~free (was the dominant cost) | Remaining failure: 14_dab_xfmr_pm8770_n97 — PM core full-disc bobbin flange overlaps side legs (~0.8 mm³ each side) |
 | `[topview]`        | pass (toroidal 2D)                    |                                            |
 | `[json]`           | pass                                  |                                            |
 | `[gapping][additive]`     | pass (448 ran, 0 failed)       |                                            |
@@ -64,10 +64,9 @@ bindings/wasm/       — Emscripten module + JS tests
 
 ### Open items
 
-1. **`[battery]` real failures** (correctness, not perf)
-   - 4× `Bobbin has no SOLID` on toroidal designs (`05_pfc_inductor_t4020_hf60`, `07_cmc_t2515_w800`, `12_boost_inductor_t5026_26`, `18_stacked_inductor_e7033_n27`) — toroidal bobbin builder produces empty shape
-   - 3× bobbin-vs-core overlap ≈ 1e-6 m³ above 1e-7 tolerance (`03_buck_inductor_pq3230_n95`, `09_planar_xfmr_er2510_3c94`, `14_dab_xfmr_pm8770_n97`) — bobbin geometry intersects core wall
-   - 1× build-budget exceedance on `13_current_sense_er95_n87` (22.8 s vs 20 s cap during `buildAllNamed`)
+1. **PM-core bobbin flange overlaps side legs** (single remaining `[battery]` failure)
+   - `BobbinBuilder` round-path builds flanges as full discs of radius `colWidth+wwWidth`, but PM (and to a lesser extent PQ/ER) cores have side-leg material at that radius. The disc cylinder punches through the legs ⇒ ~0.8 mm³ bobbin↔core overlap on `14_dab_xfmr_pm8770_n97`
+   - Fix options: subtract fused core from bobbin after build (~50–200 ms boolean), or shape flange to the actual winding-window cross-section, or treat as known modelling approximation and raise the bobbin↔core tolerance specifically
 
 2. **`[symmetry]` performance**
    - Boolean ops on PQ3230 + distributed gapping can exceed 2 minutes
