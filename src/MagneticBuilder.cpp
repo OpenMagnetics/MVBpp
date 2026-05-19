@@ -330,6 +330,13 @@ TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& c
     double columnThickness = bobbinPd.get_column_thickness();
     if (std::isnan(columnThickness) || columnThickness < 0.0) columnThickness = 0.0;
     if (flangeThickness == 0.0 && columnThickness == 0.0) return TopoDS_Shape();
+    // NOTE: we do NOT post-process the bobbin to avoid overlap with the
+    // core. The dimensions and position are taken verbatim from MAS/MKF;
+    // if the resulting bobbin geometry overlaps a core leg, that means
+    // either MAS describes a bobbin whose flange shape doesn't match the
+    // actual winding-window cross-section, or BobbinBuilder is using the
+    // wrong flange topology. Either way, the fix belongs upstream (in
+    // BobbinBuilder or in MAS), not in a silent post-hoc cut here.
     return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments);
 }
 

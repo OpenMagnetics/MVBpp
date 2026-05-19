@@ -85,9 +85,12 @@ namespace {
 // its window) are orders of magnitude larger.
 constexpr double OVERLAP_TOLERANCE_M3 = 1.0e-7;  // 100 mm^3
 
-// Polygon segmentation used by the heavy builds. Kept small so toroidal
-// designs (hundreds of turns, large major-radius rings) stay tractable.
-constexpr int CORE_SEGMENTS = 8;
+// Polygon segmentation used by the heavy builds. CORE_SEGMENTS=16 keeps the
+// round-cylinder approximation close enough to the MAS-described round
+// columns/flanges that chord-vs-chord faceting noise between bobbin and
+// core stays small. WIRE_SEGMENTS stays low so toroidal designs (hundreds
+// of turns, large major-radius rings) remain tractable.
+constexpr int CORE_SEGMENTS = 16;
 constexpr int WIRE_SEGMENTS = 6;
 
 // Per-file hard wall-clock budget. Anything slower than this points at a

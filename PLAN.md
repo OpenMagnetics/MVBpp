@@ -65,8 +65,8 @@ bindings/wasm/       — Emscripten module + JS tests
 ### Open items
 
 1. **PM-core bobbin flange overlaps side legs** (single remaining `[battery]` failure)
-   - `BobbinBuilder` round-path builds flanges as full discs of radius `colWidth+wwWidth`, but PM (and to a lesser extent PQ/ER) cores have side-leg material at that radius. The disc cylinder punches through the legs ⇒ ~0.8 mm³ bobbin↔core overlap on `14_dab_xfmr_pm8770_n97`
-   - Fix options: subtract fused core from bobbin after build (~50–200 ms boolean), or shape flange to the actual winding-window cross-section, or treat as known modelling approximation and raise the bobbin↔core tolerance specifically
+   - `BobbinBuilder` round-path builds flanges as full discs of radius `colWidth+wwWidth`, but PM cores have non-axisymmetric outer walls (side legs / spine) at that radius. The disc punches through ⇒ ~470 mm³ bobbin↔core overlap on `14_dab_xfmr_pm8770_n97`
+   - Per the "use MAS dimensions verbatim, don't modify geometry" rule we don't post-process the bobbin to cut around the core. Fix has to be a proper flange topology in `BobbinBuilder` (e.g. a `racetrack` or core-window-shaped flange driven by MAS winding-window data) so the generated geometry matches the MAS-described bobbin profile from the start
 
 2. **`[symmetry]` performance**
    - Boolean ops on PQ3230 + distributed gapping can exceed 2 minutes
