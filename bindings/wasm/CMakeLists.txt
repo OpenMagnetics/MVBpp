@@ -196,7 +196,16 @@ target_link_libraries(mvb++ PUBLIC occt MKF nlohmann_json::nlohmann_json)
 
 # ── WASM module ───────────────────────────────────────────────────────────────
 add_executable(mvbpp_wasm mvbpp_wasm.cpp)
+
+# cmrc embeds resources via static constructors in libdata.a.  When linking
+# static libraries the linker drops unreferenced object files, so the resource
+# initializers never run.  Force the entire archive so all cmrc files are kept.
 target_link_libraries(mvbpp_wasm PRIVATE mvb++)
+target_link_options(mvbpp_wasm PRIVATE
+    "LINKER:--whole-archive"
+    "$<TARGET_FILE:data>"
+    "LINKER:--no-whole-archive"
+)
 
 # Enable C++ exception catching only in mvbpp_wasm.cpp so the guard wrappers
 # at each entry point can catch std::exception thrown from MKF/OCCT (which

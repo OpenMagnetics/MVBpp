@@ -187,6 +187,13 @@ if(NOT TARGET MKF)
     # Python wheel and WASM module are fully self-contained.
     file(READ "${_MKF_SRC}/CMakeLists.txt" _mkf_cmake)
     string(REPLACE "add_library(MKF SHARED" "add_library(MKF STATIC" _mkf_cmake "${_mkf_cmake}")
+    # MKF generates CAS.hpp via the CAS custom target but forgets to declare
+    # MKF depending on it — first parallel build fails with "CAS.hpp: No such
+    # file or directory". Patch the dependency list to include CAS.
+    string(REPLACE
+        "add_dependencies(MKF MAS cci_data_gen)"
+        "add_dependencies(MKF MAS cci_data_gen CAS)"
+        _mkf_cmake "${_mkf_cmake}")
     file(WRITE "${_MKF_SRC}/CMakeLists.txt" "${_mkf_cmake}")
     include_directories("${CMAKE_BINARY_DIR}/_deps/json-src/include/nlohmann")
     add_subdirectory("${_MKF_SRC}" "${_MKF_BIN}" EXCLUDE_FROM_ALL)
@@ -195,7 +202,15 @@ endif()
 # ============================================================================
 # MVB++ library
 # ============================================================================
-add_library(mvb++ SHARED
+# When building the Python wheel we want a self-contained mvbpp.so with no
+# external libmvb++.so dependency.  Build mvb++ as STATIC + position-independent
+# so it can be linked into the pybind11 module.
+if(BUILD_PYTHON_BINDINGS)
+    set(_mvbpp_lib_kind STATIC)
+else()
+    set(_mvbpp_lib_kind SHARED)
+endif()
+add_library(mvb++ ${_mvbpp_lib_kind}
     src/MagneticBuilder.cpp
     src/SectionBuilder.cpp
     src/SectionDrawing.cpp
@@ -224,6 +239,7 @@ add_library(mvb++ SHARED
     src/shapes/ShapeUt.cpp
     src/shapes/Factory.cpp
 )
+set_target_properties(mvb++ PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(mvb++ PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -255,12 +271,17 @@ add_executable(mvb_tests
     tests/test_integration.cpp
     tests/test_json_integration.cpp
     tests/test_symmetry.cpp
+    tests/test_mas_battery.cpp
+    tests/test_toroidal_topview.cpp
 )
 
 target_compile_definitions(mvb_tests PRIVATE
     REFERENCE_STEPS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/reference_steps"
     MAS_EXAMPLES_DIR="${CMAKE_BINARY_DIR}/_deps/mas-src/examples"
     MAS_DATA_DIR="${CMAKE_BINARY_DIR}/_deps/mas-src/data"
+    # Locally-patched copies of MAS/examples/complete with stale wire/shape
+    # refs corrected to valid DB entries (see tools/fix-mas-complete-examples.py).
+    MAS_COMPLETE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/mas_complete_fixtures"
 )
 
 target_link_libraries(mvb_tests PRIVATE mvb++ Catch2::Catch2WithMain)
@@ -270,6 +291,12 @@ target_link_libraries(mvbpp_generate_steps PRIVATE mvb++)
 
 add_executable(mvbpp_step_generator tools/mvbpp_step_generator.cpp)
 target_link_libraries(mvbpp_step_generator PRIVATE mvb++)
+
+add_executable(mvbpp_inspect tools/mvbpp_inspect.cpp)
+target_link_libraries(mvbpp_inspect PRIVATE mvb++)
+
+add_executable(mvbpp_dump_pieces tools/mvbpp_dump_pieces.cpp)
+target_link_libraries(mvbpp_dump_pieces PRIVATE mvb++)
 
 add_executable(mvbpp_section tools/mvbpp_section.cpp)
 target_link_libraries(mvbpp_section PRIVATE mvb++)
@@ -315,7 +342,18 @@ if(BUILD_PYTHON_BINDINGS)
         ${CMAKE_BINARY_DIR}/_deps/spline-src/src
         ${CMAKE_BINARY_DIR}/_deps/magic-enum-src/include/magic_enum
     )
-    target_link_libraries(mvbpp PRIVATE mvb++)
+    target_link_libraries(mvbpp PRIVATE
+        "-Wl,--whole-archive" mvb++ "-Wl,--no-whole-archive")
+
+    # Static OCCT's TKService references X11 symbols (XOpenDisplay,
+    # XGetVisualInfo, XGetWindowAttributes) for offscreen visual queries.
+    # Without an explicit link line, the .so loads but throws
+    # "undefined symbol: XGetVisualInfo" on import, forcing users to
+    # LD_PRELOAD libX11. Link X11 directly (Linux only).
+    if(UNIX AND NOT APPLE)
+        find_package(X11 REQUIRED)
+        target_link_libraries(mvbpp PRIVATE ${X11_LIBRARIES})
+    endif()
 endif()
 
 # Symlink MVB testData into our build tree for runtime access
