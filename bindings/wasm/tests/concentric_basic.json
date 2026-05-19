@@ -1,4 +1,5 @@
 {
+    "masVersion": "1.0.0",
     "inputs": {
         "designRequirements": {
             "isolationSides": [
@@ -8,8 +9,7 @@
                 "nominal": 0.00039999999999999996
             },
             "name": "My Design Requirements",
-            "turnsRatios": [
-            ]
+            "turnsRatios": []
         },
         "operatingPoints": [
             {
@@ -21,7 +21,7 @@
                         "frequency": 100000,
                         "current": {
                             "processed": {
-                                "label": "Triangular",
+                                "label": "triangular",
                                 "peakToPeak": 0.5,
                                 "offset": 0,
                                 "dutyCycle": 0.5
@@ -29,7 +29,7 @@
                         },
                         "voltage": {
                             "processed": {
-                                "label": "Rectangular",
+                                "label": "rectangular",
                                 "peakToPeak": 20,
                                 "offset": 0,
                                 "dutyCycle": 0.5
@@ -43,8 +43,8 @@
     },
     "magnetic": {
         "coil": {
-            "bobbin": "Basic",
-            "functionalDescription":[
+            "bobbin": "basic",
+            "functionalDescription": [
                 {
                     "name": "Primary",
                     "numberTurns": 4,
@@ -64,20 +64,23 @@
         "core": {
             "name": "core_E_19_8_5_N87_substractive",
             "functionalDescription": {
-                "type": "two-piece set",
+                "type": "twoPieceSet",
                 "material": "N87",
                 "shape": "E 19/8/5",
-                "gapping": [{
-                    "type": "subtractive",
-                    "length": 0.0005
-                },
-                {
-                    "type": "subtractive",
-                    "length": 0.001
-                },{
-                    "type": "residual",
-                    "length": 0.00001
-                }],
+                "gapping": [
+                    {
+                        "type": "subtractive",
+                        "length": 0.0005
+                    },
+                    {
+                        "type": "subtractive",
+                        "length": 0.001
+                    },
+                    {
+                        "type": "residual",
+                        "length": 1e-05
+                    }
+                ],
                 "numberStacks": 3
             }
         },

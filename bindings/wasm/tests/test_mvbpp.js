@@ -1,5 +1,5 @@
 /**
- * mvbpp WASM binding tests.
+ * mvbpp WASM binding tests — unified 7-function API.
  *
  * Run with:  node bindings/wasm/tests/test_mvbpp.js
  * Requires:  bindings/wasm/dist/mvbpp.js  (built via `npm run build`)
@@ -16,7 +16,6 @@ const TESTS_DIR = __dirname;
 // ── tiny test harness ─────────────────────────────────────────────────────────
 
 let passed = 0, failed = 0;
-const results = [];
 
 function test(name, fn) {
     try {
@@ -47,7 +46,6 @@ function loadMagneticJson(filename) {
 }
 
 function isStepBytes(buf) {
-    // STEP files begin with "ISO-10303-21"
     const header = Buffer.from(buf.slice(0, 12));
     return header.toString('ascii') === 'ISO-10303-21';
 }
@@ -55,6 +53,11 @@ function isStepBytes(buf) {
 function bufferToString(buf) {
     return Buffer.from(buf).toString('latin1');
 }
+
+// Default parameter pack for drawXxx (all 9 trailing args)
+const DEF_3D = ['3D', 'XY', 0.0, 'step', 1.0, 32, 'none', '+X+Y+Z'];
+const DEF_2D = ['2D', 'XY', 0.0, 'step', 1.0, 32, 'none', ''];
+const NO_SIDE = ['3D', 'XY', 0.0, 'step', 1.0, 32, 'none', ''];
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
@@ -67,32 +70,33 @@ async function main() {
     const createMvbpp = require(DIST_JS);
     const mvbpp = await createMvbpp();
 
-    console.log('\nmvbpp WASM — drawMagneticToBuffer');
+    // Use concentric_rectangular_column_one_turn.json — concentric_basic.json
+    // triggers a MKF bug (CORE_SHAPE_NOT_FOUND: EI 101/50) in the WASM build.
+    const basicJson = loadMagneticJson('concentric_rectangular_column_one_turn.json');
+    const etdJson   = loadMagneticJson('ETD49_N87_10uH_5T.json');
+
+    // ── drawMagnetic ─────────────────────────────────────────────────────────
+
+    console.log('\nmvbpp WASM — drawMagnetic');
     console.log('─'.repeat(50));
 
-    // ── drawMagneticToBuffer ─────────────────────────────────────────────────
-
-    test('returns Uint8Array for concentric_basic', () => {
-        const j      = loadMagneticJson('concentric_basic.json');
-        const result = mvbpp.drawMagneticToBuffer(j);
+    test('drawMagnetic returns Uint8Array for basic fixture', () => {
+        const result = mvbpp.drawMagnetic(basicJson, ...NO_SIDE);
         assert(result instanceof Uint8Array, 'Expected Uint8Array');
     });
 
-    test('output is non-empty', () => {
-        const j      = loadMagneticJson('concentric_basic.json');
-        const result = mvbpp.drawMagneticToBuffer(j);
+    test('drawMagnetic output is non-empty', () => {
+        const result = mvbpp.drawMagnetic(basicJson, ...NO_SIDE);
         assert(result.length > 1000, `Too small: ${result.length} bytes`);
     });
 
-    test('output has valid STEP header', () => {
-        const j      = loadMagneticJson('concentric_basic.json');
-        const result = mvbpp.drawMagneticToBuffer(j);
+    test('drawMagnetic output has valid STEP header', () => {
+        const result = mvbpp.drawMagnetic(basicJson, ...NO_SIDE);
         assert(isStepBytes(result), 'Does not start with ISO-10303-21');
     });
 
-    test('STEP contains solid geometry markers', () => {
-        const j    = loadMagneticJson('concentric_basic.json');
-        const text = bufferToString(mvbpp.drawMagneticToBuffer(j));
+    test('drawMagnetic STEP contains solid geometry markers', () => {
+        const text = bufferToString(mvbpp.drawMagnetic(basicJson, ...NO_SIDE));
         assert(
             text.includes('CLOSED_SHELL') || text.includes('ADVANCED_BREP'),
             'No solid geometry markers found in STEP output'
@@ -100,91 +104,209 @@ async function main() {
     });
 
     test('ETD49 produces valid STEP', () => {
-        const j      = loadMagneticJson('ETD49_N87_10uH_5T.json');
-        const result = mvbpp.drawMagneticToBuffer(j);
+        const result = mvbpp.drawMagnetic(etdJson, ...NO_SIDE);
         assert(isStepBytes(result), 'ETD49 STEP header invalid');
         assert(result.length > 10_000, `ETD49 output too small: ${result.length}`);
     });
 
-    test('ETD49 produces more geometry than concentric_basic', () => {
-        const basic = mvbpp.drawMagneticToBuffer(loadMagneticJson('concentric_basic.json'));
-        const etd   = mvbpp.drawMagneticToBuffer(loadMagneticJson('ETD49_N87_10uH_5T.json'));
+    test('ETD49 produces more geometry than basic', () => {
+        const basic = mvbpp.drawMagnetic(basicJson, ...NO_SIDE);
+        const etd   = mvbpp.drawMagnetic(etdJson, ...NO_SIDE);
         assert(etd.length > basic.length,
             `ETD49 (${etd.length}) should be larger than basic (${basic.length})`);
     });
 
-    // ── drawMagnetic (to virtual FS path) ────────────────────────────────────
+    // ── drawMagneticToPath ───────────────────────────────────────────────────
 
-    console.log('\nmvbpp WASM — drawMagnetic (virtual FS)');
+    console.log('\nmvbpp WASM — drawMagneticToPath');
     console.log('─'.repeat(50));
 
     test('writes file to emscripten virtual FS', () => {
-        const j    = loadMagneticJson('concentric_basic.json');
         const out  = '/tmp/test_basic.step';
-        mvbpp.drawMagnetic(j, out);
+        mvbpp.drawMagneticToPath(basicJson, out, ...NO_SIDE);
         const data = mvbpp.FS.readFile(out);
         assert(data.length > 1000, `Virtual FS file too small: ${data.length}`);
         mvbpp.FS.unlink(out);
     });
 
     test('virtual FS file has valid STEP header', () => {
-        const j   = loadMagneticJson('concentric_basic.json');
         const out = '/tmp/test_header.step';
-        mvbpp.drawMagnetic(j, out);
+        mvbpp.drawMagneticToPath(basicJson, out, ...NO_SIDE);
         const data = mvbpp.FS.readFile(out);
         assert(isStepBytes(data), 'Virtual FS file does not start with ISO-10303-21');
         mvbpp.FS.unlink(out);
     });
 
     test('virtual FS file matches buffer output', () => {
-        const j   = loadMagneticJson('concentric_basic.json');
         const out = '/tmp/test_match.step';
-        mvbpp.drawMagnetic(j, out);
+        mvbpp.drawMagneticToPath(basicJson, out, ...NO_SIDE);
         const fileData   = mvbpp.FS.readFile(out);
-        const bufferData = mvbpp.drawMagneticToBuffer(j);
+        const bufferData = mvbpp.drawMagnetic(basicJson, ...NO_SIDE);
         mvbpp.FS.unlink(out);
         const ratio = Math.abs(fileData.length - bufferData.length) /
                       Math.max(fileData.length, bufferData.length);
         assert(ratio < 0.01, `File vs buffer size differs by ${(ratio * 100).toFixed(1)}%`);
     });
 
-    // ── DrawConfig ────────────────────────────────────────────────────────────
+    // ── drawCore ─────────────────────────────────────────────────────────────
 
-    console.log('\nmvbpp WASM — DrawConfig');
+    console.log('\nmvbpp WASM — drawCore');
     console.log('─'.repeat(50));
 
-    test('DrawConfig default produces valid STEP', () => {
-        const j   = loadMagneticJson('concentric_basic.json');
-        const cfg = new mvbpp.DrawConfig();
-        const res = mvbpp.drawMagneticToBufferWithConfig(j, cfg);
-        assert(isStepBytes(res), 'DrawConfig default: invalid STEP header');
-        cfg.delete();
+    test('drawCore returns valid STEP for enriched core', () => {
+        const enriched = mvbpp._enrichMagnetic(basicJson);
+        const j = JSON.parse(enriched);
+        const coreJson = JSON.stringify(j.core);
+        const result = mvbpp.drawCore(coreJson, ...NO_SIDE);
+        assert(isStepBytes(result), 'drawCore STEP header invalid');
+        assert(result.length > 500, `drawCore output too small: ${result.length}`);
     });
 
-    test('no bobbin produces smaller output', () => {
-        const j = loadMagneticJson('concentric_basic.json');
-
-        const cfgWith = new mvbpp.DrawConfig();
-        cfgWith.includeBobbin = true;
-        const withBobbin = mvbpp.drawMagneticToBufferWithConfig(j, cfgWith);
-        cfgWith.delete();
-
-        const cfgWithout = new mvbpp.DrawConfig();
-        cfgWithout.includeBobbin = false;
-        const withoutBobbin = mvbpp.drawMagneticToBufferWithConfig(j, cfgWithout);
-        cfgWithout.delete();
-
-        assert(withBobbin.length > withoutBobbin.length,
-            `With bobbin (${withBobbin.length}) should be larger than without (${withoutBobbin.length})`);
+    test('drawCore with mode=2D returns planar faces', () => {
+        const enriched = mvbpp._enrichMagnetic(basicJson);
+        const j = JSON.parse(enriched);
+        const coreJson = JSON.stringify(j.core);
+        const result = mvbpp.drawCore(coreJson, ...DEF_2D);
+        assert(isStepBytes(result), 'drawCore 2D STEP header invalid');
     });
 
-    test('scale=1000 accepted without error', () => {
-        const j   = loadMagneticJson('concentric_basic.json');
-        const cfg = new mvbpp.DrawConfig();
-        cfg.scale = 1000.0;
-        const res = mvbpp.drawMagneticToBufferWithConfig(j, cfg);
-        assert(isStepBytes(res), 'scale=1000 produced invalid STEP');
-        cfg.delete();
+    // ── drawCorePiece ────────────────────────────────────────────────────────
+
+    console.log('\nmvbpp WASM — drawCorePiece');
+    console.log('─'.repeat(50));
+
+    test('drawCorePiece returns valid STEP', () => {
+        const enriched = mvbpp._enrichMagnetic(basicJson);
+        const j = JSON.parse(enriched);
+        const shape = j.core.functionalDescription.shape;
+        const shapeJson = JSON.stringify(shape);
+        // side="" because a single piece may be centered
+        const result = mvbpp.drawCorePiece(shapeJson, '3D', 'XY', 0.0, 'step', 1.0, 32, 'none', '');
+        assert(isStepBytes(result), 'drawCorePiece STEP header invalid');
+    });
+
+    // ── drawBobbin ───────────────────────────────────────────────────────────
+
+    console.log('\nmvbpp WASM — drawBobbin');
+    console.log('─'.repeat(50));
+
+    test('drawBobbin returns valid STEP', () => {
+        const enriched = mvbpp._enrichMagnetic(basicJson);
+        const j = JSON.parse(enriched);
+        const bobbinJson = JSON.stringify(j.coil.bobbin);
+        const result = mvbpp.drawBobbin(bobbinJson, ...NO_SIDE);
+        assert(isStepBytes(result), 'drawBobbin STEP header invalid');
+    });
+
+    // ── drawTurns ────────────────────────────────────────────────────────────
+
+    console.log('\nmvbpp WASM — drawTurns');
+    console.log('─'.repeat(50));
+
+    test('drawTurns returns valid STEP', () => {
+        const enriched = mvbpp._enrichMagnetic(basicJson);
+        const j = JSON.parse(enriched);
+        const turnsJson = JSON.stringify(j.coil.turnsDescription);
+        const result = mvbpp.drawTurns(turnsJson, ...NO_SIDE);
+        assert(isStepBytes(result), 'drawTurns STEP header invalid');
+    });
+
+    // ── drawWinding ──────────────────────────────────────────────────────────
+
+    console.log('\nmvbpp WASM — drawWinding');
+    console.log('─'.repeat(50));
+
+    test('drawWinding returns valid STEP', () => {
+        const enriched = mvbpp._enrichMagnetic(basicJson);
+        const j = JSON.parse(enriched);
+        const coilJson = JSON.stringify(j.coil);
+        const result = mvbpp.drawWinding(coilJson, 'primary', ...NO_SIDE);
+        assert(isStepBytes(result), 'drawWinding STEP header invalid');
+    });
+
+    test('drawWinding throws for unknown winding name', () => {
+        const enriched = mvbpp._enrichMagnetic(basicJson);
+        const j = JSON.parse(enriched);
+        const coilJson = JSON.stringify(j.coil);
+        let threw = false;
+        try {
+            mvbpp.drawWinding(coilJson, 'nonexistent', ...NO_SIDE);
+        } catch (e) {
+            threw = true;
+        }
+        assert(threw, 'Expected exception for unknown winding name');
+    });
+
+    // ── drawView ─────────────────────────────────────────────────────────────
+
+    console.log('\nmvbpp WASM — drawView');
+    console.log('─'.repeat(50));
+
+    test('drawView returns SVG string', () => {
+        const result = mvbpp.drawView(basicJson, true, 'XY', 0.0, 800, 'svg');
+        assert(typeof result === 'string', 'Expected string');
+        assert(result.startsWith('<?xml'), 'Expected XML/SVG header');
+        assert(result.includes('<svg'), 'Expected <svg tag');
+    });
+
+    test('drawView without dimensions returns plain SVG', () => {
+        const result = mvbpp.drawView(basicJson, false, 'XY', 0.0, 800, 'svg');
+        assert(typeof result === 'string', 'Expected string');
+        assert(result.includes('<svg'), 'Expected <svg tag');
+    });
+
+    test('drawViewToPath writes SVG to virtual FS', () => {
+        const out = '/tmp/test_view.svg';
+        mvbpp.drawViewToPath(basicJson, out, true, 'XY', 0.0, 800, 'svg');
+        const data = mvbpp.FS.readFile(out, { encoding: 'utf8' });
+        assert(data.includes('<svg'), 'Expected <svg tag in file');
+        mvbpp.FS.unlink(out);
+    });
+
+    // ── symmetry / side ──────────────────────────────────────────────────────
+
+    console.log('\nmvbpp WASM — symmetry & side');
+    console.log('─'.repeat(50));
+
+    test('symmetry=half reduces output size', () => {
+        const full = mvbpp.drawMagnetic(basicJson, ...NO_SIDE);
+        const half = mvbpp.drawMagnetic(basicJson, '3D', 'XY', 0.0, 'step', 1.0, 32, 'half', '+X+Y+Z');
+        assert(half.length < full.length,
+            `Half symmetry (${half.length}) should be smaller than full (${full.length})`);
+    });
+
+    test('symmetry=quarter reduces more than half', () => {
+        const half    = mvbpp.drawMagnetic(basicJson, '3D', 'XY', 0.0, 'step', 1.0, 32, 'half', '+X+Y+Z');
+        const quarter = mvbpp.drawMagnetic(basicJson, '3D', 'XY', 0.0, 'step', 1.0, 32, 'quarter', '+X+Y+Z');
+        assert(quarter.length < half.length,
+            `Quarter symmetry (${quarter.length}) should be smaller than half (${half.length})`);
+    });
+
+    test('side=+X filters geometry', () => {
+        const unfiltered = mvbpp.drawMagnetic(basicJson, '3D', 'XY', 0.0, 'step', 1.0, 32, 'none', '');
+        const filtered   = mvbpp.drawMagnetic(basicJson, '3D', 'XY', 0.0, 'step', 1.0, 32, 'none', '+X');
+        assert(filtered.length <= unfiltered.length,
+            `Filtered (${filtered.length}) should not be larger than unfiltered (${unfiltered.length})`);
+    });
+
+    test('invalid symmetry throws', () => {
+        let threw = false;
+        try {
+            mvbpp.drawMagnetic(basicJson, '3D', 'XY', 0.0, 'step', 1.0, 32, 'sextant', '+X+Y+Z');
+        } catch (e) {
+            threw = true;
+        }
+        assert(threw, 'Expected exception for invalid symmetry');
+    });
+
+    test('invalid side throws', () => {
+        let threw = false;
+        try {
+            mvbpp.drawMagnetic(basicJson, '3D', 'XY', 0.0, 'step', 1.0, 32, 'none', '+Q');
+        } catch (e) {
+            threw = true;
+        }
+        assert(threw, 'Expected exception for invalid side');
     });
 
     // ── error handling ────────────────────────────────────────────────────────
@@ -194,14 +316,24 @@ async function main() {
 
     test('invalid JSON throws', () => {
         let threw = false;
-        try { mvbpp.drawMagneticToBuffer('not json'); } catch { threw = true; }
+        try { mvbpp.drawMagnetic('not json', ...NO_SIDE); } catch { threw = true; }
         assert(threw, 'Expected exception for invalid JSON');
     });
 
     test('empty object throws', () => {
         let threw = false;
-        try { mvbpp.drawMagneticToBuffer('{}'); } catch { threw = true; }
+        try { mvbpp.drawMagnetic('{}', ...NO_SIDE); } catch { threw = true; }
         assert(threw, 'Expected exception for empty object');
+    });
+
+    test('2D mode with STL format throws', () => {
+        let threw = false;
+        try {
+            mvbpp.drawMagnetic(basicJson, '2D', 'XY', 0.0, 'stl', 1.0, 32, 'none', '');
+        } catch (e) {
+            threw = true;
+        }
+        assert(threw, 'Expected exception for 2D+STL');
     });
 
     // ── summary ───────────────────────────────────────────────────────────────

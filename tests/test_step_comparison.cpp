@@ -180,8 +180,12 @@ static void compareSTEPAgainstReference(const std::string& refPath,
                                          const MAS::Magnetic& magnetic,
                                          const std::string& testName) {
     mvb::MagneticBuilder builder;
-    auto coreShapes = builder.buildCore(magnetic.get_core());
-    REQUIRE(!coreShapes.empty());
+    auto coreNamed = builder.buildCoreNamed(magnetic.get_core());
+    REQUIRE(!coreNamed.empty());
+
+    std::vector<TopoDS_Shape> coreShapes;
+    coreShapes.reserve(coreNamed.size());
+    for (auto& ns : coreNamed) coreShapes.push_back(ns.shape);
 
     // Scale to mm to match Python MVB export convention
     {
@@ -231,32 +235,40 @@ static void compareFullAssemblyAgainstReference(const std::string& refPath,
                                                  const MAS::Magnetic& magnetic,
                                                  const std::string& testName) {
     mvb::MagneticBuilder builder;
-    std::vector<TopoDS_Shape> coreShapes;
-    TopoDS_Shape bobbinShape;
-    std::vector<TopoDS_Shape> turnShapes;
+    std::vector<mvb::NamedShape> coreNamed;
+    mvb::NamedShape bobbinNamed;
+    std::vector<mvb::NamedShape> turnsNamed;
     try {
-        coreShapes = builder.buildCore(magnetic.get_core());
+        coreNamed = builder.buildCoreNamed(magnetic.get_core());
     } catch (const std::exception& e) {
-        FAIL("buildCore exception: " << e.what());
+        FAIL("buildCoreNamed exception: " << e.what());
     } catch (...) {
-        FAIL("buildCore unknown exception");
+        FAIL("buildCoreNamed unknown exception");
     }
     try {
-        bobbinShape = builder.buildBobbin(magnetic.get_coil(), magnetic.get_core());
+        bobbinNamed = builder.buildBobbinNamed(magnetic.get_coil(), magnetic.get_core());
     } catch (const std::exception& e) {
-        FAIL("buildBobbin exception: " << e.what());
+        FAIL("buildBobbinNamed exception: " << e.what());
     } catch (...) {
-        FAIL("buildBobbin unknown exception");
+        FAIL("buildBobbinNamed unknown exception");
     }
     try {
-        turnShapes = builder.buildTurns(magnetic.get_coil(), magnetic.get_core());
+        turnsNamed = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core());
     } catch (const std::exception& e) {
-        FAIL("buildTurns exception: " << e.what());
+        FAIL("buildTurnsNamed exception: " << e.what());
     } catch (...) {
-        FAIL("buildTurns unknown exception");
+        FAIL("buildTurnsNamed unknown exception");
     }
 
-    REQUIRE(!coreShapes.empty());
+    REQUIRE(!coreNamed.empty());
+
+    std::vector<TopoDS_Shape> coreShapes;
+    coreShapes.reserve(coreNamed.size());
+    for (auto& ns : coreNamed) coreShapes.push_back(ns.shape);
+    TopoDS_Shape bobbinShape = bobbinNamed.shape;
+    std::vector<TopoDS_Shape> turnShapes;
+    turnShapes.reserve(turnsNamed.size());
+    for (auto& ns : turnsNamed) turnShapes.push_back(ns.shape);
 
     // Cut bobbin with cores and turns to match Python MVB behavior
     std::vector<TopoDS_Shape> cutters = coreShapes;
@@ -379,32 +391,40 @@ static void compareFullAssemblyAgainstReference(const std::string& refPath,
                                                  const OpenMagnetics::Magnetic& magnetic,
                                                  const std::string& testName) {
     mvb::MagneticBuilder builder;
-    std::vector<TopoDS_Shape> coreShapes;
-    TopoDS_Shape bobbinShape;
-    std::vector<TopoDS_Shape> turnShapes;
+    std::vector<mvb::NamedShape> coreNamed;
+    mvb::NamedShape bobbinNamed;
+    std::vector<mvb::NamedShape> turnsNamed;
     try {
-        coreShapes = builder.buildCore(magnetic.get_core());
+        coreNamed = builder.buildCoreNamed(magnetic.get_core());
     } catch (const std::exception& e) {
-        FAIL("buildCore exception: " << e.what());
+        FAIL("buildCoreNamed exception: " << e.what());
     } catch (...) {
-        FAIL("buildCore unknown exception");
+        FAIL("buildCoreNamed unknown exception");
     }
     try {
-        bobbinShape = builder.buildBobbin(magnetic.get_coil(), magnetic.get_core());
+        bobbinNamed = builder.buildBobbinNamed(magnetic.get_coil(), magnetic.get_core());
     } catch (const std::exception& e) {
-        FAIL("buildBobbin exception: " << e.what());
+        FAIL("buildBobbinNamed exception: " << e.what());
     } catch (...) {
-        FAIL("buildBobbin unknown exception");
+        FAIL("buildBobbinNamed unknown exception");
     }
     try {
-        turnShapes = builder.buildTurns(magnetic.get_coil(), magnetic.get_core());
+        turnsNamed = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core());
     } catch (const std::exception& e) {
-        FAIL("buildTurns exception: " << e.what());
+        FAIL("buildTurnsNamed exception: " << e.what());
     } catch (...) {
-        FAIL("buildTurns unknown exception");
+        FAIL("buildTurnsNamed unknown exception");
     }
 
-    REQUIRE(!coreShapes.empty());
+    REQUIRE(!coreNamed.empty());
+
+    std::vector<TopoDS_Shape> coreShapes;
+    coreShapes.reserve(coreNamed.size());
+    for (auto& ns : coreNamed) coreShapes.push_back(ns.shape);
+    TopoDS_Shape bobbinShape = bobbinNamed.shape;
+    std::vector<TopoDS_Shape> turnShapes;
+    turnShapes.reserve(turnsNamed.size());
+    for (auto& ns : turnsNamed) turnShapes.push_back(ns.shape);
 
     std::vector<TopoDS_Shape> cutters = coreShapes;
     cutters.insert(cutters.end(), turnShapes.begin(), turnShapes.end());

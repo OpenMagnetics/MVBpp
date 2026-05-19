@@ -72,19 +72,17 @@ static MAS::Magnetic make_simple_t_magnetic() {
 
 static void exportCore(const std::string& outPath, const MAS::Magnetic& magnetic) {
     mvb::MagneticBuilder builder;
-    auto shapes = builder.buildCore(magnetic.get_core());
+    auto named = builder.buildCoreNamed(magnetic.get_core());
 
     gp_Trsf trsf;
     trsf.SetScale(gp_Pnt(0, 0, 0), 1000.0);
-    for (auto& s : shapes) {
-        s = BRepBuilderAPI_Transform(s, trsf).Shape();
+    for (auto& ns : named) {
+        if (!ns.shape.IsNull()) {
+            ns.shape = BRepBuilderAPI_Transform(ns.shape, trsf).Shape();
+        }
     }
 
-    std::vector<std::string> names;
-    for (size_t i = 0; i < shapes.size(); ++i) {
-        names.push_back("Core_" + std::to_string(i));
-    }
-    mvb::exportSTEP(shapes, names, outPath);
+    mvb::exportSTEP(named, outPath);
 }
 
 int main(int argc, char* argv[]) {

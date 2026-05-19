@@ -33,12 +33,12 @@ static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t"};
 
 namespace {
 
-double total_volume(const std::vector<TopoDS_Shape>& shapes) {
+double total_volume(const std::vector<mvb::NamedShape>& pieces) {
     double total = 0.0;
-    for (const auto& s : shapes) {
-        if (s.IsNull()) continue;
+    for (const auto& ns : pieces) {
+        if (ns.shape.IsNull()) continue;
         GProp_GProps p;
-        BRepGProp::VolumeProperties(s, p);
+        BRepGProp::VolumeProperties(ns.shape, p);
         total += p.Mass();
     }
     return total;
@@ -81,7 +81,7 @@ GappingResult build_with_gapping(const json& shape, const json& gapping,
             core = OpenMagnetics::Core(noGap);
         }
         mvb::MagneticBuilder builder;
-        auto pieces = builder.buildCore(core);
+        auto pieces = builder.buildCoreNamed(core);
         r.n_pieces = static_cast<int>(pieces.size());
         r.volume = total_volume(pieces);
         r.ok = (r.n_pieces > 0 && r.volume > 0.0);

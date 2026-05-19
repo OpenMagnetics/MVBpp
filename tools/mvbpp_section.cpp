@@ -40,16 +40,16 @@ int main(int argc, char* argv[]) {
 
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson);
     mvb::MagneticBuilder builder;
-    auto pieces = builder.buildCore(enriched.get_core());
-    if (pieces.empty()) {
+    auto namedPieces = builder.buildCoreNamed(enriched.get_core());
+    if (namedPieces.empty()) {
         std::cerr << "No core pieces built\n";
         return 1;
     }
 
     // Fuse core halves so the section captures the assembled cross-section.
-    TopoDS_Shape core = pieces[0];
-    for (size_t i = 1; i < pieces.size(); ++i) {
-        BRepAlgoAPI_Fuse fuser(core, pieces[i]);
+    TopoDS_Shape core = namedPieces[0].shape;
+    for (size_t i = 1; i < namedPieces.size(); ++i) {
+        BRepAlgoAPI_Fuse fuser(core, namedPieces[i].shape);
         if (fuser.IsDone()) core = fuser.Shape();
     }
 

@@ -59,12 +59,13 @@ TEST_CASE("E core builds manually", "[core][e]") {
     auto magnetic = make_simple_e_magnetic();
 
     mvb::MagneticBuilder builder;
-    auto shapes = builder.buildCore(magnetic.get_core());
+    auto pieces = builder.buildCoreNamed(magnetic.get_core());
 
-    REQUIRE(shapes.size() == 2);
+    REQUIRE(pieces.size() == 2);
 
     double totalVolume = 0.0;
-    for (const auto& s : shapes) {
+    for (const auto& ns : pieces) {
+        const auto& s = ns.shape;
         REQUIRE(!s.IsNull());
 
         Bnd_Box box;
@@ -154,12 +155,13 @@ TEST_CASE("PQ core builds manually with non-zero volume", "[core][pq]") {
     auto magnetic = make_simple_pq_magnetic();
 
     mvb::MagneticBuilder builder;
-    auto shapes = builder.buildCore(magnetic.get_core());
+    auto pieces = builder.buildCoreNamed(magnetic.get_core());
 
-    REQUIRE(shapes.size() == 2);
+    REQUIRE(pieces.size() == 2);
 
     double totalVolume = 0.0;
-    for (const auto& s : shapes) {
+    for (const auto& ns : pieces) {
+        const auto& s = ns.shape;
         REQUIRE(!s.IsNull());
 
         Bnd_Box box;
@@ -181,11 +183,11 @@ TEST_CASE("T core builds manually", "[core][t]") {
     auto magnetic = make_simple_t_magnetic();
 
     mvb::MagneticBuilder builder;
-    auto shapes = builder.buildCore(magnetic.get_core());
+    auto pieces = builder.buildCoreNamed(magnetic.get_core());
 
-    REQUIRE(shapes.size() == 1);
+    REQUIRE(pieces.size() == 1);
 
-    const auto& s = shapes[0];
+    const auto& s = pieces[0].shape;
     REQUIRE(!s.IsNull());
 
     Bnd_Box box;

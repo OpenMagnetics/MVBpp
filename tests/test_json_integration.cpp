@@ -39,40 +39,40 @@ TEST_CASE("Build complete magnetic from concentric_rectangular_column_one_turn.j
     }
 
     mvb::MagneticBuilder builder;
-    std::vector<TopoDS_Shape> coreShapes;
-    TopoDS_Shape bobbinShape;
-    std::vector<TopoDS_Shape> turnShapes;
+    std::vector<mvb::NamedShape> corePieces;
+    mvb::NamedShape bobbinNamed;
+    std::vector<mvb::NamedShape> turnPieces;
     try {
-        coreShapes = builder.buildCore(magnetic.get_core());
-        bobbinShape = builder.buildBobbin(magnetic.get_coil(), magnetic.get_core());
-        turnShapes = builder.buildTurns(magnetic.get_coil(), magnetic.get_core());
+        corePieces = builder.buildCoreNamed(magnetic.get_core());
+        bobbinNamed = builder.buildBobbinNamed(magnetic.get_coil(), magnetic.get_core());
+        turnPieces = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core());
     } catch (const std::exception& e) {
         FAIL("Build failed: " << e.what());
     }
 
-    REQUIRE(!coreShapes.empty());
-    REQUIRE(!bobbinShape.IsNull());
-    REQUIRE(!turnShapes.empty());
+    REQUIRE(!corePieces.empty());
+    REQUIRE(!bobbinNamed.shape.IsNull());
+    REQUIRE(!turnPieces.empty());
 
     int solids = 0;
     double totalVolume = 0.0;
-    for (const auto& s : coreShapes) {
+    for (const auto& ns : corePieces) {
         GProp_GProps props;
-        BRepGProp::VolumeProperties(s, props);
+        BRepGProp::VolumeProperties(ns.shape, props);
         totalVolume += props.Mass();
-        for (TopExp_Explorer exp(s, TopAbs_SOLID); exp.More(); exp.Next()) ++solids;
+        for (TopExp_Explorer exp(ns.shape, TopAbs_SOLID); exp.More(); exp.Next()) ++solids;
     }
-    for (const auto& s : {bobbinShape}) {
+    {
         GProp_GProps props;
-        BRepGProp::VolumeProperties(s, props);
+        BRepGProp::VolumeProperties(bobbinNamed.shape, props);
         totalVolume += props.Mass();
-        for (TopExp_Explorer exp(s, TopAbs_SOLID); exp.More(); exp.Next()) ++solids;
+        for (TopExp_Explorer exp(bobbinNamed.shape, TopAbs_SOLID); exp.More(); exp.Next()) ++solids;
     }
-    for (const auto& s : turnShapes) {
+    for (const auto& ns : turnPieces) {
         GProp_GProps props;
-        BRepGProp::VolumeProperties(s, props);
+        BRepGProp::VolumeProperties(ns.shape, props);
         totalVolume += props.Mass();
-        for (TopExp_Explorer exp(s, TopAbs_SOLID); exp.More(); exp.Next()) ++solids;
+        for (TopExp_Explorer exp(ns.shape, TopAbs_SOLID); exp.More(); exp.Next()) ++solids;
     }
 
     REQUIRE(totalVolume > 0.0);
@@ -168,7 +168,7 @@ TEST_CASE("Core3DVisualizer: buildCoreSTL with core-only E shape", "[3d][empty-c
     REQUIRE(enriched.get_core().get_geometrical_description().has_value());
 
     mvb::MagneticBuilder builder;
-    std::vector<TopoDS_Shape> pieces;
-    REQUIRE_NOTHROW(pieces = builder.buildCore(enriched.get_core()));
+    std::vector<mvb::NamedShape> pieces;
+    REQUIRE_NOTHROW(pieces = builder.buildCoreNamed(enriched.get_core()));
     REQUIRE(!pieces.empty());
 }
