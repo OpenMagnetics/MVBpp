@@ -58,6 +58,8 @@ TopoDS_Shape ShapeEr::applyMachining(const TopoDS_Shape& piece,
     if (coords.size() < 2) return piece;
 
     double gapLength = machining.get_length();
+    // Skip zero-length residual gaps to avoid degenerate cylinder/box tools.
+    if (std::abs(gapLength) < 1e-12) return piece;
     double xCoord = coords[0];
     double yCoord = coords[1];
 

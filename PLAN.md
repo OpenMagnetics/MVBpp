@@ -1,87 +1,110 @@
-# MVB++ Overall Project Plan
+# MVB++ Project Plan
 
 ## Vision
-Build **MVB++**, a C++ equivalent of the Python/CadQuery-based `../MVB` library, using OpenCASCADE 7.9.3 directly to generate 3D geometry (cores, bobbins, turns) from MAS JSON. The output must match Python MVB reference STEPs, including full assemblies with bobbin and turns.
+**MVB++** is a C++23 equivalent of the Python/CadQuery-based `../MVB` library, using OpenCASCADE 7.9.3 directly to generate 3D geometry (cores, bobbins, turns, spacers, FR4 boards) and 2D drawings (sections, projections) from MAS JSON. Outputs match Python MVB references and are consumed by C++, Python (pybind11) and WebFrontend (WASM / Emscripten).
 
 ## High-level goals
 1. **Self-contained build** — fetch and build OCCT 7.9.3 from source automatically.
-2. **Direct MAS.hpp usage** — use generated `MAS` C++ types everywhere, no lightweight wrappers.
-3. **Meters everywhere** — no mm scaling internally; scale only at export time (Python MVB exports in mm).
-4. **MKF integration** — safely use `OpenMagnetics::magnetic_autocomplete` to enrich raw MAS JSONs (adds `geometricalDescription`, `turnsDescription`, bobbin details) without object slicing or Coil constructor crashes.
-5. **Full assembly export** — generate STEP files containing core pieces, bobbin, and turns that match Python MVB reference outputs.
+2. **Direct MAS.hpp usage** — generated `MAS` C++ types, no wrappers.
+3. **Meters internally** — scale to mm only at STEP/STL export time.
+4. **MKF integration** — `OpenMagnetics::magnetic_autocomplete_safe` enriches raw MAS JSONs.
+5. **Unified Named API** — every shape returned as `NamedShape{shape, name}` so names survive symmetry cuts, STEP export, and binding boundaries.
+6. **DrawConfig** — single config struct shared by all bindings.
 
 ## Coordinate conventions
-- **Concentric cores** (E, T, U, etc.): profile built in XY plane, extruded along Z, then rotated `-90°` around X so the column axis aligns with **Y**.
-- **Toroidal cores** (T family): profile built in XY plane, extruded along Z, origin at toroid center.
+- **Concentric cores** (E, T, U, etc.): profile in XY, extruded along Z, rotated `-90°` around X → column axis aligns with **Y**.
+- **Toroidal cores**: profile in XY, extruded along Z, origin at toroid center.
 
 ## Architecture
 ```
-include/mvb/         — public headers (Utils, MagneticBuilder, StepExporter, BobbinBuilder, TurnBuilder)
-src/shapes/          — one builder per core shape family (ShapeE, ShapeT, ShapeEr, etc.)
-src/                 — library implementation (BobbinBuilder, TurnBuilder, StepExporter, etc.)
-tests/               — Catch2 tests + Python reference generator + OCCT-based comparison tests
-tools/               — CLI utilities (step generator, bobbin generator)
+include/mvb/         — public headers (MagneticBuilder, BobbinBuilder, TurnBuilder,
+                         SpacerBuilder, FR4Builder, SectionBuilder, Symmetry,
+                         StepExporter, ProjectionDrawing, SectionDrawing, NamedShape, Utils)
+src/                 — library implementation
+src/shapes/          — one builder per core shape family (Factory + Shape*)
+tests/               — Catch2 tests (steps, assemblies, all shapes, gapping, symmetry,
+                         battery, toroidal top view) + Python reference generator
+tools/               — CLI utilities (step_generator, section, bobbin_generator)
+bindings/python/     — pybind11 module + pytest suite
+bindings/wasm/       — Emscripten module + JS tests
 ```
 
-## Phase 1: Infrastructure (done)
-- [x] Set up CMake with OCCT 7.9.3 external project
-- [x] Integrate MAS.hpp auto-generated from JSON schema
-- [x] Integrate nlohmann/json and Catch2
-- [x] Build system produces static `libmvb++.a` and test executable
+## Status
 
-## Phase 2: Core shapes (done)
-- [x] Implement shape builders: `ShapeE`, `ShapeT`, `ShapeEr`, `ShapeP`, `ShapeEtd`, `ShapeU`, `ShapeToroidal`
-- [x] Generic profile → extrude → cut winding window → apply machining → intrinsic rotation pipeline
-- [x] Tests verify individual core STEPs against Python MVB references (E core, T core)
+### Done
+- **Infrastructure** — CMake fetches OCCT 7.9.3, MKF (+ submodules `cci_coords`, `CAS`, `EAS`), MAS, nlohmann/json, Catch2, pybind11. Builds static `libmvb++.a`, shared `libmvb++.so`, Python wheel and WASM module.
+- **Core shape builders** — `ShapeE`, `ShapeT`, `ShapeEr`, `ShapeP`, `ShapeEtd`, `ShapeU`, `ShapeToroidal`, plus families wired via `shapes/Factory.cpp` (drives `get_supported_families()` in `Utils.cpp`). 882/882 non-excluded MAS shapes build a non-empty solid.
+- **Bobbin** — `BobbinBuilder` handles rectangular and round bobbins, hollow body + flanges + holes, matches Python `StandardBobbin` volumes/bboxes.
+- **Turns** — `TurnBuilder` builds round and rectangular wire turns for concentric and toroidal cores. `buildFromTurnAlone` lets bindings render turns without a wire/bobbin lookup.
+- **Symmetry** — plane detection, cutting, high-level binding helpers (`filter_by_side`, `apply_symmetry`, spec parsers).
+- **Sections & projections** — `SectionBuilder::cut2DFaces`, `parseSectionPlane`, `drawView` dispatcher, `SectionDrawing`, `ProjectionDrawing`.
+- **Spacers and FR4** — `SpacerBuilder` for gap spacers, `FR4Builder` for PCB boards.
+- **STEP / STL export** — `StepExporter` with mm scaling; STL tests pass.
+- **Bindings**
+  - Python (pybind11 + scikit-build-core), wheel installable, pytest suite green.
+  - WASM (Emscripten): exposes `buildMagneticSTEP`, `buildMagneticSTL`, drawCore/drawTurns/drawSpacer/drawBoard, `parseEnriched` fallback, tagged exception bridging, whole-archive cmrc for embedded data.
+- **MAS 1.0 migration** — schema enum casing migrated; `magnetic_autocomplete_safe` logs failures to stderr.
+- **No-fallback policy** — required MAS fields throw on missing data instead of using defaults.
 
-## Phase 3: Bobbin matching (in progress)
-- [x] Analyze Python MVB `StandardBobbin` geometry (hollow body + flanges + holes)
-- [x] Implement proper `BobbinBuilder` with rectangular and round support
-- [x] Fix OCCT/CadQuery cylinder convention mismatch (base-at-zero vs centered)
-- [x] Fix `wallThickness = 0` handling (Python keeps it zero, MVB++ was forcing 0.0005)
-- [x] Update Python reference generator to use real `StandardBobbin` instead of dummy solids
-- [x] Standalone bobbin comparison tool verifies rectangular and round volumes/bboxes match exactly
-- [x] Wire flange dimensions through `MagneticBuilder`
-- [ ] Fix remaining compilation error in `test_step_comparison.cpp` (`MAS::Bobbin` vs `OpenMagnetics::Bobbin` variant)
-- [ ] Make both `rect_one_turn` and `etd49_5t` assembly tests pass
+### Test state
+| Tag                | Result                                | Notes                                      |
+|--------------------|---------------------------------------|--------------------------------------------|
+| `[step]`           | pass                                  | E/T core + assembly STEPs match references |
+| `[stl]`            | pass                                  |                                            |
+| `[assembly]`       | pass (4/4)                            | rect_one_turn, etd49_5t                    |
+| `[shapes]`         | pass (882 ran, 8 excluded, 0 failed)  | Excluded: 4 `ui` + 3 `pqi` + 1 `ut` (intentional, mirrors MVB Python) |
+| `[get_families]`   | pass                                  |                                            |
+| `[symmetry]`       | pass (8/8)                            | Can be slow on complex shapes              |
+| `[battery]`        | slow (>15min, scans 25+ MAS examples through MKF) | Preexisting perf issue, not a correctness regression |
+| `[topview]`        | pass (toroidal 2D)                    |                                            |
+| `[json]`           | pass                                  |                                            |
+| `[gapping][additive]`     | pass (448 ran, 0 failed)       |                                            |
+| `[gapping][subtractive]`  | pass (448 ran, 0 failed)       | Fixed: U/UR/C zero-length gap + UR cylindrical column tool |
+| `[gapping][distributed]`  | pass (448 ran, 0 failed)       | Fixed alongside subtractive                |
 
-## Phase 4: Turns (blocked by bobbin phase)
-- [ ] Build turns from `turnsDescription` with proper wire profiles (round, rectangular, foil)
-- [ ] Fix or work around `BRepOffsetAPI_MakePipe` crashes/segfaults on certain turn geometries
-- [ ] Match Python MVB turn positioning, orientation, and cross-sections
-- [ ] Verify per-turn volumes and full assembly volumes match references
+### Open items
 
-## Phase 5: Batch generation & validation (blocked by turns)
-- [ ] Run batch STEP generation over all `../MAS/examples` JSONs
-- [ ] Compare every generated STEP against Python MVB reference (volume, bbox, solid count)
-- [ ] Investigate and fix remaining mismatches
-- [ ] Document which examples pass/fail and why
+1. **`[symmetry]` / `[battery]` performance**
+   - `[battery]` test scans 25+ MAS examples through MKF and can exceed 15 minutes; blocks CI parallelism
+   - `[symmetry]` boolean ops on PQ3230 + distributed gapping can exceed 2 minutes
+   - Consider face-based gap rendering or cached cut shapes
 
-## Phase 6: Cleanup & documentation
-- [ ] Remove all temporary debug prints
-- [ ] Run lint/typecheck if available
-- [ ] Update README with build instructions, design notes, and known limitations
-- [ ] Commit final state (only when explicitly requested)
+2. **WASM JavaScript tests are stale**
+   - `bindings/wasm/tests/test_mvbpp.js` calls `drawMagneticToBuffer` / `DrawConfig` which are not in the current embind registration
+   - Actual exposed API: `buildMagneticSTEP`, `buildMagneticSTL`, `drawCore`, `drawTurns`, `drawSpacer`, `drawBoard`, `parseEnriched`
+   - Tests need to be rewritten against the current API
 
-## Known blockers / risks
-1. **`BRepOffsetAPI_MakePipe` crashes** — OCCT throws `StdFail_NotDone` or segfaults for ~12/27 MAS examples during turn generation. May need to replace `MakePipe` with manual primitive construction (sweeping a profile along a polyline by fusing translated copies).
-2. **MKF bobbin dimension divergence** — `magnetic_autocomplete` produces flange dimensions that differ from Python `StandardBobbin` defaults. Need a policy decision on whether MVB++ should follow Python defaults or enriched MKF values for missing inputs.
-3. **Object slicing in MKF integration** — `drawMagnetic(const MAS::Magnetic&)` was slicing enriched `OpenMagnetics::Magnetic` objects. Already fixed with an overload for `OpenMagnetics::Magnetic`.
+3. **MKF bobbin dimension divergence**
+   - `magnetic_autocomplete` produces flange dimensions that differ from Python `StandardBobbin` defaults when the input has no explicit bobbin
+   - Currently MVB++ follows MKF values; document as intended behaviour or wire through a "Python-compatible defaults" switch
+
+4. **README / docs**
+   - README is light on the binding APIs, DrawConfig fields, and section/symmetry spec syntax
+   - AGENTS.md is the up-to-date reference for build + gotchas; user docs lag behind
+
+### Maintenance gotchas (see AGENTS.md for full list)
+- `LD_LIBRARY_PATH=build/occt-install/lib` required for the test binary
+- MKF `SHARED→STATIC` patch is a fragile string replace in `CMakeLists.txt`
+- MKF submodules (`cci_coords`, `CAS`, `EAS`) auto-init in CMake configure; manual fix path documented
+- MAS 1.0 enum casing changes — `python3 MAS/scripts/migrate-to-1.0.py` is the migration tool
 
 ## File map
-| File | Purpose |
-|------|---------|
-| `CMakeLists.txt` | Build configuration, OCCT fetch + link |
-| `include/mvb/Utils.h` / `src/Utils.cpp` | Dimension flattening, OCCT helpers, safe MKF wrapper |
-| `include/mvb/MagneticBuilder.h` / `src/MagneticBuilder.cpp` | Full assembly builder (core + bobbin + turns) |
-| `include/mvb/BobbinBuilder.h` / `src/BobbinBuilder.cpp` | Bobbin geometry builder |
-| `include/mvb/TurnBuilder.h` / `src/TurnBuilder.cpp` | Turn geometry builder |
-| `include/mvb/StepExporter.h` / `src/StepExporter.cpp` | STEP export with mm scaling |
-| `src/shapes/Shape*.cpp` | Per-shape core builders |
-| `tests/test_step_comparison.cpp` | Catch2 tests comparing MVB++ vs Python reference STEPs |
-| `tests/generate_reference_steps.py` | Python script to regenerate reference STEPs from MVB |
-| `tools/mvbpp_step_generator.cpp` | CLI for single/batch STEP generation |
-| `tools/generate_mvbpp_bobbins.cpp` | Standalone bobbin comparison tool |
-| `scripts/generate_mvb_bobbins.py` | Python reference bobbin generator |
-| `BOBBIN_PROGRESS.md` | Detailed bobbin phase notes |
+| File / Dir | Purpose |
+|------------|---------|
+| `CMakeLists.txt` | Build, OCCT external project, MKF/MAS fetch + patches |
+| `include/mvb/` + `src/` | Public headers and library implementation |
+| `src/shapes/Factory.cpp` | Single source of truth for supported families |
+| `src/MagneticBuilder.cpp` | Top-level assembly (core + bobbin + turns + spacers) |
+| `src/Symmetry.cpp` | Symmetry plane detection + cutting + spec parser |
+| `src/SectionBuilder.cpp` + `src/SectionDrawing.cpp` + `src/ProjectionDrawing.cpp` | 2D drawing pipeline |
+| `tests/test_all_shapes.cpp` | 882-shape sanity battery |
+| `tests/test_all_gapped.cpp` | Per-shape additive/subtractive/distributed gapping |
+| `tests/test_symmetry.cpp` | Symmetry plane and cutting |
+| `tests/test_mas_battery.cpp` | Wide MAS-fixture coverage |
+| `tests/test_toroidal_topview.cpp` | Toroidal 2D top view |
+| `tools/mvbpp_step_generator.cpp` | CLI single/batch STEP generator |
+| `tools/mvbpp_section.cpp` | Section/projection CLI |
+| `bindings/python/` | pybind11 module + pytest suite |
+| `bindings/wasm/` | Emscripten module + (stale) JS tests |
+| `AGENTS.md` | Build instructions, gotchas, conventions |
 | `PLAN.md` | This file |

@@ -64,6 +64,9 @@ TopoDS_Shape ShapeU::applyMachining(const TopoDS_Shape& piece,
     if (coords.size() < 2) return piece;
 
     double gapLength = machining.get_length();
+    // Zero-length residual gaps (emitted by MKF as part of multi-gap layouts)
+    // would build a degenerate box and throw Standard_DomainError. Skip them.
+    if (std::abs(gapLength) < 1e-12) return piece;
     double xCoord = coords[0];
     double yCoord = coords[1];
 

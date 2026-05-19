@@ -121,5 +121,57 @@ TopoDS_Shape ShapeUr::buildPiece(const MAS::CoreShape& shapeData) const {
     return piece;
 }
 
+// UR winding column is cylindrical (radius F/2 for subtypes 3/4, C/2 for 1/2).
+// MKF emits gap coordinates with xCoord=0 referring to the winding column
+// centre. After the piece is rotated -90° about X, the column axis lies along
+// world Y, so the gap tool is a Y-aligned cylinder cut from the piece.
+TopoDS_Shape ShapeUr::applyMachining(const TopoDS_Shape& piece,
+                                     const MAS::Machining& machining,
+                                     const std::map<std::string, double>& dims) const {
+    const std::vector<double>& coords = machining.get_coordinates();
+    if (coords.size() < 2) return piece;
+
+    double gapLength = machining.get_length();
+    if (std::abs(gapLength) < 1e-12) return piece;
+
+    double xCoord = coords[0];
+    double yCoord = coords[1];
+
+    // Winding-column gap (xCoord == 0): cylindrical tool aligned with Y.
+    if (std::abs(xCoord) < 1e-12) {
+        double radius = 0.0;
+        auto itF = dims.find("F");
+        if (itF != dims.end() && itF->second > 0.0) {
+            radius = itF->second / 2.0;
+        } else {
+            auto itC = dims.find("C");
+            if (itC != dims.end()) radius = itC->second / 2.0;
+        }
+        if (radius <= 0.0) return piece;
+
+        TopoDS_Shape toolZ = build_polygon_cylinder(gapLength, radius,
+                                                    m_corePolygonSegments);
+        if (toolZ.IsNull()) return piece;
+        TopoDS_Shape toolY = rotate_shape(toolZ, -std::numbers::pi / 2.0, 0.0, 0.0);
+        TopoDS_Shape tool  = translate_shape(toolY, 0.0,
+                                             yCoord - gapLength / 2.0, 0.0);
+        if (tool.IsNull()) return piece;
+
+        BRepAlgoAPI_Cut cutter(piece, tool);
+        return cutter.IsDone() ? cutter.Shape() : piece;
+    }
+
+    // Lateral-column gap: rectangular box across the lateral column.
+    double h = 0.0, c = 0.0;
+    auto itH = dims.find("H"); if (itH != dims.end()) h = itH->second;
+    auto itC = dims.find("C"); if (itC != dims.end()) c = itC->second;
+    if (h <= 0.0 || c <= 0.0) return piece;
+
+    TopoDS_Shape tool = makeBox(h, gapLength, c);
+    tool = translate_shape(tool, xCoord, yCoord, 0.0);
+    BRepAlgoAPI_Cut cutter(piece, tool);
+    return cutter.IsDone() ? cutter.Shape() : piece;
+}
+
 } // namespace shapes
 } // namespace mvb

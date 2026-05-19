@@ -292,12 +292,6 @@ target_link_libraries(mvbpp_generate_steps PRIVATE mvb++)
 add_executable(mvbpp_step_generator tools/mvbpp_step_generator.cpp)
 target_link_libraries(mvbpp_step_generator PRIVATE mvb++)
 
-add_executable(mvbpp_inspect tools/mvbpp_inspect.cpp)
-target_link_libraries(mvbpp_inspect PRIVATE mvb++)
-
-add_executable(mvbpp_dump_pieces tools/mvbpp_dump_pieces.cpp)
-target_link_libraries(mvbpp_dump_pieces PRIVATE mvb++)
-
 add_executable(mvbpp_section tools/mvbpp_section.cpp)
 target_link_libraries(mvbpp_section PRIVATE mvb++)
 
