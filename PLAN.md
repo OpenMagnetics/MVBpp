@@ -64,9 +64,8 @@ bindings/wasm/       — Emscripten module + JS tests
 
 ### Open items
 
-1. **README / docs polish** (low priority — README is in)
-   - Cross-check the Python/WASM tests against the documented API surface
-   - Add a one-page architecture diagram
+_None._ README + architecture diagram are in; Python/WASM API surfaces
+cross-checked against their test suites.
 
 ### Design decisions
 
