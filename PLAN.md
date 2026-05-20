@@ -54,7 +54,7 @@ bindings/wasm/       — Emscripten module + JS tests
 | `[assembly]`       | pass (4/4)                            | rect_one_turn, etd49_5t                    |
 | `[shapes]`         | pass (882 ran, 8 excluded, 0 failed)  | Excluded: 4 `ui` + 3 `pqi` + 1 `ut` (intentional, mirrors MVB Python) |
 | `[get_families]`   | pass                                  |                                            |
-| `[symmetry]`       | pass (8/8, ~2:23 wall)                | AABB-prefiltered analyze and cut; was 4:32 before optimisation |
+| `[symmetry]`       | pass (8/8, ~1:35 wall)                | AABB-prefiltered analyze/cut + per-fixture test cache; was 4:32 baseline |
 | `[battery]`        | 25/25 simple pass; overlap phase ~free (was the dominant cost) | PM uses 64-faceted cylinders in the test (vs default 16) to keep the bobbin/core polygon chord-error under the artefact tolerance |
 | `[topview]`        | pass (toroidal 2D)                    |                                            |
 | `[json]`           | pass                                  |                                            |
@@ -64,12 +64,9 @@ bindings/wasm/       — Emscripten module + JS tests
 
 ### Open items
 
-1. **`[symmetry]` further perf** (lower priority — already 47% faster)
-   - Each ETD34 case rebuilds `buildAllNamed` twice (V_full + V_cut); a per-fixture build cache would halve build cost
-   - Face-based gap rendering or cached cut shapes could shave more
-
-2. **README / docs**
-   - README is light on the binding APIs, DrawConfig fields, and section/symmetry spec syntax
+1. **README / docs polish** (low priority — README is in)
+   - Cross-check the Python/WASM tests against the documented API surface
+   - Add a one-page architecture diagram
 
 ### Design decisions
 
