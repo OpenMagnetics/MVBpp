@@ -136,8 +136,15 @@ svg_bytes  = mvbpp.drawView(mas, None,
 
 All `draw*` functions share the same trailing keyword arguments:
 `mode={"3D","2D"}`, `plane={"XY","XZ","YZ"}`, `offset`, `format`,
-`scale`, `polygonSegments`, `symmetry={"none","mirror"}`, `side`
-(e.g. `"+X+Y+Z"` for the positive octant).
+`scale`, `polygonSegments`, `symmetry`, `side`.
+
+- `symmetry` (default `"none"`) — `"none"`/`"0"` full, `"half"`/`"1"` cuts
+  along one symmetry plane, `"quarter"`/`"2"` cuts along two. Unknown
+  values raise.
+- `side` (default `"+X+Y+Z"`, FEM-friendly positive octant) — keeps only
+  shapes whose centroid lies in the requested half-spaces. Combine axes
+  like `"+X"`, `"+X-Y"`, `"+X+Y+Z"`. Pass `""`, `"none"`, or `"auto"` to
+  disable filtering. Unknown tokens raise.
 
 Available entry points:
 
@@ -159,7 +166,8 @@ STL is not allowed in 2-D mode.
 
 ## WebAssembly API
 
-The embind surface mirrors the Python API. Each `draw*` returns a `Uint8Array`;
+The embind surface mirrors the Python API and adds two extras
+(`drawSpacer`, `drawBoard`). Each `draw*` returns a `Uint8Array`;
 each `*ToPath` variant writes to a virtual-FS path inside the WASM module.
 
 ```js
@@ -179,10 +187,11 @@ const stepBytes = mvbpp.drawMagnetic(
 );
 ```
 
-All nine config args (`mode, plane, offset, format, scale, polygonSegments,
-symmetry, side`) are required positional arguments; they map 1-to-1 onto the
-Python keyword arguments. See `bindings/wasm/mvbpp_wasm.cpp` for the full
-signature.
+The 9 trailing args (`mode, plane, offset, format, scale, polygonSegments,
+symmetry, side`) are required positional arguments; they map 1-to-1 onto
+the Python keyword arguments above (same accepted values, same defaults
+when called from Python). See `bindings/wasm/mvbpp_wasm.cpp` for the full
+signature and `bindings/wasm/tests/test_mvbpp.js` for end-to-end usage.
 
 The test helper `_enrichMagnetic(masJson)` exposes `magnetic_autocomplete`
 for callers that want the MKF-enriched MAS JSON without going through a
@@ -214,7 +223,7 @@ The test binary supports Catch2 tag filters. Common combinations:
 ./build/mvb_tests "[stl]"                # STL reference comparisons (~10 s)
 ./build/mvb_tests "[assembly]"           # Full magnetic assemblies (~30 s)
 ./build/mvb_tests "[shapes]"             # Iterates 882 MAS core shapes
-./build/mvb_tests "[symmetry]"           # ~2:23 — boolean cuts on heavy ETD/PQ
+./build/mvb_tests "[symmetry]"           # ~1:35 — boolean cuts on heavy ETD/PQ
 ./build/mvb_tests "[gapping]"            # ~5 min — additive/subtractive/distributed
 ./build/mvb_tests "[battery][simple]"    # 25 MAS examples, full pipeline
 ./build/mvb_tests "[topview]"            # Toroidal 2-D top view
