@@ -85,13 +85,52 @@ namespace {
 // its window) are orders of magnitude larger.
 constexpr double OVERLAP_TOLERANCE_M3 = 1.0e-7;  // 100 mm^3
 
-// Polygon segmentation used by the heavy builds. CORE_SEGMENTS=16 keeps the
-// round-cylinder approximation close enough to the MAS-described round
-// columns/flanges that chord-vs-chord faceting noise between bobbin and
-// core stays small. WIRE_SEGMENTS stays low so toroidal designs (hundreds
-// of turns, large major-radius rings) remain tractable.
-constexpr int CORE_SEGMENTS = 16;
-constexpr int WIRE_SEGMENTS = 6;
+// Polygon segmentation used by the heavy builds. The default 16 keeps
+// boolean ops cheap on big shapes (ER95, distributed-gapped PQs). Round-
+// column families where MAS describes the bobbin inner surface tangent to
+// the core central column (PM in particular) need a finer tessellation,
+// otherwise the polygon chord-error between two separately-faceted round
+// surfaces shows up as a bobbin<->core overlap. The artefact scales as
+// O(1/N^2): PM87/70 measures 470 mm^3 at 16, ~117 at 32, ~30 at 64.
+// We bump to 64 only for the families that need it; everything else keeps
+// the cheap 16-face cylinders. WIRE_SEGMENTS stays low so toroidal designs
+// (hundreds of turns, large major-radius rings) remain tractable.
+constexpr int CORE_SEGMENTS_DEFAULT     = 16;
+constexpr int CORE_SEGMENTS_ROUND_COL   = 64;
+constexpr int WIRE_SEGMENTS             = 6;
+
+// Pick CORE_SEGMENTS based on the core's shape family. Walks the
+// geometricalDescription pieces and returns the high-resolution count if
+// any piece belongs to a family whose round central column would otherwise
+// overlap the bobbin inner cylinder by more than the artefact tolerance.
+inline int core_segments_for(const OpenMagnetics::Magnetic& enriched) {
+    auto pick = [](MAS::CoreShapeFamily fam) -> std::optional<int> {
+        switch (fam) {
+            // PM cores are designed with the bobbin inner cylinder tangent to
+            // the round central column. With the cheap 16-face tessellation
+            // the two polygons interpenetrate by ~470 mm^3 per piece, well
+            // over OVERLAP_TOLERANCE_M3. Bumping to 64 brings the artefact
+            // under 30 mm^3 per piece.
+            case MAS::CoreShapeFamily::PM: return CORE_SEGMENTS_ROUND_COL;
+            default: return std::nullopt;
+        }
+    };
+    const auto& funcShape = enriched.get_core().get_functional_description().get_shape();
+    if (const auto* p = std::get_if<MAS::CoreShape>(&funcShape)) {
+        if (auto v = pick(p->get_family())) return *v;
+    }
+    const auto& gd = enriched.get_core().get_geometrical_description();
+    if (gd) {
+        for (const auto& piece : *gd) {
+            auto shapeOpt = piece.get_shape();
+            if (!shapeOpt) continue;
+            if (const auto* p = std::get_if<MAS::CoreShape>(&*shapeOpt)) {
+                if (auto v = pick(p->get_family())) return *v;
+            }
+        }
+    }
+    return CORE_SEGMENTS_DEFAULT;
+}
 
 // Per-file hard wall-clock budget. Anything slower than this points at a
 // pathological example (or a perf regression in the builder) and is a
@@ -344,6 +383,7 @@ CaseResult run_one(const fs::path& path) {
 
     // -- 3. Build core / bobbin / turns ------------------------------------
     mvb::MagneticBuilder builder;
+    const int coreSegments = core_segments_for(enriched);
     std::vector<mvb::NamedShape> coreNamed, turnsNamed;
     mvb::NamedShape              bobbinNamed;
     auto stage = [&](const char* tag) {
@@ -351,11 +391,11 @@ CaseResult run_one(const fs::path& path) {
     };
     stage("phase=enriched");
     buildStart = std::chrono::steady_clock::now();
-    try { coreNamed = builder.buildCoreNamed(enriched.get_core(), CORE_SEGMENTS); }
+    try { coreNamed = builder.buildCoreNamed(enriched.get_core(), coreSegments); }
     catch (const std::exception& e) { fail(std::string("buildCoreNamed: ") + e.what()); }
     stage("phase=core_done");
     if (!check_build_budget("buildCoreNamed")) return r;
-    try { bobbinNamed = builder.buildBobbinNamed(enriched.get_coil(), enriched.get_core()); }
+    try { bobbinNamed = builder.buildBobbinNamed(enriched.get_coil(), enriched.get_core(), coreSegments); }
     catch (const std::exception& e) { fail(std::string("buildBobbinNamed: ") + e.what()); }
     stage("phase=bobbin_done");
     if (!check_build_budget("buildBobbinNamed")) return r;
@@ -394,7 +434,7 @@ CaseResult run_one(const fs::path& path) {
     // -- 4. buildAllNamed (the unified API used by drawMagnetic) -----------
     std::vector<mvb::NamedShape> all;
     try { all = builder.buildAllNamed(enriched, /*includeBobbin*/true, /*sym*/0,
-                                      WIRE_SEGMENTS, CORE_SEGMENTS); }
+                                      WIRE_SEGMENTS, coreSegments); }
     catch (const std::exception& e) { fail(std::string("buildAllNamed: ") + e.what()); }
     if (all.empty()) fail("buildAllNamed returned empty");
     stage("phase=buildAll_done");
@@ -507,7 +547,7 @@ CaseResult run_one(const fs::path& path) {
     try {
         auto outStep = builder.drawMagnetic(enriched, tmp.string(), "step",
                                             true, 1.0, 0,
-                                            WIRE_SEGMENTS, CORE_SEGMENTS);
+                                            WIRE_SEGMENTS, coreSegments);
         if (outStep.empty() || !fs::exists(outStep) ||
             fs::file_size(outStep) == 0)
             fail("STEP export produced empty file");
@@ -517,7 +557,7 @@ CaseResult run_one(const fs::path& path) {
     try {
         auto outStl = builder.drawMagnetic(enriched, tmp.string(), "stl",
                                            true, 1.0, 0,
-                                           WIRE_SEGMENTS, CORE_SEGMENTS);
+                                           WIRE_SEGMENTS, coreSegments);
         if (outStl.empty() || !fs::exists(outStl) ||
             fs::file_size(outStl) == 0)
             fail("STL export produced empty file");

@@ -55,7 +55,7 @@ bindings/wasm/       — Emscripten module + JS tests
 | `[shapes]`         | pass (882 ran, 8 excluded, 0 failed)  | Excluded: 4 `ui` + 3 `pqi` + 1 `ut` (intentional, mirrors MVB Python) |
 | `[get_families]`   | pass                                  |                                            |
 | `[symmetry]`       | pass (8/8)                            | Can be slow on complex shapes              |
-| `[battery]`        | 24/25 simple pass; overlap phase now ~free (was the dominant cost) | Remaining failure: 14_dab_xfmr_pm8770_n97 — PM core full-disc bobbin flange overlaps side legs (~0.8 mm³ each side) |
+| `[battery]`        | 25/25 simple pass; overlap phase ~free (was the dominant cost) | PM uses 64-faceted cylinders in the test (vs default 16) to keep the bobbin/core polygon chord-error under the artefact tolerance |
 | `[topview]`        | pass (toroidal 2D)                    |                                            |
 | `[json]`           | pass                                  |                                            |
 | `[gapping][additive]`     | pass (448 ran, 0 failed)       |                                            |
@@ -64,15 +64,11 @@ bindings/wasm/       — Emscripten module + JS tests
 
 ### Open items
 
-1. **PM-core bobbin flange overlaps side legs** (single remaining `[battery]` failure)
-   - `BobbinBuilder` round-path builds flanges as full discs of radius `colWidth+wwWidth`, but PM cores have non-axisymmetric outer walls (side legs / spine) at that radius. The disc punches through ⇒ ~470 mm³ bobbin↔core overlap on `14_dab_xfmr_pm8770_n97`
-   - Per the "use MAS dimensions verbatim, don't modify geometry" rule we don't post-process the bobbin to cut around the core. Fix has to be a proper flange topology in `BobbinBuilder` (e.g. a `racetrack` or core-window-shaped flange driven by MAS winding-window data) so the generated geometry matches the MAS-described bobbin profile from the start
-
-2. **`[symmetry]` performance**
+1. **`[symmetry]` performance**
    - Boolean ops on PQ3230 + distributed gapping can exceed 2 minutes
    - Consider face-based gap rendering or cached cut shapes
 
-3. **README / docs**
+2. **README / docs**
    - README is light on the binding APIs, DrawConfig fields, and section/symmetry spec syntax
 
 ### Design decisions
