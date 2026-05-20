@@ -54,6 +54,72 @@ JavaScript host.
 
 ---
 
+## Architecture
+
+```
+                       ┌──────────────────────┐
+                       │   MAS JSON (input)   │
+                       └──────────┬───────────┘
+                                  │
+                  ┌───────────────▼────────────────┐
+                  │  MKF magnetic_autocomplete     │   (skipped if MAS
+                  │  → enriched MAS::Magnetic      │    already has
+                  └───────────────┬────────────────┘    geometricalDescription)
+                                  │
+        ┌─────────────────────────┼─────────────────────────┐
+        │                         │                         │
+        ▼                         ▼                         ▼
+┌──────────────┐         ┌──────────────────┐      ┌────────────────┐
+│ shapes/      │         │ BobbinBuilder    │      │ TurnBuilder    │
+│ Factory.cpp  │         │ (rect / round,   │      │ (round / rect, │
+│ → ShapeE,    │         │  flanges, holes) │      │  concentric /  │
+│   ShapeP,    │         └──────┬───────────┘      │  toroidal)     │
+│   ShapeEtd,  │                │                  └───────┬────────┘
+│   ShapeT,    │                │                          │
+│   ShapeU,    │                │     SpacerBuilder        │
+│   ShapeEr,   │                │     FR4Builder           │
+│   Toroidal…  │                │                          │
+└──────┬───────┘                │                          │
+       │                        │                          │
+       └────────────┬───────────┴──────────────┬───────────┘
+                    ▼                          ▼
+            ┌───────────────────────────────────────┐
+            │      MagneticBuilder::buildAllNamed   │
+            │   → std::vector<NamedShape>           │
+            │     (named TopoDS_Shape parts)        │
+            └───────────────┬───────────────────────┘
+                            │
+       ┌────────────────────┼─────────────────────────┐
+       ▼                    ▼                         ▼
+┌──────────────┐   ┌────────────────────┐    ┌──────────────────┐
+│  Symmetry    │   │  SectionBuilder    │    │  StepExporter    │
+│  analyze /   │   │  cut2DFaces (XY/   │    │  STEP / STL      │
+│  apply /     │   │  XZ/YZ, offset)    │    │  (m → mm)        │
+│  filter_by_  │   │  → planar Faces    │    └────────┬─────────┘
+│  side        │   └────────┬───────────┘             │
+└──────┬───────┘            │                         │
+       │                    ▼                         │
+       │            ┌───────────────────┐             │
+       │            │ Section/Projection│             │
+       │            │ Drawing → SVG     │             │
+       │            └────────┬──────────┘             │
+       │                     │                        │
+       └─────────────────────┴────────────┬───────────┘
+                                          ▼
+                       ┌──────────────────────────────────┐
+                       │  Bindings: C++ / Python / WASM   │
+                       │  (DrawConfig + draw* dispatch)   │
+                       └──────────────────────────────────┘
+```
+
+Data flows top-to-bottom: MAS JSON in, enriched by MKF, decomposed into
+named OCCT shapes by `MagneticBuilder`, then post-processed (symmetry,
+2-D sectioning) and exported. All three binding surfaces (`mvb::`,
+`mvbpp` Python module, `mvbpp` WASM module) consume the same
+`DrawConfig` and return the same `NamedShape` set.
+
+---
+
 ## C++ API
 
 Everything lives in namespace `mvb`. The entry point is `MagneticBuilder`.
