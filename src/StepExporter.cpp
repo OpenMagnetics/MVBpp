@@ -1,7 +1,9 @@
 #include "mvb/StepExporter.h"
 
+#include <BRepBndLib.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <Bnd_Box.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <STEPCAFControl_Reader.hxx>
 #include <STEPCAFControl_Writer.hxx>
@@ -19,6 +21,7 @@
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
 
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -141,9 +144,22 @@ std::string exportSTLToBytes(const std::vector<TopoDS_Shape>& shapes,
     }
     if (!any) return {};
 
-    // Model coordinates are in SI (meters). Use relative linear deflection so
-    // mesh quality is scale-independent; angularTolerance (radians) drives roundness.
-    BRepMesh_IncrementalMesh mesh(compound, 0.001, Standard_True,
+    // Model coordinates are in SI (meters). Compute a scale-appropriate
+    // absolute linear deflection from the overall bounding-box diagonal.
+    // Using relative deflection (0.001 = 0.1 %) on tiny per-face boxes
+    // (e.g. individual wire turns) creates sub-micron meshes and OOMs in
+    // WASM. Absolute deflection capped at ~0.5 % of overall size keeps
+    // mesh counts bounded while preserving recognisable geometry.
+    Bnd_Box bbox;
+    BRepBndLib::Add(compound, bbox);
+    Standard_Real xMin, yMin, zMin, xMax, yMax, zMax;
+    bbox.Get(xMin, yMin, zMin, xMax, yMax, zMax);
+    const Standard_Real dx = xMax - xMin;
+    const Standard_Real dy = yMax - yMin;
+    const Standard_Real dz = zMax - zMin;
+    const Standard_Real diagonal = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const Standard_Real linDeflection = std::max(diagonal * 0.005, 0.001);
+    BRepMesh_IncrementalMesh mesh(compound, linDeflection, Standard_False,
                                    angularTolerance, Standard_False);
     mesh.Perform();
 
