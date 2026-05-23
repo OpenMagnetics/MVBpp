@@ -1,4 +1,6 @@
 #include "mvb/Utils.h"
+#include <algorithm>
+#include <vector>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
@@ -398,45 +400,62 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
     BRep_Builder cbld;
     cbld.MakeCompound(resultComp);
 
+    // Chunk size for the BOP cut. Feeding more than ~10 tools to a single
+    // BRepAlgoAPI_Cut blows the WASM heap (OCCT internally builds a full
+    // bbox-pair table and intermediate shapes). 80-turn bobbin cuts then
+    // crash with `Aborted()` mid-Build. Iterate `current <- current ∖ batch`
+    // in fixed-size batches so peak BOP memory stays bounded regardless of
+    // total tool count. Native (non-WASM) builds also benefit (linear vs
+    // ~quadratic-on-tools growth in OCCT's internal data structures).
+    constexpr std::size_t BOP_TOOL_CHUNK = 8;
+
     for (const auto& solid : solids) {
         TopoDS_Shape solidScaled = BRepBuilderAPI_Transform(solid, up).Shape();
         Bnd_Box solidBox;
         BRepBndLib::Add(solidScaled, solidBox);
 
-        TopTools_ListOfShape tools;
+        std::vector<TopoDS_Shape> relevant;
+        relevant.reserve(scaledTools.size());
         for (const auto& st : scaledTools) {
             if (solidBox.IsOut(st.box)) continue;
-            tools.Append(st.shape);
+            relevant.push_back(st.shape);
         }
-        if (tools.IsEmpty()) {
+        if (relevant.empty()) {
             cbld.Add(resultComp, solid);
             continue;
         }
 
-        TopTools_ListOfShape args;
-        args.Append(solidScaled);
+        TopoDS_Shape current = solidScaled;
+        bool ok = true;
+        for (std::size_t i = 0; i < relevant.size(); i += BOP_TOOL_CHUNK) {
+            TopTools_ListOfShape args, batchTools;
+            args.Append(current);
+            const std::size_t end = std::min(i + BOP_TOOL_CHUNK, relevant.size());
+            for (std::size_t j = i; j < end; ++j) {
+                batchTools.Append(relevant[j]);
+            }
 
-        BRepAlgoAPI_Cut cutter;
-        cutter.SetArguments(args);
-        cutter.SetTools(tools);
-        cutter.SetUseOBB(true);
-        cutter.SetRunParallel(true);
-        cutter.SetGlue(BOPAlgo_GlueShift);
-        cutter.SetCheckInverted(false);
-        cutter.SetNonDestructive(false);
-        cutter.Build();
-        if (!cutter.IsDone()) {
-            cbld.Add(resultComp, solid);
-            continue;
+            BRepAlgoAPI_Cut cutter;
+            cutter.SetArguments(args);
+            cutter.SetTools(batchTools);
+            cutter.SetUseOBB(true);
+            cutter.SetRunParallel(true);
+            cutter.SetGlue(BOPAlgo_GlueShift);
+            cutter.SetCheckInverted(false);
+            cutter.SetNonDestructive(false);
+            cutter.Build();
+            if (!cutter.IsDone()) { ok = false; break; }
+            TopoDS_Shape step = cutter.Shape();
+            if (step.IsNull())   { ok = false; break; }
+            current = step;
         }
-        TopoDS_Shape candidate = cutter.Shape();
-        if (candidate.IsNull()) {
+        if (!ok) {
             cbld.Add(resultComp, solid);
             continue;
         }
 
         bool inverted = false;
-        for (TopExp_Explorer exp(candidate, TopAbs_SOLID); exp.More(); exp.Next()) {
+        for (TopExp_Explorer exp(current, TopAbs_SOLID); exp.More(); exp.Next()) {
             GProp_GProps props;
             BRepGProp::VolumeProperties(exp.Current(), props);
             if (props.Mass() < 0) { inverted = true; break; }
@@ -446,7 +465,7 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
             continue;
         }
 
-        TopoDS_Shape downScaled = BRepBuilderAPI_Transform(candidate, down).Shape();
+        TopoDS_Shape downScaled = BRepBuilderAPI_Transform(current, down).Shape();
         cbld.Add(resultComp, downScaled);
     }
 

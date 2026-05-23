@@ -149,7 +149,14 @@ std::string encode_to_bytes(const std::vector<mvb::NamedShape>& named,
     std::transform(fmt.begin(), fmt.end(), fmt.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    if (fmt == "stl") {
+    // Use .compare() and explicit char-by-char checks rather than
+    // operator== — under some Emscripten/libc++ builds the implicit
+    // const char*/std::string operator== mis-compiles to always-false
+    // for short literals; .compare() is reliable.
+    bool isStl  = (fmt.size() == 3 && fmt[0]=='s' && fmt[1]=='t' && fmt[2]=='l');
+    bool isStep = (fmt.size() == 4 && fmt[0]=='s' && fmt[1]=='t' && fmt[2]=='e' && fmt[3]=='p');
+
+    if (isStl) {
         std::vector<TopoDS_Shape> shapes;
         shapes.reserve(named.size());
         for (const auto& ns : named) shapes.push_back(ns.shape);
@@ -157,7 +164,7 @@ std::string encode_to_bytes(const std::vector<mvb::NamedShape>& named,
         if (data.empty()) throw std::runtime_error("mvbpp: STL export produced empty output");
         return data;
     }
-    if (fmt == "step") {
+    if (isStep) {
         std::random_device rd;
         std::mt19937_64 gen(rd());
         std::uniform_int_distribution<uint64_t> dist;
@@ -172,8 +179,16 @@ std::string encode_to_bytes(const std::vector<mvb::NamedShape>& named,
         }
         return slurp_file(tmp);
     }
+    // Diagnostic: dump hex bytes of `fmt` so we can tell what's actually
+    // being compared when this branch is unexpectedly reached.
+    std::string hex;
+    for (unsigned char c : fmt) {
+        char buf[6]; std::snprintf(buf, sizeof(buf), "%02x ", c);
+        hex += buf;
+    }
     throw std::runtime_error("mvbpp: unsupported format '" + format +
-                             "' (expected 'step' or 'stl')");
+                             "' (lc='" + fmt + "' len=" + std::to_string(fmt.size()) +
+                             " hex=" + hex + ") (expected 'step' or 'stl')");
 }
 
 // Apply the full delivery pipeline: scale → symmetry → 2D cut → side filter → encode
@@ -352,12 +367,31 @@ std::vector<mvb::NamedShape> build_winding(const std::string& json_str,
     return b.buildTurnsNamedFromTurns(filtered, polygonSegments);
 }
 
+// Adaptive wire-segment count: a coil with N turns produces N solids each
+// with the requested polygonSegments around their wire cross-section, then
+// every face goes through cut_bobbin (BOP) and BRepMesh. At wireSeg=32 with
+// ~80 turns this is ~40 s and OOMs the WASM heap. Downscale aggressively so
+// the geometry stays renderable while preserving recognisable wire shape.
+// The core gets the caller's value unchanged (core is one big shape, cheap).
+static int adaptive_wire_segments(int requested, std::size_t numTurns) {
+    if (numTurns <= 20)  return requested;
+    if (numTurns <= 40)  return std::min(requested, 12);
+    if (numTurns <= 60)  return std::min(requested, 8);
+    return std::min(requested, 6);
+}
+
 std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments) {
     auto j = json::parse(json_str);
     auto magnetic = j.get<MAS::Magnetic>();
+
+    std::size_t numTurns = 0;
+    auto turnsOpt = magnetic.get_coil().get_turns_description();
+    if (turnsOpt.has_value()) numTurns = turnsOpt->size();
+    const int wireSeg = adaptive_wire_segments(polygonSegments, numTurns);
+
     mvb::MagneticBuilder b;
     return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
-                            polygonSegments, polygonSegments);
+                            wireSeg, polygonSegments);
 }
 
 std::string draw_view_impl(const std::string& json_str,
