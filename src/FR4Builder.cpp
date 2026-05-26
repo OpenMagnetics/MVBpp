@@ -4,40 +4,29 @@
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
+#include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Trsf.hxx>
 
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 #include <optional>
 
 namespace mvb {
 
-namespace {
-
-// Bobbin processed description fields we need. The type is on MAS::Coil
-// as a variant<Bobbin, string>; callers typically hand us an enriched
-// coil where the struct is populated.
-std::optional<MAS::CoreBobbinProcessedDescription>
-getBobbinPd(const MAS::Coil& coil) {
-    const auto& var = coil.get_bobbin();
-    const MAS::Bobbin* b = std::get_if<MAS::Bobbin>(&var);
-    if (!b) return std::nullopt;
-    return b->get_processed_description();
-}
-
-} // namespace
-
 TopoDS_Shape FR4Builder::buildFR4Board(
-    const MAS::Coil& coil,
+    const std::vector<MAS::Group>& groups,
+    const MAS::CoreBobbinProcessedDescription& bobbinPd,
     double borderToWireDistance,
     double coreToLayerDistance)
 {
-    const auto& groupsOpt = coil.get_groups_description();
-    if (!groupsOpt || groupsOpt->empty()) return TopoDS_Shape();
+    if (groups.empty()) return TopoDS_Shape();
 
-    const auto& group0 = (*groupsOpt).front();
+    const auto& group0 = groups.front();
     if (group0.get_type() != MAS::WiringTechnology::PRINTED) return TopoDS_Shape();
 
     const auto& groupCoords = group0.get_coordinates();
@@ -49,24 +38,26 @@ TopoDS_Shape FR4Builder::buildFR4Board(
     const double groupWidth  = groupDims[0];
     const double groupHeight = groupDims[1];
 
-    // Widest layer across all groups — sets the Y (depth) extent of the board.
+    // Widest layer across all groups — used as the Y (depth) extent of
+    // rectangular/oblong boards. Round boards size purely from group 0's
+    // own dimensions.
     double maxLayerWidth = 0.0;
-    for (const auto& g : *groupsOpt) {
+    for (const auto& g : groups) {
         const auto& d = g.get_dimensions();
         if (!d.empty()) maxLayerWidth = std::max(maxLayerWidth, d[0]);
     }
 
-    // Bobbin column metrics.
-    double columnWidth  = 0.002;  // 2 mm default
-    double columnDepth  = 0.002;
-    MAS::ColumnShape columnShape = MAS::ColumnShape::RECTANGULAR;
-
-    auto bobbinPd = getBobbinPd(coil);
-    if (bobbinPd) {
-        if (auto cw = bobbinPd->get_column_width()) columnWidth = *cw;
-        columnDepth = bobbinPd->get_column_depth();
-        columnShape = bobbinPd->get_column_shape();
+    // Bobbin column metrics — required, must be populated by the caller.
+    if (!bobbinPd.get_column_width()) {
+        throw std::runtime_error(
+            "FR4Builder::buildFR4Board: bobbinPd.column_width is unset. "
+            "The caller must populate the bobbin processed description "
+            "(see MagneticBuilder::patchBobbinDimensions) before drawing "
+            "the FR4 board.");
     }
+    const double columnWidth          = *bobbinPd.get_column_width();
+    const double columnDepth          = bobbinPd.get_column_depth();
+    const MAS::ColumnShape columnShape = bobbinPd.get_column_shape();
 
     // Board thickness: group height minus a 4 µm clearance so the FR4 plane
     // doesn't Z-fight with turn planes — with a MIN_FR4_THICKNESS floor.
@@ -74,9 +65,10 @@ TopoDS_Shape FR4Builder::buildFR4Board(
     const double fr4Thickness = std::max(groupHeight - clearance,
                                           MIN_FR4_THICKNESS - clearance);
 
-    // Radial extents in replicad logic: groupX ± groupWidth/2.
+    // Radial extents come straight from the group's own dimensions — no
+    // border/margin additions. The group already describes the FR4 footprint.
     const double innerRadius     = groupX - groupWidth / 2.0;
-    const double outerRadius     = groupX + groupWidth / 2.0 + borderToWireDistance;
+    const double outerRadius     = groupX + groupWidth / 2.0;
     const double holeInnerRadius = innerRadius - coreToLayerDistance;
 
     // Y-depth of the board: use bobbin column depth + widest layer width.
@@ -155,6 +147,17 @@ TopoDS_Shape FR4Builder::buildFR4Board(
         } else {
             board = plate;
         }
+    }
+
+    // The board is built with the column axis along Z (flat face in XY).
+    // The rest of the magnetic — bobbin (BobbinBuilder.cpp:172), turns,
+    // spacers — uses Y as the column axis. Rotate -π/2 around X to bring
+    // the board into the Y-axis convention so its flat face lands in XZ.
+    if (!board.IsNull()) {
+        gp_Trsf rot;
+        rot.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)),
+                        -std::numbers::pi / 2.0);
+        board = BRepBuilderAPI_Transform(board, rot).Shape();
     }
 
     return board;

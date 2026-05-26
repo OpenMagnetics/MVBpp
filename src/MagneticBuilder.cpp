@@ -5,6 +5,7 @@
 #include "mvb/shapes/ShapeBuilder.h"
 #include "mvb/TurnBuilder.h"
 #include "mvb/BobbinBuilder.h"
+#include "mvb/FR4Builder.h"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/CorePiece.h"
 #include "support/Utils.h"
@@ -96,6 +97,11 @@ static void patchBobbinDimensions(MAS::CoreBobbinProcessedDescription& bobbinPd,
             if (centralCol.get_depth() > 0.0) {
                 bobbinPd.set_column_depth(centralCol.get_depth() / 2.0 + wallThickness);
             }
+            // Propagate the column shape too — FR4Builder picks its annulus /
+            // rectangular / oblong branch off this. The default-constructed
+            // ColumnShape is RECTANGULAR, which silently produces the wrong
+            // board for round-column cores.
+            bobbinPd.set_column_shape(centralCol.get_shape());
         }
     }
 }
@@ -506,6 +512,19 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
             all.emplace_back(turnShapes[i], n);
         }
 
+        // Planar (PCB) coils get an FR4 substrate board. Patch the bobbin
+        // processed description first so column_shape/width/depth are
+        // populated from the core when MKF left the bobbin variant empty.
+        if (auto groupsOpt = magnetic.get_coil().get_groups_description();
+            groupsOpt && !groupsOpt->empty()) {
+            auto bobbinPd = getBobbinProcessed(magnetic.get_coil());
+            patchBobbinDimensions(bobbinPd, magnetic.get_core());
+            auto fr4 = FR4Builder::buildFR4Board(*groupsOpt, bobbinPd);
+            if (!fr4.IsNull()) {
+                all.emplace_back(fr4, "FR4Board");
+            }
+        }
+
         return apply_symmetry(std::move(all), symmetryPlanes);
     }
 
@@ -543,6 +562,16 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                 ? turnNames[i]
                                 : "Turn_" + std::to_string(i);
         all.emplace_back(turnShapes[i], n);
+    }
+
+    if (auto groupsOpt = magnetic.get_coil().get_groups_description();
+        groupsOpt && !groupsOpt->empty()) {
+        auto bobbinPd = getBobbinProcessed(magnetic.get_coil());
+        patchBobbinDimensions(bobbinPd, magnetic.get_core());
+        auto fr4 = FR4Builder::buildFR4Board(*groupsOpt, bobbinPd);
+        if (!fr4.IsNull()) {
+            all.emplace_back(fr4, "FR4Board");
+        }
     }
 
     return apply_symmetry(std::move(all), symmetryPlanes);

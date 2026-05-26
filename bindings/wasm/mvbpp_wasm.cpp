@@ -298,8 +298,35 @@ std::vector<mvb::NamedShape> build_spacer(const std::string& json_str, int /*pol
 std::vector<mvb::NamedShape> build_board(const std::string& json_str, int /*polygonSegments*/) {
     auto enriched = parseEnriched(json_str);
     const auto& coilOm = enriched.get_coil();
-    // OpenMagnetics::Coil derives from MAS::Coil — pass directly.
-    auto shape = mvb::FR4Builder::buildFR4Board(coilOm);
+    const auto& core   = enriched.get_core();
+
+    auto groupsOpt = coilOm.get_groups_description();
+    if (!groupsOpt || groupsOpt->empty()) return {};
+
+    // Pull the bobbin's processed description and patch from the core's
+    // centre column when MKF left the bobbin variant as a string (common
+    // after enrichment of raw MAS planar fixtures). Mirrors the helper
+    // used in MagneticBuilder::buildAllNamed; kept inline here so this
+    // binding doesn't need a private MagneticBuilder header.
+    MAS::CoreBobbinProcessedDescription bobbinPd;
+    if (const auto* b = std::get_if<OpenMagnetics::Bobbin>(&coilOm.get_bobbin())) {
+        if (auto pd = b->get_processed_description()) bobbinPd = *pd;
+    }
+    if (bobbinPd.get_column_width().value_or(0.0) <= 0.0) {
+        auto corePd = core.get_processed_description();
+        if (corePd && !corePd->get_columns().empty()) {
+            const auto& centralCol = corePd->get_columns()[0];
+            double wallThickness = bobbinPd.get_wall_thickness();
+            if (std::isnan(wallThickness) || wallThickness < 0.0) wallThickness = 0.0;
+            if (centralCol.get_width() > 0.0)
+                bobbinPd.set_column_width(centralCol.get_width() / 2.0 + wallThickness);
+            if (centralCol.get_depth() > 0.0)
+                bobbinPd.set_column_depth(centralCol.get_depth() / 2.0 + wallThickness);
+            bobbinPd.set_column_shape(centralCol.get_shape());
+        }
+    }
+
+    auto shape = mvb::FR4Builder::buildFR4Board(*groupsOpt, bobbinPd);
     std::vector<mvb::NamedShape> out;
     if (!shape.IsNull()) out.push_back(mvb::NamedShape{ std::move(shape), "FR4Board" });
     return out;
