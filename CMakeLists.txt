@@ -273,6 +273,7 @@ add_executable(mvb_tests
     tests/test_symmetry.cpp
     tests/test_mas_battery.cpp
     tests/test_toroidal_topview.cpp
+    tests/test_toroidal_single_turn_centered.cpp
 )
 
 target_compile_definitions(mvb_tests PRIVATE
@@ -291,6 +292,9 @@ target_link_libraries(mvbpp_generate_steps PRIVATE mvb++)
 
 add_executable(mvbpp_step_generator tools/mvbpp_step_generator.cpp)
 target_link_libraries(mvbpp_step_generator PRIVATE mvb++)
+
+add_executable(mvbpp_dump_turns tools/dump_turns.cpp)
+target_link_libraries(mvbpp_dump_turns PRIVATE mvb++)
 
 add_executable(mvbpp_section tools/mvbpp_section.cpp)
 target_link_libraries(mvbpp_section PRIVATE mvb++)

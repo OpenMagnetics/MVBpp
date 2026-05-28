@@ -519,15 +519,44 @@ static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& 
         outerRadial = innerRadial + wwRadialHeight;
     }
 
+    // Special case: when the inner cartesian is at (or very near) the toroid
+    // origin, atan2(0, 0) returns 0 — but the racetrack is meant to extend
+    // toward the outer leg, not along +X. Inherit the outer leg's angle so
+    // the angleDiff is zero and both halves are built coherently along the
+    // single line connecting origin to the outer leg.
+    if (innerRadial < 1e-9) {
+        innerAngleDeg = outerAngleDeg;
+    }
+
     double turnAngleDeg = turn.get_rotation().value_or(0.0);
     double angleDiffRad = (outerAngleDeg - innerAngleDeg) * std::numbers::pi / 180.0;
     double turnRotationRad = (turnAngleDeg - 180.0) * std::numbers::pi / 180.0;
 
     double halfDepth = bobbin.get_column_depth();
     double bendRadius = rect_wire ? std::max(wire_w, wire_h) / 2.0 : wire_radius;
-    double baseClearance = wire_radius;
-    double layerClearance = wwRadialHeight - innerRadial;
-    double radialHeight = halfDepth + baseClearance + layerClearance;
+    // The Y-clearance between a turn and the core's top/bottom face must
+    // match the X-Z clearance between that turn's outer surface and the
+    // core's inner hole surface. So:
+    //   - layer-0 turn (against inner wall, innerRadial = B/2 - wire_radius):
+    //       radial gap = 0  ⇒  Y gap = 0  ⇒  vertical tube length = C/2.
+    //   - layer-1 turn (one wire OD further inward):
+    //       radial gap = wire_OD  ⇒  Y gap = wire_OD  ⇒  vertical tube longer
+    //       by wire_OD so the top/bottom horizontal segments clear layer 0.
+    //   - a wire centered in the hole (innerRadial = 0):
+    //       radial gap = B/2 - wire_radius (the whole inner hole minus the
+    //       wire half) ⇒ tube length stretched to wrap the full ring.
+    //
+    // layerOffset = radial distance from this turn's outer surface to the
+    //               core's inner hole boundary. The wire's "radial" half-
+    //               dimension is wire_w/2 for rectangular wire (the face
+    //               that points toward the toroidal axis) and wire_radius
+    //               for round wire. Using wire_radius for rect wires would
+    //               subtract the wrong amount whenever wire_w ≠ wire_h.
+    // Both inner AND outer vertical tubes share the same length, so the
+    // top/bottom horizontal segments stay parallel to the core's faces.
+    double radialHalf = rect_wire ? wire_w / 2.0 : wire_radius;
+    double layerOffset = std::max(0.0, (wwRadialHeight - innerRadial) - radialHalf);
+    double radialHeight = halfDepth + layerOffset + bendRadius;
 
     double tubeLength = std::max(1e-7, radialHeight - bendRadius);
     double radialDistance = outerRadial - innerRadial;
