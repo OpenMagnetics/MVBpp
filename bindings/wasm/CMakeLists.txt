@@ -106,8 +106,8 @@ set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
 FetchContent_Declare(
     MAS
     GIT_REPOSITORY "${_MAS_LOCAL}"
-    # Pinned to same commit as root CMakeLists.txt — keep in sync.
-    GIT_TAG        a16a6007fa364e4af2fc81a1dc895da4fe393e7c
+    # Track MAS main (kept in lockstep with the MKF main pin below).
+    GIT_TAG        main
     GIT_SHALLOW    FALSE
 )
 FetchContent_MakeAvailable(MAS)
@@ -120,8 +120,8 @@ set(_MKF_BIN "${CMAKE_BINARY_DIR}/_deps/mkf-build")
 FetchContent_Declare(
     MKF
     GIT_REPOSITORY "${_MKF_LOCAL}"
-    # Pinned to same commit as root CMakeLists.txt — keep in sync.
-    GIT_TAG        424bf300022a07b73b9bafd90a53bb817514fef4
+    # Track MKF main (kept in lockstep with the MAS main pin above).
+    GIT_TAG        main
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
@@ -135,10 +135,12 @@ endif()
 if(NOT EXISTS "${_MKF_SRC}/MAS")
     file(CREATE_LINK "${_MAS_SRC}" "${_MKF_SRC}/MAS" SYMBOLIC)
 endif()
-# Initialize submodules MKF needs (cci_coords for codegen, CAS for Topology.h)
+# Initialize submodules MKF needs (cci_coords for codegen, CAS for CAS.hpp,
+# PEAS for the PEAS-integrated schemas). MKF main no longer has an EAS submodule,
+# so listing it would fail the whole command and leave CAS uninitialised.
 if(IS_DIRECTORY "${_MKF_SRC}/cci_coords" AND NOT EXISTS "${_MKF_SRC}/cci_coords/coordinates")
     execute_process(
-        COMMAND git submodule update --init cci_coords CAS EAS
+        COMMAND git submodule update --init cci_coords CAS PEAS
         WORKING_DIRECTORY "${_MKF_SRC}"
     )
 endif()

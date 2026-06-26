@@ -147,11 +147,9 @@ set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
 FetchContent_Declare(
     MAS
     GIT_REPOSITORY "${_MAS_LOCAL}"
-    # Pinned to MAS origin/main HEAD. Includes the magneticApplication /
-    # subApplication schema that MKF origin/main (pinned below) requires, plus
-    # PFC topology variants, AHB/PSFB updates and the MAS 1.0 enum migration.
-    # Moves in lockstep with the MKF pin.
-    GIT_TAG        b7c3af5029790e943247eaa1be8e97776295953b
+    # Track MAS main. Provides the magneticApplication / subApplication schema
+    # that MKF main (below) requires. Moves in lockstep with the MKF main pin.
+    GIT_TAG        main
     GIT_SHALLOW    FALSE
 )
 FetchContent_MakeAvailable(MAS)
@@ -167,12 +165,10 @@ set(_MKF_BIN "${CMAKE_BINARY_DIR}/_deps/mkf-build")
 FetchContent_Declare(
     MKF
     GIT_REPOSITORY "${_MKF_LOCAL}"
-    # Pinned to MKF origin/main. It brings Coil::build_centered_single_turn_toroidal
-    # (needed by the toroidal single-turn e2e test) and references newer MAS types
-    # (MagneticApplication / SubApplication / BobbinFamily::T) — now satisfied by the
-    # MAS origin/main pin below (the schema was pushed). Keep both pins on origin/main
-    # together; they must move in lockstep.
-    GIT_TAG        de1567551dcab2b98ee81fc26c6e7fe00338bd3d
+    # Track MKF main. Brings Coil::build_centered_single_turn_toroidal (needed by
+    # the toroidal single-turn e2e test) and references newer MAS types now
+    # satisfied by the MAS main pin above. Keep both on main, in lockstep.
+    GIT_TAG        main
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )

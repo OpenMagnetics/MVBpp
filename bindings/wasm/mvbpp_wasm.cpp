@@ -435,7 +435,7 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
     auto magnetic = j.get<MAS::Magnetic>();
 
     std::size_t numTurns = 0;
-    auto turnsOpt = magnetic.get_coil().get_turns_description();
+    auto turnsOpt = magnetic.get_coil().value().get_turns_description();
     if (turnsOpt.has_value()) numTurns = turnsOpt->size();
     const int wireSeg = adaptive_wire_segments(polygonSegments, numTurns);
 
