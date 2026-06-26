@@ -72,7 +72,7 @@ static MAS::Magnetic make_simple_t_magnetic() {
 
 static void exportCore(const std::string& outPath, const MAS::Magnetic& magnetic) {
     mvb::MagneticBuilder builder;
-    auto named = builder.buildCoreNamed(magnetic.get_core());
+    auto named = builder.buildCoreNamed(magnetic.get_core().value());
 
     gp_Trsf trsf;
     trsf.SetScale(gp_Pnt(0, 0, 0), 1000.0);

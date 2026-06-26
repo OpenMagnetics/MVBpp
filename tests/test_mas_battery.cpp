@@ -366,7 +366,7 @@ CaseResult run_one(const fs::path& path) {
     catch (const std::exception& e) { fail(std::string("MAS parse: ") + e.what()); return r; }
 
     int64_t expectedTurns = 0;
-    try { expectedTurns = expected_turn_count(rawMagnetic.get_coil()); }
+    try { expectedTurns = expected_turn_count(rawMagnetic.get_coil().value()); }
     catch (const std::exception& e) { fail(std::string("turn count: ") + e.what()); return r; }
 
     // -- 2. MKF autocomplete ------------------------------------------------

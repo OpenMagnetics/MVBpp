@@ -88,9 +88,9 @@ TEST_CASE("E core with bobbin and turns builds complete assembly", "[integration
     magnetic.set_coil(coil);
 
     mvb::MagneticBuilder builder;
-    auto coreNamed = builder.buildCoreNamed(magnetic.get_core());
-    auto bobbinNamed = builder.buildBobbinNamed(magnetic.get_coil(), magnetic.get_core());
-    auto turnsNamed = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core());
+    auto coreNamed = builder.buildCoreNamed(magnetic.get_core().value());
+    auto bobbinNamed = builder.buildBobbinNamed(magnetic.get_coil().value(), magnetic.get_core().value());
+    auto turnsNamed = builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value());
 
     REQUIRE(coreNamed.size() == 2);
     REQUIRE(!bobbinNamed.shape.IsNull());

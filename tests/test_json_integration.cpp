@@ -46,9 +46,9 @@ TEST_CASE("Build complete magnetic from concentric_rectangular_column_one_turn.j
     mvb::NamedShape bobbinNamed;
     std::vector<mvb::NamedShape> turnPieces;
     try {
-        corePieces = builder.buildCoreNamed(magnetic.get_core());
-        bobbinNamed = builder.buildBobbinNamed(magnetic.get_coil(), magnetic.get_core());
-        turnPieces = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core());
+        corePieces = builder.buildCoreNamed(magnetic.get_core().value());
+        bobbinNamed = builder.buildBobbinNamed(magnetic.get_coil().value(), magnetic.get_core().value());
+        turnPieces = builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value());
     } catch (const std::exception& e) {
         FAIL("Build failed: " << e.what());
     }

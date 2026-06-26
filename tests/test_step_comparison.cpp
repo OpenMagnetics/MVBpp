@@ -180,7 +180,7 @@ static void compareSTEPAgainstReference(const std::string& refPath,
                                          const MAS::Magnetic& magnetic,
                                          const std::string& testName) {
     mvb::MagneticBuilder builder;
-    auto coreNamed = builder.buildCoreNamed(magnetic.get_core());
+    auto coreNamed = builder.buildCoreNamed(magnetic.get_core().value());
     REQUIRE(!coreNamed.empty());
 
     std::vector<TopoDS_Shape> coreShapes;
@@ -239,21 +239,21 @@ static void compareFullAssemblyAgainstReference(const std::string& refPath,
     mvb::NamedShape bobbinNamed;
     std::vector<mvb::NamedShape> turnsNamed;
     try {
-        coreNamed = builder.buildCoreNamed(magnetic.get_core());
+        coreNamed = builder.buildCoreNamed(magnetic.get_core().value());
     } catch (const std::exception& e) {
         FAIL("buildCoreNamed exception: " << e.what());
     } catch (...) {
         FAIL("buildCoreNamed unknown exception");
     }
     try {
-        bobbinNamed = builder.buildBobbinNamed(magnetic.get_coil(), magnetic.get_core());
+        bobbinNamed = builder.buildBobbinNamed(magnetic.get_coil().value(), magnetic.get_core().value());
     } catch (const std::exception& e) {
         FAIL("buildBobbinNamed exception: " << e.what());
     } catch (...) {
         FAIL("buildBobbinNamed unknown exception");
     }
     try {
-        turnsNamed = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core());
+        turnsNamed = builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value());
     } catch (const std::exception& e) {
         FAIL("buildTurnsNamed exception: " << e.what());
     } catch (...) {

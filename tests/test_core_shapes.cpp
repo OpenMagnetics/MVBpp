@@ -59,7 +59,7 @@ TEST_CASE("E core builds manually", "[core][e]") {
     auto magnetic = make_simple_e_magnetic();
 
     mvb::MagneticBuilder builder;
-    auto pieces = builder.buildCoreNamed(magnetic.get_core());
+    auto pieces = builder.buildCoreNamed(magnetic.get_core().value());
 
     REQUIRE(pieces.size() == 2);
 
@@ -155,7 +155,7 @@ TEST_CASE("PQ core builds manually with non-zero volume", "[core][pq]") {
     auto magnetic = make_simple_pq_magnetic();
 
     mvb::MagneticBuilder builder;
-    auto pieces = builder.buildCoreNamed(magnetic.get_core());
+    auto pieces = builder.buildCoreNamed(magnetic.get_core().value());
 
     REQUIRE(pieces.size() == 2);
 
@@ -183,7 +183,7 @@ TEST_CASE("T core builds manually", "[core][t]") {
     auto magnetic = make_simple_t_magnetic();
 
     mvb::MagneticBuilder builder;
-    auto pieces = builder.buildCoreNamed(magnetic.get_core());
+    auto pieces = builder.buildCoreNamed(magnetic.get_core().value());
 
     REQUIRE(pieces.size() == 1);
 

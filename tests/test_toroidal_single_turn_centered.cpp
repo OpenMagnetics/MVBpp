@@ -275,7 +275,7 @@ TEST_CASE("Toroidal single turn centered: 3D turn solid built at origin",
                                                 /*rotationDeg=*/180.0);
 
     mvb::MagneticBuilder builder;
-    auto turnsNamed = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core(), /*wirePolygonSegments=*/0);
+    auto turnsNamed = builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value(), /*wirePolygonSegments=*/0);
 
     REQUIRE(turnsNamed.size() == 1);
     REQUIRE(!turnsNamed[0].shape.IsNull());
@@ -293,7 +293,7 @@ TEST_CASE("Toroidal single turn centered: 3D turn solid built at origin",
     REQUIRE(ymin <= 0.0);
     REQUIRE(ymax >= 0.0);
 
-    auto coreNamed = builder.buildCoreNamed(magnetic.get_core(), /*corePolygonSegments=*/0);
+    auto coreNamed = builder.buildCoreNamed(magnetic.get_core().value(), /*corePolygonSegments=*/0);
 
     // Collision check: turn must not intersect the toroidal core ring.
     double collision = turn_core_collision_volume(turnsNamed[0].shape, coreNamed);
@@ -331,7 +331,7 @@ TEST_CASE("Toroidal single turn against inner wall: 3D turn solid at inner edge"
         /*rotationDeg=*/180.0);
 
     mvb::MagneticBuilder builder;
-    auto turnsNamed = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core(), /*wirePolygonSegments=*/0);
+    auto turnsNamed = builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value(), /*wirePolygonSegments=*/0);
 
     REQUIRE(turnsNamed.size() == 1);
     REQUIRE(!turnsNamed[0].shape.IsNull());
@@ -356,7 +356,7 @@ TEST_CASE("Toroidal single turn against inner wall: 3D turn solid at inner edge"
     REQUIRE_THAT(ymax, Catch::Matchers::WithinAbs( 0.006,  5e-4));   // wire top edge ≈ C/2 + wire_OD
     INFO("xmin=" << xmin << " xmax=" << xmax << " ymin=" << ymin << " ymax=" << ymax);
 
-    auto coreNamed = builder.buildCoreNamed(magnetic.get_core(), /*corePolygonSegments=*/0);
+    auto coreNamed = builder.buildCoreNamed(magnetic.get_core().value(), /*corePolygonSegments=*/0);
 
     // Collision check: a 1 mm wire at the inner wall should clear the core.
     // The wire is exactly tangent to both B/2 and A/2 walls; OCCT boolean

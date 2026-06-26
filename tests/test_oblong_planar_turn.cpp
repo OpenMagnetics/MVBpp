@@ -124,7 +124,7 @@ TEST_CASE("Oblong planar turn: flat racetrack in X-Z, not a vertical fountain",
     auto magnetic = make_magnetic(make_planar_wire(wireWidth, wireHeight, "Planar 104um"));
 
     mvb::MagneticBuilder builder;
-    auto turns = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core(),
+    auto turns = builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value(),
                                          /*wirePolygonSegments=*/0);
     REQUIRE(turns.size() == 1);
     REQUIRE(!turns[0].shape.IsNull());
@@ -167,7 +167,7 @@ TEST_CASE("Oblong planar turn: straight legs are rectangular foil, centred in Z"
     auto magnetic = make_magnetic(make_planar_wire(wireWidth, wireHeight, "Planar 104um"));
 
     mvb::MagneticBuilder builder;
-    auto turns = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core(),
+    auto turns = builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value(),
                                          /*wirePolygonSegments=*/0);
     REQUIRE(turns.size() == 1);
 
@@ -202,7 +202,7 @@ TEST_CASE("Oblong round wire turn: round cross-section preserved",
     auto magnetic = make_magnetic(make_round_wire(diameter, "Round 0.40"));
 
     mvb::MagneticBuilder builder;
-    auto turns = builder.buildTurnsNamed(magnetic.get_coil(), magnetic.get_core(),
+    auto turns = builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value(),
                                          /*wirePolygonSegments=*/0);
     REQUIRE(turns.size() == 1);
     REQUIRE(!turns[0].shape.IsNull());

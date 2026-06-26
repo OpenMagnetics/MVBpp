@@ -147,10 +147,11 @@ set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
 FetchContent_Declare(
     MAS
     GIT_REPOSITORY "${_MAS_LOCAL}"
-    # Bumped to MAS origin/main HEAD: PFC topology variants, AHB/PSFB schema
-    # updates, dutyCycle bounds, bulkCapacitance, plus MAS 1.0 enum migration
-    # (twoPieceSet, wound, innerOrTop, etc. via migrate-to-1.0.py).
-    GIT_TAG        a16a6007fa364e4af2fc81a1dc895da4fe393e7c
+    # Pinned to MAS origin/main HEAD. Includes the magneticApplication /
+    # subApplication schema that MKF origin/main (pinned below) requires, plus
+    # PFC topology variants, AHB/PSFB updates and the MAS 1.0 enum migration.
+    # Moves in lockstep with the MKF pin.
+    GIT_TAG        b7c3af5029790e943247eaa1be8e97776295953b
     GIT_SHALLOW    FALSE
 )
 FetchContent_MakeAvailable(MAS)
@@ -166,10 +167,12 @@ set(_MKF_BIN "${CMAKE_BINARY_DIR}/_deps/mkf-build")
 FetchContent_Declare(
     MKF
     GIT_REPOSITORY "${_MKF_LOCAL}"
-    # Bumped to MKF origin/main HEAD to match the MAS 2f37eea pin above.
-    # PtP harness additions, topology expansions. MKF's magnetic_autocomplete
-    # and Core/Coil constructors are what MVB++ actually uses.
-    GIT_TAG        424bf300022a07b73b9bafd90a53bb817514fef4
+    # Pinned to MKF origin/main. It brings Coil::build_centered_single_turn_toroidal
+    # (needed by the toroidal single-turn e2e test) and references newer MAS types
+    # (MagneticApplication / SubApplication / BobbinFamily::T) — now satisfied by the
+    # MAS origin/main pin below (the schema was pushed). Keep both pins on origin/main
+    # together; they must move in lockstep.
+    GIT_TAG        de1567551dcab2b98ee81fc26c6e7fe00338bd3d
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
@@ -185,10 +188,13 @@ endif()
 if(NOT EXISTS "${_MKF_SRC}/MAS")
     file(CREATE_LINK "${_MAS_SRC}" "${_MKF_SRC}/MAS" SYMBOLIC)
 endif()
-# Initialize submodules MKF needs (cci_coords for codegen, CAS for Topology.h)
+# Initialize submodules MKF needs (cci_coords for codegen, CAS for CAS.hpp /
+# Topology.h, PEAS for the PEAS-integrated schemas). MKF origin/main no longer
+# carries an EAS submodule, so initialising it would fail the whole command and
+# leave CAS uninitialised — list only the submodules that actually exist.
 if(IS_DIRECTORY "${_MKF_SRC}/cci_coords" AND NOT EXISTS "${_MKF_SRC}/cci_coords/coordinates")
     execute_process(
-        COMMAND git submodule update --init cci_coords CAS EAS
+        COMMAND git submodule update --init cci_coords CAS PEAS
         WORKING_DIRECTORY "${_MKF_SRC}"
         RESULT_VARIABLE _cci_result
     )

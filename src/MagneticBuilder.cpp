@@ -490,19 +490,24 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                                                          int wirePolygonSegments,
                                                          int corePolygonSegments,
                                                          bool paintCoating) const {
+    // MAS 1.x makes Magnetic.core / Magnetic.coil optional, but this builder
+    // requires both present. The generated getters return the optional BY VALUE,
+    // so bind COPIES (not references — a reference would dangle past the temporary).
+    const MAS::MagneticCore core = magnetic.get_core().value();
+    const MAS::Coil coil = magnetic.get_coil().value();
     // If geometricalDescription is already present, skip expensive MKF
     // autocomplete and use the pre-enriched data directly.
-    auto geoOpt = magnetic.get_core().get_geometrical_description();
+    auto geoOpt = core.get_geometrical_description();
     if (geoOpt && geoOpt.has_value() && !geoOpt->empty()) {
         // Build directly from MAS types — no MKF enrichment needed.
-        auto all = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
+        auto all = buildCoreNamed(core, corePolygonSegments);
 
         std::vector<std::string> turnNames;
         auto turnShapes = buildTurnsImpl<MAS::Coil, MAS::Wire>(
-            magnetic.get_coil(), magnetic.get_core(), &turnNames, wirePolygonSegments, paintCoating);
+            coil, core, &turnNames, wirePolygonSegments, paintCoating);
 
         if (includeBobbin) {
-            auto bobbin = buildBobbinNamed(magnetic.get_coil(), magnetic.get_core(), corePolygonSegments);
+            auto bobbin = buildBobbinNamed(coil, core, corePolygonSegments);
             if (!bobbin.shape.IsNull()) {
                 std::vector<TopoDS_Shape> cutters;
                 for (const auto& ns : all) cutters.push_back(ns.shape);
@@ -522,10 +527,10 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
         // Planar (PCB) coils get an FR4 substrate board. Patch the bobbin
         // processed description first so column_shape/width/depth are
         // populated from the core when MKF left the bobbin variant empty.
-        if (auto groupsOpt = magnetic.get_coil().get_groups_description();
+        if (auto groupsOpt = coil.get_groups_description();
             groupsOpt && !groupsOpt->empty()) {
-            auto bobbinPd = getBobbinProcessed(magnetic.get_coil());
-            patchBobbinDimensions(bobbinPd, magnetic.get_core());
+            auto bobbinPd = getBobbinProcessed(coil);
+            patchBobbinDimensions(bobbinPd, core);
             auto fr4 = FR4Builder::buildFR4Board(*groupsOpt, bobbinPd);
             if (!fr4.IsNull()) {
                 all.emplace_back(fr4, "FR4Board");
