@@ -8,18 +8,58 @@
 #include <BRepGProp.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <BRepBuilderAPI_MakeEdge.hxx>
+#include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRep_Builder.hxx>
 #include <TopoDS_Compound.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 #include <gp_Ax1.hxx>
+#include <gp_Ax2.hxx>
+#include <gp_Circ.hxx>
 #include <gp_Dir.hxx>
+#include <algorithm>
 #include <cmath>
 #include <numbers>
 
 namespace mvb {
+
+// Build a rectangular prism (w x d, extruded `h` along +Z from `zBottom`) whose
+// four vertical corners are rounded with radius `r` (true circular arcs, so STEP
+// stays clean). `r <= 0` (or a degenerate radius) falls back to a plain box, so
+// callers can pass r=0 for non-rounded shapes. `r` is clamped to < min(w,d)/2.
+static TopoDS_Shape makeRoundedRectPrism(double w, double d, double h,
+                                         double r, double zBottom) {
+    const double hw = w / 2.0, hd = d / 2.0;
+    const double rmax = std::min(hw, hd);
+    if (r > rmax - 1e-9) r = rmax - 1e-9;
+    if (r <= 1e-9 || hw <= 0.0 || hd <= 0.0) {
+        gp_Pnt corner(-hw, -hd, zBottom);
+        return BRepPrimAPI_MakeBox(corner, w, d, h).Shape();
+    }
+    const double pi = std::numbers::pi;
+    auto line = [](gp_Pnt a, gp_Pnt b) { return BRepBuilderAPI_MakeEdge(a, b).Edge(); };
+    auto arc = [&](double cx, double cy, double a1, double a2) {
+        gp_Circ c(gp_Ax2(gp_Pnt(cx, cy, 0.0), gp_Dir(0, 0, 1)), r);
+        return BRepBuilderAPI_MakeEdge(c, a1, a2).Edge();
+    };
+    BRepBuilderAPI_MakeWire wire;
+    wire.Add(line(gp_Pnt(hw, -(hd - r), 0), gp_Pnt(hw, hd - r, 0)));    // right
+    wire.Add(arc(hw - r, hd - r, 0.0, pi / 2));                          // top-right
+    wire.Add(line(gp_Pnt(hw - r, hd, 0), gp_Pnt(-(hw - r), hd, 0)));     // top
+    wire.Add(arc(-(hw - r), hd - r, pi / 2, pi));                        // top-left
+    wire.Add(line(gp_Pnt(-hw, hd - r, 0), gp_Pnt(-hw, -(hd - r), 0)));   // left
+    wire.Add(arc(-(hw - r), -(hd - r), pi, 3 * pi / 2));                 // bottom-left
+    wire.Add(line(gp_Pnt(-(hw - r), -hd, 0), gp_Pnt(hw - r, -hd, 0)));   // bottom
+    wire.Add(arc(hw - r, -(hd - r), 3 * pi / 2, 2 * pi));                // bottom-right
+    TopoDS_Face face = BRepBuilderAPI_MakeFace(wire.Wire()).Face();
+    TopoDS_Shape prism = BRepPrimAPI_MakePrism(face, gp_Vec(0, 0, h)).Shape();
+    return translate_shape(prism, 0.0, 0.0, zBottom);
+}
 
 static void checkIsDone(const BRepAlgoAPI_Cut& op, const char* ctx) {
     if (!op.IsDone()) throw std::runtime_error(std::string("BobbinBuilder: Cut failed: ") + ctx);
@@ -130,10 +170,19 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         if (holeDepth <= 0.0) holeDepth = outerDepth * 0.8;
         double eps = wallThickness > 0 ? wallThickness * 0.1 : 1e-6;
 
-        gp_Pnt oCorner(-outerWidth / 2.0, -outerDepth / 2.0, -height / 2.0);
-        TopoDS_Shape outer = BRepPrimAPI_MakeBox(oCorner, outerWidth, outerDepth, height).Shape();
-        gp_Pnt cCorner(-holeWidth / 2.0, -holeDepth / 2.0, -height / 2.0 - eps);
-        TopoDS_Shape central = BRepPrimAPI_MakeBox(cCorner, holeWidth, holeDepth, height + 2.0 * eps).Shape();
+        // Rounded corners (radius = 1/4 of the smaller yoke dimension): real U/E
+        // bobbins are moulded with a corner radius on the OUTER winding surface
+        // rather than a sharp 90°. The inner bore (and the flange holes) stay
+        // SQUARE so they still match the square core central column — rounding
+        // the bore would push bobbin material into the column corners and
+        // overlap it. Only for true RECTANGULAR columns; round/oblong/irregular
+        // pass r=0 (box).
+        const bool roundCorners = (bobbin.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
+        const double rOuter = roundCorners ? 0.25 * std::min(outerWidth, outerDepth) : 0.0;
+        const double rInner = 0.0;  // bore matches the (square) core column
+
+        TopoDS_Shape outer = makeRoundedRectPrism(outerWidth, outerDepth, height, rOuter, -height / 2.0);
+        TopoDS_Shape central = makeRoundedRectPrism(holeWidth, holeDepth, height + 2.0 * eps, rInner, -height / 2.0 - eps);
         BRepAlgoAPI_Cut bodyCut(outer, central);
         checkIsDone(bodyCut, "rect body hollow");
 
@@ -141,18 +190,15 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             double flangeWidth = 2.0 * (colWidth + wwWidth);
             double flangeDepth = 2.0 * (colDepth + wwWidth);
             double holeEps = flangeThickness * 0.1;
+            const double rFlange = roundCorners ? 0.25 * std::min(flangeWidth, flangeDepth) : 0.0;
 
-            gp_Pnt tfCorner(-flangeWidth / 2.0, -flangeDepth / 2.0, height / 2.0);
-            TopoDS_Shape topFlange = BRepPrimAPI_MakeBox(tfCorner, flangeWidth, flangeDepth, flangeThickness).Shape();
-            gp_Pnt thCorner(-holeWidth / 2.0, -holeDepth / 2.0, height / 2.0 - holeEps);
-            TopoDS_Shape topHole = BRepPrimAPI_MakeBox(thCorner, holeWidth, holeDepth, flangeThickness + 2.0 * holeEps).Shape();
+            TopoDS_Shape topFlange = makeRoundedRectPrism(flangeWidth, flangeDepth, flangeThickness, rFlange, height / 2.0);
+            TopoDS_Shape topHole = makeRoundedRectPrism(holeWidth, holeDepth, flangeThickness + 2.0 * holeEps, rInner, height / 2.0 - holeEps);
             BRepAlgoAPI_Cut topCut(topFlange, topHole);
             checkIsDone(topCut, "rect top flange");
 
-            gp_Pnt bfCorner(-flangeWidth / 2.0, -flangeDepth / 2.0, -(height / 2.0 + flangeThickness));
-            TopoDS_Shape bottomFlange = BRepPrimAPI_MakeBox(bfCorner, flangeWidth, flangeDepth, flangeThickness).Shape();
-            gp_Pnt bhCorner(-holeWidth / 2.0, -holeDepth / 2.0, -(height / 2.0 + flangeThickness) - holeEps);
-            TopoDS_Shape bottomHole = BRepPrimAPI_MakeBox(bhCorner, holeWidth, holeDepth, flangeThickness + 2.0 * holeEps).Shape();
+            TopoDS_Shape bottomFlange = makeRoundedRectPrism(flangeWidth, flangeDepth, flangeThickness, rFlange, -(height / 2.0 + flangeThickness));
+            TopoDS_Shape bottomHole = makeRoundedRectPrism(holeWidth, holeDepth, flangeThickness + 2.0 * holeEps, rInner, -(height / 2.0 + flangeThickness) - holeEps);
             BRepAlgoAPI_Cut bottomCut(bottomFlange, bottomHole);
             checkIsDone(bottomCut, "rect bottom flange");
 

@@ -216,19 +216,23 @@ std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int polyg
     return {b.buildBobbinNamedFromBobbin(bobbin, /*axisIsY=*/true, polygonSegments)};
 }
 
-std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygonSegments) {
+std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygonSegments,
+                                         bool paintCoating) {
     auto j = json::parse(json_str);
     if (!j.is_array()) {
         throw std::runtime_error("drawTurns: input must be a JSON array of MAS::Turn objects");
     }
     auto turns = j.get<std::vector<MAS::Turn>>();
     mvb::MagneticBuilder b;
-    return b.buildTurnsNamedFromTurns(turns, polygonSegments);
+    // paintCoating=false throws here — a bare Turn carries no copper/strand
+    // data; use drawMagnetic with a full Magnetic JSON for conductor geometry.
+    return b.buildTurnsNamedFromTurns(turns, polygonSegments, paintCoating);
 }
 
 std::vector<mvb::NamedShape> build_winding(const std::string& json_str,
                                             const std::string& windingName,
-                                            int polygonSegments) {
+                                            int polygonSegments,
+                                            bool paintCoating) {
     auto j = json::parse(json_str);
     auto coil = j.get<MAS::Coil>();
     auto turnsOpt = coil.get_turns_description();
@@ -249,17 +253,21 @@ std::vector<mvb::NamedShape> build_winding(const std::string& json_str,
         throw std::runtime_error("drawWinding: no turns match windingName='" + windingName + "'");
     }
     mvb::MagneticBuilder b;
-    return b.buildTurnsNamedFromTurns(filtered, polygonSegments);
+    return b.buildTurnsNamedFromTurns(filtered, polygonSegments, paintCoating);
 }
 
-std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments) {
+std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments,
+                                            bool paintCoating) {
     auto j = json::parse(json_str);
     auto magnetic = j.get<MAS::Magnetic>();
     mvb::MagneticBuilder b;
     // Use polygonSegments for both wire and core for simplicity; the user
     // can craft separate paths later if they need finer-grained control.
+    // paintCoating: true → OUTER (insulation) diameter [default], false →
+    // CONDUCTING (copper) diameter for FEM winding-loss meshing (LITZ → bare
+    // bundle as a solid via MKF).
     return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
-                            polygonSegments, polygonSegments);
+                            polygonSegments, polygonSegments, paintCoating);
 }
 
 // --------------------------------------------------------------------------
@@ -330,9 +338,9 @@ Inputs are MAS-1.0 JSON strings.
     mvbpp.drawCore       (core_json,        outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawCorePiece  (core_shape_json,  outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawBobbin     (bobbin_json,      outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
-    mvbpp.drawTurns      (turns_json,       outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
-    mvbpp.drawWinding    (coil_json, windingName, outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
-    mvbpp.drawMagnetic   (magnetic_json,    outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
+    mvbpp.drawTurns      (turns_json,       outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
+    mvbpp.drawWinding    (coil_json, windingName, outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
+    mvbpp.drawMagnetic   (magnetic_json,    outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
 
 Pictorial-view function
 -----------------------
@@ -348,6 +356,12 @@ Notes
 * drawView with dimensions=True currently supports plane in {"XY","XZ"} and
   offset=0.0; other combinations throw.  dimensions=False renders a plain
   outline at any plane/offset.
+* paintCoating (drawMagnetic/drawTurns/drawWinding): True → turns drawn at the
+  OUTER (insulation) diameter [default, for visualisation]; False → turns drawn
+  at the CONDUCTING (copper) diameter for FEM winding-loss meshing (LITZ → bare
+  bundle treated as one solid conductor via MKF).  False requires full wire
+  data: only drawMagnetic (full Magnetic JSON) supports it; drawTurns/drawWinding
+  operate on bare turns and raise for paintCoating=False.
 )doc";
 
     auto def_draw = [&](const char* name,
@@ -380,11 +394,47 @@ Notes
               py::arg("side") = std::string("+X+Y+Z"));
     };
 
-    def_draw("drawCore",      &build_core);
-    def_draw("drawCorePiece", &build_core_piece);
-    def_draw("drawBobbin",    &build_bobbin);
-    def_draw("drawTurns",     &build_turns);
-    def_draw("drawMagnetic",  &build_magnetic);
+    // Paint-aware variant for the turn-drawing functions: adds a trailing
+    // keyword-only `paintCoating` (true → OUTER/insulation [default], false →
+    // CONDUCTING/copper for FEM winding-loss meshing). pybind11 honours the
+    // default, so existing callers are unaffected.
+    auto def_draw_paint = [&](const char* name,
+                              std::vector<mvb::NamedShape> (*build)(const std::string&, int, bool)) {
+        m.def(name,
+              [build](const std::string& json_str,
+                      py::object outputPath,
+                      const std::string& mode,
+                      const std::string& plane,
+                      double offset,
+                      const std::string& format,
+                      double scale,
+                      int polygonSegments,
+                      const std::string& symmetry,
+                      const std::string& side,
+                      bool paintCoating) {
+                  auto named = build(json_str, polygonSegments, paintCoating);
+                  return deliver(std::move(named), outputPath, mode, plane,
+                                  offset, format, scale, symmetry, side);
+              },
+              py::arg("json_str"),
+              py::arg("outputPath") = py::none(),
+              py::kw_only(),
+              py::arg("mode") = std::string("3D"),
+              py::arg("plane") = std::string("XY"),
+              py::arg("offset") = 0.0,
+              py::arg("format") = std::string("step"),
+              py::arg("scale") = 1.0,
+              py::arg("polygonSegments") = mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+              py::arg("symmetry") = std::string("none"),
+              py::arg("side") = std::string("+X+Y+Z"),
+              py::arg("paintCoating") = true);
+    };
+
+    def_draw("drawCore",       &build_core);
+    def_draw("drawCorePiece",  &build_core_piece);
+    def_draw("drawBobbin",     &build_bobbin);
+    def_draw_paint("drawTurns",    &build_turns);
+    def_draw_paint("drawMagnetic", &build_magnetic);
 
     // drawWinding takes an extra positional `windingName`.
     m.def("drawWinding",
@@ -398,8 +448,9 @@ Notes
               double scale,
               int polygonSegments,
               const std::string& symmetry,
-              const std::string& side) {
-              auto named = build_winding(coil_json, windingName, polygonSegments);
+              const std::string& side,
+              bool paintCoating) {
+              auto named = build_winding(coil_json, windingName, polygonSegments, paintCoating);
               return deliver(std::move(named), outputPath, mode, plane,
                               offset, format, scale, symmetry, side);
           },
@@ -414,7 +465,8 @@ Notes
           py::arg("scale") = 1.0,
           py::arg("polygonSegments") = mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
           py::arg("symmetry") = std::string("none"),
-          py::arg("side") = std::string("+X+Y+Z"));
+          py::arg("side") = std::string("+X+Y+Z"),
+          py::arg("paintCoating") = true);
 
     // Test-only helper: enrich a raw MAS::Magnetic JSON via MKF autocomplete
     // so test code can extract pre-enriched substructures for drawCore /

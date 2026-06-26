@@ -1,5 +1,6 @@
 #include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
+#include "constructive_models/Wire.h"
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
@@ -45,7 +46,82 @@ static double get_wire_diameter(const MAS::Wire& wire) {
     return 0.001;
 }
 
-static std::pair<double, double> get_wire_dimensions(const MAS::Wire& wire, const MAS::Turn& turn) {
+// Copper (conducting) cross-section of the wire — the geometry FEM winding-loss
+// extraction must mesh, because the eddy/proximity currents and the skin-depth
+// boundary live in the copper, not the insulation/serving. This intentionally
+// ignores turn.get_dimensions() (those carry the OUTER/insulation footprint).
+//
+// For LITZ the meshable "copper" is the bare bundle treated as a single solid
+// conductor: its diameter is computed from the strand geometry by MKF
+// (Wire::get_outer_diameter_bare_litz), the single source of truth for that
+// formula. Throws (no silent fallback) when the data needed is missing.
+static std::pair<double, double> get_conducting_dimensions(const MAS::Wire& wire) {
+    const std::string wireName = wire.get_name().value_or("<unnamed>");
+    switch (wire.get_type()) {
+        case MAS::WireType::ROUND: {
+            auto cd = wire.get_conducting_diameter();
+            if (!cd || !cd->get_nominal()) {
+                throw std::runtime_error(
+                    "get_conducting_dimensions: ROUND wire '" + wireName
+                    + "' has no conductingDiameter.nominal (required to draw the copper cross-section)");
+            }
+            double d = cd->get_nominal().value();
+            return {d, d};
+        }
+        case MAS::WireType::RECTANGULAR:
+        case MAS::WireType::PLANAR: {
+            auto cw = wire.get_conducting_width();
+            auto ch = wire.get_conducting_height();
+            if (!cw || !cw->get_nominal() || !ch || !ch->get_nominal()) {
+                throw std::runtime_error(
+                    "get_conducting_dimensions: RECTANGULAR/PLANAR wire '" + wireName
+                    + "' has no conductingWidth.nominal / conductingHeight.nominal");
+            }
+            return {cw->get_nominal().value(), ch->get_nominal().value()};
+        }
+        case MAS::WireType::LITZ: {
+            OpenMagnetics::Wire omWire(wire);
+            if (!omWire.get_number_conductors()) {
+                throw std::runtime_error(
+                    "get_conducting_dimensions: LITZ wire '" + wireName
+                    + "' has no numberConductors (required for the bare-bundle diameter)");
+            }
+            int numberConductors = static_cast<int>(omWire.get_number_conductors().value());
+            auto strand = omWire.resolve_strand();
+            auto scd = strand.get_conducting_diameter();
+            if (!scd.get_nominal()) {
+                throw std::runtime_error(
+                    "get_conducting_dimensions: LITZ wire '" + wireName
+                    + "' strand has no conductingDiameter.nominal");
+            }
+            double strandConductingDiameter = scd.get_nominal().value();
+            auto strandCoating = OpenMagnetics::Wire::resolve_coating(strand);
+            if (!strandCoating || !strandCoating->get_grade()) {
+                throw std::runtime_error(
+                    "get_conducting_dimensions: LITZ wire '" + wireName
+                    + "' strand has no coating grade (required for the bare-bundle diameter)");
+            }
+            int grade = strandCoating->get_grade().value();
+            auto standard = omWire.get_standard().value_or(MAS::WireStandard::IEC_60317);
+            // Bare bundle outer diameter, treated as one solid copper conductor.
+            double bundleDiameter = OpenMagnetics::Wire::get_outer_diameter_bare_litz(
+                strandConductingDiameter, numberConductors, grade, standard);
+            return {bundleDiameter, bundleDiameter};
+        }
+        default:
+            throw std::runtime_error(
+                "get_conducting_dimensions: unsupported wire type for wire '" + wireName + "'");
+    }
+}
+
+// Resolve the wire cross-section used to build a turn solid.
+//   paintCoating == true  → OUTER (insulation) footprint  [default, unchanged]
+//   paintCoating == false → CONDUCTING (copper) footprint  [FEM winding-loss]
+static std::pair<double, double> get_wire_dimensions(const MAS::Wire& wire, const MAS::Turn& turn,
+                                                     bool paintCoating) {
+    if (!paintCoating) {
+        return get_conducting_dimensions(wire);
+    }
     auto td = turn.get_dimensions();
     if (td && td->size() >= 2) {
         return {(*td)[0], (*td)[1]};
@@ -493,9 +569,10 @@ static TopoDS_Shape make_toroidal_quarter_swept_rectangle(
 static std::map<ToroidalTurnKey, TopoDS_Shape> s_toroidalTurnCache;
 
 static TopoDS_Shape build_toroidal_turn(const MAS::Turn& turn, const MAS::Wire& wire,
-                                         const MAS::CoreBobbinProcessedDescription& bobbin) {
+                                         const MAS::CoreBobbinProcessedDescription& bobbin,
+                                         bool paintCoating) {
     bool rect_wire = is_rectangular_wire(wire);
-    auto [wire_w, wire_h] = get_wire_dimensions(wire, turn);
+    auto [wire_w, wire_h] = get_wire_dimensions(wire, turn, paintCoating);
     double wire_radius = std::min(wire_w, wire_h) / 2.0;
 
     const auto& coords = turn.get_coordinates();
@@ -705,30 +782,62 @@ static TopoDS_Shape build_concentric_oblong_turn(double radial_pos, double wire_
 
     double tube_z_length = 2.0 * straight_half;
     double prof_r = rect_wire ? std::min(wire_width, wire_height) / 2.0 : wire_radius;
+    // Rectangular/planar wire cross-section: wire_width is the radial extent (X),
+    // wire_height the axial/stacking extent (Y). Round wire uses prof_r.
+    double hw = wire_width / 2.0;   // radial half-width (X)
+    double hh = wire_height / 2.0;  // vertical half-height (Y)
 
-    // Helper to create an exact cylinder along Z at the same placement as before.
-    auto make_z_cylinder = [&](double cx, double cz) -> TopoDS_Shape {
-        gp_Ax2 ax(gp_Pnt(cx, height_pos, cz), gp_Dir(0, 0, 1));
+    // Straight segments run along Z at x = ±radial_pos, centred on z = 0 so their
+    // ends meet the bends at z = ±straight_half. (Previously based at z = 0 and
+    // extended +Z for the whole length, leaving the straight part shifted by
+    // +straight_half — i.e. not centred in Z.) Rectangular/planar wire → a box of
+    // the true foil cross-section; round wire → a cylinder.
+    auto make_straight = [&](double cx) -> TopoDS_Shape {
+        if (rect_wire) {
+            gp_Pnt corner(cx - hw, height_pos - hh, -straight_half);
+            return BRepPrimAPI_MakeBox(corner, wire_width, wire_height, tube_z_length).Shape();
+        }
+        gp_Ax2 ax(gp_Pnt(cx, height_pos, -straight_half), gp_Dir(0, 0, 1));
         return BRepPrimAPI_MakeCylinder(ax, prof_r, tube_z_length).Shape();
     };
 
-    TopoDS_Shape tube_px = make_z_cylinder(radial_pos, 0.0);
-    TopoDS_Shape tube_nx = make_z_cylinder(-radial_pos, 0.0);
+    TopoDS_Shape tube_px = make_straight(radial_pos);
+    TopoDS_Shape tube_nx = make_straight(-radial_pos);
 
-    // Half-torus arcs at ±Z ends
-    auto make_half_torus = [&](double cz, double start_angle_deg) -> TopoDS_Shape {
-        gp_Pnt circ_center(radial_pos, height_pos, cz);
-        double angle_rad = start_angle_deg * std::numbers::pi / 180.0;
-        gp_Dir normal(std::cos(angle_rad), 0.0, std::sin(angle_rad));
-        gp_Ax2 circ_axis(circ_center, normal);
+    // Bends at the ±Z ends. The turn lies flat in the X-Z plane at height y, so the
+    // bend must sweep in X-Z: revolve the wire cross-section 180° about the Y axis
+    // through the end-centre. (Previously this revolved about the Z axis, which
+    // swept the bend up in the X-Y plane — the "fountain" artefact.)
+    // The cross-section matches the straight segment it continues: a rectangle
+    // (radial wire_width × vertical wire_height) in the X-Y plane for rect/planar
+    // wire — NOT a round tube — or a circle for round wire. The profile lies in the
+    // X-Y plane (z = cz), coplanar with the Y revolve axis.
+    // y_axis_sign selects the outward bulge: +Z end bulges +Z, -Z end bulges -Z.
+    auto make_bend = [&](double cz, double y_axis_sign) -> TopoDS_Shape {
+        TopoDS_Face profile;
+        if (rect_wire) {
+            BRepBuilderAPI_MakePolygon poly;
+            poly.Add(gp_Pnt(radial_pos - hw, height_pos - hh, cz));
+            poly.Add(gp_Pnt(radial_pos + hw, height_pos - hh, cz));
+            poly.Add(gp_Pnt(radial_pos + hw, height_pos + hh, cz));
+            poly.Add(gp_Pnt(radial_pos - hw, height_pos + hh, cz));
+            poly.Close();
+            BRepBuilderAPI_MakeFace fm(poly.Wire());
+            if (!fm.IsDone()) {
+                std::cerr << "ERROR build_concentric_oblong_turn: MakeFace failed for rect bend\n";
+                return TopoDS_Shape();
+            }
+            profile = fm.Face();
+        } else {
+            gp_Ax2 circ_axis(gp_Pnt(radial_pos, height_pos, cz), gp_Dir(0, 0, 1));
+            Handle(Geom_Circle) circle = GC_MakeCircle(circ_axis, prof_r).Value();
+            TopoDS_Edge edge = BRepBuilderAPI_MakeEdge(circle).Edge();
+            TopoDS_Wire circ_wire = BRepBuilderAPI_MakeWire(edge).Wire();
+            profile = BRepBuilderAPI_MakeFace(circ_wire).Face();
+        }
 
-        Handle(Geom_Circle) circle = GC_MakeCircle(circ_axis, prof_r).Value();
-        TopoDS_Edge edge = BRepBuilderAPI_MakeEdge(circle).Edge();
-        TopoDS_Wire circ_wire = BRepBuilderAPI_MakeWire(edge).Wire();
-        TopoDS_Face circ_face = BRepBuilderAPI_MakeFace(circ_wire).Face();
-
-        gp_Ax1 rev_axis(gp_Pnt(0, height_pos, cz), gp_Dir(0, 0, 1));
-        BRepPrimAPI_MakeRevol revol(circ_face, rev_axis, std::numbers::pi);
+        gp_Ax1 rev_axis(gp_Pnt(0, height_pos, cz), gp_Dir(0, y_axis_sign, 0));
+        BRepPrimAPI_MakeRevol revol(profile, rev_axis, std::numbers::pi);
         try {
             return revol.Shape();
         } catch (const Standard_Failure& e) {
@@ -740,8 +849,8 @@ static TopoDS_Shape build_concentric_oblong_turn(double radial_pos, double wire_
         }
     };
 
-    TopoDS_Shape torus_pz = make_half_torus(straight_half, 90.0);
-    TopoDS_Shape torus_nz = make_half_torus(-straight_half, -90.0);
+    TopoDS_Shape torus_pz = make_bend(straight_half, -1.0);
+    TopoDS_Shape torus_nz = make_bend(-straight_half, 1.0);
 
     // Return compound directly — fusing unnecessary for STL visualization.
     BRep_Builder cb;
@@ -759,17 +868,18 @@ TopoDS_Shape TurnBuilder::buildTurn(const MAS::Turn& turn,
                                     const MAS::CoreBobbinProcessedDescription& bobbin,
                                     bool isToroidal,
                                     int wirePolygonSegments,
-                                    int wireRevolutionSegments) {
+                                    int wireRevolutionSegments,
+                                    bool paintCoating) {
     const auto& coords = turn.get_coordinates();
     double radial_pos = coords.size() > 0 ? coords[0] : 0.0;
     double height_pos = coords.size() > 1 ? coords[1] : 0.0;
 
     bool rect_wire = is_rectangular_wire(wire);
-    auto [wire_w, wire_h] = get_wire_dimensions(wire, turn);
+    auto [wire_w, wire_h] = get_wire_dimensions(wire, turn, paintCoating);
     double wire_radius = std::min(wire_w, wire_h) / 2.0;
 
     if (isToroidal) {
-        return build_toroidal_turn(turn, wire, bobbin);
+        return build_toroidal_turn(turn, wire, bobbin, paintCoating);
     }
 
     double half_col_width = bobbin.get_column_width().value_or(0.0);
@@ -799,7 +909,19 @@ void TurnBuilder::clearCache() {
 }
 
 TopoDS_Shape TurnBuilder::buildFromTurnAlone(const MAS::Turn& turn,
-                                              int wirePolygonSegments) {
+                                              int wirePolygonSegments,
+                                              bool paintCoating) {
+    if (!paintCoating) {
+        // A bare Turn carries only its OUTER footprint (turn.dimensions); the
+        // copper / strand geometry needed to draw the conducting cross-section
+        // is not present. Surface this loudly instead of silently emitting the
+        // outer solid mislabelled as copper.
+        throw std::runtime_error(
+            "TurnBuilder::buildFromTurnAlone: conducting-diameter geometry "
+            "(paintCoating=false) requires wire/strand data that a standalone "
+            "Turn does not carry. Use drawMagnetic with a full Magnetic JSON "
+            "(coil + core + wire) for copper-cross-section turns.");
+    }
     // Validate required Turn fields explicitly — no silent fallbacks.
     const auto& coords = turn.get_coordinates();
     if (coords.size() < 2) {

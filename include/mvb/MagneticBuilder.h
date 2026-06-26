@@ -24,6 +24,10 @@ struct DrawConfig {
     int         symmetryPlanes        = 0;       // 0=full, 1=half, 2=quarter
     int         wirePolygonSegments    = DEFAULT_WIRE_POLYGON_SEGMENTS;
     int         corePolygonSegments    = DEFAULT_CORE_POLYGON_SEGMENTS;
+    // true  → turns drawn at the OUTER (insulation) diameter (visualisation).
+    // false → turns drawn at the CONDUCTING (copper) diameter — required for
+    //         FEM winding-loss meshing (LITZ → bare bundle as a solid).
+    bool        paintCoating           = true;
 };
 
 class MagneticBuilder {
@@ -79,10 +83,12 @@ public:
                                             int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
     std::vector<NamedShape> buildTurnsNamed(const MAS::Coil& coil,
                                             const MAS::MagneticCore& core,
-                                            int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) const;
+                                            int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                            bool paintCoating = true) const;
     std::vector<NamedShape> buildTurnsNamed(const OpenMagnetics::Coil& coil,
                                             const MAS::MagneticCore& core,
-                                            int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) const;
+                                            int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                            bool paintCoating = true) const;
     NamedShape buildBobbinNamed(const MAS::Coil& coil,
                                 const MAS::MagneticCore& core,
                                 int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
@@ -96,12 +102,14 @@ public:
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
-                                          int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
+                                          int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
+                                          bool paintCoating = true) const;
     std::vector<NamedShape> buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
-                                          int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
+                                          int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
+                                          bool paintCoating = true) const;
 
     // ---- Standalone builders for the unified bindings API -----------------
     //
@@ -125,9 +133,13 @@ public:
     // missing required fields. Toroidal layout is auto-detected from the
     // presence of `additional_coordinates`; otherwise concentric round
     // column is assumed.
+    // paintCoating must stay true: standalone turns carry only their outer
+    // footprint, so the conducting cross-section cannot be recovered here and
+    // paintCoating=false throws (use a full Magnetic JSON via drawMagnetic).
     std::vector<NamedShape> buildTurnsNamedFromTurns(
         const std::vector<MAS::Turn>& turns,
-        int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS) const;
+        int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
+        bool paintCoating = true) const;
 };
 
 } // namespace mvb

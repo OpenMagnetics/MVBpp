@@ -1,4 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
+#include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
 #include "mvb/MagneticBuilder.h"
 #include "mvb/Utils.h"
 #include "mvb/SectionDrawing.h"
@@ -173,4 +176,52 @@ TEST_CASE("Core3DVisualizer: buildCoreSTL with core-only E shape", "[3d][empty-c
     std::vector<mvb::NamedShape> pieces;
     REQUIRE_NOTHROW(pieces = builder.buildCoreNamed(enriched.get_core()));
     REQUIRE(!pieces.empty());
+}
+
+// A U core's coordinate origin sits INSIDE the winding column (one leg) — the
+// MAS/MKF convention the bobbin and turns are expressed in — NOT at the core's
+// geometric centre. The two legs must be equal width ((A-E)/2), so the window is
+// centred between them. Regression for the "U window not centred / unequal legs"
+// report (and the over-correction that wrongly bbox-centred the core).
+TEST_CASE("U core: origin in the winding column, equal legs", "[3d][ucore][centering]") {
+    json magneticJson = R"({
+        "core": {
+            "functionalDescription": {
+                "shape": {"family": "u", "type": "custom", "name": "Custom U 93/76",
+                          "dimensions": {"A": {"nominal": 0.093}, "B": {"nominal": 0.076},
+                                         "C": {"nominal": 0.020}, "D": {"nominal": 0.048},
+                                         "E": {"nominal": 0.0346}}},
+                "material": "N87",
+                "gapping": [],
+                "numberStacks": 1,
+                "type": "two-piece set"
+            }
+        }
+    })"_json;
+    const double A = 93.0, E = 34.6;
+    const double wcw = (A - E) / 2.0;  // winding-column / leg width = 29.2 mm
+
+    OpenMagnetics::Magnetic enriched;
+    REQUIRE_NOTHROW(enriched = mvb::magnetic_autocomplete_safe(magneticJson));
+
+    mvb::MagneticBuilder builder;
+    auto pieces = builder.buildCoreNamed(enriched.get_core());
+    REQUIRE(!pieces.empty());
+
+    Bnd_Box box;
+    for (const auto& ns : pieces) if (!ns.shape.IsNull()) BRepBndLib::Add(ns.shape, box);
+    REQUIRE_FALSE(box.IsVoid());
+    double xmin, ymin, zmin, xmax, ymax, zmax;
+    box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    double xminMm = xmin * 1000.0, xmaxMm = xmax * 1000.0;
+    double nearEdge = std::min(std::abs(xminMm), std::abs(xmaxMm));
+    double farEdge  = std::max(std::abs(xminMm), std::abs(xmaxMm));
+    INFO("U core X span (mm) = [" << xminMm << ", " << xmaxMm << "]");
+    // Origin lies inside the winding column (core straddles X=0).
+    REQUIRE(xminMm < 0.0);
+    REQUIRE(xmaxMm > 0.0);
+    // The winding column is centred on the origin: its outer face is wcw/2 away.
+    REQUIRE(nearEdge == Catch::Approx(wcw / 2.0).margin(0.5));   // ≈ 14.6 mm
+    // The far (return) leg's outer face is A - wcw/2 away → equal legs.
+    REQUIRE(farEdge == Catch::Approx(A - wcw / 2.0).margin(0.5)); // ≈ 78.4 mm
 }

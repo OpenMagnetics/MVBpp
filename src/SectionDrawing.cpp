@@ -151,12 +151,22 @@ std::vector<Dim> buildCoreShapeFrontDims(const MAS::CoreShape& shape) {
            C = getMm(flat, "C"), D = getMm(flat, "D"), E = getMm(flat, "E");
 
     if (fam == "t") {
-        // Toroidal: C = height along the column axis.
-        if (C > 0) {
-            std::ostringstream l; l << std::fixed << std::setprecision(2) << "C = " << C;
-            dims.push_back({l.str(), 0.0, -C / 2.0, 0.0, +C / 2.0, false,
-                             std::max(A * 0.6, 15.0)});
+        // Toroidal front view shows the donut FACE: two concentric circles
+        // (outer diameter A, inner diameter B). Dimension them as horizontal
+        // diameters centred on the origin — the height C is along the viewing
+        // axis (Y) and is not visible here, so it belongs to a side view.
+        double sh = A / 2.0;
+        double off = std::max(A * 0.15, 5.0);
+        if (B > 0) {
+            std::ostringstream l; l << std::fixed << std::setprecision(2) << "B = " << B;
+            dims.push_back({l.str(), -B / 2.0, 0.0, +B / 2.0, 0.0, true, off + sh});
+            off += std::max(A * 0.10, 4.0);
         }
+        if (A > 0) {
+            std::ostringstream l; l << std::fixed << std::setprecision(2) << "A = " << A;
+            dims.push_back({l.str(), -A / 2.0, 0.0, +A / 2.0, 0.0, true, off + sh});
+        }
+        (void)C;
         return dims;
     }
 
@@ -362,16 +372,12 @@ std::vector<Dim> buildCoreShapeTopDims(const MAS::CoreShape& shape) {
 
     // ---------- T (toroidal) ----------
     if (fam == "t") {
-        // Python: B then A, both DistanceX centred on origin.
-        double sh = A / 2.0;
-        if (B > 0) {
-            std::ostringstream l; l << std::fixed << std::setprecision(2) << "B = " << B;
-            pushDistX(-B / 2.0, 0.0, +B / 2.0, 0.0, l.str(), v_offset + sh);
-            v_offset += increment;
-        }
-        if (A > 0) {
-            std::ostringstream l; l << std::fixed << std::setprecision(2) << "A = " << A;
-            pushDistX(-A / 2.0, 0.0, +A / 2.0, 0.0, l.str(), v_offset + sh);
+        // Toroidal TOP view is the meridional section (two rectangles): annotate
+        // the height C along the axis (a vertical dimension). The A (OD) / B (ID)
+        // diameters are shown on the FRONT view (the donut face) instead.
+        if (C > 0) {
+            std::ostringstream l; l << std::fixed << std::setprecision(2) << "C = " << C;
+            pushDistY(A / 2.0, -C / 2.0, A / 2.0, +C / 2.0, l.str(), h_offset);
         }
         return dims;
     }
@@ -716,14 +722,20 @@ static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnet
 
     std::set<std::string> seenEdges;
 
-    auto collectEdges = [&](const TopoDS_Shape& shape) {
+    auto collectEdges = [&](const TopoDS_Shape& shape, ViewKind sampleKind) {
         for (TopExp_Explorer exp(shape, TopAbs_EDGE); exp.More(); exp.Next()) {
-            auto poly = sampleEdge(TopoDS::Edge(exp.Current()), view);
+            auto poly = sampleEdge(TopoDS::Edge(exp.Current()), sampleKind);
             if (poly.size() < 2) continue;
-            // Filter out degenerate projected segments (edges running purely in Y).
-            double px0 = poly.front().first, py0 = poly.front().second;
-            double px1 = poly.back().first,  py1 = poly.back().second;
-            if (std::abs(px1 - px0) < 1e-9 && std::abs(py1 - py0) < 1e-9) continue;
+            // Drop edges that project to a single point (e.g. edges running
+            // perpendicular to the view plane). Use the full projected bbox, not
+            // just first-vs-last: a closed curve (e.g. a toroid's circular OD/ID)
+            // has coincident endpoints but a non-degenerate bbox and must be kept.
+            double pmnx = +1e30, pmxx = -1e30, pmny = +1e30, pmxy = -1e30;
+            for (const auto& p : poly) {
+                pmnx = std::min(pmnx, p.first);  pmxx = std::max(pmxx, p.first);
+                pmny = std::min(pmny, p.second); pmxy = std::max(pmxy, p.second);
+            }
+            if ((pmxx - pmnx) < 1e-9 && (pmxy - pmny) < 1e-9) continue;
             std::vector<std::pair<double,double>> mmPoly;
             mmPoly.reserve(poly.size());
             for (auto& p : poly) {
@@ -744,16 +756,40 @@ static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnet
         }
     };
 
+    // Toroidal cores are built with their hole axis along world Y (the
+    // geometricalDescription rotates the ShapeT annulus by {pi/2, pi/2, 0} in
+    // buildCoreShapes_impl), so the donut face — two concentric circles
+    // (outer + inner diameter) — lies in the XZ plane, NOT XY.
+    bool isToroidalCore = [&]{
+        auto geo = magnetic.get_core().get_geometrical_description();
+        if (!geo) return false;
+        for (const auto& p : *geo)
+            if (p.get_type() == MAS::CoreGeometricalDescriptionElementType::TOROIDAL)
+                return true;
+        return false;
+    }();
+
     if (view == ViewKind::FRONT) {
-        // FRONT: section the fused assembly at z=0 (XY plane).
         TopoDS_Shape core = pieces[0].shape;
         for (size_t i = 1; i < pieces.size(); ++i) {
             BRepAlgoAPI_Fuse fuser(core, pieces[i].shape);
             if (fuser.IsDone()) core = fuser.Shape();
         }
-        auto edges = SectionBuilder::sectionCore(core, SectionPlane::XY);
-        if (edges.IsNull()) throw std::runtime_error("SectionDrawing: front section returned nothing");
-        collectEdges(edges);
+        if (isToroidalCore) {
+            // Section perpendicular to the hole axis (Y) → the XZ plane cuts the
+            // outer and inner cylindrical walls in two concentric circles.
+            // Sectioning at XY instead would cut meridionally and (wrongly) show
+            // two rectangles. Sample as (X, Z) to match the A/B horizontal
+            // diameter dimensions.
+            auto edges = SectionBuilder::sectionCore(core, SectionPlane::XZ);
+            if (edges.IsNull()) throw std::runtime_error("SectionDrawing: toroidal front section returned nothing");
+            collectEdges(edges, ViewKind::TOP);
+        } else {
+            // FRONT: section the fused assembly at z=0 (XY plane).
+            auto edges = SectionBuilder::sectionCore(core, SectionPlane::XY);
+            if (edges.IsNull()) throw std::runtime_error("SectionDrawing: front section returned nothing");
+            collectEdges(edges, ViewKind::FRONT);
+        }
     } else if (view == ViewKind::TOP && [&]{
                   auto geo = magnetic.get_core().get_geometrical_description();
                   if (!geo) return false;
@@ -816,7 +852,7 @@ static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnet
                                             Standard_True,  // unify faces
                                             Standard_False); // don't concat B-splines
         healer.Build();
-        collectEdges(healer.Shape());
+        collectEdges(healer.Shape(), view);
     }
 
     if (polylines.empty()) throw std::runtime_error("SectionDrawing: no polylines");

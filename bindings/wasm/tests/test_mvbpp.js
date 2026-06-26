@@ -70,6 +70,21 @@ async function main() {
     const createMvbpp = require(DIST_JS);
     const mvbpp = await createMvbpp();
 
+    // drawMagnetic/drawTurns/drawWinding (+ *ToPath) gained a trailing
+    // `paintCoating` argument: true → OUTER (insulation) footprint, false →
+    // CONDUCTING (copper) footprint for FEM winding-loss meshing. embind
+    // enforces exact arity, so every call must now pass it. The frontend
+    // default is coating (true); wrap these so the existing positional calls
+    // below keep exercising that default. rawDraw* keep the unwrapped handles
+    // for the explicit copper-vs-coating test.
+    const rawDrawMagnetic = mvbpp.drawMagnetic.bind(mvbpp);
+    for (const fn of ['drawMagnetic', 'drawMagneticToPath',
+                      'drawTurns', 'drawTurnsToPath',
+                      'drawWinding', 'drawWindingToPath']) {
+        const orig = mvbpp[fn].bind(mvbpp);
+        mvbpp[fn] = (...a) => orig(...a, /*paintCoating=*/true);
+    }
+
     // Use concentric_rectangular_column_one_turn.json — concentric_basic.json
     // triggers a MKF bug (CORE_SHAPE_NOT_FOUND: EI 101/50) in the WASM build.
     const basicJson = loadMagneticJson('concentric_rectangular_column_one_turn.json');
@@ -114,6 +129,28 @@ async function main() {
         const etd   = mvbpp.drawMagnetic(etdJson, ...NO_SIDE);
         assert(etd.length > basic.length,
             `ETD49 (${etd.length}) should be larger than basic (${basic.length})`);
+    });
+
+    // ── paintCoating (ABT #7) ────────────────────────────────────────────────
+
+    console.log('\nmvbpp WASM — paintCoating (conductor vs insulation)');
+    console.log('─'.repeat(50));
+
+    const STL_3D = ['3D', 'XY', 0.0, 'stl', 1.0, 16, 'none', ''];
+
+    test('paintCoating=false draws copper, differs from coating', () => {
+        const coating = rawDrawMagnetic(etdJson, ...STL_3D, true);
+        const copper  = rawDrawMagnetic(etdJson, ...STL_3D, false);
+        assert(coating.length > 0 && copper.length > 0, 'both outputs non-empty');
+        assert(coating.length !== copper.length,
+            `copper geometry (${copper.length}) must differ from coating (${coating.length})`);
+    });
+
+    test('paintCoating=undefined defaults to coating (frontend default)', () => {
+        const coating = rawDrawMagnetic(etdJson, ...STL_3D, true);
+        const omitted = rawDrawMagnetic(etdJson, ...STL_3D, undefined);
+        assert(coating.length === omitted.length,
+            'omitted paintCoating must equal explicit coating (true)');
     });
 
     // ── drawMagneticToPath ───────────────────────────────────────────────────
@@ -191,11 +228,45 @@ async function main() {
     console.log('─'.repeat(50));
 
     test('drawBobbin returns valid STEP', () => {
-        const enriched = mvbpp._enrichMagnetic(basicJson);
-        const j = JSON.parse(enriched);
-        const bobbinJson = JSON.stringify(j.coil.bobbin);
-        const result = mvbpp.drawBobbin(bobbinJson, ...NO_SIDE);
+        // A core WITH a real bobbin: non-zero wall + column thickness, so
+        // buildBobbin renders a hollow body and flanges. (basicJson's enriched
+        // bobbin is a zero-thickness column footprint — i.e. no real bobbin — so
+        // it is intentionally NOT used here; see the no-bobbin test below.)
+        const realBobbin = JSON.stringify({
+            processedDescription: {
+                columnShape: 'rectangular', columnWidth: 0.005, columnDepth: 0.005,
+                columnThickness: 0.001, wallThickness: 0.001, coordinates: [0, 0, 0],
+                windingWindows: [{
+                    coordinates: [0.0075, 0, 0], height: 0.01, width: 0.005,
+                    shape: 'rectangular'
+                }]
+            }
+        });
+        const result = mvbpp.drawBobbin(realBobbin, ...NO_SIDE);
         assert(isStepBytes(result), 'drawBobbin STEP header invalid');
+    });
+
+    test('drawBobbin on a no-bobbin (planar) core returns empty, not an error', () => {
+        // Planar / PCB windings have no physical bobbin: MKF emits a column
+        // footprint with columnThickness = wallThickness = 0, so buildBobbin
+        // yields an empty shape. drawBobbin must return an empty buffer rather
+        // than throw "[mvbpp] unknown C++ exception".
+        const planarBobbin = JSON.stringify({
+            processedDescription: {
+                columnDepth: 0.004505, columnShape: 'oblong', columnThickness: 0,
+                columnWidth: 0.00196, coordinates: [0, 0, 0], wallThickness: 0,
+                windingWindows: [{
+                    area: 2.7e-05, coordinates: [0.00421, 0, 0], height: 0.006,
+                    sectionsAlignment: 'centered', sectionsOrientation: 'contiguous',
+                    shape: 'rectangular', width: 0.0045
+                }]
+            }
+        });
+        let result, threw = false;
+        try { result = mvbpp.drawBobbin(planarBobbin, ...NO_SIDE); }
+        catch (e) { threw = true; }
+        assert(!threw, 'drawBobbin must not throw on a no-bobbin (planar) core');
+        assert(result.length === 0, 'no-bobbin core should yield empty bobbin output');
     });
 
     // ── drawTurns ────────────────────────────────────────────────────────────

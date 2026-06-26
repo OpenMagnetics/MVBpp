@@ -16,9 +16,14 @@ TopoDS_Face ShapeU::buildProfile(const std::map<std::string, double>& dims) cons
     it = dims.find("C"); if (it != dims.end()) c = it->second / 2.0;
     it = dims.find("E"); if (it != dims.end()) e = it->second;
 
+    // Coordinate origin sits INSIDE the winding column (one leg), not at the
+    // core centre — this is the MAS/MKF convention the bobbin and turns are
+    // expressed in, so the core must follow it. The winding column is centred at
+    // X=0 (width windingColumnWidth); the window and the return leg extend to one
+    // side. Both legs are equal width = (A-E)/2.
     double windingColumnWidth = (a - e) / 2.0;
-    double leftA = a - windingColumnWidth / 2.0;
-    double rightA = windingColumnWidth / 2.0;
+    double leftA = a - windingColumnWidth / 2.0;  // outer edge of the far (return) leg
+    double rightA = windingColumnWidth / 2.0;      // outer edge of the winding column
 
     BRepBuilderAPI_MakePolygon poly;
     poly.Add(gp_Pnt(rightA, c, 0.0));
@@ -42,9 +47,14 @@ TopoDS_Shape ShapeU::buildWindingWindow(const std::map<std::string, double>& dim
 
     if (b == 0.0 || d == 0.0) return TopoDS_Shape();
 
-    // MVB.js U: WW = box(E, 2C, D), translated by -(windingColumnWidth/2 + E/2) in X.
+    // The window occupies the gap between the winding column (centred at X=0,
+    // inner edge at -windingColumnWidth/2) and the return leg, i.e.
+    // X in [-(windingColumnWidth/2 + E), -windingColumnWidth/2]. The previous
+    // -(wcw/2 + E/2) placed it half a window too far, cutting into the winding
+    // column and leaving unequal legs.
+    (void)aFull;
     double windingColumnWidth = (aFull - e) / 2.0;
-    gp_Pnt corner(-(windingColumnWidth / 2.0 + e / 2.0), -cFull, b - d);
+    gp_Pnt corner(-(windingColumnWidth / 2.0 + e), -cFull, b - d);
     TopoDS_Shape ww = BRepPrimAPI_MakeBox(corner, e, 2.0 * cFull, d).Shape();
     return ww;
 }

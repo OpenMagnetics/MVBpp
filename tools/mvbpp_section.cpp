@@ -11,6 +11,8 @@
 #include <BRep_Builder.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <TopoDS_Compound.hxx>
+#include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
 
 #include <fstream>
 #include <iostream>
@@ -44,6 +46,26 @@ int main(int argc, char* argv[]) {
     if (namedPieces.empty()) {
         std::cerr << "No core pieces built\n";
         return 1;
+    }
+
+    // --- Diagnostic: core piece bboxes (model space, metres) + MKF geo coords ---
+    for (size_t i = 0; i < namedPieces.size(); ++i) {
+        Bnd_Box bb; BRepBndLib::Add(namedPieces[i].shape, bb);
+        Standard_Real xmn, ymn, zmn, xmx, ymx, zmx;
+        bb.Get(xmn, ymn, zmn, xmx, ymx, zmx);
+        std::cerr << "PIECE " << i << " '" << namedPieces[i].name << "' X[" << xmn*1000 << "," << xmx*1000
+                  << "] cx=" << (xmn+xmx)*500 << " Y[" << ymn*1000 << "," << ymx*1000
+                  << "] Z[" << zmn*1000 << "," << zmx*1000 << "] (mm)\n";
+    }
+    if (auto geo = enriched.get_core().get_geometrical_description()) {
+        for (size_t i = 0; i < geo->size(); ++i) {
+            const auto& p = (*geo)[i];
+            std::cerr << "GEO " << i << " coords=[";
+            for (double c : p.get_coordinates()) std::cerr << c*1000 << " ";
+            std::cerr << "]mm rot=[";
+            if (p.get_rotation()) for (double r : *p.get_rotation()) std::cerr << r << " ";
+            std::cerr << "]\n";
+        }
     }
 
     // Fuse core halves so the section captures the assembled cross-section.

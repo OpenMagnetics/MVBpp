@@ -88,7 +88,21 @@ set(OCCT_ESSENTIAL_LIBS
     TKTObj TKBinTObj TKXmlTObj
     TKDEGLTF TKDEOBJ TKDEPLY TKDEVRML
 )
-target_link_libraries(occt INTERFACE ${OCCT_ESSENTIAL_LIBS})
+# OCCT 7.9.3 toolkits have circular dependencies (e.g. TKGeomAlgo <-> TKMath),
+# which no single left-to-right ordering of static archives can satisfy — GNU ld
+# would drop symbols pulled later (undefined references to math_FunctionSet,
+# GProp_PGProps, ...). Wrap the whole set in --start-group/--end-group so ld
+# iterates the archives until all cross-references resolve. Use full .a paths so
+# the group survives CMake's link-item processing.
+set(_occt_group_libs)
+foreach(_lib ${OCCT_ESSENTIAL_LIBS})
+    list(APPEND _occt_group_libs "${OCCT_PREFIX}/lib/lib${_lib}.a")
+endforeach()
+target_link_libraries(occt INTERFACE
+    -Wl,--start-group
+    ${_occt_group_libs}
+    -Wl,--end-group
+)
 
 # ============================================================================
 # nlohmann/json — reused by both MKF and MVB++
@@ -274,6 +288,7 @@ add_executable(mvb_tests
     tests/test_mas_battery.cpp
     tests/test_toroidal_topview.cpp
     tests/test_toroidal_single_turn_centered.cpp
+    tests/test_oblong_planar_turn.cpp
 )
 
 target_compile_definitions(mvb_tests PRIVATE

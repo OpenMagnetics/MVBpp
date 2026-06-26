@@ -70,6 +70,25 @@ val makeUint8Array(const std::string& data) {
     return out;
 }
 
+// Remove NamedShapes whose geometry is null/empty. Used where an empty result
+// is legitimate (e.g. a planar core has no bobbin) so we can return an empty
+// buffer instead of throwing on the downstream empty-export guard.
+void drop_null_shapes(std::vector<mvb::NamedShape>& named) {
+    named.erase(std::remove_if(named.begin(), named.end(),
+                    [](const mvb::NamedShape& ns) { return ns.shape.IsNull(); }),
+                named.end());
+}
+
+// paintCoating arrives from JS as an optional trailing argument. To keep the
+// long-standing default (turns drawn at the OUTER/insulation diameter), an
+// omitted/undefined value MUST resolve to true — existing callers pass no such
+// argument and must keep getting the insulation footprint. Pass false to draw
+// the CONDUCTING (copper) cross-section for FEM winding-loss meshing.
+bool resolvePaintCoating(const val& v) {
+    if (v.isUndefined() || v.isNull()) return true;
+    return v.as<bool>();
+}
+
 std::string upper(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
@@ -346,22 +365,24 @@ std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int polyg
     return {b.buildBobbinNamedFromBobbin(bobbin, /*axisIsY=*/true, polygonSegments)};
 }
 
-std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygonSegments) {
+std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygonSegments,
+                                         bool paintCoating) {
     auto j = json::parse(json_str);
     mvb::MagneticBuilder b;
     if (j.is_array()) {
         // Standalone path: each Turn must carry its own dimensions and
         // cross_sectional_shape. Throws for toroidal turns (which need
         // bobbin context); callers should hand a full magnetic instead.
+        // paintCoating=false also throws here — a bare Turn has no copper data.
         auto turns = j.get<std::vector<MAS::Turn>>();
-        return b.buildTurnsNamedFromTurns(turns, polygonSegments);
+        return b.buildTurnsNamedFromTurns(turns, polygonSegments, paintCoating);
     }
     if (j.is_object() && (j.contains("coil") || j.contains("core"))) {
         // Magnetic JSON: enrich + use bobbin-aware overload so toroidal
         // and concentric turns both work uniformly.
         auto enriched = parseEnriched(json_str);
         return b.buildTurnsNamed(enriched.get_coil(), enriched.get_core(),
-                                  polygonSegments);
+                                  polygonSegments, paintCoating);
     }
     throw std::runtime_error(
         "drawTurns: input must be a JSON array of MAS::Turn objects, or a "
@@ -370,7 +391,8 @@ std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygo
 
 std::vector<mvb::NamedShape> build_winding(const std::string& json_str,
                                             const std::string& windingName,
-                                            int polygonSegments) {
+                                            int polygonSegments,
+                                            bool paintCoating) {
     auto j = json::parse(json_str);
     auto coil = j.get<MAS::Coil>();
     auto turnsOpt = coil.get_turns_description();
@@ -391,7 +413,7 @@ std::vector<mvb::NamedShape> build_winding(const std::string& json_str,
         throw std::runtime_error("drawWinding: no turns match windingName='" + windingName + "'");
     }
     mvb::MagneticBuilder b;
-    return b.buildTurnsNamedFromTurns(filtered, polygonSegments);
+    return b.buildTurnsNamedFromTurns(filtered, polygonSegments, paintCoating);
 }
 
 // Adaptive wire-segment count: a coil with N turns produces N solids each
@@ -407,7 +429,8 @@ static int adaptive_wire_segments(int requested, std::size_t numTurns) {
     return std::min(requested, 6);
 }
 
-std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments) {
+std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments,
+                                            bool paintCoating) {
     auto j = json::parse(json_str);
     auto magnetic = j.get<MAS::Magnetic>();
 
@@ -418,7 +441,7 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
 
     mvb::MagneticBuilder b;
     return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
-                            wireSeg, polygonSegments);
+                            wireSeg, polygonSegments, paintCoating);
 }
 
 std::string draw_view_impl(const std::string& json_str,
@@ -426,7 +449,10 @@ std::string draw_view_impl(const std::string& json_str,
                             const std::string& plane,
                             double offset,
                             double widthPx,
-                            const std::string& format) {
+                            const std::string& format,
+                            double labelFontPx,
+                            const std::string& projColor,
+                            const std::string& dimColor) {
     std::string fmt = format;
     std::transform(fmt.begin(), fmt.end(), fmt.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -456,7 +482,8 @@ std::string draw_view_impl(const std::string& json_str,
     }
 
     return mvb::SectionDrawing::drawView(magnetic, plane, offset,
-                                          dimensions, widthPx);
+                                          dimensions, widthPx,
+                                          labelFontPx, projColor, dimColor);
 }
 
 } // namespace
@@ -543,6 +570,13 @@ val _drawBobbin(const std::string& json_str,
                 const std::string& symmetry,
                 const std::string& side) {
     auto named = build_bobbin(json_str, polygonSegments);
+    // A planar / PCB winding (and many MAS examples — ER25/15 planar, PQ3230,
+    // E70/33 stacked) has no physical bobbin: buildBobbin returns an empty
+    // shape. That is NOT an error, so return an empty buffer and let the caller
+    // simply render no bobbin, rather than throwing "STL export produced empty
+    // output" (which surfaced as "[mvbpp] unknown C++ exception").
+    drop_null_shapes(named);
+    if (named.empty()) return makeUint8Array(std::string());
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     return makeUint8Array(data);
@@ -559,6 +593,9 @@ std::string _drawBobbinToPath(const std::string& json_str,
                               const std::string& symmetry,
                               const std::string& side) {
     auto named = build_bobbin(json_str, polygonSegments);
+    // See _drawBobbin: an empty bobbin (planar / no-bobbin cores) is valid.
+    drop_null_shapes(named);
+    if (named.empty()) { write_bytes(path, std::string()); return path; }
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     write_bytes(path, data);
@@ -574,8 +611,9 @@ val _drawTurns(const std::string& json_str,
                double scale,
                int polygonSegments,
                const std::string& symmetry,
-               const std::string& side) {
-    auto named = build_turns(json_str, polygonSegments);
+               const std::string& side,
+               val paintCoating) {
+    auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     return makeUint8Array(data);
@@ -590,8 +628,9 @@ std::string _drawTurnsToPath(const std::string& json_str,
                              double scale,
                              int polygonSegments,
                              const std::string& symmetry,
-                             const std::string& side) {
-    auto named = build_turns(json_str, polygonSegments);
+                             const std::string& side,
+                             val paintCoating) {
+    auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     write_bytes(path, data);
@@ -608,8 +647,10 @@ val _drawWinding(const std::string& json_str,
                  double scale,
                  int polygonSegments,
                  const std::string& symmetry,
-                 const std::string& side) {
-    auto named = build_winding(json_str, windingName, polygonSegments);
+                 const std::string& side,
+                 val paintCoating) {
+    auto named = build_winding(json_str, windingName, polygonSegments,
+                               resolvePaintCoating(paintCoating));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     return makeUint8Array(data);
@@ -625,8 +666,10 @@ std::string _drawWindingToPath(const std::string& json_str,
                                double scale,
                                int polygonSegments,
                                const std::string& symmetry,
-                               const std::string& side) {
-    auto named = build_winding(json_str, windingName, polygonSegments);
+                               const std::string& side,
+                               val paintCoating) {
+    auto named = build_winding(json_str, windingName, polygonSegments,
+                               resolvePaintCoating(paintCoating));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     write_bytes(path, data);
@@ -710,8 +753,9 @@ val _drawMagnetic(const std::string& json_str,
                   double scale,
                   int polygonSegments,
                   const std::string& symmetry,
-                  const std::string& side) {
-    auto named = build_magnetic(json_str, polygonSegments);
+                  const std::string& side,
+                  val paintCoating) {
+    auto named = build_magnetic(json_str, polygonSegments, resolvePaintCoating(paintCoating));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     return makeUint8Array(data);
@@ -726,8 +770,9 @@ std::string _drawMagneticToPath(const std::string& json_str,
                                 double scale,
                                 int polygonSegments,
                                 const std::string& symmetry,
-                                const std::string& side) {
-    auto named = build_magnetic(json_str, polygonSegments);
+                                const std::string& side,
+                                val paintCoating) {
+    auto named = build_magnetic(json_str, polygonSegments, resolvePaintCoating(paintCoating));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     write_bytes(path, data);
@@ -741,7 +786,8 @@ std::string _drawView(const std::string& json_str,
                       double offset,
                       double widthPx,
                       const std::string& format) {
-    return draw_view_impl(json_str, dimensions, plane, offset, widthPx, format);
+    return draw_view_impl(json_str, dimensions, plane, offset, widthPx, format,
+                          /*labelFontPx=*/12.0, /*projColor=*/"#000000", /*dimColor=*/"#1976d2");
 }
 
 std::string _drawViewToPath(const std::string& json_str,
@@ -751,9 +797,23 @@ std::string _drawViewToPath(const std::string& json_str,
                             double offset,
                             double widthPx,
                             const std::string& format) {
-    auto svg = draw_view_impl(json_str, dimensions, plane, offset, widthPx, format);
+    auto svg = draw_view_impl(json_str, dimensions, plane, offset, widthPx, format,
+                              12.0, "#000000", "#1976d2");
     write_bytes(path, svg);
     return path;
+}
+
+// Dimensioned 2D view with caller-supplied colors (used by Core2DVisualizer via
+// the worker). Separate from drawView so the plain drawView keeps its arity and
+// existing callers are unaffected.
+std::string _drawDimensionedView(const std::string& json_str,
+                                 const std::string& plane,
+                                 double widthPx,
+                                 double labelFontPx,
+                                 const std::string& projColor,
+                                 const std::string& dimColor) {
+    return draw_view_impl(json_str, /*dimensions=*/true, plane, /*offset=*/0.0,
+                          widthPx, "svg", labelFontPx, projColor, dimColor);
 }
 
 // Test helper
@@ -793,6 +853,7 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
     function("drawMagneticToPath",  &guard<&_drawMagneticToPath>::call);
     function("drawView",            &guard<&_drawView>::call);
     function("drawViewToPath",      &guard<&_drawViewToPath>::call);
+    function("drawDimensionedView", &guard<&_drawDimensionedView>::call);
 
     // Test helper
     function("_enrichMagnetic",     &guard<&_enrichMagnetic>::call);
