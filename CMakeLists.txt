@@ -165,10 +165,10 @@ set(_MKF_BIN "${CMAKE_BINARY_DIR}/_deps/mkf-build")
 FetchContent_Declare(
     MKF
     GIT_REPOSITORY "${_MKF_LOCAL}"
-    # Track MKF main. Brings Coil::build_centered_single_turn_toroidal (needed by
-    # the toroidal single-turn e2e test) and references newer MAS types now
-    # satisfied by the MAS main pin above. Keep both on main, in lockstep.
-    GIT_TAG        main
+    # Pinned to MKF main @ 028b3b9c, which is the prior main + a header-only addition
+    # exposing get_wire_insulation_relative_permittivity (used by OMFEM's electrostatic
+    # mesh). Same MAS-main compatibility as the previous main HEAD. Bump alongside MAS.
+    GIT_TAG        028b3b9c
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
