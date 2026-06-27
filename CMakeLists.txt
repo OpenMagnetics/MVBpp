@@ -228,6 +228,7 @@ else()
 endif()
 add_library(mvb++ ${_mvbpp_lib_kind}
     src/MagneticBuilder.cpp
+    src/MeshableModel.cpp
     src/SectionBuilder.cpp
     src/SectionDrawing.cpp
     src/ProjectionDrawing.cpp
@@ -287,6 +288,7 @@ add_executable(mvb_tests
     tests/test_integration.cpp
     tests/test_json_integration.cpp
     tests/test_symmetry.cpp
+    tests/test_meshable.cpp
     tests/test_mas_battery.cpp
     tests/test_toroidal_topview.cpp
     tests/test_toroidal_single_turn_centered.cpp
