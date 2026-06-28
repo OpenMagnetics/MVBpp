@@ -16,7 +16,11 @@
 #include <TopoDS_Wire.hxx>
 #include <TopTools_HSequenceOfShape.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Pnt2d.hxx>
 #include <gp_Pln.hxx>
+#include <BRep_Tool.hxx>
+#include <BRepClass_FaceClassifier.hxx>
+#include <ElSLib.hxx>
 
 #include <algorithm>
 #include <cctype>
@@ -224,18 +228,51 @@ std::vector<NamedShape> SectionBuilder::cut2DFaces(const std::vector<NamedShape>
         std::vector<TopoDS_Shape> children;
 
         if (!wireSeq.IsNull()) {
+            // Separate closed wires (candidate faces) from open ones.
+            std::vector<TopoDS_Wire> cw;
             for (Standard_Integer i = 1; i <= wireSeq->Length(); ++i) {
                 TopoDS_Wire wire = TopoDS::Wire(wireSeq->Value(i));
                 if (wire.IsNull()) continue;
-                if (wire.Closed()) {
-                    BRepBuilderAPI_MakeFace mkFace(pln, wire, Standard_True);
-                    if (mkFace.IsDone()) {
-                        children.push_back(mkFace.Face());
-                        continue;
-                    }
+                if (wire.Closed()) cw.push_back(wire);
+                else children.push_back(wire);   // open wire: keep as-is
+            }
+            // Build a face + interior test point (a vertex projected to the section plane)
+            // for each closed wire, then nest CONTAINED wires as HOLES. A single solid still
+            // sections into an outer loop PLUS inner loop(s) when it has a through-hole (a
+            // toroid annulus, a closed winding window); making one face per wire would yield
+            // overlapping disks where the inner disk fills the hole. Even containment depth =
+            // solid outer boundary, odd = hole (punched out of its enclosing outer face).
+            std::vector<TopoDS_Face> face(cw.size());
+            std::vector<gp_Pnt2d>    pt(cw.size());
+            std::vector<bool>        ok(cw.size(), false);
+            std::vector<int>         depth(cw.size(), 0);
+            for (std::size_t i = 0; i < cw.size(); ++i) {
+                BRepBuilderAPI_MakeFace mk(pln, cw[i], Standard_True);
+                TopExp_Explorer ve(cw[i], TopAbs_VERTEX);
+                if (!mk.IsDone() || !ve.More()) { children.push_back(cw[i]); continue; }
+                face[i] = mk.Face();
+                gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(ve.Current()));
+                Standard_Real u, v; ElSLib::Parameters(pln, p, u, v);
+                pt[i] = gp_Pnt2d(u, v);
+                ok[i] = true;
+            }
+            for (std::size_t i = 0; i < cw.size(); ++i) {
+                if (!ok[i]) continue;
+                for (std::size_t j = 0; j < cw.size(); ++j) {
+                    if (j == i || !ok[j]) continue;
+                    BRepClass_FaceClassifier cls(face[j], pt[i], 1e-7);
+                    if (cls.State() == TopAbs_IN) depth[i]++;
                 }
-                // Open or face-build failed → keep wire as-is
-                children.push_back(wire);
+            }
+            for (std::size_t i = 0; i < cw.size(); ++i) {
+                if (!ok[i] || (depth[i] % 2) != 0) continue;   // skip holes (odd depth)
+                BRepBuilderAPI_MakeFace mk(pln, cw[i], Standard_True);
+                for (std::size_t j = 0; j < cw.size(); ++j) {  // punch directly-nested holes
+                    if (j == i || !ok[j] || depth[j] != depth[i] + 1) continue;
+                    BRepClass_FaceClassifier cls(face[i], pt[j], 1e-7);
+                    if (cls.State() == TopAbs_IN) mk.Add(TopoDS::Wire(cw[j].Reversed()));
+                }
+                children.push_back(mk.IsDone() ? TopoDS_Shape(mk.Face()) : TopoDS_Shape(cw[i]));
             }
         }
         if (children.empty()) {
