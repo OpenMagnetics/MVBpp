@@ -83,6 +83,29 @@ TopoDS_Shape ShapeEp::buildWindingWindow(const std::map<std::string, double>& di
     return ww;
 }
 
+// EP center column is round (diameter F). The generic gap cutter (ShapeBuilder::
+// applyMachining) sizes the center-column tool depth to C, a rectangular-column
+// assumption; for EP, C >> F, so the box reaches past the round post into the closed pot
+// back wall and clips the column corner at the -Z face. Size the cutter to F instead so
+// it matches the round column exactly (its corners then fall in the bore = air, harmless).
+// Side-column gaps (not used by round EP) defer to the generic handler.
+TopoDS_Shape ShapeEp::applyMachining(const TopoDS_Shape& piece,
+                                     const MAS::Machining& machining,
+                                     const std::map<std::string, double>& dims) const {
+    const std::vector<double>& coords = machining.get_coordinates();
+    if (coords.size() < 2) return piece;
+    const double gapLength = machining.get_length();
+    if (std::abs(gapLength) < 1e-12) return piece;       // zero-gap no-op
+    const double xCoord = coords[0];
+    if (std::abs(xCoord) >= 1e-12)
+        return ShapeBuilder::applyMachining(piece, machining, dims);  // side column
+    const double f = dims.count("F") ? dims.at("F") : 0.0;
+    TopoDS_Shape tool = makeBox(f, gapLength, f);         // F (width) x gap x F (round depth)
+    tool = translate_shape(tool, 0.0, coords[1], 0.0);
+    BRepAlgoAPI_Cut cutter(piece, tool);
+    return cutter.IsDone() ? cutter.Shape() : piece;
+}
+
 TopoDS_Shape ShapeEp::applyExtras(const std::map<std::string, double>& dims,
                                   const TopoDS_Shape& piece) const {
     double b = 0.0;
