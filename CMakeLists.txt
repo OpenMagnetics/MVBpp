@@ -291,6 +291,7 @@ add_executable(mvb_tests
     tests/test_toroidal_topview.cpp
     tests/test_toroidal_single_turn_centered.cpp
     tests/test_oblong_planar_turn.cpp
+    tests/test_section_projection.cpp
 )
 
 target_compile_definitions(mvb_tests PRIVATE

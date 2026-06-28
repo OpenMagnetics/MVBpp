@@ -21,6 +21,8 @@
 #include <BRep_Tool.hxx>
 #include <BRepClass_FaceClassifier.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
+#include <BRepGProp.hxx>
+#include <GProp_GProps.hxx>
 #include <ElSLib.hxx>
 
 #include <algorithm>
@@ -201,33 +203,32 @@ std::vector<NamedShape> SectionBuilder::cut2DFaces(const std::vector<NamedShape>
 
     gp_Pln pln = planeFor(plane, offset);
 
-    for (const auto& ns : shapes) {
-        if (ns.shape.IsNull()) continue;
-
-        BRepAlgoAPI_Section section(ns.shape, pln, Standard_False);
+    // Section ONE shape (a single solid or a face/shell) at `pln` and append the resulting
+    // faces (closed loops, contained loops nested as holes) and any open wires to `children`.
+    // Sectioning the SUB-SOLIDS of a compound separately — rather than the whole compound at
+    // once — keeps each sub-piece's cross-section a self-contained closed loop. A toroidal
+    // turn is an UNFUSED compound of quarter-tori + segments ("fusing is unnecessary" for 3D
+    // viz, and fusing curved booleans per turn is prohibitively slow); sectioning the whole
+    // compound merged edges across the unfused gaps and they never closed into faces, so each
+    // turn produced 0 cross-sections instead of two (one inner, one outer).
+    auto sectionOneSolid = [&pln](const TopoDS_Shape& solid, std::vector<TopoDS_Shape>& children) {
+        BRepAlgoAPI_Section section(solid, pln, Standard_False);
         section.ComputePCurveOn1(Standard_True);
         section.Approximation(Standard_True);
         section.Build();
-        if (!section.IsDone()) continue;
+        if (!section.IsDone()) return;
         TopoDS_Shape edgesShape = section.Shape();
-        if (edgesShape.IsNull()) continue;
+        if (edgesShape.IsNull()) return;
 
-        // Collect edges
         Handle(TopTools_HSequenceOfShape) edgeSeq = new TopTools_HSequenceOfShape();
-        for (TopExp_Explorer exp(edgesShape, TopAbs_EDGE); exp.More(); exp.Next()) {
+        for (TopExp_Explorer exp(edgesShape, TopAbs_EDGE); exp.More(); exp.Next())
             edgeSeq->Append(exp.Current());
-        }
-        if (edgeSeq->IsEmpty()) continue;
+        if (edgeSeq->IsEmpty()) return;
 
-        // Connect edges into wires
         Handle(TopTools_HSequenceOfShape) wireSeq;
         ShapeAnalysis_FreeBounds::ConnectEdgesToWires(edgeSeq, 1e-6, Standard_False, wireSeq);
 
-        BRep_Builder builder;
-        TopoDS_Compound compound;
-        builder.MakeCompound(compound);
-        std::vector<TopoDS_Shape> children;
-
+        const std::size_t before = children.size();
         if (!wireSeq.IsNull()) {
             // Separate closed wires (candidate faces) from open ones.
             std::vector<TopoDS_Wire> cw;
@@ -282,25 +283,55 @@ std::vector<NamedShape> SectionBuilder::cut2DFaces(const std::vector<NamedShape>
                 children.push_back(result);
             }
         }
-        if (children.empty()) {
+        if (children.size() == before) {
             // Fallback: keep raw edges
-            for (TopExp_Explorer exp(edgesShape, TopAbs_EDGE); exp.More(); exp.Next()) {
+            for (TopExp_Explorer exp(edgesShape, TopAbs_EDGE); exp.More(); exp.Next())
                 children.push_back(exp.Current());
-            }
         }
+    };
+
+    for (const auto& ns : shapes) {
+        if (ns.shape.IsNull()) continue;
+        // Section each SUB-SOLID independently (a compound's pieces section cleanly on their
+        // own); if the shape has no solids (a bare face/shell), section it directly.
+        std::vector<TopoDS_Shape> children;
+        bool anySolid = false;
+        for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next()) {
+            anySolid = true;
+            sectionOneSolid(e.Current(), children);
+        }
+        if (!anySolid) sectionOneSolid(ns.shape, children);
         if (children.empty()) continue;
 
-        // Emit one NamedShape per child so STEPCAFControl_Writer attaches
-        // the source name to every product, not just the compound parent
-        // (which OCCT auto-decomposes on write).  Multi-face sections get a
-        // suffix so each face is uniquely identifiable.
+        // Deduplicate coincident cross-sections: when the section plane grazes a JOINT between
+        // two sub-solids (a toroidal turn's inner/outer crossing sits exactly at the mid-height
+        // joint of its quarter-tori), both sub-solids emit the same disk. Keep one per (3D
+        // centroid, area) so each physical crossing is a single face.
+        if (children.size() > 1) {
+            std::vector<TopoDS_Shape> uniq;
+            std::vector<std::array<double, 4>> seen;   // cx, cy, cz, area
+            for (const auto& ch : children) {
+                GProp_GProps g; BRepGProp::SurfaceProperties(ch, g);
+                const double a = std::abs(g.Mass());
+                const gp_Pnt c = g.CentreOfMass();
+                bool dup = false;
+                for (const auto& s : seen)
+                    if (std::abs(s[0]-c.X())<1e-7 && std::abs(s[1]-c.Y())<1e-7 &&
+                        std::abs(s[2]-c.Z())<1e-7 && std::abs(s[3]-a)<1e-12) { dup = true; break; }
+                if (dup) continue;
+                seen.push_back({c.X(), c.Y(), c.Z(), a});
+                uniq.push_back(ch);
+            }
+            children.swap(uniq);
+        }
+
+        // Emit one NamedShape per child so STEPCAFControl_Writer attaches the source name to
+        // every product. Multi-face sections get a suffix so each is uniquely identifiable.
         if (children.size() == 1) {
             out.push_back(NamedShape{children[0], ns.name});
         } else {
-            for (std::size_t k = 0; k < children.size(); ++k) {
-                out.push_back(NamedShape{children[k],
-                                          ns.name + "_" + std::to_string(k)});
-            }
+            for (std::size_t k = 0; k < children.size(); ++k)
+                out.push_back(NamedShape{children[k], ns.name + "_" + std::to_string(k)});
         }
     }
 
