@@ -587,6 +587,22 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         }
     }
 
+    // MKF's geometricalDescription rotates the toroid by {pi/2, pi/2, 0} (Core.cpp), tipping
+    // the ring out of the MAS XY plane: it lands in XZ with the hole axis along world Y, and
+    // the turns are placed to match. Counter-rotate the WHOLE assembled magnetic (core + turns
+    // together, so they stay consistent) by -pi/2 about X, restoring the MAS convention: the
+    // ring lies in XY with the hole axis along Z. 2D consumers can then project the toroid's
+    // magnetic path in XY like any other core.
+    const bool isToroidal = [&]{
+        auto geo = magnetic.get_core().get_geometrical_description();
+        if (!geo) return false;
+        for (const auto& p : *geo)
+            if (p.get_type() == MAS::CoreGeometricalDescriptionElementType::TOROIDAL) return true;
+        return false;
+    }();
+    if (isToroidal)
+        for (auto& ns : all) ns.shape = rotate_shape(ns.shape, -std::numbers::pi / 2.0, 0.0, 0.0);
+
     return apply_symmetry(std::move(all), symmetryPlanes);
 }
 
