@@ -20,6 +20,7 @@
 #include <gp_Pln.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepClass_FaceClassifier.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
 #include <ElSLib.hxx>
 
 #include <algorithm>
@@ -266,13 +267,19 @@ std::vector<NamedShape> SectionBuilder::cut2DFaces(const std::vector<NamedShape>
             }
             for (std::size_t i = 0; i < cw.size(); ++i) {
                 if (!ok[i] || (depth[i] % 2) != 0) continue;   // skip holes (odd depth)
-                BRepBuilderAPI_MakeFace mk(pln, cw[i], Standard_True);
-                for (std::size_t j = 0; j < cw.size(); ++j) {  // punch directly-nested holes
+                // Subtract the directly-nested hole faces with a boolean cut (orientation-
+                // robust: adding a wire as a hole depends on its winding, which differs
+                // between polygon and true-circle section loops and silently inflated the
+                // area). Cut the inner disks out of the outer disk -> the annulus.
+                TopoDS_Shape result = face[i];
+                for (std::size_t j = 0; j < cw.size(); ++j) {
                     if (j == i || !ok[j] || depth[j] != depth[i] + 1) continue;
                     BRepClass_FaceClassifier cls(face[i], pt[j], 1e-7);
-                    if (cls.State() == TopAbs_IN) mk.Add(TopoDS::Wire(cw[j].Reversed()));
+                    if (cls.State() != TopAbs_IN) continue;
+                    BRepAlgoAPI_Cut cut(result, face[j]);
+                    if (cut.IsDone() && !cut.Shape().IsNull()) result = cut.Shape();
                 }
-                children.push_back(mk.IsDone() ? TopoDS_Shape(mk.Face()) : TopoDS_Shape(cw[i]));
+                children.push_back(result);
             }
         }
         if (children.empty()) {
