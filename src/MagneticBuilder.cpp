@@ -20,6 +20,9 @@
 #include <stdexcept>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
+#include <BRepOffsetAPI_MakeOffsetShape.hxx>
+#include <BRepOffset_Mode.hxx>
+#include <GeomAbs_JoinType.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepBndLib.hxx>
@@ -30,6 +33,29 @@
 namespace mvb {
 
 using json = nlohmann::json;
+
+// Build the core's insulating COATING (epoxy/parylene/etc., MAS CoreCoating) as a real conformal
+// SHELL solid: offset the core surface outward by the coating thickness and subtract the core, so
+// the result is a uniform-thickness layer wrapping the whole core (outer/inner/top/bottom). Returns
+// a null shape if the offset/cut fails (e.g. a sharp-cornered core OCCT cannot offset) -- caller skips
+// it (no fabrication). Geometry-agnostic: works on any core solid (toroid, PQ, ...).
+static TopoDS_Shape buildCoreCoatingShell(const TopoDS_Shape& core, double thickness) {
+    if (thickness <= 0.0 || core.IsNull()) return TopoDS_Shape();
+    try {
+        BRepOffsetAPI_MakeOffsetShape mk;
+        mk.PerformByJoin(core, thickness, 1e-7, BRepOffset_Skin,
+                         Standard_False, Standard_False, GeomAbs_Intersection);
+        if (!mk.IsDone()) return TopoDS_Shape();
+        TopoDS_Shape bigger = mk.Shape();
+        if (bigger.IsNull()) return TopoDS_Shape();
+        BRepAlgoAPI_Cut cut(bigger, core);            // shell = offset - core
+        if (!cut.IsDone()) return TopoDS_Shape();
+        TopoDS_Shape shell = cut.Shape();
+        return shell.IsNull() ? TopoDS_Shape() : shell;
+    } catch (const Standard_Failure&) {
+        return TopoDS_Shape();
+    }
+}
 
 static bool isCoreToroidal(const MAS::MagneticCore& core) {
     auto geo = core.get_geometrical_description();
@@ -546,7 +572,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                                                          int corePolygonSegments,
                                                          bool paintCoating,
                                                          bool emitCoatingShells,
-                                                         bool includeInsulation) const {
+                                                         bool includeInsulation,
+                                                         double coreCoatingThickness) const {
     // MAS 1.x makes Magnetic.core / Magnetic.coil optional, but this builder
     // requires both present. The generated getters return the optional BY VALUE,
     // so bind COPIES (not references — a reference would dangle past the temporary).
@@ -558,6 +585,15 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
     if (geoOpt && geoOpt.has_value() && !geoOpt->empty()) {
         // Build directly from MAS types — no MKF enrichment needed.
         auto all = buildCoreNamed(core, corePolygonSegments);
+
+        if (coreCoatingThickness > 0.0) {   // conformal core-coating shells (offset core - core)
+            std::vector<NamedShape> coatings;
+            for (auto& ns : all) {
+                auto shell = buildCoreCoatingShell(ns.shape, coreCoatingThickness);
+                if (!shell.IsNull()) coatings.push_back({shell, ns.name + " coating"});
+            }
+            for (auto& c : coatings) all.push_back(std::move(c));
+        }
 
         std::vector<std::string> turnNames;
         auto turnShapes = buildTurnsImpl<MAS::Coil, MAS::Wire>(
@@ -605,7 +641,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
     OpenMagnetics::Magnetic enriched = magnetic_autocomplete_safe(magnetic);
     return buildAllNamed(enriched, includeBobbin, symmetryPlanes,
                          wirePolygonSegments, corePolygonSegments, paintCoating, emitCoatingShells,
-                         includeInsulation);
+                         includeInsulation, coreCoatingThickness);
 }
 
 std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
@@ -615,8 +651,18 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                                          int corePolygonSegments,
                                                          bool paintCoating,
                                                          bool emitCoatingShells,
-                                                         bool includeInsulation) const {
+                                                         bool includeInsulation,
+                                                         double coreCoatingThickness) const {
     auto all = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
+
+    if (coreCoatingThickness > 0.0) {   // conformal core-coating shells (offset core - core)
+        std::vector<NamedShape> coatings;
+        for (auto& ns : all) {
+            auto shell = buildCoreCoatingShell(ns.shape, coreCoatingThickness);
+            if (!shell.IsNull()) coatings.push_back({shell, ns.name + " coating"});
+        }
+        for (auto& c : coatings) all.push_back(std::move(c));
+    }
 
     // Build turns ONCE, then reuse for both bobbin-cutting and the final assembly.
     std::vector<std::string> turnNames;

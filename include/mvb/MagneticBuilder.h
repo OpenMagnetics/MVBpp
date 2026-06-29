@@ -111,7 +111,8 @@ public:
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
                                           bool paintCoating = true,
                                           bool emitCoatingShells = false,
-                                          bool includeInsulation = false) const;
+                                          bool includeInsulation = false,
+                                          double coreCoatingThickness = 0.0) const;
     std::vector<NamedShape> buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
@@ -119,7 +120,10 @@ public:
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
                                           bool paintCoating = true,
                                           bool emitCoatingShells = false,
-                                          bool includeInsulation = false) const;
+                                          bool includeInsulation = false,
+                                          // >0: build the core's insulating coating as a conformal
+                                          // shell solid ("<core> coating") of this thickness [m].
+                                          double coreCoatingThickness = 0.0) const;
 
     // ---- Standalone builders for the unified bindings API -----------------
     //
