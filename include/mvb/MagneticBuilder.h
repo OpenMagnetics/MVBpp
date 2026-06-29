@@ -101,20 +101,25 @@ public:
     // emitCoatingShells: emit BOTH the bare-copper turn ("<turn>") and the outer insulated
     // footprint ("<turn> coating") per turn, so a thermal mesh can resolve the low-k wire enamel
     // (the mesher fragments the overlap into copper core + coating annulus). Implies copper turns.
+    // includeInsulation: also emit INSULATION-layer solids ("insulation_layer_<i>") for the
+    // inter-layer/inter-section tape, when they carry real thickness (zero-thickness placeholders
+    // are skipped). For thermal FEA -- a low-k conduction barrier between windings.
     std::vector<NamedShape> buildAllNamed(const MAS::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
                                           bool paintCoating = true,
-                                          bool emitCoatingShells = false) const;
+                                          bool emitCoatingShells = false,
+                                          bool includeInsulation = false) const;
     std::vector<NamedShape> buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
                                           bool paintCoating = true,
-                                          bool emitCoatingShells = false) const;
+                                          bool emitCoatingShells = false,
+                                          bool includeInsulation = false) const;
 
     // ---- Standalone builders for the unified bindings API -----------------
     //

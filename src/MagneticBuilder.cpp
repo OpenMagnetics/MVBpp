@@ -408,6 +408,49 @@ std::vector<TopoDS_Shape> buildTurnsImpl(const CoilT& coil, const MAS::MagneticC
     return result;
 }
 
+// Build INSULATION-layer solids (inter-layer / inter-section tape). Each insulation layer is a thin
+// ring spanning the layer footprint; we synthesize a RECTANGULAR "turn" from the layer's
+// coordinates+dimensions and reuse buildTurn(), so every column shape (round/rect/oblong/toroidal)
+// is covered. Zero-thickness layers (logical placeholders with no material/thickness) are SKIPPED
+// (no silent fabrication). Names "insulation_layer_<i>" so a thermal FEA can tag them as the low-k
+// conduction barrier between windings (unlike wire enamel, this sits on the winding<->winding
+// conduction path with no convection film in series, so it can matter thermally).
+template<typename CoilT>
+std::vector<NamedShape> buildInsulationLayersImpl(const CoilT& coil, const MAS::MagneticCore& core,
+                                                  int wirePolygonSegments) {
+    std::vector<NamedShape> out;
+    auto layersOpt = coil.get_layers_description();
+    if (!layersOpt || layersOpt->empty()) return out;
+    const bool toroidal = isCoreToroidal(core);
+    auto bobbinPd = getBobbinProcessed(coil);
+    patchBobbinDimensions(bobbinPd, core);
+    int idx = 0;
+    for (const auto& layer : *layersOpt) {
+        const int i = idx++;
+        if (layer.get_type() != MAS::ElectricalType::INSULATION) continue;
+        const auto& dims = layer.get_dimensions();
+        const auto& coords = layer.get_coordinates();
+        if (dims.size() < 2 || coords.size() < 2) continue;
+        const double w = dims[0], h = dims[1];
+        if (w <= 1e-9 || h <= 1e-9) continue;   // zero-thickness placeholder -> nothing physical to build
+        MAS::Turn turn;
+        turn.set_coordinates(std::vector<double>{coords[0], coords[1]});
+        turn.set_dimensions(std::vector<double>{w, h});
+        turn.set_cross_sectional_shape(MAS::TurnCrossSectionalShape::RECTANGULAR);
+        MAS::Wire wire; wire.set_type(MAS::WireType::RECTANGULAR);
+        MAS::DimensionWithTolerance ww; ww.set_nominal(w);
+        MAS::DimensionWithTolerance hh; hh.set_nominal(h);
+        wire.set_outer_width(std::optional<MAS::DimensionWithTolerance>(ww));
+        wire.set_outer_height(std::optional<MAS::DimensionWithTolerance>(hh));
+        wire.set_conducting_width(std::optional<MAS::DimensionWithTolerance>(ww));
+        wire.set_conducting_height(std::optional<MAS::DimensionWithTolerance>(hh));
+        TopoDS_Shape s = TurnBuilder::buildTurn(turn, wire, bobbinPd, toroidal,
+                                                wirePolygonSegments, DEFAULT_WIRE_REVOLUTION_SEGMENTS, true);
+        if (!s.IsNull()) out.push_back({s, "insulation_layer_" + std::to_string(i)});
+    }
+    return out;
+}
+
 } // anonymous namespace
 
 // ---- Named-shape overloads ------------------------------------------------
@@ -502,7 +545,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                                                          int wirePolygonSegments,
                                                          int corePolygonSegments,
                                                          bool paintCoating,
-                                                         bool emitCoatingShells) const {
+                                                         bool emitCoatingShells,
+                                                         bool includeInsulation) const {
     // MAS 1.x makes Magnetic.core / Magnetic.coil optional, but this builder
     // requires both present. The generated getters return the optional BY VALUE,
     // so bind COPIES (not references — a reference would dangle past the temporary).
@@ -537,6 +581,11 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
             all.emplace_back(turnShapes[i], n);
         }
 
+        if (includeInsulation) {
+            auto ins = buildInsulationLayersImpl<MAS::Coil>(coil, core, wirePolygonSegments);
+            for (auto& ns : ins) all.push_back(std::move(ns));
+        }
+
         // Planar (PCB) coils get an FR4 substrate board. Patch the bobbin
         // processed description first so column_shape/width/depth are
         // populated from the core when MKF left the bobbin variant empty.
@@ -555,7 +604,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
 
     OpenMagnetics::Magnetic enriched = magnetic_autocomplete_safe(magnetic);
     return buildAllNamed(enriched, includeBobbin, symmetryPlanes,
-                         wirePolygonSegments, corePolygonSegments, paintCoating, emitCoatingShells);
+                         wirePolygonSegments, corePolygonSegments, paintCoating, emitCoatingShells,
+                         includeInsulation);
 }
 
 std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
@@ -564,7 +614,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                                          int wirePolygonSegments,
                                                          int corePolygonSegments,
                                                          bool paintCoating,
-                                                         bool emitCoatingShells) const {
+                                                         bool emitCoatingShells,
+                                                         bool includeInsulation) const {
     auto all = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
 
     // Build turns ONCE, then reuse for both bobbin-cutting and the final assembly.
@@ -589,6 +640,11 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                 ? turnNames[i]
                                 : "Turn_" + std::to_string(i);
         all.emplace_back(turnShapes[i], n);
+    }
+
+    if (includeInsulation) {
+        auto ins = buildInsulationLayersImpl<OpenMagnetics::Coil>(magnetic.get_coil(), magnetic.get_core(), wirePolygonSegments);
+        for (auto& ns : ins) all.push_back(std::move(ns));
     }
 
     if (auto groupsOpt = magnetic.get_coil().get_groups_description();
