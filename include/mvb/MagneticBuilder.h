@@ -98,18 +98,23 @@ public:
 
     // Assemble all geometry as named shapes (no export). Optionally applies
     // symmetry cuts according to symmetryPlanes (0=full, 1=half, 2=quarter).
+    // emitCoatingShells: emit BOTH the bare-copper turn ("<turn>") and the outer insulated
+    // footprint ("<turn> coating") per turn, so a thermal mesh can resolve the low-k wire enamel
+    // (the mesher fragments the overlap into copper core + coating annulus). Implies copper turns.
     std::vector<NamedShape> buildAllNamed(const MAS::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
-                                          bool paintCoating = true) const;
+                                          bool paintCoating = true,
+                                          bool emitCoatingShells = false) const;
     std::vector<NamedShape> buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
-                                          bool paintCoating = true) const;
+                                          bool paintCoating = true,
+                                          bool emitCoatingShells = false) const;
 
     // ---- Standalone builders for the unified bindings API -----------------
     //

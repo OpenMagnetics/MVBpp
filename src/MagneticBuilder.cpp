@@ -352,8 +352,13 @@ TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& c
 // Internal turns builder. Public surface goes through buildTurnsNamed() or
 // buildTurnsNamedFromTurns(). The template covers both the MAS and the
 // OpenMagnetics coil/wire variants used internally by buildAllNamed.
+// emitCoatingShells: when true, emit TWO concentric solids per turn -- the bare COPPER core
+// (named "<turn>") and the OUTER insulated footprint (named "<turn> coating"). They overlap (copper
+// inside outer); the downstream mesher fragments them into a copper volume + the enamel annulus, so
+// a thermal FEA gets the real low-k wire coating between turns. Reuses buildTurn(), so it works for
+// every column shape (round/rect/oblong/toroidal) and wire type (round/rect/litz) unchanged.
 template<typename CoilT, typename WireT>
-std::vector<TopoDS_Shape> buildTurnsImpl(const CoilT& coil, const MAS::MagneticCore& core, std::vector<std::string>* outNames, int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS, bool paintCoating = true) {
+std::vector<TopoDS_Shape> buildTurnsImpl(const CoilT& coil, const MAS::MagneticCore& core, std::vector<std::string>* outNames, int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS, bool paintCoating = true, bool emitCoatingShells = false) {
     std::vector<TopoDS_Shape> result;
     auto turnsOpt = coil.get_turns_description();
     if (!turnsOpt || turnsOpt->empty()) return result;
@@ -382,14 +387,21 @@ std::vector<TopoDS_Shape> buildTurnsImpl(const CoilT& coil, const MAS::MagneticC
             wire = it->second;
         }
 
-        TopoDS_Shape t = TurnBuilder::buildTurn(turn, wire, bobbinPd, toroidal, wirePolygonSegments,
-                                                DEFAULT_WIRE_REVOLUTION_SEGMENTS, paintCoating);
-        if (!t.IsNull()) {
-            result.push_back(t);
-            if (outNames) {
-                const std::string& n = turn.get_name();
-                outNames->push_back(n.empty() ? ("Turn_" + std::to_string(turnIdx)) : n);
+        const std::string baseName = turn.get_name().empty()
+                                        ? ("Turn_" + std::to_string(turnIdx)) : turn.get_name();
+        auto emit = [&](bool coat, const std::string& suffix) {
+            TopoDS_Shape t = TurnBuilder::buildTurn(turn, wire, bobbinPd, toroidal, wirePolygonSegments,
+                                                    DEFAULT_WIRE_REVOLUTION_SEGMENTS, coat);
+            if (!t.IsNull()) {
+                result.push_back(t);
+                if (outNames) outNames->push_back(baseName + suffix);
             }
+        };
+        if (emitCoatingShells) {
+            emit(false, "");           // bare copper core
+            emit(true, " coating");    // outer insulated footprint -> enamel shell after fragment
+        } else {
+            emit(paintCoating, "");
         }
         ++turnIdx;
     }
@@ -489,7 +501,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                                                          int symmetryPlanes,
                                                          int wirePolygonSegments,
                                                          int corePolygonSegments,
-                                                         bool paintCoating) const {
+                                                         bool paintCoating,
+                                                         bool emitCoatingShells) const {
     // MAS 1.x makes Magnetic.core / Magnetic.coil optional, but this builder
     // requires both present. The generated getters return the optional BY VALUE,
     // so bind COPIES (not references — a reference would dangle past the temporary).
@@ -504,7 +517,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
 
         std::vector<std::string> turnNames;
         auto turnShapes = buildTurnsImpl<MAS::Coil, MAS::Wire>(
-            coil, core, &turnNames, wirePolygonSegments, paintCoating);
+            coil, core, &turnNames, wirePolygonSegments, paintCoating, emitCoatingShells);
 
         if (includeBobbin) {
             auto bobbin = buildBobbinNamed(coil, core, corePolygonSegments);
@@ -542,7 +555,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
 
     OpenMagnetics::Magnetic enriched = magnetic_autocomplete_safe(magnetic);
     return buildAllNamed(enriched, includeBobbin, symmetryPlanes,
-                         wirePolygonSegments, corePolygonSegments, paintCoating);
+                         wirePolygonSegments, corePolygonSegments, paintCoating, emitCoatingShells);
 }
 
 std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
@@ -550,13 +563,14 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                                          int symmetryPlanes,
                                                          int wirePolygonSegments,
                                                          int corePolygonSegments,
-                                                         bool paintCoating) const {
+                                                         bool paintCoating,
+                                                         bool emitCoatingShells) const {
     auto all = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
 
     // Build turns ONCE, then reuse for both bobbin-cutting and the final assembly.
     std::vector<std::string> turnNames;
     auto turnShapes = buildTurnsImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(
-        magnetic.get_coil(), magnetic.get_core(), &turnNames, wirePolygonSegments, paintCoating);
+        magnetic.get_coil(), magnetic.get_core(), &turnNames, wirePolygonSegments, paintCoating, emitCoatingShells);
 
     if (includeBobbin) {
         auto bobbin = buildBobbinNamed(magnetic.get_coil(), magnetic.get_core(), corePolygonSegments);
