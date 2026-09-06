@@ -217,17 +217,27 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
 // --segments 16 peaked at 15.1 GB and died against a 16 GB cap. This box is shared with other
 // agents' builds, and a job that takes the whole machine OOM-kills somebody else's work.
 // MVB_OCC_THREADS caps the pool; unset or <= 0 leaves OCC's default (all cores).
-static void applyOccThreadCap() {
+// FACETED GEOMETRY RUNS ITS BOOLEANS SERIALLY (2026-09-06, ABT #1111). At --segments 12 the
+// corpus crashed and hung inside OCCT's parallel boolean workers: single_switch 28 min in
+// BOPAlgo_PaveFiller::PerformEF -> Extrema_GenExtPS::BuildGrid, then (after a Common was
+// removed) SIGSEGV in NCollection_Array2::Resize from BOPAlgo_VertexFace under cut_bobbin;
+// 14_dab the same Resize crash from PerformEF. With the pool at ONE thread the same
+// single_switch run completes in 470 s. Every worker builds its own Extrema grid on the
+// faceted B-spline strips, and that is what does not fit (this file already records 14_dab
+// at 15.1 GB against a 16 GB cap at 16 segments). Exact round geometry (segments 0) keeps
+// OCC's default pool: it has run the whole corpus clean on it. MVB_OCC_THREADS overrides both.
+static void applyOccThreadCap(int segments) {
     const char* v = std::getenv("MVB_OCC_THREADS");
-    if (!v) return;
-    const int n = std::atoi(v);
+    int n = 0;
+    if (v) n = std::atoi(v);
+    else if (segments > 0) n = 1;
     if (n <= 0) return;
     OSD_ThreadPool::DefaultPool()->Init(n);
-    std::cerr << "[occ] boolean thread pool capped at " << n << " thread(s)\n";
+    std::cerr << "[occ] boolean thread pool capped at " << n << " thread(s)"
+              << (v ? " (MVB_OCC_THREADS)" : " (faceted geometry: serial booleans)") << "\n";
 }
 
 int main(int argc, char* argv[]) {
-    applyOccThreadCap();
     if (argc < 2) {
         printUsage(argv[0]);
         return 1;
@@ -280,7 +290,8 @@ int main(int argc, char* argv[]) {
             inputPath = arg;
         }
     }
-    
+    applyOccThreadCap(segments);   // after --segments: faceted geometry gets a serial pool
+
     if (inputPath.empty()) {
         std::cerr << "Error: No input file specified\n";
         printUsage(argv[0]);

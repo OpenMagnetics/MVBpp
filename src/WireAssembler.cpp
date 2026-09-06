@@ -1416,12 +1416,14 @@ static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double 
                                      std::vector<gp_Pnt>* endCapOut = nullptr,
                                      bool sharedTrusted = false,
                                      bool* startAdoptedOut = nullptr,
-                                     bool staggerAdopt = false) {
-    if (segments <= 0) return {};
+                                     bool staggerAdopt = false,
+                                     std::string* why = nullptr) {
+    auto refuse = [&](const std::string& r) { if (why) *why = r; return TopoDS_Shape(); };
+    if (segments <= 0) return refuse("segments <= 0");
     const double dS = dir.XYZ().Dot(ns), dE = dir.XYZ().Dot(ne);
     // The upstream bisector guarantee is tilt <= ~50 deg; below 0.2 the plane is close to
     // parallel to the axis and the projection blows up -- refuse and let the knife path run.
-    if (std::abs(dS) < 0.2 || std::abs(dE) < 0.2) return {};
+    if (std::abs(dS) < 0.2 || std::abs(dE) < 0.2) return refuse("cut plane too oblique (|d.n| < 0.2)");
     gp_Ax2 plane = deterministicSectionFrame(a, dir);
     const gp_Dir dx = plane.XDirection(), dy = plane.YDirection();
     const double offset = kPi / segments;
@@ -1594,9 +1596,9 @@ static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double 
         loft.AddWire(ws.Wire());
         loft.AddWire(we.Wire());
         loft.Build();
-        if (!loft.IsDone() || loft.Shape().IsNull()) return {};
+        if (!loft.IsDone() || loft.Shape().IsNull()) return refuse("loft failed");
         const TopoDS_Shape out = loft.Shape();
-        if (!BRepCheck_Analyzer(out).IsValid()) return {};
+        if (!BRepCheck_Analyzer(out).IsValid()) return refuse("loft invalid (BRepCheck)");
         // SUB-RESOLUTION SLIVER GUARD. "> 0" let through prisms whose two end planes almost
         // coincide: positive volume below what the B-Rep can represent (measured on the
         // mitre-corner toroid: 18-face solids at 0.000000 mm3, flagged DEFECTIVE by stage A).
@@ -1604,20 +1606,31 @@ static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double 
         // model's own length resolution, and the volume must be at least half of
         // section-area x span -- a true prism is exactly area x span, so half catches any
         // degenerate or folded loft without a tuned constant.
-        double spanSum = 0;
-        for (int i = 0; i < segments; ++i)
-            spanSum += (ve[i].XYZ() - vs[i].XYZ()).Dot(dir.XYZ());
+        double spanSum = 0, spanMin = std::numeric_limits<double>::max();
+        for (int i = 0; i < segments; ++i) {
+            const double sp = (ve[i].XYZ() - vs[i].XYZ()).Dot(dir.XYZ());
+            spanSum += sp;
+            spanMin = std::min(spanMin, sp);
+        }
         const double span = spanSum / segments;
-        if (span <= Precision::Confusion()) return {};
+        if (span <= Precision::Confusion()) return refuse("non-positive mean span " + std::to_string(span * 1e6) + " um");
+        // FOLDED LOFT GUARD (2026-09-05, 13_current_sense at --segments 12). When the piece is
+        // shorter than its two mitre bevels the end planes CROSS inside the section: some polygon
+        // vertices end up with a NEGATIVE axial span, the side quads between them are bow-ties,
+        // and the loft is a self-intersecting solid that BRepCheck accepts and the volume gate
+        // (mean span, total volume) cannot see -- two such pieces (15 um and 105 um long on
+        // 97 um and 490 um wires) reached the STEP as 3-self-intersection crumbs. The mean span
+        // says nothing about this; every vertex must clear its own plane.
+        if (spanMin <= Precision::Confusion()) return refuse("folded loft: min vertex span " + std::to_string(spanMin * 1e6) + " um (mean " + std::to_string(span * 1e6) + " um)");
         // Inscribed polygon area: n/2 * r^2 * sin(2 pi / n).
         const double area = 0.5 * segments * r * r * std::sin(kTwoPi / segments);
         GProp_GProps g;
         BRepGProp::VolumeProperties(out, g);
-        if (g.Mass() < 0.5 * area * span) return {};
+        if (g.Mass() < 0.5 * area * span) return refuse("volume " + std::to_string(g.Mass() * 1e9) + " mm3 < half of area x span " + std::to_string(0.5 * area * span * 1e9) + " mm3");
         if (endCapOut) *endCapOut = ve;
         return out;
-    } catch (const Standard_Failure&) {
-        return {};
+    } catch (const Standard_Failure& e) {
+        return refuse(std::string("OCCT exception: ") + (e.GetMessageString() ? e.GetMessageString() : "?"));
     }
 }
 
@@ -2433,6 +2446,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // (prism cap adoption, or pipe/arc phase continuation). An exactly shared cap is an
         // internal face -- see the weld gate below.
         bool startCapAdopted = false;
+        bool staggerHereForAudit = false;
         std::vector<Primitive> pieces = revolutionHalves(*ptrs[i]);
         // The section-wire handoff (see rawGrownSolid): the previous piece's ACTUAL end
         // section enters this piece as its start profile when the junction is tangent and
@@ -2481,6 +2495,9 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // whose green state was measured with the offer UNCONDITIONAL. The receiving piece's
         // own geometric fit check remains the only gate.
         const bool junctionEndpointExact = i > 0;
+        // Did THIS piece receive its predecessor's exact end cap? Read before the piece is built
+        // (building it overwrites prevEndCapValid for the next one). Used by the abutment gate.
+        const bool receivedCap = junctionEndpointExact && prevEndCapValid;
 
         // Pipes/revolves receiving from a LONG STRAIGHT source get the staggered offer (the
         // cap rotated half a facet about the source axis): 04_forward's corner pipes receive
@@ -2628,11 +2645,18 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                 // 3.6 r: green verbatim, 5/50 staggered). Boundary: one section circumference.
                 const bool staggerHere =
                     tangentIn && dv.Magnitude() > kTwoPi * wireRadius;
+                staggerHereForAudit = staggerHere;   // a staggered adoption is a half-facet rotation: NOT the same face
+                std::string facetWhy;
                 TopoDS_Shape prism = mitredFacetPrism(
                     A, dir, wireRadius, segments, Ps, nsx, Pe, nex,
                     (junctionEndpointExact && prevEndCapValid) ? &prevEndCap : nullptr, &endCap,
                     /*sharedTrusted=*/prevEndCapTrusted, &startCapAdopted,
-                    /*staggerAdopt=*/staggerHere);
+                    /*staggerAdopt=*/staggerHere, &facetWhy);
+                if (prism.IsNull() && std::getenv("MVB_MITRE_DIAG")) {
+                    std::cerr << "[facet-prism] '" << ptrs[i]->label << "' len " << dv.Magnitude() * 1e6
+                              << " um r " << wireRadius * 1e6 << " um bentS=" << bentS << " bentE=" << bentE
+                              << " refused (" << facetWhy << "); falling back to the swept piece + knife\n";
+                }
                 if (!prism.IsNull()) {
                     solid = prism;
                     prismDone = true;
@@ -2894,8 +2918,25 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // two pieces share one end cap, so any common volume is a construction error in one of
         // the caps, not a bridged stub. Bridged joints (angle > 1e-12, grown on purpose) stay
         // exempt.
+        // A FACETED PRISM THAT ADOPTED ITS PREDECESSOR'S CAP VERBATIM SHARES THAT FACE BY
+        // CONSTRUCTION (same vertices, same plane): there is no lens to measure. Running the
+        // Common anyway is what hung single_switch at --segments 12 (28 min inside
+        // BOPAlgo_PaveFiller::PerformEF <- BRepAlgoAPI_Common, from this very call: twelve
+        // coincident facets per joint, two frames per joint, every joint) and what crashed
+        // 14_dab (the same chain, one frame deeper, in Extrema_GenExtPS::BuildGrid). The gate
+        // stays on every joint whose caps are NOT provably the same face -- refused prisms,
+        // knife-trimmed pieces, curved sources -- which is where a lens can exist.
+        // ...and the same holds for a faceted PIPE/REVOLVE at a TANGENT joint that received the
+        // cap: the sweep starts on the neighbour's polygon (startProfileOverride), so the two
+        // caps are one face by construction. single_switch's last line before the 30-minute
+        // hang was exactly such a joint: "junction 49->50 SPIRAL->SPIRAL angle=1.4e-14 deg".
+        // Mitred (bent) joints keep the gate whatever the piece kind: their caps are cut, not
+        // handed over, and a lens there is a real defect.
+        const bool capsProvablyShared = (prismDone && startCapAdopted && !staggerHereForAudit)
+                                     || (segments > 0 && !bentS && receivedCap);
         if (i > 0 && (bentS || (angS <= 1e-12 && dpS <= 1e-9))) {
-            checkMitredAbutment(prevBuilt, solid,
+            if (capsProvablyShared) ++abutChecked;   // verdict: shared face, zero lens, by construction
+            else checkMitredAbutment(prevBuilt, solid,
                                 std::string(bentS ? "" : "tangent ") + "'" + ptrs[i - 1]->label +
                                     "' -> '" + ptrs[i]->label + "'");
         }
