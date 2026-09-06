@@ -27,10 +27,15 @@
 #include <TopoDS_Edge.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Circ.hxx>
+#include <gp_Torus.hxx>
+#include "mvb/WireAssembler.h"
 #include <gp_Dir.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
 #include <BOPAlgo_CheckerSI.hxx>
+#include <BOPAlgo_ArgumentAnalyzer.hxx>
+#include <BRep_Tool.hxx>
+#include <Geom_Surface.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
@@ -1541,4 +1546,134 @@ TEST_CASE("Real winding: a foil terminal floats on its solder film, never tangen
         ++joints;
     }
     REQUIRE(joints == 2);
+}
+
+// ABT #1111 (2026-09-06). The FEM product's periodic-face -> B-spline pass used to run in
+// buildAllNamed, in METRES; exportSTEP then scaled the poles x1000 and left the knots alone, so
+// every length-parametrised B-spline direction (a facet strip's generatrix, a planar cap) spanned
+// 1000 mm of geometry per parameter unit. BOPAlgo converts 3D tolerances to parameter space
+// through exactly that ratio and reported sporadic self-intersections on faceted revolves: 11 of
+// 38 corpus designs at --segments 12, each one clean again once rescaled to metres. The pass now
+// runs inside the exporter on the millimetre shape. This reads the written file back and checks
+// the invariant directly: no B-spline face may span more than a few millimetres of geometry per
+// parameter unit (a well-parametrised conversion spans ~1 mm/unit along a length, ~r mm/rad
+// along an angle), and every solid must pass BOPAlgo's self-intersection analysis.
+TEST_CASE("Real winding: the FEM STEP's B-splines are parametrised in the millimetres they are "
+          "written in",
+          "[realwinding][step][nurbs]") {
+    auto magneticJson = loadFixture("realwinding_e138_rectcolumn.json");  // E 13/7/4, 6 turns, 0.4 mm round
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                       /*wirePolygonSegments=*/12,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    REQUIRE_FALSE(named.empty());
+
+    const std::string path = outputPath("abt1111_e138_seg12_fem.step");
+    mvb::StepExportOptions opts;
+    opts.nurbsPeriodicSolids = true;
+    REQUIRE(mvb::exportSTEP(named, path, opts));
+
+    const auto back = mvb::importSTEP(path);
+    REQUIRE_FALSE(back.empty());
+    int bsplineFaces = 0, periodicFaces = 0, solids = 0, faulty = 0;
+    double worstMmPerUnit = 0.0;
+    std::string worstFace;
+    for (const auto& ns : back) {
+        for (TopExp_Explorer se(ns.shape, TopAbs_SOLID); se.More(); se.Next(), ++solids) {
+            int fidx = 0;
+            for (TopExp_Explorer fe(se.Current(), TopAbs_FACE); fe.More(); fe.Next(), ++fidx) {
+                const TopoDS_Face f = TopoDS::Face(fe.Current());
+                Handle(Geom_Surface) srf = BRep_Tool::Surface(f);
+                if (!srf.IsNull() && (srf->IsUPeriodic() || srf->IsVPeriodic())) ++periodicFaces;
+                BRepAdaptor_Surface ad(f, false);
+                if (ad.GetType() != GeomAbs_BSplineSurface) continue;
+                ++bsplineFaces;
+                // Resolution(1 mm) is the parameter step that moves the surface by 1 mm, i.e.
+                // 1 / (mm per parameter unit). Metre-scale knots under mm poles give 1e-3.
+                for (double res : {ad.UResolution(1.0), ad.VResolution(1.0)}) {
+                    if (!(res > 0.0)) continue;
+                    const double mmPerUnit = 1.0 / res;
+                    if (mmPerUnit > worstMmPerUnit) {
+                        worstMmPerUnit = mmPerUnit;
+                        worstFace = ns.name + " solid " + std::to_string(solids) + " face " +
+                                    std::to_string(fidx);
+                    }
+                }
+            }
+            BOPAlgo_ArgumentAnalyzer an;
+            an.SetShape1(se.Current());
+            an.SelfInterMode() = Standard_True;
+            an.ArgumentTypeMode() = Standard_False;
+            an.Perform();
+            if (an.HasFaulty()) ++faulty;
+        }
+    }
+    INFO("solids " << solids << ", B-spline faces " << bsplineFaces << ", periodic faces left "
+                   << periodicFaces << ", worst parametrisation " << worstMmPerUnit
+                   << " mm per parameter unit at " << worstFace);
+    // The design carries faceted revolves at 12 segments, so the pass had something to convert.
+    REQUIRE(bsplineFaces > 0);
+    CHECK(periodicFaces == 0);
+    // Length-parametrised directions span ~1 mm/unit, angles ~r mm/rad (r < 1 mm here). The
+    // metre-frame conversion this guards against sits at 1000.
+    CHECK(worstMmPerUnit < 20.0);
+    CHECK(faulty == 0);
+    std::filesystem::remove(path);
+}
+
+// ABT #1111 (2026-09-06): in faceted mode an arc bent tighter than kFacetTightArcExactRatio wire
+// radii is revolved on the exact round profile (a torus), because the 12-gon's innermost facet
+// strip on such a piece is micrometres long and BOPAlgo rejects it. The in-memory FEM product
+// keeps its analytic surfaces (the B-spline re-expression happens in the exporter), so the rule
+// is visible directly: the winding must contain tori, every one of them tighter than the ratio,
+// and each with the wire's own minor radius.
+TEST_CASE("Real winding: faceted mode revolves tight arcs exactly, and only tight arcs",
+          "[realwinding][tightarc]") {
+    // A toroid: its window corners are ARC3 pieces bent at kRoundCornerBendFactor (1.05 r), the
+    // tightest arcs the assembler emits. (A rect-column design's corners are pitched SPIRALs and
+    // would exercise nothing here.)
+    auto magneticJson = loadFixture("realwinding_toroid.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                       /*wirePolygonSegments=*/12,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    REQUIRE_FALSE(named.empty());
+
+    int tori = 0, loose = 0;
+    double minorMin = 1e300, minorMax = 0.0, ratioMax = 0.0;
+    for (const auto& ns : named) {
+        if (ns.name.find(" parallel ") == std::string::npos || ns.name.find(" terminal ") != std::string::npos)
+            continue;
+        for (TopExp_Explorer fe(ns.shape, TopAbs_FACE); fe.More(); fe.Next()) {
+            BRepAdaptor_Surface ad(TopoDS::Face(fe.Current()), false);
+            if (ad.GetType() != GeomAbs_Torus) continue;
+            ++tori;
+            const gp_Torus t = ad.Torus();
+            const double ratio = t.MajorRadius() / t.MinorRadius();
+            ratioMax = std::max(ratioMax, ratio);
+            minorMin = std::min(minorMin, t.MinorRadius());
+            minorMax = std::max(minorMax, t.MinorRadius());
+            if (ratio >= mvb::kFacetTightArcExactRatio) ++loose;
+        }
+    }
+    INFO("torus faces " << tori << ", tightest-to-loosest bend ratio max " << ratioMax
+                        << ", minor radius " << minorMin * 1e6 << ".." << minorMax * 1e6 << " um");
+    // The terminal-corner fillets sit at 1.05 r, so the rule must have fired somewhere...
+    CHECK(tori > 0);
+    // ...and nowhere else: a faceted design has no other reason to carry a torus.
+    CHECK(loose == 0);
+    // The revolve is of the wire itself: one radius for every torus, and a wire-sized one.
+    CHECK(minorMax - minorMin < 1e-9);
+    CHECK(minorMin > 0.05e-3);
+    CHECK(minorMax < 1.0e-3);
 }

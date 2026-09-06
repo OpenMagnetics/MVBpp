@@ -967,7 +967,15 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         // the axis. Nothing here checked it, and the result is copper that is BRepCheck-VALID,
         // watertight and overlap-clean while being BOPAlgo SELF-INTERSECTING (ABT #958:
         // 02_flyback ships 42 such chunks, exactly one per turn of Primary parallel 0).
-        if (std::getenv("MVB_TIGHTARC_DIAG") && radius <= r * 2.0) {
+        // MVB_TIGHTARC_DIAG=<ratio> widens the report to every arc below that bend ratio
+        // (any non-numeric value keeps the historical 2.0).
+        const double tightReportRatio = [] {
+            const char* v = std::getenv("MVB_TIGHTARC_DIAG");
+            if (!v) return 0.0;
+            const double f = std::atof(v);
+            return f > 0.0 ? f : 2.0;
+        }();
+        if (tightReportRatio > 0.0 && radius <= r * tightReportRatio) {
             std::fprintf(stderr,
                 "[tight-arc] '%s' radius=%.6f mm wireR=%.6f mm ratio=%.3f sweep=%.4f deg "
                 "arclen=%.6f mm%s\n",
@@ -1010,6 +1018,16 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
             if (startPhasedOut) *startPhasedOut = true;
         } else if (segments > 0) {
             profWire = wireProfileWire(start, gp_Dir(tangent), r, segments);
+        }
+        // Tight arcs are revolved exactly even in faceted mode -- see kFacetTightArcExactRatio.
+        // The exact piece carries no polygon phase, so a neighbour cannot adopt one from it.
+        if (!profWire.IsNull() && radius < kFacetTightArcExactRatio * r) {
+            if (std::getenv("MVB_MITRE_DIAG"))
+                std::cerr << "[tight-arc] '" << pr.label << "' bend " << radius * 1e6 << " um < "
+                          << kFacetTightArcExactRatio << " x r (" << r * 1e6
+                          << " um): exact round revolve\n";
+            profWire.Nullify();
+            if (startPhasedOut) *startPhasedOut = false;
         }
         TopoDS_Face prof =
             !profWire.IsNull()

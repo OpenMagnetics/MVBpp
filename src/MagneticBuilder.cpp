@@ -28,12 +28,9 @@
 #include <GeomAbs_JoinType.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
-#include <BRepBuilderAPI_NurbsConvert.hxx>
 #include <BRepCheck_Analyzer.hxx>
-#include <Precision.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS.hxx>
-#include <Geom_Surface.hxx>
 #include <BRep_Tool.hxx>
 #include <Standard_Failure.hxx>
 #include <iostream>
@@ -147,7 +144,8 @@ static void patchBobbinDimensions(MAS::CoreBobbinProcessedDescription& bobbinPd,
 static std::string drawMagneticCommon(const std::vector<NamedShape>& named,
                                       const std::string& outputPath,
                                       const std::string& format,
-                                      double scale) {
+                                      double scale,
+                                      bool femReady) {
     // ABT #685: keep the NamedShapes WHOLE. Splitting them into parallel {shape, name}
     // vectors and calling the shapes+names overload silently dropped `partNames`, so every
     // STEP written through drawMagnetic (i.e. everything the CLI and the bindings produce)
@@ -184,7 +182,9 @@ static std::string drawMagneticCommon(const std::vector<NamedShape>& named,
         return out.string();
     }
     out /= "magnetic.step";
-    exportSTEP(scaled, out.string());
+    StepExportOptions opts;
+    opts.nurbsPeriodicSolids = femReady;
+    exportSTEP(scaled, out.string(), opts);
     return out.string();
 }
 
@@ -209,7 +209,7 @@ std::string MagneticBuilder::drawMagnetic(const MAS::Magnetic& magnetic,
                                cfg.paintCoating, /*emitCoatingShells=*/false,
                                /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
                                cfg.useRealWindingGeometry, cfg.femReady);
-    return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale);
+    return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale, cfg.femReady);
 }
 
 std::string MagneticBuilder::drawMagnetic(const OpenMagnetics::Magnetic& magnetic,
@@ -233,7 +233,7 @@ std::string MagneticBuilder::drawMagnetic(const OpenMagnetics::Magnetic& magneti
                                cfg.paintCoating, /*emitCoatingShells=*/false,
                                /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
                                cfg.useRealWindingGeometry, cfg.femReady);
-    return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale);
+    return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale, cfg.femReady);
 }
 
 namespace {
@@ -984,120 +984,13 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     if (isToroidal)
         for (auto& ns : all) ns.shape = rotate_shape(ns.shape, -std::numbers::pi / 2.0, 0.0, 0.0);
 
-    // FEM product only: re-express every surface as a B-spline (ABT #490 class, 2026-08-25).
-    //
-    // gmsh decides whether to send a face to its markedly more fragile periodic mesher by
-    // reading the UNDERLYING SURFACE, not the face -- OCCFace.cpp:142,
-    //   _periodic[0] = surface.IsUPeriodic();
-    // so a 60-degree panel of a cylinder, or a 20-degree slice of a torus, is treated exactly
-    // like a full closed one and routed to meshGeneratorPeriodic. That path produced 16 of the
-    // 23 corpus mesh failures measured on 2026-08-24 ("Impossible to mesh periodic surface" x6
-    // and "The 1D mesh seems not to be forming a closed loop" x10, both raised inside it).
-    // Round wire is nothing but cylinders, tori and swept pipes, so nearly every conductor face
-    // took it: 3938 cylinder + 1342 torus faces across the 30-design corpus.
-    //
-    // A conic IS exactly representable as a rational B-spline, so this conversion MOVES NO
-    // POINT -- it is not a tolerance-based approximation and not a geometry change. It simply
-    // drops the periodicity flag on faces that do not actually wrap, which is every conductor
-    // face once the section is faceted. Measured: 03_buck 20 -> 0 periodic surfaces (226 faces
-    // unchanged), 05_pfc toroid 2668 -> 0 (7288 faces unchanged), and both stay BRepCheck-valid.
-    //
-    // Deliberately NOT applied to the drawing product: exact analytic surfaces are smaller and
-    // render better, and a viewer never meets gmsh. MVB_NO_NURBS=1 disables it for comparison.
-    if (femReady && !std::getenv("MVB_NO_NURBS")) {
-        for (auto& ns : all) {
-            if (ns.shape.IsNull()) continue;
-            // ONLY SOLIDS THAT ACTUALLY CARRY A PERIODIC FACE -- per SOLID, not per part.
-            // NurbsConvert rewrites EVERY surface, so run unconditionally it re-expressed 9579
-            // PLANAR faces of the faceted 14_dab as B-splines -- planes are never periodic, so
-            // that bought nothing and made every downstream boolean heavier and hungrier (a
-            // faceted design went 29 s -> 608 s). Per-PART gating was still too coarse: one
-            // periodic lead pipe condemned every all-planar prism in the conductor to bspline
-            // re-expression, and two abutting prisms' independently converted caps are what the
-            // fragment then imprints as nm slivers and folded facets (10_emi's trimmed riser
-            // PLC-failed ALONE; 12_boost's 32 fragment micro-edges). A planar solid stays
-            // analytic: its junction caps remain the same exact planes as its neighbour's.
-            auto hasPeriodicFace = [](const TopoDS_Shape& s) {
-                for (TopExp_Explorer fx(s, TopAbs_FACE); fx.More(); fx.Next()) {
-                    Handle(Geom_Surface) srf = BRep_Tool::Surface(TopoDS::Face(fx.Current()));
-                    if (!srf.IsNull() && (srf->IsUPeriodic() || srf->IsVPeriodic())) return true;
-                }
-                return false;
-            };
-            if (!hasPeriodicFace(ns.shape)) continue;
-            const bool wasValid = BRepCheck_Analyzer(ns.shape).IsValid();
-            try {
-                // Rebuild the part solid-by-solid, converting only the periodic-carrying ones.
-                TopoDS_Shape out;
-                if (ns.shape.ShapeType() == TopAbs_COMPOUND) {
-                    TopoDS_Compound rebuilt;
-                    BRep_Builder rb;
-                    rb.MakeCompound(rebuilt);
-                    for (TopoDS_Iterator it(ns.shape); it.More(); it.Next()) {
-                        const TopoDS_Shape& child = it.Value();
-                        if (hasPeriodicFace(child)) {
-                            BRepBuilderAPI_NurbsConvert cc(child, /*Copy=*/Standard_True);
-                            rb.Add(rebuilt, cc.Shape().IsNull() ? child : cc.Shape());
-                        } else {
-                            rb.Add(rebuilt, child);
-                        }
-                    }
-                    out = rebuilt;
-                } else {
-                    BRepBuilderAPI_NurbsConvert conv(ns.shape, /*Copy=*/Standard_True);
-                    out = conv.Shape();
-                }
-                if (out.IsNull()) continue;
-                // Conversion is exact, so both volume and validity must survive it. Anything
-                // else is OCC damage, not a representation change -- keep the original and say
-                // so rather than shipping a silently degraded solid.
-                // ADAPTIVE integration on BOTH sides. The default VolumeProperties integrates an
-                // analytic face exactly and a B-spline face by fixed-order quadrature, so
-                // comparing the two measures the INTEGRATION SCHEME, not the geometry: every part
-                // came back ~0.17% "changed" (Core_0 84412.6 -> 84555.4 mm3) and was reverted,
-                // which silently disabled this whole pass. The Eps overload refines until the
-                // requested relative accuracy is met, so both numbers describe the same solid.
-                // Judge the difference against the INTEGRATOR'S OWN reported accuracy, not a
-                // chosen threshold. VolumeProperties(.., Eps) returns the relative error it
-                // actually achieved; a difference inside the sum of the two reported errors says
-                // nothing about the geometry, only about the quadrature. This is what makes the
-                // test honest on both sides: analytic faces integrate almost exactly while
-                // B-spline faces do not, so a fixed tolerance either reverts everything (1e-6 did)
-                // or waves real changes through.
-                GProp_GProps g0, g1;
-                const double eps = 1e-7;
-                const double err0 = std::abs(BRepGProp::VolumeProperties(ns.shape, g0, eps));
-                const double err1 = std::abs(BRepGProp::VolumeProperties(out, g1, eps));
-                const double v0 = std::abs(g0.Mass());
-                // Two uncertainties, both physical, whichever is larger. (1) the integrators'
-                // own reported error; (2) what the B-Rep can even express: every face is located
-                // only to within the shape tolerance, so the volume is defined only to about
-                // tolerance x surface area. A difference below that is not a geometry change, it
-                // is the model's own resolution.
-                GProp_GProps sp;
-                BRepGProp::SurfaceProperties(ns.shape, sp);
-                const double brepTol = Precision::Confusion() * std::abs(sp.Mass());
-                const double noise = std::max((err0 + err1) * v0, brepTol);
-                if (v0 > 0 && std::abs(g1.Mass() - v0) > noise) {
-                    std::cerr << "[nurbs] '" << ns.name << "' volume changed "
-                              << g0.Mass() * 1e9 << " -> " << g1.Mass() * 1e9
-                              << " mm3 (beyond the model's own " << noise * 1e9
-                              << " mm3); keeping the analytic surfaces\n";
-                    continue;
-                }
-                if (wasValid && !BRepCheck_Analyzer(out).IsValid()) {
-                    std::cerr << "[nurbs] '" << ns.name
-                              << "' conversion produced an invalid solid; keeping the analytic"
-                                 " surfaces\n";
-                    continue;
-                }
-                ns.shape = out;
-            } catch (const Standard_Failure& e) {
-                std::cerr << "[nurbs] '" << ns.name << "' conversion threw ("
-                          << e.GetMessageString() << "); keeping the analytic surfaces\n";
-            }
-        }
-    }
+    // FEM product: the periodic-surface -> B-spline re-expression (ABT #490 class) is NOT done
+    // here any more. It has to run in the frame the STEP is written in, so it lives in
+    // exportSTEP (StepExportOptions::nurbsPeriodicSolids), which every FEM consumer goes
+    // through. Converting here, in metres, and scaling x1000 at export left every
+    // length-parametrised B-spline (facet strips, caps) with knots 1000x too compressed for its
+    // geometry: BOPAlgo then reported sporadic self-intersections on faceted revolves (ABT #1111
+    // -- 11 of 38 designs at --segments 12; the same solids are clean rescaled to metres).
 
     return apply_symmetry(std::move(all), symmetryPlanes);
 }

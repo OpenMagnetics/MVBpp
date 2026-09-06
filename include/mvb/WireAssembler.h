@@ -48,6 +48,16 @@ constexpr double kMaxSagFraction = 0.02;
 // choke, a 1.5 factor put the poloidal corner 0.5 * wireRadius = 219 um into the entrance
 // lead's corridor and the router (correctly) refused the design.
 constexpr double kRoundCornerBendFactor = 1.05;
+// FACETED MODE ONLY (segments > 0): an arc bent tighter than this many wire radii is revolved
+// on the EXACT round profile, not the polygon (ABT #1111, 2026-09-06; Alf's call: "do option
+// 1"). A 12-gon revolved about an axis 1.05 r away puts its innermost facet ~0.08 r from the
+// axis; on a short remainder arc (the terminal fillet's 5-degree third piece) that strip is
+// under 2 um long and BOPAlgo reports too-small edges and self-intersections -- real
+// micro-geometry, faulty at any scale (single_switch Reset Winding solid 4), unlike the
+// parametrisation defect the exporter now fixes. The torus of the same arc has no strip. 1.5
+// covers every corner fillet and toroid window corner (1.05-1.15 r); the bump-riser biarcs sit
+// at 9-140 r and stay faceted.
+constexpr double kFacetTightArcExactRatio = 1.5;
 // The measurement's own error bound: a sampled polyline lies within this sag of the true
 // curve, so a measured polyline-polyline distance can under-read the true centreline
 // distance by at most the two prims' sag bounds. Derived from the sampling rule actually

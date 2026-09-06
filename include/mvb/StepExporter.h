@@ -15,6 +15,20 @@ namespace mvb {
 bool exportSTEP(const std::vector<NamedShape>& shapes,
                 const std::string& filepath);
 
+struct StepExportOptions {
+    // FEM product only (ABT #490 class): re-express every solid that carries a PERIODIC surface
+    // (cylinder, cone, torus, surface of revolution) as B-splines, so gmsh does not route its
+    // faces to the periodic mesher. Done HERE, on the millimetre geometry the file is written in:
+    // a B-spline converted in metres and scaled x1000 keeps metre-scale knots under mm-scale
+    // poles, and BOPAlgo then finds sporadic self-intersections on faceted revolves (ABT #1111).
+    // The conversion is exact (a conic is a rational B-spline); it moves no point.
+    bool nurbsPeriodicSolids = false;
+};
+
+bool exportSTEP(const std::vector<NamedShape>& shapes,
+                const std::string& filepath,
+                const StepExportOptions& options);
+
 // Legacy overload — pairs shapes and names positionally, delegates to the
 // NamedShape overload. Kept so existing callers compile; new code should
 // use NamedShape directly.
