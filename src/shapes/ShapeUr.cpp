@@ -1,3 +1,4 @@
+#include <stdexcept>
 #include "mvb/shapes/ShapeUr.h"
 #include "mvb/Utils.h"
 #include <BRepBuilderAPI_MakePolygon.hxx>
@@ -160,7 +161,8 @@ TopoDS_Shape ShapeUr::applyMachining(const TopoDS_Shape& piece,
         if (tool.IsNull()) return piece;
 
         BRepAlgoAPI_Cut cutter(piece, tool);
-        return cutter.IsDone() ? cutter.Shape() : piece;
+        if (!cutter.IsDone()) throw std::runtime_error("applyMachining: the gap cut did not complete (OCCT boolean failed) at x=" + std::to_string(coords[0]) + " y=" + std::to_string(coords[1]) + " length=" + std::to_string(gapLength));
+    return cutter.Shape();
     }
 
     // Lateral-column gap: rectangular box across the lateral column.
@@ -172,7 +174,8 @@ TopoDS_Shape ShapeUr::applyMachining(const TopoDS_Shape& piece,
     TopoDS_Shape tool = makeBox(h, gapLength, c);
     tool = translate_shape(tool, xCoord, yCoord, 0.0);
     BRepAlgoAPI_Cut cutter(piece, tool);
-    return cutter.IsDone() ? cutter.Shape() : piece;
+    if (!cutter.IsDone()) throw std::runtime_error("applyMachining: the gap cut did not complete (OCCT boolean failed) at x=" + std::to_string(coords[0]) + " y=" + std::to_string(coords[1]) + " length=" + std::to_string(gapLength));
+    return cutter.Shape();
 }
 
 } // namespace shapes

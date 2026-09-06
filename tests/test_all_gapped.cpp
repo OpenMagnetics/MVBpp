@@ -171,3 +171,63 @@ TEST_CASE("All shapes build with additive gapping",
     });
     run_gap_test("additive_gapping", gapping, 1);
 }
+
+// EVERY SUBTRACTIVE GAP MUST CUT. Found 2026-09-05 on the OMFEM 3D pipeline with 00_debug
+// (PQ 20/16, one turn, three 5 um residual gaps retyped to subtractive so the FEM sees them):
+// ShapeP::applyMachining -- which PQ, RM and PM inherit -- returned the piece untouched for any
+// side-column machining ("no outer column to cut"), and MagneticBuilder accepted a cut that
+// removed nothing. The core reached the mesher gapped on the centre post only and the 3D
+// inductance read +82% against MKF; the fault was chased through the mesher and the solver
+// before the geometry was checked. This test builds the same core and asks the only question
+// that matters: did each machining remove material?
+//   - centre gap alone must remove ~ (column area) x gap
+//   - all three must remove strictly more than the centre alone
+// and MagneticBuilder now throws on a cut that removes nothing, so a regression fails loudly
+// either way.
+TEST_CASE("PQ 20/16: a subtractive gap on each leg is machined, not just the centre post",
+          "[shapes][gapping][sidegap][abt-omfem-00debug]") {
+    std::ifstream f(std::string(MAS_DATA_DIR) + "/core_shapes.ndjson");
+    REQUIRE(f.is_open());
+    json pq;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        json shape = json::parse(line, nullptr, false);
+        if (!shape.is_discarded() && shape.value("name", "") == "PQ 20/16") { pq = shape; break; }
+    }
+    REQUIRE(!pq.is_null());
+    mvb::patch_dimension_nominals(pq);
+
+    const double gap = 5e-6;
+    // The gap layout MKF itself emits for an all-legs ground core: one per column, with
+    // coordinates (00_debug's gapping, retyped).
+    json all = json::array({
+        {{"length", gap}, {"type", "subtractive"}, {"coordinates", {0.0, 0.0, 0.0}}, {"shape", "round"},
+         {"area", 6.0821e-05}, {"sectionDimensions", {0.0088, 0.0088}},
+         {"distanceClosestNormalSurface", 0.0051475}, {"distanceClosestParallelSurface", 0.0046}},
+        {{"length", gap}, {"type", "subtractive"}, {"coordinates", {0.010122107, 0.0, 0.0}}, {"shape", "irregular"},
+         {"area", 3.1419e-05}, {"sectionDimensions", {0.002244214, 0.014}},
+         {"distanceClosestNormalSurface", 0.0051475}, {"distanceClosestParallelSurface", 0.0046}},
+        {{"length", gap}, {"type", "subtractive"}, {"coordinates", {-0.010122107, 0.0, 0.0}}, {"shape", "irregular"},
+         {"area", 3.1419e-05}, {"sectionDimensions", {0.002244214, 0.014}},
+         {"distanceClosestNormalSurface", 0.0051475}, {"distanceClosestParallelSurface", 0.0046}},
+    });
+    json centreOnly = json::array({all[0]});
+    json none = json::array();
+
+    auto vNone = build_with_gapping(pq, none);
+    auto vCentre = build_with_gapping(pq, centreOnly);
+    auto vAll = build_with_gapping(pq, all);
+    INFO("ungapped: " << vNone.error << " centre: " << vCentre.error << " all: " << vAll.error);
+    REQUIRE(vNone.ok); REQUIRE(vCentre.ok); REQUIRE(vAll.ok);
+
+    const double removedCentre = vNone.volume - vCentre.volume;   // both halves
+    const double removedAll = vNone.volume - vAll.volume;
+    INFO("removed by the centre gap: " << removedCentre * 1e9 << " mm3, by all three: " << removedAll * 1e9 << " mm3");
+    // centre column: F = 8.8 mm round -> 60.8 mm2 x 5 um (2.5 um per half, two halves) ~ 0.30 mm3;
+    // the 12-segment polygon column is a little smaller than the circle.
+    CHECK(removedCentre > 0.25e-9);
+    CHECK(removedCentre < 0.35e-9);
+    // the two legs add ~ 2 x 31.4 mm2 x 5 um ~ 0.31 mm3 -- at least half of that must be there
+    CHECK(removedAll - removedCentre > 0.15e-9);
+}

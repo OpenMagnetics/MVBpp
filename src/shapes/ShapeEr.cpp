@@ -1,3 +1,4 @@
+#include <stdexcept>
 #include "mvb/shapes/ShapeEr.h"
 #include "mvb/Utils.h"
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -86,7 +87,8 @@ TopoDS_Shape ShapeEr::applyMachining(const TopoDS_Shape& piece,
         if (tool.IsNull()) return piece;
 
         BRepAlgoAPI_Cut cutter(piece, tool);
-        return cutter.IsDone() ? cutter.Shape() : piece;
+        if (!cutter.IsDone()) throw std::runtime_error("applyMachining: the gap cut did not complete (OCCT boolean failed) at x=" + std::to_string(coords[0]) + " y=" + std::to_string(coords[1]) + " length=" + std::to_string(gapLength));
+    return cutter.Shape();
     }
 
     // Side columns: use generic rectangular tool from base class

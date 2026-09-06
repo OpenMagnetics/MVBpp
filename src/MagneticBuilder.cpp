@@ -1,4 +1,6 @@
 #include "mvb/MagneticBuilder.h"
+#include <cstdio>
+#include <cstdlib>
 #include "mvb/StepExporter.h"
 #include "mvb/Symmetry.h"
 #include "mvb/Utils.h"
@@ -281,13 +283,35 @@ std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
             shape = rotate_shape(shape, (*rotOpt)[0], (*rotOpt)[1], (*rotOpt)[2]);
         }
 
-        // Apply machining after rotation. Wrap each cut so that an
-        // OCCT/std failure on one column doesn't abort the whole core —
-        // the un-gapped shape is a strictly-better fallback than no shape.
+        // Apply machining after rotation. EVERY cut must remove material. This used to say the
+        // un-gapped shape was "a strictly-better fallback than no shape" -- it is the opposite:
+        // a gap that silently is not there makes the FEM report the gapless inductance with no
+        // sign anything is wrong (00_debug, 2026-09-05: +82% against MKF, chased for hours
+        // through the mesher and the solver before the core turned out to be uncut). A boolean
+        // that fails throws inside applyMachining; a boolean that "succeeds" without touching
+        // the piece (tool placed off the column) is caught here by the volume.
         auto machiningOpt = piece.get_machining();
         if (machiningOpt) {
             for (const auto& mach : *machiningOpt) {
+                GProp_GProps before, after;
+                BRepGProp::VolumeProperties(shape, before);
                 shape = builder->applyMachining(shape, mach, dims);
+                BRepGProp::VolumeProperties(shape, after);
+                const double removed = before.Mass() - after.Mass();
+                const auto& mc = mach.get_coordinates();
+                if (std::getenv("MVB_CORE_DIAG"))
+                    std::fprintf(stderr, "[machining] '%s' gap %.4g mm at (%.4g, %.4g) mm: removed %.5f mm3 (piece %.4f -> %.4f mm3)\n",
+                                 shapeData->get_name().value_or(std::string("?")).c_str(), mach.get_length() * 1e3,
+                                 mc.size() > 0 ? mc[0] * 1e3 : 0.0, mc.size() > 1 ? mc[1] * 1e3 : 0.0,
+                                 removed * 1e9, before.Mass() * 1e9, after.Mass() * 1e9);
+                if (std::abs(mach.get_length()) > 1e-12 && !(removed > 1e-6 * before.Mass())) {
+                    throw std::runtime_error("core machining removed nothing: gap length " +
+                        std::to_string(mach.get_length() * 1e3) + " mm at (" +
+                        (mc.size() > 0 ? std::to_string(mc[0] * 1e3) : std::string("?")) + ", " +
+                        (mc.size() > 1 ? std::to_string(mc[1] * 1e3) : std::string("?")) + ") mm on '" +
+                        shapeData->get_name().value_or(std::string("?")) + "' -- the tool missed the column (piece volume " +
+                        std::to_string(before.Mass() * 1e9) + " -> " + std::to_string(after.Mass() * 1e9) + " mm3)");
+                }
             }
         }
 

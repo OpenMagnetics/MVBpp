@@ -1,3 +1,4 @@
+#include <stdexcept>
 #include "mvb/shapes/ShapeEp.h"
 #include "mvb/Utils.h"
 #include <BRepBuilderAPI_MakePolygon.hxx>
@@ -103,7 +104,8 @@ TopoDS_Shape ShapeEp::applyMachining(const TopoDS_Shape& piece,
     TopoDS_Shape tool = makeBox(f, gapLength, f);         // F (width) x gap x F (round depth)
     tool = translate_shape(tool, 0.0, coords[1], 0.0);
     BRepAlgoAPI_Cut cutter(piece, tool);
-    return cutter.IsDone() ? cutter.Shape() : piece;
+    if (!cutter.IsDone()) throw std::runtime_error("applyMachining: the gap cut did not complete (OCCT boolean failed) at x=" + std::to_string(coords[0]) + " y=" + std::to_string(coords[1]) + " length=" + std::to_string(gapLength));
+    return cutter.Shape();
 }
 
 TopoDS_Shape ShapeEp::applyExtras(const std::map<std::string, double>& dims,
