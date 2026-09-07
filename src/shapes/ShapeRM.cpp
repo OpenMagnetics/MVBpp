@@ -9,6 +9,7 @@
 #include <BRepAlgoAPI_Cut.hxx>
 #include <gp_Pnt.hxx>
 #include <cmath>
+#include <stdexcept>
 #include <numbers>
 
 namespace mvb {
@@ -19,21 +20,29 @@ namespace shapes {
 // Then a donut-shaped winding window (E/2 outer, F/2 inner, height D) is cut
 // at the top. Optional central H hole through the full height.
 TopoDS_Shape ShapeRM::buildPiece(const MAS::CoreShape& shapeData) const {
+    const std::string shapeName = shapeData.get_name().value_or("RM");
     auto dimsOpt = shapeData.get_dimensions();
-    if (!dimsOpt) return TopoDS_Shape();
+    if (!dimsOpt) {
+        throw std::runtime_error("shape '" + shapeName + "' carries no dimensions at all");
+    }
     auto dims = flatten_dimensions(*dimsOpt);
 
-    double a = 0.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0, g = 0.0, h = 0.0, j = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) a = it->second / 2.0;
-    it = dims.find("B"); if (it != dims.end()) b = it->second;
-    it = dims.find("C"); if (it != dims.end()) c = it->second / 2.0;
-    it = dims.find("D"); if (it != dims.end()) d = it->second;
-    it = dims.find("E"); if (it != dims.end()) e = it->second / 2.0;
-    it = dims.find("F"); if (it != dims.end()) f = it->second / 2.0;
-    it = dims.find("G"); if (it != dims.end()) g = it->second / 2.0;
-    it = dims.find("H"); if (it != dims.end()) h = it->second / 2.0;
-    it = dims.find("J"); if (it != dims.end()) j = it->second;
-    if (b == 0.0) return TopoDS_Shape();
+    // Every one of these is load-bearing for the profile. Defaulting an absent
+    // one to zero builds a degenerate solid instead of reporting the data gap
+    // (ABT #1126): RM 7LP had no C and was extruded with zero half-depth.
+    const double a = require_dimension(dims, "A", shapeName) / 2.0;
+    const double b = require_dimension(dims, "B", shapeName);
+    const double c = require_dimension(dims, "C", shapeName) / 2.0;
+    const double d = require_dimension(dims, "D", shapeName);
+    const double e = require_dimension(dims, "E", shapeName) / 2.0;
+    const double f = require_dimension(dims, "F", shapeName) / 2.0;
+    const double g = require_dimension(dims, "G", shapeName) / 2.0;
+    const double j = require_dimension(dims, "J", shapeName);
+
+    // H is the optional centre hole: the /I and LP variants have none.
+    double h = 0.0;
+    auto it = dims.find("H");
+    if (it != dims.end()) h = it->second / 2.0;
 
     std::string familySubtype = shapeData.get_family_subtype().value_or("1");
 

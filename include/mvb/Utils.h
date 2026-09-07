@@ -58,6 +58,16 @@ double flatten_dimension(const MAS::Dimension& dim);
 // Extract all nominal dimensions from a shape dimension map
 std::map<std::string, double> flatten_dimensions(const std::map<std::string, MAS::Dimension>& dims);
 
+// The value of a dimension the profile cannot be built without.
+//
+// A dimension that silently defaults to zero does not fail: it extrudes a
+// degenerate solid that reads as a modelling bug rather than the data gap it
+// is. RM 7LP shipped for years with no C and rendered as a mangled polyhedron
+// (ABT #1126). Throws naming the shape and the dimension.
+double require_dimension(const std::map<std::string, double>& dims,
+                         const std::string& key,
+                         const std::string& shapeName);
+
 // Build a polygon-approximated circle wire in the XY plane centered at origin
 // segments = 0 yields a perfect BRep circle edge.
 //
