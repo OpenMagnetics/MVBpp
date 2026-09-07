@@ -44,6 +44,29 @@ namespace mvb {
 
 using json = nlohmann::json;
 
+// The coating thickness to DRAW, resolved from the MAS the caller handed in.
+//
+// Only a coating the design actually declares is drawn. MKF's Core::get_coating_thickness()
+// also invents a default jacket for an uncoated toroid -- correct for the dielectric path it
+// exists for (a bare-ferrite toroid wound with bare wire is rare), but drawing that would put
+// a shell on every toroid in every consumer, including designs whose author never mentioned a
+// coating. So the PRESENCE of the layer is decided here, from functionalDescription.coating,
+// while its THICKNESS is still resolved by MKF -- which is what turns the name-only form
+// ("epoxy") into a datasheet number, and what nothing here should be re-deriving.
+//
+// MAGNETIC_EPOXY is not this kind of coating: it is the powder-loaded shield cap moulded over
+// the winding of a semishielded drum, drawn separately (and translucently) by drawCoreShell.
+// Same exclusion StrayCapacitance::resolve_core_jacket makes, for the same reason.
+static double declaredCoreCoatingThickness(const MAS::MagneticCore& masCore) {
+    const auto coating = masCore.get_functional_description().get_coating();
+    if (!coating) return 0.0;
+    if (std::holds_alternative<MAS::CoreCoating>(coating.value())) {
+        const auto type = std::get<MAS::CoreCoating>(coating.value()).get_type();
+        if (type && type.value() == MAS::CoatingType::MAGNETIC_EPOXY) return 0.0;
+    }
+    return OpenMagnetics::Core(masCore).get_coating_thickness();
+}
+
 // Build the core's insulating COATING (epoxy/parylene/etc., MAS CoreCoating) as a real conformal
 // SHELL solid: offset the core surface outward by the coating thickness and subtract the core, so
 // the result is a uniform-thickness layer wrapping the whole core (outer/inner/top/bottom). Returns
@@ -205,7 +228,8 @@ std::string MagneticBuilder::drawMagnetic(const MAS::Magnetic& magnetic,
     auto named = buildAllNamed(magnetic, cfg.includeBobbin, cfg.symmetryPlanes,
                                cfg.wirePolygonSegments, cfg.corePolygonSegments,
                                cfg.paintCoating, /*emitCoatingShells=*/false,
-                               /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                               /*includeInsulation=*/false,
+                               magnetic.get_core() ? declaredCoreCoatingThickness(magnetic.get_core().value()) : 0.0,
                                cfg.useRealWindingGeometry, cfg.femReady);
     return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale);
 }
@@ -229,7 +253,8 @@ std::string MagneticBuilder::drawMagnetic(const OpenMagnetics::Magnetic& magneti
     auto named = buildAllNamed(magnetic, cfg.includeBobbin, cfg.symmetryPlanes,
                                cfg.wirePolygonSegments, cfg.corePolygonSegments,
                                cfg.paintCoating, /*emitCoatingShells=*/false,
-                               /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                               /*includeInsulation=*/false,
+                               declaredCoreCoatingThickness(magnetic.get_core()),
                                cfg.useRealWindingGeometry, cfg.femReady);
     return drawMagneticCommon(named, outputPath, cfg.format, cfg.scale);
 }
