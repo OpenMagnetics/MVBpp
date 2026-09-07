@@ -69,6 +69,22 @@ std::map<std::string, double> flatten_dimensions(const std::map<std::string, MAS
     return result;
 }
 
+double require_dimension(const std::map<std::string, double>& dims,
+                         const std::string& key,
+                         const std::string& shapeName) {
+    auto it = dims.find(key);
+    if (it == dims.end()) {
+        throw std::runtime_error("shape '" + shapeName + "' has no dimension " + key
+                                 + ", which its profile cannot be built without");
+    }
+    if (!(it->second > 0.0)) {
+        throw std::runtime_error("shape '" + shapeName + "' has dimension " + key + " = "
+                                 + std::to_string(it->second)
+                                 + ", which its profile cannot be built from");
+    }
+    return it->second;
+}
+
 TopoDS_Wire build_polygon_circle(double radius, int segments, bool circumscribed) {
     if (segments <= 0) {
         gp_Circ circ(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), radius);
