@@ -9,6 +9,13 @@
 
 namespace mvb {
 
+// The CONDUCTING cross-section of a MAS wire, {width, height} in metres: round -> {d, d};
+// rectangular/planar -> {w, h}; LITZ -> the bare bundle treated as one solid conductor, its
+// diameter from MKF's Wire::get_outer_diameter_bare_litz (capped by the catalogue outer
+// diameter). The single source of truth for what MVB++ draws as copper and what OMFEM's
+// level-set mesher carves; throws (no silent fallback) when the wire lacks the data.
+std::pair<double, double> conducting_dimensions(const MAS::Wire& wire);
+
 class TurnBuilder {
 public:
     // Context for a turn wound around a NON-MAIN core column (MAS multi-column placement:

@@ -195,6 +195,10 @@ static std::pair<double, double> get_conducting_dimensions(const MAS::Wire& wire
     }
 }
 
+std::pair<double, double> conducting_dimensions(const MAS::Wire& wire) {
+    return get_conducting_dimensions(wire);
+}
+
 // Resolve the wire cross-section used to build a turn solid.
 //   paintCoating == true  → OUTER (insulation) footprint  [default, unchanged]
 //   paintCoating == false → CONDUCTING (copper) footprint  [FEM winding-loss]
