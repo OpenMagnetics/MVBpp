@@ -14543,7 +14543,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // lead-tip caps are planar full-cross-section faces in either representation. (The old
         // nsol == 1 gate assumed a compound has "no single pair of terminals" -- it does: the
         // same two path free ends.)
-        if (!opts.femReady || p.isRectangular) continue;
+        // RECTANGULAR wire gets its ports too (2026-09-08). The old `|| p.isRectangular` gate left
+        // every rectangular real winding without terminal caps, so the 3D FEM had no surface to
+        // inject current through and fell back to a cut-plane guess that is meaningless on a helix
+        // (03_buck_inductor_pq3230_n95, 3.0 x 0.5 mm: the mesh carried only 'outer'). The cap is the
+        // full CONDUCTOR cross-section either way -- pi r^2 for round, width x height for rect --
+        // which is what the area window below tests, so a junction sliver still cannot be picked.
+        if (!opts.femReady) continue;
         int nsol = 0;
         for (TopExp_Explorer e(cond, TopAbs_SOLID); e.More(); e.Next()) ++nsol;
         if (nsol < 1 || p.prims.empty()) continue;
@@ -14558,10 +14564,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // cross-section so a junction sliver can never be picked. (ABT #332)
         const gp_Pnt freeEnds[2] = {primEndpoints(p.prims.front()).first,
                                     primEndpoints(p.prims.back()).second};
-        const double wantArea = kPi * p.wireRadius * p.wireRadius;
+        const double wantArea = p.isRectangular ? (p.wireWidth * p.wireHeight)
+                                                : (kPi * p.wireRadius * p.wireRadius);
+        // characteristic radius for the centroid-match tolerance: the round radius, or half the
+        // rectangle's diagonal (its own bounding radius) so a wide flat cap is never missed.
+        const double rChar = p.isRectangular
+                           ? 0.5 * std::hypot(p.wireWidth, p.wireHeight) : p.wireRadius;
         for (int k = 0; k < 2; ++k) {
             TopoDS_Face bestFace;
-            double bestD = 0.75 * p.wireRadius;
+            double bestD = 0.75 * rChar;
             for (TopExp_Explorer fe(cond, TopAbs_FACE); fe.More(); fe.Next()) {
                 const TopoDS_Face& f = TopoDS::Face(fe.Current());
                 if (BRepAdaptor_Surface(f).GetType() != GeomAbs_Plane) continue;
