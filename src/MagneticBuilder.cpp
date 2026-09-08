@@ -57,7 +57,7 @@ using json = nlohmann::json;
 // MAGNETIC_EPOXY is not this kind of coating: it is the powder-loaded shield cap moulded over
 // the winding of a semishielded drum, drawn separately (and translucently) by drawCoreShell.
 // Same exclusion StrayCapacitance::resolve_core_jacket makes, for the same reason.
-static double declaredCoreCoatingThickness(const MAS::MagneticCore& masCore) {
+double MagneticBuilder::declaredCoreCoatingThickness(const MAS::MagneticCore& masCore) {
     const auto coating = masCore.get_functional_description().get_coating();
     if (!coating) return 0.0;
     if (std::holds_alternative<MAS::CoreCoating>(coating.value())) {
@@ -72,7 +72,7 @@ static double declaredCoreCoatingThickness(const MAS::MagneticCore& masCore) {
 // the result is a uniform-thickness layer wrapping the whole core (outer/inner/top/bottom). Returns
 // a null shape if the offset/cut fails (e.g. a sharp-cornered core OCCT cannot offset) -- caller skips
 // it (no fabrication). Geometry-agnostic: works on any core solid (toroid, PQ, ...).
-static TopoDS_Shape buildCoreCoatingShell(const TopoDS_Shape& core, double thickness) {
+TopoDS_Shape MagneticBuilder::buildCoreCoatingShell(const TopoDS_Shape& core, double thickness) {
     if (thickness <= 0.0 || core.IsNull()) return TopoDS_Shape();
     try {
         BRepOffsetAPI_MakeOffsetShape mk;
