@@ -55,6 +55,10 @@ int main(int argc, char** argv) {
                 lowZ = std::min(lowZ, p[2]); highZ = std::max(highZ, p[2]);
             }
         }
+        std::cout << path.name << ": end0 (" << path.end0[0]*1e3 << "," << path.end0[1]*1e3 << "," << path.end0[2]*1e3
+                  << ") dir0 (" << path.dir0[0] << "," << path.dir0[1] << "," << path.dir0[2] << ")  end1 ("
+                  << path.end1[0]*1e3 << "," << path.end1[1]*1e3 << "," << path.end1[2]*1e3 << ") dir1 ("
+                  << path.dir1[0] << "," << path.dir1[1] << "," << path.dir1[2] << ")  [mm; lead ends = terminal caps]\n";
         std::cout << path.name << ": x [" << lowX * 1e3 << "," << highX * 1e3 << "] y ["
                   << lowY * 1e3 << "," << highY * 1e3 << "] z [" << lowZ * 1e3 << ","
                   << highZ * 1e3 << "] mm, " << points.size() << " sampled points\n";

@@ -6928,6 +6928,69 @@ double pointSegDistance2d(const gp_XY& p, const gp_XY& a, const gp_XY& b) {
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------
+// TOROID TERMINAL TIPS ON ONE PLANE (ABT #1155, Alf 2026-09-11). Each parallel's leads leave
+// the ring radially at their own crossing azimuth with the same run length, so the tips of a
+// 3-parallel winding sit on a CIRCLE (buck_inductor_complete: x = -7.17 / -6.68 / -5.74 mm at
+// 7.5 / 22.5 / 37.5 deg). A FEM port is a planar box face: OMFEM snaps it to the first tip, cuts
+// two leads correctly, trims two short and leaves two tips 0.77 mm inside the air -- floating
+// strands. Under MVB_FAN_TERMINALS_ON_PLANE (the same switch that anchors the concentric fan
+// on the plane) every toroidal lead's radial run is LENGTHENED along its own direction until
+// its tip lies on the axis-aligned plane through the farthest tip (axis = the box axis closest
+// to the mean exit direction). Only the stub lengths change (< 1.5 mm here); the crossings,
+// azimuths and levels stay MKF's. The collision gate runs on the result.
+static void pinToroidLeadTipsToPlane(std::vector<ConductorPath>& paths) {
+    struct Tip { ConductorPath* path; size_t prim; bool atA; gp_Pnt tip; gp_XYZ u; };
+    std::vector<Tip> tips;
+    for (auto& p : paths) {
+        if (!p.toroidal || p.prims.size() < 2) continue;
+        auto freeEnd = [&](size_t i, size_t nb, Tip& t) -> bool {
+            const Primitive& pr = p.prims[i];
+            if (pr.kind != Primitive::SEG || !pr.isLead) return false;
+            auto [na, nb2] = primEndpoints(p.prims[nb]);
+            const bool aShared = pr.seg.a.Distance(na) < 1e-9 || pr.seg.a.Distance(nb2) < 1e-9;
+            const bool bShared = pr.seg.b.Distance(na) < 1e-9 || pr.seg.b.Distance(nb2) < 1e-9;
+            if (aShared == bShared) return false;
+            t.path = &p; t.prim = i; t.atA = !aShared;
+            t.tip = t.atA ? pr.seg.a : pr.seg.b;
+            gp_XYZ u = t.tip.XYZ() - (t.atA ? pr.seg.b : pr.seg.a).XYZ();
+            if (u.Modulus() < 1e-12) return false;
+            t.u = u / u.Modulus();
+            return true;
+        };
+        Tip t0, t1;
+        if (freeEnd(0, 1, t0)) tips.push_back(t0);
+        if (freeEnd(p.prims.size() - 1, p.prims.size() - 2, t1)) tips.push_back(t1);
+    }
+    if (tips.size() < 2) return;
+    gp_XYZ mean(0, 0, 0);
+    for (const auto& t : tips) mean += t.u;
+    int axis = std::abs(mean.X()) >= std::abs(mean.Z()) ? 0 : 2;   // leads run in the ring plane (xz)
+    auto comp = [axis](const gp_XYZ& v) { return axis == 0 ? v.X() : v.Z(); };
+    const double sgn = comp(mean) >= 0 ? 1.0 : -1.0;
+    double target = -std::numeric_limits<double>::max();
+    for (const auto& t : tips) target = std::max(target, sgn * comp(t.tip.XYZ()));
+    for (auto& t : tips) {
+        const double ua = sgn * comp(t.u);
+        if (ua < 0.1) {
+            throw std::runtime_error("ConductorBuilder: toroidal lead of " + t.path->name +
+                                     " runs nearly parallel to the common terminal plane (direction "
+                                     "component " + std::to_string(ua) + "); its tip cannot be pinned "
+                                     "to the plane -- the parallels' exit azimuths spread too far");
+        }
+        const double ext = (target - sgn * comp(t.tip.XYZ())) / ua;
+        if (ext <= 1e-12) continue;
+        gp_Pnt np(t.tip.XYZ() + t.u * ext);
+        Primitive& pr = t.path->prims[t.prim];
+        if (t.atA) pr.seg.a = np; else pr.seg.b = np;
+        if (std::getenv("MVB_DIAG"))
+            std::cerr << "[toro-tip] " << t.path->name << " '" << pr.label << "' lengthened by "
+                      << ext * 1e3 << " mm onto the terminal plane (" << (axis == 0 ? "x" : "z")
+                      << " = " << sgn * target * 1e3 << " mm)\n";
+    }
+}
+
 template <typename CoilT, typename WireT>
 std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                      const MAS::CoreBobbinProcessedDescription& bobbinPd,
@@ -14382,6 +14445,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
     }
 
+    if (std::getenv("MVB_FAN_TERMINALS_ON_PLANE")) pinToroidLeadTipsToPlane(paths);
     if (opts.diagnosticSkipCollisionCheck) {
         // Loud on purpose: a build that skipped this gate produces overlapping copper and
         // must not be mistaken for a valid part further downstream.
