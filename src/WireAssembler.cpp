@@ -2115,6 +2115,72 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
                       solid);
 }
 
+// EXACT-ROUND SHARED CAP (segments <= 0). ABT #1186. At a TANGENT junction the two pieces' end
+// caps are two INDEPENDENTLY constructed circles on the same plane -- one disc geometrically,
+// two faces topologically -- and that is the worst possible input for BOPAlgo_PaveFiller's
+// edge/face stage. Measured on 13_current_sense_er95_n87 at segments = 0: the abutment gate's
+// two Common booleans cost a mean 6.42 s on each of the 134 ARC3->ARC3 biarc-riser joints, 64%
+// of an 833 s build, for a lens that cannot exist.
+//
+// The faceted path already exempts exactly this case (capsProvablyShared below), and its clause
+// is gated on segments > 0 -- correctly, because ITS proof is the polygon handoff, and
+// startProfileOverride is a PHASE continuation (sectionPhaseOf / wireProfileWirePhased) that
+// only means something on an n-gon. The guard is right about the mechanism and silent about the
+// conclusion: at segments <= 0 the section is wireProfileWireSplit(point, dir, r, 2), a circle
+// fully determined by the junction point, the tangent and the wire radius. There is nothing to
+// hand over because two pieces meeting at one point with one tangent already build THE SAME
+// DISC -- and therefore nothing for the boolean to find.
+//
+// That is not assumed here, it is MEASURED on the solids as built. capDiscAt reads the planar
+// boundary faces a solid actually presents in the junction plane and requires them to add up to
+// the whole nominal disc: same plane to 0.1 nm, total area pi*r^2 to 1e-6 relative, area-
+// weighted centroid on the junction point to 1e-6 r. An exact revolve or prism passes; a sweep
+// whose cap landed where MakePipeShell transported it does not (the [pipe-cap] probe has
+// measured 0.13 r off nominal), and keeps its booleans. So the exemption follows the geometry,
+// never the primitive kind.
+//
+// The residual is bounded, not hand-waved: two caps whose planes are within 1e-10 m can enclose
+// at most pi*r^2 * 2e-10 m^3 -- 6e-7 mm^3 even for a 1 mm wire radius, below the gate's own
+// 1e-6 mm^3 floor, and 1.6e-9 mm^3 on this design's 50 um wire. What is NOT re-proved is a
+// piece looping back onto its immediate neighbour far from the shared cap; the faceted
+// exemption does not test for that either, and the per-solid interpenetration sweep
+// (MVB_MITRE_INTERPEN) is where that question lives.
+static bool capDiscAt(const TopoDS_Shape& s, const gp_Pnt& j, const gp_Dir& n, double r,
+                      double* areaOut, double* planeOffOut) {
+    if (areaOut) *areaOut = 0.0;
+    if (planeOffOut) *planeOffOut = -1.0;
+    if (s.IsNull() || !(r > 0.0)) return false;
+    const double kCapPlaneTol = 1e-10;   // metres between the two cap planes
+    const double kCapNormalTol = 1e-9;   // radians
+    double area = 0.0, worstOff = 0.0;
+    gp_XYZ moment(0.0, 0.0, 0.0);
+    int nf = 0;
+    for (TopExp_Explorer fx(s, TopAbs_FACE); fx.More(); fx.Next()) {
+        const TopoDS_Face f = TopoDS::Face(fx.Current());
+        BRepAdaptor_Surface sf(f);
+        if (sf.GetType() != GeomAbs_Plane) continue;
+        const gp_Pln pln = sf.Plane();
+        const gp_Dir pn = pln.Axis().Direction();
+        if (std::min(pn.Angle(n), pn.Angle(n.Reversed())) > kCapNormalTol) continue;
+        const double off = pln.Distance(j);
+        if (off > kCapPlaneTol) continue;
+        GProp_GProps g;
+        BRepGProp::SurfaceProperties(f, g);
+        const double a = g.Mass();
+        if (!(a > 0.0)) continue;
+        area += a;
+        moment += g.CentreOfMass().XYZ() * a;
+        worstOff = std::max(worstOff, off);
+        ++nf;
+    }
+    if (areaOut) *areaOut = area;
+    if (planeOffOut) *planeOffOut = nf ? worstOff : -1.0;
+    if (nf == 0) return false;
+    const double want = kPi * r * r;
+    if (std::abs(area - want) > 1e-6 * want) return false;   // not the whole section
+    return gp_Pnt(moment / area).Distance(j) <= 1e-6 * r;    // and centred on the junction
+}
+
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wireRadius,
                           int segments, CornerStyle corners,
                           std::vector<size_t>* primIndexPerSolid) {
@@ -2950,8 +3016,28 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // hang was exactly such a joint: "junction 49->50 SPIRAL->SPIRAL angle=1.4e-14 deg".
         // Mitred (bent) joints keep the gate whatever the piece kind: their caps are cut, not
         // handed over, and a lens there is a real defect.
+        // ...and at segments <= 0 the two exact round caps ARE one disc, verified on the built
+        // solids rather than inferred from the handoff that does not exist there (see capDiscAt,
+        // ABT #1186). Only a tangent, endpoint-exact, ungrown junction qualifies: a mitred joint's
+        // caps are cut, not shared, and a lens there is a real defect.
+        bool roundCapsShared = false;
+        if (segments <= 0 && i > 0 && !bentS && angS <= 1e-12 && dpS <= 1e-9 &&
+            !sphereAtPrevJunction && !prevBuilt.IsNull() && !solid.IsNull()) {
+            const gp_Pnt jPt = primEndpoints(*ptrs[i]).first;
+            double aPrev = 0.0, aCur = 0.0, offPrev = 0.0, offCur = 0.0;
+            roundCapsShared = capDiscAt(prevBuilt, jPt, fs[i], wireRadius, &aPrev, &offPrev) &&
+                              capDiscAt(solid, jPt, fs[i], wireRadius, &aCur, &offCur);
+            if (diag)
+                std::cerr << "[abut]   round-cap exemption "
+                          << (roundCapsShared ? "TAKEN   " : "declined") << " '"
+                          << ptrs[i - 1]->label << "' -> '" << ptrs[i]->label << "' capArea prev="
+                          << aPrev * 1e6 << " cur=" << aCur * 1e6 << " mm2 (want "
+                          << kPi * wireRadius * wireRadius * 1e6 << "), planeOff prev="
+                          << offPrev * 1e9 << " cur=" << offCur * 1e9 << " nm\n";
+        }
         const bool capsProvablyShared = (prismDone && startCapAdopted && !staggerHereForAudit)
-                                     || (segments > 0 && !bentS && receivedCap);
+                                     || (segments > 0 && !bentS && receivedCap)
+                                     || roundCapsShared;
         if (i > 0 && (bentS || (angS <= 1e-12 && dpS <= 1e-9))) {
             if (capsProvablyShared) ++abutChecked;   // verdict: shared face, zero lens, by construction
             else checkMitredAbutment(prevBuilt, solid,
