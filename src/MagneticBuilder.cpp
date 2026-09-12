@@ -315,6 +315,22 @@ std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
         // through the mesher and the solver before the core turned out to be uncut). A boolean
         // that fails throws inside applyMachining; a boolean that "succeeds" without touching
         // the piece (tool placed off the column) is caught here by the volume.
+        //
+        // "Removed nothing" is measured against the piece as the knife FOUND it, and that answers
+        // two different questions at once -- only one of which is a bug (ABT #1184):
+        //   * the tool never overlapped the column, so the gap is missing from the geometry. That
+        //     is the failure this guard exists for and it still throws;
+        //   * the tool did overlap the column, but an EARLIER gap on the same column had already
+        //     ground that material away, so the gap IS in the geometry, cut by its overlapping
+        //     neighbour. MKF spaces a distributed gap by columnHeight / (numberGaps + 1) counting
+        //     gap CENTRES only, never their lengths, so gaps as long as that spacing overlap and
+        //     one can land wholly inside another: on RM 5/8 (3.8 mm central column) the 0.5 mm gap
+        //     at y = 0 and the 2 mm gap at y = +0.95 mm put the latter's 0.05 mm bottom-half slab
+        //     (y in [-0.05, 0]) entirely inside the former's (y in [-0.25, 0]).
+        // So a cut that removes nothing is retried against the piece as it was before ANY gap, and
+        // only a tool that removes nothing from THAT throws: a tool placed off the column finds no
+        // material on the pristine piece either, so the original defect is still caught.
+        const TopoDS_Shape pristinePiece = shape;
         auto machiningOpt = piece.get_machining();
         if (machiningOpt) {
             for (const auto& mach : *machiningOpt) {
@@ -329,7 +345,23 @@ std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
                                  shapeData->get_name().value_or(std::string("?")).c_str(), mach.get_length() * 1e3,
                                  mc.size() > 0 ? mc[0] * 1e3 : 0.0, mc.size() > 1 ? mc[1] * 1e3 : 0.0,
                                  removed * 1e9, before.Mass() * 1e9, after.Mass() * 1e9);
+                bool alreadyCutByAnEarlierGap = false;
                 if (std::abs(mach.get_length()) > 1e-12 && !(removed > 1e-6 * before.Mass())) {
+                    // Same tool, pristine piece: did this gap ever have material to remove?
+                    GProp_GProps pristineBefore, pristineAfter;
+                    BRepGProp::VolumeProperties(pristinePiece, pristineBefore);
+                    const TopoDS_Shape pristineCut = builder->applyMachining(pristinePiece, mach, dims);
+                    BRepGProp::VolumeProperties(pristineCut, pristineAfter);
+                    const double removedFromPristine = pristineBefore.Mass() - pristineAfter.Mass();
+                    alreadyCutByAnEarlierGap = removedFromPristine > 1e-6 * pristineBefore.Mass();
+                    if (std::getenv("MVB_CORE_DIAG"))
+                        std::fprintf(stderr, "[machining] '%s' no-op cut re-tried on the pristine piece: removed %.5f mm3 -> %s\n",
+                                     shapeData->get_name().value_or(std::string("?")).c_str(),
+                                     removedFromPristine * 1e9,
+                                     alreadyCutByAnEarlierGap ? "gap already cut by an overlapping neighbour" : "the tool misses the column");
+                }
+                if (std::abs(mach.get_length()) > 1e-12 && !(removed > 1e-6 * before.Mass())
+                        && !alreadyCutByAnEarlierGap) {
                     throw std::runtime_error("core machining removed nothing: gap length " +
                         std::to_string(mach.get_length() * 1e3) + " mm at (" +
                         (mc.size() > 0 ? std::to_string(mc[0] * 1e3) : std::string("?")) + ", " +

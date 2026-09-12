@@ -8,6 +8,8 @@
 // requested gapping spec, let MKF compute geometricalDescription/machining,
 // then build the core via MagneticBuilder and verify a positive volume.
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "mvb/MagneticBuilder.h"
 #include "mvb/Utils.h"
 #include "MAS.hpp"
@@ -230,4 +232,96 @@ TEST_CASE("PQ 20/16: a subtractive gap on each leg is machined, not just the cen
     CHECK(removedCentre < 0.35e-9);
     // the two legs add ~ 2 x 31.4 mm2 x 5 um ~ 0.31 mm3 -- at least half of that must be there
     CHECK(removedAll - removedCentre > 0.15e-9);
+}
+
+// ---------------------------------------------------------------------------------------------
+// ABT #1184. "This cut removed nothing" answers two different questions, and only one of them is
+// a defect. Both are pinned here, so neither half of the distinction can be lost again.
+namespace {
+
+// A core of the named shape with one subtractive gap, taken through MKF so the machining that
+// comes back is the real thing rather than something hand-written.
+OpenMagnetics::Core one_gap_core(const std::string& shapeName, double gapLength) {
+    std::ifstream f(std::string(MAS_DATA_DIR) + "/core_shapes.ndjson");
+    REQUIRE(f.is_open());
+    std::string line;
+    json shape;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        json candidate = json::parse(line, nullptr, false);
+        if (candidate.is_discarded()) continue;
+        if (candidate.value("name", "") == shapeName) { shape = candidate; break; }
+    }
+    REQUIRE(!shape.is_null());
+    mvb::patch_dimension_nominals(shape);
+    json coreJson;
+    coreJson["functionalDescription"] = {
+        {"name", "dummy"}, {"type", "two-piece set"}, {"material", "N97"}, {"shape", shape},
+        {"gapping", json::array({ json{{"length", gapLength}, {"type", "subtractive"}} })},
+        {"numberStacks", 1},
+    };
+    return OpenMagnetics::Core(coreJson);
+}
+
+} // namespace
+
+TEST_CASE("A gap tool that misses the column is an error", "[shapes][gapping][machining]") {
+    auto core = one_gap_core("E 42/21/20", 0.001);
+    auto geometry = core.get_geometrical_description().value();
+
+    mvb::MagneticBuilder builder;
+    REQUIRE(builder.buildCoreNamed(core).size() == 2);   // as MKF places it, the gap is cut
+
+    // The same gap with its tool moved 50 mm along the column axis, far outside the piece.
+    // Nothing is removed because nothing is there, and that silently-ungapped core is what this
+    // guard exists to catch: a FEM run on it reports the gapless inductance with no sign
+    // anything is wrong.
+    int toolsMoved = 0;
+    for (auto& piece : geometry) {
+        if (!piece.get_machining()) continue;
+        auto machining = *piece.get_machining();
+        for (auto& operation : machining) {
+            auto coordinates = operation.get_coordinates();
+            coordinates[1] = (coordinates[1] >= 0 ? 0.05 : -0.05);
+            operation.set_coordinates(coordinates);
+            ++toolsMoved;
+        }
+        piece.set_machining(machining);
+    }
+    REQUIRE(toolsMoved > 0);
+
+    auto missed = core;
+    missed.set_geometrical_description(geometry);
+    REQUIRE_THROWS_WITH(builder.buildCoreNamed(missed),
+                        Catch::Matchers::ContainsSubstring("core machining removed nothing"));
+}
+
+TEST_CASE("A gap already cut by an overlapping neighbour is not a missing gap",
+          "[shapes][gapping][machining]") {
+    auto core = one_gap_core("E 42/21/20", 0.001);
+    mvb::MagneticBuilder builder;
+    const double singleCutVolume = total_volume(builder.buildCoreNamed(core));
+    REQUIRE(singleCutVolume > 0.0);
+
+    // Two cuts in the same place. The second finds the material gone -- yet the gap it asks for
+    // is there, ground by the first. MKF produces exactly this whenever a distributed gapping's
+    // gaps are longer than the columnHeight / (numberGaps + 1) spacing it lays them out on,
+    // which is why 102 catalogue shapes used to fail the distributed case above.
+    auto geometry = core.get_geometrical_description().value();
+    int piecesDuplicated = 0;
+    for (auto& piece : geometry) {
+        if (!piece.get_machining()) continue;
+        auto machining = *piece.get_machining();
+        machining.push_back(machining.front());
+        piece.set_machining(machining);
+        ++piecesDuplicated;
+    }
+    REQUIRE(piecesDuplicated > 0);
+
+    auto overlapping = core;
+    overlapping.set_geometrical_description(geometry);
+    auto pieces = builder.buildCoreNamed(overlapping);
+    REQUIRE(pieces.size() == 2);
+    // cutting the same slab twice leaves exactly the geometry cutting it once does
+    CHECK(total_volume(pieces) == Catch::Approx(singleCutVolume));
 }
