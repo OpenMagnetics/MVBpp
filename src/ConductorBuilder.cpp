@@ -6608,29 +6608,96 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     // sampled: the corner arc's plane is vertical, so its horizontal projection is the straight
     // segment pout -> pout - heading*bend, and arc-vs-vertical-tube distance is 2D
     // point-to-segment distance.
+    //
+    // ABT #1183: POLOIDAL IS A CANDIDATE, NOT A GUARANTEE. "Clears every tube by the full drawn
+    // margin by construction" holds only for a neighbour lying exactly along the local tangent.
+    // Two crossings on the SAME rim circle subtend a chord tilted off that tangent by half their
+    // azimuthal separation, so stepping radially inward (or outward) from one of them still
+    // closes on the other. Measured on current_transformer_complete: Secondary turn 21's rim
+    // crossing (3.454742, -12.446431) mm and turn 55's (3.966331, -12.292970) mm are 534.110 um
+    // apart against a 534.000 um coated envelope -- 110 nm of margin -- and turn 21's poloidal
+    // bottom corner spends 117 nm of it, certifying 3.79 nm INSIDE turn 55's envelope. Taking
+    // poloidal unverified was a fallback in exactly the sense the house rules forbid. The rim
+    // heading is now SOLVED: the natural tangent if it clears, else poloidal if IT clears, else
+    // the smallest rotation away from poloidal that clears every rim tube AND still has a chord.
+    // (At that crossing every heading from 105.60 to 287.80 deg clears and poloidal sits at
+    // 105.51 deg, so the first 0.05 deg step lands inside the window.) No clearing heading at
+    // all is a loud refusal, never a silent near-miss.
     const double poutR = c0.pout.Modulus();
-    auto outerHeading = [&](const gp_XY& natural) -> gp_XY {
-        if (poutR < 1e-12) return natural;
-        const gp_XY poloidal = c0.pout / poutR;
-        if (rimTubes == nullptr) return natural;
+    // Worst (distance - coated envelope) between this rim corner's horizontal footprint -- the
+    // segment pout -> pout + sign*h*bend, the corner arc's plane being vertical -- and every
+    // OTHER rim tube. Negative means interpenetration.
+    auto rimCornerSlack = [&](const gp_XY& h, double sign) {
         const double ownCoated = b / kRoundCornerBendFactor;
-        const gp_XY segEnd(c0.pout.X() - natural.X() * b, c0.pout.Y() - natural.Y() * b);
+        const gp_XY u(h.X() * b * sign, h.Y() * b * sign);
+        const double len2 = u.Dot(u);
+        double worst = std::numeric_limits<double>::max();
         for (const auto& [tube, tubeCoated] : *rimTubes) {
             const gp_XY toTube = tube - c0.pout;
             if (toTube.Modulus() < 1e-12) continue;   // its own tube
-            // point-to-segment(tube, pout -> segEnd)
-            const gp_XY u = segEnd - c0.pout;
-            const double len2 = u.Dot(u);
-            const double tPar =
-                len2 < 1e-24 ? 0.0 : std::clamp(toTube.Dot(u) / len2, 0.0, 1.0);
+            // point-to-segment(tube, pout -> pout + u)
+            const double tPar = len2 < 1e-24 ? 0.0 : std::clamp(toTube.Dot(u) / len2, 0.0, 1.0);
             const gp_XY closest(c0.pout.X() + u.X() * tPar, c0.pout.Y() + u.Y() * tPar);
-            if ((tube - closest).Modulus() < ownCoated + tubeCoated + 1e-9) {
-                return poloidal;   // the natural corner would enter this tube's envelope
+            worst = std::min(worst, (tube - closest).Modulus() - (ownCoated + tubeCoated));
+        }
+        return worst;
+    };
+    // `sign` is -1 for the TOP corner (whose footprint runs pout - heading*bend) and +1 for the
+    // BOTTOM's (pout + heading*bend). `station`/`prescribed`/`top` are the inner end the chord is
+    // solved from, so a candidate heading no chord can meet is discarded here instead of throwing
+    // out of solveToroChordBend afterwards.
+    auto rimHeading = [&](const gp_XY& natural, double sign, const gp_XY& station,
+                          const std::optional<gp_XY>& prescribed, bool top) -> gp_XY {
+        if (poutR < 1e-12 || rimTubes == nullptr) return natural;
+        // Touching at the coated envelope is allowed; the nanometre keeps the emitted corner on
+        // the clear side of the certified gate instead of exactly on it (and reproduces the
+        // original ABT #865 acceptance test bit for bit).
+        constexpr double kRimClear = 1e-9;
+        if (rimCornerSlack(natural, sign) >= kRimClear) return natural;
+        const gp_XY poloidal(-sign * c0.pout.X() / poutR, -sign * c0.pout.Y() / poutR);
+        double bestSlack = rimCornerSlack(poloidal, sign);
+        if (bestSlack >= kRimClear) return poloidal;
+        const double minArc = 2.0 * b / kRoundCornerBendFactor;
+        for (int n = 1; n <= 1800; ++n) {   // 0.05 deg steps out to +-90 deg from poloidal
+            for (const double dir : {1.0, -1.0}) {
+                const double rot = dir * n * 0.05 * kPi / 180.0;
+                const gp_XY cand(poloidal.X() * std::cos(rot) - poloidal.Y() * std::sin(rot),
+                                 poloidal.X() * std::sin(rot) + poloidal.Y() * std::cos(rot));
+                const double slack = rimCornerSlack(cand, sign);
+                bestSlack = std::max(bestSlack, slack);
+                if (slack < kRimClear) continue;
+                std::string why;
+                if (!trySolveToroChordBend(station, prescribed, c0.pout, cand, b, top, label, &why,
+                                           minArc))
+                    continue;   // no chord meets this rim heading: not a usable corner
+                return cand;
             }
         }
-        return natural;
+        // NOT a refusal, and deliberately so. This 2D test is the ABT #865 TRIGGER, not an
+        // authority: it treats every drawn crossing as a full-height tube, so it counts
+        // neighbours whose tube never reaches this corner's height band, and it counts crossings
+        // that are never emitted as a tube at all (a ring-transition turn, the chain's last
+        // turn). On realwinding_toroid_3in it reports ring 2's pushed-out crossings (r up to
+        // 22.77 mm) as 344 um inside an inner ring's at r = 21.037 mm on the same azimuth --
+        // tubes that in fact clear, because they occupy different heights. Turning that into a
+        // throw would refuse designs the certified gate accepts. So when no heading satisfies
+        // the trigger, the corner keeps the poloidal heading ABT #865 gave it -- byte for byte
+        // today's geometry -- and the certified enamel gate downstream remains the authority on
+        // whether the emitted copper actually interpenetrates. Nothing is hidden: the deficit is
+        // named under MVB_TORO_DIAG, and the real fix (rim tubes with their y-bands, inside the
+        // corner solve) is ABT #1185.
+        if (std::getenv("MVB_TORO_DIAG")) {
+            std::cerr.precision(12);
+            std::cerr << "[toro-rim] " << label << " " << (sign < 0 ? "top" : "bottom")
+                      << " corner at the crossing (" << c0.pout.X() << ", " << c0.pout.Y()
+                      << "): no heading within 90 deg of poloidal satisfies the rim-tube trigger "
+                         "(best slack "
+                      << bestSlack * 1e9 << " nm); keeping the poloidal heading. The trigger is "
+                         "height-blind (ABT #1185), so this is usually a phantom." << std::endl;
+        }
+        return poloidal;
     };
-    const gp_XY dTopChord = outerHeading(dTopEnd);
+    const gp_XY dTopChord = rimHeading(dTopEnd, -1.0, c0.pin, topHeading, /*top=*/true);
     std::optional<ToroChordBend> topBend;
     if ((dTopChord - dTopEnd).Modulus() > 0.0) {
         // ABT #865 imposed the poloidal rim heading: the chord becomes spiral + bend arc.
@@ -6703,28 +6770,10 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     // Same as the top half: no local rule, no fallback -- the caller's solve plus the certified
     // verification own clearance.
 
-    // Same conditional rule for the bottom outer corner (see the top's comment); the bottom
-    // corner's footprint runs pout + heading*bend, so the sign mirrors.
-    auto outerHeadingBot = [&](const gp_XY& natural) -> gp_XY {
-        if (poutR < 1e-12 || rimTubes == nullptr) return natural;
-        const gp_XY poloidal(-c0.pout.X() / poutR, -c0.pout.Y() / poutR);
-        const double ownCoated = b / kRoundCornerBendFactor;
-        const gp_XY segEnd(c0.pout.X() + natural.X() * b, c0.pout.Y() + natural.Y() * b);
-        for (const auto& [tube, tubeCoated] : *rimTubes) {
-            const gp_XY toTube = tube - c0.pout;
-            if (toTube.Modulus() < 1e-12) continue;
-            const gp_XY u = segEnd - c0.pout;
-            const double len2 = u.Dot(u);
-            const double tPar =
-                len2 < 1e-24 ? 0.0 : std::clamp(toTube.Dot(u) / len2, 0.0, 1.0);
-            const gp_XY closest(c0.pout.X() + u.X() * tPar, c0.pout.Y() + u.Y() * tPar);
-            if ((tube - closest).Modulus() < ownCoated + tubeCoated + 1e-9) {
-                return poloidal;
-            }
-        }
-        return natural;
-    };
-    const gp_XY eBotChord = outerHeadingBot(eBotStart);
+    // Same solved rule for the bottom outer corner (see the top's comment): its footprint runs
+    // pout + heading*bend, so the sign mirrors, and the chord is solved from the NEXT turn's
+    // inner station (c1.pin, bottomHeading) travelling rim -> bore.
+    const gp_XY eBotChord = rimHeading(eBotStart, +1.0, c1.pin, bottomHeading, /*top=*/false);
     std::optional<ToroChordBend> botBend;
     if ((eBotChord - eBotStart).Modulus() > 0.0) {
         botBend = solveToroChordBend(c1.pin, bottomHeading, c0.pout, eBotChord, b, /*top=*/false, label,
@@ -11672,6 +11721,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     std::string winding;
                     int64_t parallel = 0;
                     size_t transition = 0;
+                    // Signed azimuth from the station to the rim crossing: the shape of the face
+                    // chord this corner drags, and so what decides whether the shared tilt's
+                    // congruence argument covers it at all (ABT #1183).
+                    double span = 0;
                 };
                 std::vector<SolveCorner> corners;
                 auto spiralTangent = [](const gp_XY& from, const gp_XY& to, bool atStart) {
@@ -11748,10 +11801,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                                                       ownRingPitch)))
                                        : 0;
                         };
+                        auto spanOf = [](const gp_XY& from, const gp_XY& to) {
+                            return std::remainder(std::atan2(to.Y(), to.X()) -
+                                                      std::atan2(from.Y(), from.X()),
+                                                  kTwoPi);
+                        };
                         corners.push_back({pin, dTop, pout, true, ringOf(pin), bend, coatedRw,
-                                           ct2.winding, ct2.parallel, i});
+                                           ct2.winding, ct2.parallel, i, spanOf(pin, pout)});
                         corners.push_back({nextPin, eEnd, pout, false, ringOf(nextPin), bend,
-                                           coatedRw, ct2.winding, ct2.parallel, i});
+                                           coatedRw, ct2.winding, ct2.parallel, i,
+                                           spanOf(nextPin, pout)});
                     }
                 }
                 // THE OUTER CROSSINGS ARE PINNED DATA -- AUDIT THEM BEFORE SOLVING THE CORNERS.
@@ -11999,6 +12058,70 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                            (a2.transition > b2.transition ? a2.transition - b2.transition
                                                           : b2.transition - a2.transition) <= 1;
                 };
+                // ABT #1183: THE SHARED TILT COVERS ONLY THE CORNERS ITS ARGUMENT IS ABOUT.
+                // Stage 1's justification for one ABSOLUTE tilt is that it makes the corners --
+                // and the face spirals they drag -- exactly congruent rotated copies, so their
+                // mutual distance is the station spacing. That is true only of corners whose
+                // chords ARE congruent: same station radius, same rim radius, same azimuth span.
+                // A ring's CLOSING turn is not one of them. Its rim crossing is the midpoint
+                // between its own station and the next, and when the ring's stations jump (the
+                // leftover arc after the last regular turn) that half-step is a multiple of the
+                // regular one: on realwinding_toroid_3in, Primary turn 24's crossing sits
+                // 16.891 deg from its station where every other ring-0 chord spans 6.041 deg.
+                // Imposing the median tilt on it does not make it congruent with anything, it
+                // just distorts it -- solveToroFaceSpiral has to shift the spiral centre 6335 um
+                // (regular wraps need ~1370 um, and ~0.001..0.07 um where the natural heading is
+                // kept) and the chord bows 302 um radially inward, straight into the rim tube of
+                // ring 1's turn 44 at azimuth 100.564 deg: 1.957667 mm against the 2.074 mm
+                // coated envelope. The natural chord clears the same tube by 185.4 um, and the
+                // chosen tilt was the natural MEDIAN anyway (7.85518176086 deg, certified slack
+                // 233 um) -- so nothing whatsoever asked for that displacement.
+                //
+                // So a corner whose chord is not a rotated copy of its ring's chord family keeps
+                // its OWN natural tangent, which is the heading the drawn turn data already
+                // implies, and is then certified exactly like every other corner.
+                //
+                // The test is deliberately one-sided and blunt: only a chord spanning more than
+                // TWICE its ring's median span is exempt. Over-long is the shape that produces
+                // the defect -- the further a chord reaches around the toroid, the more azimuthal
+                // its natural tangent is, and the further solveToroFaceSpiral has to push the
+                // spiral centre to meet a tilt taken from short chords, which is what bows it.
+                // A chord SHORTER than the family is not distorted that way, and MKF's lean/rest
+                // sweep moves a crossing by fractions of a wire and so lands nowhere near 2x, so
+                // the rule catches the ring-closing half-steps (turn 24 is 2.80x) and leaves
+                // ordinary jitter on the shared tilt where it belongs.
+                std::vector<bool> sharedTilt(corners.size(), true);
+                {
+                    using SpanKey = std::tuple<std::string, int64_t, int, bool>;
+                    std::map<SpanKey, std::vector<double>> spans;
+                    for (const auto& k : corners)
+                        spans[{k.winding, k.parallel, k.ring, k.top}].push_back(std::abs(k.span));
+                    std::map<SpanKey, double> medianSpan;
+                    for (auto& [key, v] : spans) {
+                        std::sort(v.begin(), v.end());
+                        medianSpan[key] = v[v.size() / 2];
+                    }
+                    for (size_t idx = 0; idx < corners.size(); ++idx) {
+                        const auto& k = corners[idx];
+                        const double med =
+                            medianSpan.at(SpanKey{k.winding, k.parallel, k.ring, k.top});
+                        if (med < 1e-12) continue;   // a purely radial family: no span to compare
+                        if (std::abs(k.span) <= 2.0 * med) continue;
+                        sharedTilt[idx] = false;
+                        if (std::getenv("MVB_TORO_ARC_DIAG")) {
+                            std::cerr.precision(6);
+                            std::cerr << "[span] " << k.winding << " p" << k.parallel << " t"
+                                      << k.transition << " ring" << k.ring
+                                      << (k.top ? " top" : " bottom") << " chord spans "
+                                      << std::abs(k.span) * 180.0 / kPi << " deg, "
+                                      << std::abs(k.span) / med << "x the ring median of "
+                                      << med * 180.0 / kPi
+                                      << " deg: over-long, so not a rotated copy of the family -- "
+                                         "it keeps its own natural tangent (ABT #1183)"
+                                      << std::endl;
+                        }
+                    }
+                }
                 // Stage-1 headings per corner, filled per half below and consumed by stage 2.
                 std::map<size_t, gp_XY> stage1Dir;
                 for (bool top : {true, false}) {
@@ -12028,16 +12151,33 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         const gp_XY t(-r.Y(), r.X());
                         frames[idx] = {r, t};
                         half.push_back(idx);
-                        tilts.push_back(std::atan2(k.want.Dot(t), k.want.Dot(r)));
+                        // Only the corners the shared tilt will actually be applied to may set
+                        // it; a ring-closing chord's own tangent is not part of the family and
+                        // must not drag the median (ABT #1183).
+                        if (sharedTilt[idx])
+                            tilts.push_back(std::atan2(k.want.Dot(t), k.want.Dot(r)));
                     }
                     if (half.empty()) continue;
                     std::vector<double> sortedTilts = tilts;
                     std::sort(sortedTilts.begin(), sortedTilts.end());
-                    const double tilt0 = sortedTilts[sortedTilts.size() / 2];
+                    // No corner in this half takes the shared tilt (every chord in it is its own
+                    // shape): the scan below then evaluates one configuration -- every corner on
+                    // its natural tangent -- and the tilt value itself is never read, because
+                    // dirFor routes past dirAt for all of them.
+                    const double tilt0 = sortedTilts.empty()
+                                             ? 0.0
+                                             : sortedTilts[sortedTilts.size() / 2];
                     auto dirAt = [&](size_t idx, double tilt) {
                         const Frame& f = frames[idx];
                         return gp_XY(f.radial.X() * std::cos(tilt) + f.tangent.X() * std::sin(tilt),
                                      f.radial.Y() * std::cos(tilt) + f.tangent.Y() * std::sin(tilt));
+                    };
+                    // The heading a corner actually takes at this tilt: the shared tilt where the
+                    // congruence argument covers the corner, its own natural tangent where it does
+                    // not (ABT #1183). Every clearance below is measured on THIS heading, so the
+                    // certification still rules on the configuration that will be emitted.
+                    auto dirFor = [&](size_t idx, double tilt) {
+                        return sharedTilt[idx] ? dirAt(idx, tilt) : corners[idx].want;
                     };
                     auto pairIndices = [&]() {
                         std::vector<std::pair<size_t, size_t>> out;
@@ -12059,8 +12199,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         double worst = std::numeric_limits<double>::max();
                         for (const auto& [ia, ib] : pairIndices) {
                             const double E2 = corners[ia].coatedRw + corners[ib].coatedRw;
-                            worst = std::min(worst, footPairMin(corners[ia], dirAt(ia, tilt),
-                                                                corners[ib], dirAt(ib, tilt)) -
+                            worst = std::min(worst, footPairMin(corners[ia], dirFor(ia, tilt),
+                                                                corners[ib], dirFor(ib, tilt)) -
                                                         E2);
                         }
                         return worst;
@@ -12070,8 +12210,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         for (const auto& [ia, ib] : pairIndices) {
                             const double E2 = corners[ia].coatedRw + corners[ib].coatedRw;
                             Primitive aArc, aSp, bArc, bSp;
-                            if (!makeFootprint(corners[ia], dirAt(ia, tilt), aArc, aSp) ||
-                                !makeFootprint(corners[ib], dirAt(ib, tilt), bArc, bSp))
+                            if (!makeFootprint(corners[ia], dirFor(ia, tilt), aArc, aSp) ||
+                                !makeFootprint(corners[ib], dirFor(ib, tilt), bArc, bSp))
                                 return -std::numeric_limits<double>::infinity();
                             for (const Primitive* u : {&aArc, &aSp})
                                 for (const Primitive* v : {&bArc, &bSp})
@@ -12088,8 +12228,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         std::vector<std::tuple<double, size_t, size_t>> ranked;
                         for (const auto& [ia, ib] : pairIndices) {
                             const double E2 = corners[ia].coatedRw + corners[ib].coatedRw;
-                            ranked.push_back({footPairMin(corners[ia], dirAt(ia, tilt0),
-                                                          corners[ib], dirAt(ib, tilt0)) -
+                            ranked.push_back({footPairMin(corners[ia], dirFor(ia, tilt0),
+                                                          corners[ib], dirFor(ib, tilt0)) -
                                                   E2,
                                               ia, ib});
                         }
@@ -12167,8 +12307,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         double worstSlack = std::numeric_limits<double>::max();
                         for (const auto& [ia, ib] : pairIndices) {
                             const double E2 = corners[ia].coatedRw + corners[ib].coatedRw;
-                            const double slack = footPairMin(corners[ia], dirAt(ia, tilt0),
-                                                             corners[ib], dirAt(ib, tilt0)) - E2;
+                            const double slack = footPairMin(corners[ia], dirFor(ia, tilt0),
+                                                             corners[ib], dirFor(ib, tilt0)) - E2;
                             if (slack < worstSlack) {
                                 worstSlack = slack;
                                 wa = ia;
@@ -12232,7 +12372,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                   << " deg, certified slack " << certifiedMinAt(chosenTilt) * 1e9
                                   << " nm" << std::endl;
                     }
-                    for (size_t idx : half) stage1Dir[idx] = dirAt(idx, chosenTilt);
+                    for (size_t idx : half) stage1Dir[idx] = dirFor(idx, chosenTilt);
                     // STAGE 2: DIRECTED TWIST PROPAGATION. A corner pinched by a terminal lead
                     // must leave the common tilt by up to ~15 deg, and at exact touch no
                     // neighbour tolerates that relative twist -- the deviation has to decay
