@@ -281,12 +281,13 @@ std::vector<NamedShape> cut_half_space(const NamedShape& in,
     const auto solids = flatten_solids(result);
     if (solids.empty()) return out;  // whole shape was on the other side
 
+    // ABT #1169: the role survives the cut — a half core piece is still a core piece.
     if (solids.size() == 1) {
-        out.emplace_back(solids.front(), in.name);
+        out.emplace_back(solids.front(), in.name, in.role);
     } else {
         for (std::size_t i = 0; i < solids.size(); ++i) {
             out.emplace_back(solids[i],
-                             in.name + "_" + std::to_string(i));
+                             in.name + "_" + std::to_string(i), in.role);
         }
     }
     return out;

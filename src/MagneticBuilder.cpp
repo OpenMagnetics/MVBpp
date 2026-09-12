@@ -736,9 +736,19 @@ std::vector<NamedShape> buildInsulationLayersImpl(const CoilT& coil, const MAS::
         TopoDS_Shape s = TurnBuilder::buildTurn(turn, wire, bobbinPd, toroidal,
                                                 wirePolygonSegments, DEFAULT_WIRE_REVOLUTION_SEGMENTS, true,
                                                 woundColumn);
-        if (!s.IsNull()) out.push_back({s, "insulation_layer_" + std::to_string(i)});
+        if (!s.IsNull()) out.push_back({s, "insulation_layer_" + std::to_string(i), Role::Insulation});
     }
     return out;
+}
+
+// ABT #1169. A turn solid drawn at its OUTER insulated footprint is emitted with a " coating"
+// suffix by buildTurnsImpl(emitCoatingShells=true); the copper body keeps the bare name. Role
+// follows that one distinction, so a consumer never has to re-parse the suffix itself.
+Role turn_role_for(const std::string& name) {
+    static const std::string kCoating = " coating";
+    const bool coated = name.size() > kCoating.size() &&
+        name.compare(name.size() - kCoating.size(), kCoating.size(), kCoating) == 0;
+    return coated ? Role::TurnCoating : Role::Turn;
 }
 
 } // anonymous namespace
@@ -754,7 +764,7 @@ std::vector<NamedShape> MagneticBuilder::buildCoreNamed(const MAS::MagneticCore&
     const bool single = shapes.size() == 1;
     for (std::size_t i = 0; i < shapes.size(); ++i) {
         out.emplace_back(shapes[i],
-                         single ? base : base + "_" + std::to_string(i));
+                         single ? base : base + "_" + std::to_string(i), Role::Core);
     }
     return out;
 }
@@ -771,7 +781,7 @@ std::vector<NamedShape> MagneticBuilder::buildTurnsNamed(const MAS::Coil& coil,
         const std::string n = (i < names.size() && !names[i].empty())
                                 ? names[i]
                                 : "Turn_" + std::to_string(i);
-        out.emplace_back(shapes[i], n);
+        out.emplace_back(shapes[i], n, turn_role_for(n));
     }
     return out;
 }
@@ -788,7 +798,7 @@ std::vector<NamedShape> MagneticBuilder::buildTurnsNamed(const OpenMagnetics::Co
         const std::string n = (i < names.size() && !names[i].empty())
                                 ? names[i]
                                 : "Turn_" + std::to_string(i);
-        out.emplace_back(shapes[i], n);
+        out.emplace_back(shapes[i], n, turn_role_for(n));
     }
     return out;
 }
@@ -799,6 +809,7 @@ NamedShape MagneticBuilder::buildBobbinNamed(const MAS::Coil& coil,
     NamedShape ns;
     ns.shape = buildBobbinShape_impl(coil, core, corePolygonSegments);
     ns.name = getBobbinNameT<MAS::Bobbin>(coil.get_bobbin(), "Bobbin");
+    ns.role = Role::Bobbin;
     return ns;
 }
 
@@ -808,6 +819,7 @@ NamedShape MagneticBuilder::buildBobbinNamed(const OpenMagnetics::Coil& coil,
     NamedShape ns;
     ns.shape = buildBobbinShape_impl(coil, core, corePolygonSegments);
     ns.name = getBobbinNameT<OpenMagnetics::Bobbin>(coil.get_bobbin(), "Bobbin");
+    ns.role = Role::Bobbin;
     return ns;
 }
 
@@ -822,7 +834,7 @@ static std::vector<NamedShape> buildTurnsNamedImpl(const CoilT& coil, const MAS:
         const std::string n = (i < names.size() && !names[i].empty())
                                 ? names[i]
                                 : "Turn_" + std::to_string(i);
-        out.emplace_back(shapes[i], n);
+        out.emplace_back(shapes[i], n, turn_role_for(n));
     }
     return out;
 }
@@ -872,7 +884,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
             std::vector<NamedShape> coatings;
             for (auto& ns : all) {
                 auto shell = buildCoreCoatingShell(ns.shape, coreCoatingThickness);
-                if (!shell.IsNull()) coatings.push_back({shell, ns.name + " coating"});
+                if (!shell.IsNull()) coatings.push_back({shell, ns.name + " coating", Role::CoreCoating});
             }
             for (auto& c : coatings) all.push_back(std::move(c));
         }
@@ -892,11 +904,16 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
             }
         }
 
+        appendAccessorySolids(all, magnetic,
+                              AccessoryOptions{includeBobbin, wirePolygonSegments,
+                                               corePolygonSegments, paintCoating,
+                                               useRealWindingGeometry, femReady});
+
         for (std::size_t i = 0; i < turnShapes.size(); ++i) {
             const std::string n = (i < turnNames.size() && !turnNames[i].empty())
                                     ? turnNames[i]
                                     : "Turn_" + std::to_string(i);
-            all.emplace_back(turnShapes[i], n);
+            all.emplace_back(turnShapes[i], n, turn_role_for(n));
         }
 
         if (includeInsulation) {
@@ -913,7 +930,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
             patchBobbinDimensions(bobbinPd, core);
             auto fr4 = FR4Builder::buildFR4Board(*groupsOpt, bobbinPd);
             if (!fr4.IsNull()) {
-                all.emplace_back(fr4, "FR4Board");
+                all.emplace_back(fr4, "FR4Board", Role::FR4);
             }
         }
 
@@ -943,7 +960,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         std::vector<NamedShape> coatings;
         for (auto& ns : all) {
             auto shell = buildCoreCoatingShell(ns.shape, coreCoatingThickness);
-            if (!shell.IsNull()) coatings.push_back({shell, ns.name + " coating"});
+            if (!shell.IsNull()) coatings.push_back({shell, ns.name + " coating", Role::CoreCoating});
         }
         for (auto& c : coatings) all.push_back(std::move(c));
     }
@@ -997,16 +1014,21 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         }
     }
 
+    appendAccessorySolids(all, magnetic,
+                          AccessoryOptions{includeBobbin, wirePolygonSegments,
+                                           corePolygonSegments, paintCoating,
+                                           useRealWindingGeometry, femReady});
+
     // Append the already-built turns (no second build).
     for (std::size_t i = 0; i < turnShapes.size(); ++i) {
         const std::string n = (i < turnNames.size() && !turnNames[i].empty())
                                 ? turnNames[i]
                                 : "Turn_" + std::to_string(i);
         if (i < turnPartNames.size() && !turnPartNames[i].empty()) {
-            all.emplace_back(turnShapes[i], n, turnPartNames[i]);   // ABT #685
+            all.emplace_back(turnShapes[i], n, turnPartNames[i], turn_role_for(n));   // ABT #685
         }
         else {
-            all.emplace_back(turnShapes[i], n);
+            all.emplace_back(turnShapes[i], n, turn_role_for(n));
         }
     }
 
@@ -1021,7 +1043,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         patchBobbinDimensions(bobbinPd, magnetic.get_core());
         auto fr4 = FR4Builder::buildFR4Board(*groupsOpt, bobbinPd);
         if (!fr4.IsNull()) {
-            all.emplace_back(fr4, "FR4Board");
+            all.emplace_back(fr4, "FR4Board", Role::FR4);
         }
     }
 
@@ -1050,6 +1072,24 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     // -- 11 of 38 designs at --segments 12; the same solids are clean rescaled to metres).
 
     return apply_symmetry(std::move(all), symmetryPlanes);
+}
+
+// ---- ABT #1169 (WP0): accessory-solid hook --------------------------------
+//
+// Deliberately empty. See MagneticBuilder::AccessoryOptions in the header for what each
+// later work package attaches here and the naming/role contract it must honour. The two
+// overloads exist because buildAllNamed has a MAS-typed (pre-enriched geometricalDescription)
+// path and an MKF-enriched path; an accessory that only MKF can size belongs in the second.
+void MagneticBuilder::appendAccessorySolids(std::vector<NamedShape>& all,
+                                            const MAS::Magnetic& magnetic,
+                                            const AccessoryOptions& opts) const {
+    (void)all; (void)magnetic; (void)opts;
+}
+
+void MagneticBuilder::appendAccessorySolids(std::vector<NamedShape>& all,
+                                            const OpenMagnetics::Magnetic& magnetic,
+                                            const AccessoryOptions& opts) const {
+    (void)all; (void)magnetic; (void)opts;
 }
 
 // ---- Standalone builders for the unified bindings API ---------------------
@@ -1081,7 +1121,7 @@ NamedShape MagneticBuilder::buildCorePieceNamed(const MAS::CoreShape& shape,
     }
 
     std::string name = shape.get_name().value_or(core_shape_family_to_string(family));
-    return NamedShape{geom, name};
+    return NamedShape{geom, name, Role::Core};
 }
 
 NamedShape MagneticBuilder::buildBobbinNamedFromBobbin(const MAS::Bobbin& bobbin,
@@ -1115,9 +1155,9 @@ NamedShape MagneticBuilder::buildBobbinNamedFromBobbin(const MAS::Bobbin& bobbin
         hasSolid = exp.More();
     }
     if (!hasSolid) {
-        return NamedShape{TopoDS_Shape(), name};
+        return NamedShape{TopoDS_Shape(), name, Role::Bobbin};
     }
-    return NamedShape{s, name};
+    return NamedShape{s, name, Role::Bobbin};
 }
 
 // The ONE place real-winding conductors are emitted. buildAllNamed (whole assembly, one
@@ -1160,7 +1200,11 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
             // Carry the per-solid names through (ABT #685) — rebuilding the NamedShape from
             // {shape, name} alone silently dropped them, and the STEP went back to one unnamed
             // multi-solid product.
-            out.push_back({ns.shape, ns.name + suffix, std::move(ns.partNames)});
+            // ABT #1169: the conductor builder already roled each solid (Turn / Terminal /
+            // Solder); the coating pass re-draws the SAME conductors at their outer footprint,
+            // so only a Turn becomes a TurnCoating — a terminal cap or a solder body does not.
+            const Role r = (coat && ns.role == Role::Turn) ? Role::TurnCoating : ns.role;
+            out.push_back({ns.shape, ns.name + suffix, std::move(ns.partNames), r});
         }
     };
     if (emitCoatingShells) {
@@ -1204,7 +1248,7 @@ std::vector<NamedShape> MagneticBuilder::buildTurnsNamedFromTurns(
                 + std::to_string(i));
         }
         const std::string& n = turns[i].get_name();
-        out.emplace_back(s, n.empty() ? ("Turn_" + std::to_string(i)) : n);
+        out.emplace_back(s, n.empty() ? ("Turn_" + std::to_string(i)) : n, Role::Turn);
     }
     return out;
 }

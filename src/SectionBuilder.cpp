@@ -328,10 +328,10 @@ std::vector<NamedShape> SectionBuilder::cut2DFaces(const std::vector<NamedShape>
         // Emit one NamedShape per child so STEPCAFControl_Writer attaches the source name to
         // every product. Multi-face sections get a suffix so each is uniquely identifiable.
         if (children.size() == 1) {
-            out.push_back(NamedShape{children[0], ns.name});
+            out.push_back(NamedShape{children[0], ns.name, ns.role});   // ABT #1169
         } else {
             for (std::size_t k = 0; k < children.size(); ++k)
-                out.push_back(NamedShape{children[k], ns.name + "_" + std::to_string(k)});
+                out.push_back(NamedShape{children[k], ns.name + "_" + std::to_string(k), ns.role});
         }
     }
 

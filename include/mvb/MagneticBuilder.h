@@ -234,6 +234,40 @@ public:
         bool femReady = false,
         bool diagnosticSkipCollisionCheck = false) const;
 
+    // ---- ABT #1169 (WP0): the accessory-solid attachment point ------------------------
+    //
+    // Everything a real magnetic carries that is neither a core piece nor a conductor:
+    // core spacers (WP1), bobbin dividers and pins (WP2/WP4), magnetic shunts (WP6), lead
+    // sleeves (WP7), a toroid base (WP4). Those work packages add their builders HERE and
+    // nowhere else, so the whole assembly, the STEP export, the 2D sections and the OMFEM
+    // meshers all pick them up from one place.
+    //
+    // Called once from each buildAllNamed overload, immediately after the bobbin block.
+    // Names must follow D2 of the manufacturing-fidelity proposal ("Spacer_<i>",
+    // "<bobbin> pin <name>", "<bobbin> divider <i>", "Shunt_<i>",
+    // "<winding> parallel <p> <entrance|exit> sleeve", "<bobbin> base") because names are
+    // the only channel that survives the STEP round-trip into OMFEM's classify(); each
+    // solid must also carry its Role. A solid that overlaps the former (a divider, a pin)
+    // has to be added to the bobbin cutter list in buildAllNamed as well — the bobbin is
+    // already cut by the time this runs.
+    //
+    // Empty in WP0 on purpose: the hook lands with the strict classifier so that the first
+    // accessory to be drawn cannot be silently meshed as core.
+    struct AccessoryOptions {
+        bool includeBobbin          = false;
+        int  wirePolygonSegments    = DEFAULT_WIRE_POLYGON_SEGMENTS;
+        int  corePolygonSegments    = DEFAULT_CORE_POLYGON_SEGMENTS;
+        bool paintCoating           = true;
+        bool useRealWindingGeometry = false;
+        bool femReady               = false;
+    };
+    void appendAccessorySolids(std::vector<NamedShape>& all,
+                               const MAS::Magnetic& magnetic,
+                               const AccessoryOptions& opts) const;
+    void appendAccessorySolids(std::vector<NamedShape>& all,
+                               const OpenMagnetics::Magnetic& magnetic,
+                               const AccessoryOptions& opts) const;
+
   private:
     // Single implementation of real-winding conductor emission, shared by buildAllNamed
     // and buildRealWindingTurnsNamed so the assembly and the viewer cannot drift apart.

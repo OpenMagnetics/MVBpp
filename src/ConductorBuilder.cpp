@@ -13399,6 +13399,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     NamedShape sd;
                     sd.shape = cut.Shape();
                     sd.name = nm + " solder joint";
+                    sd.role = Role::Solder;   // ABT #1169
                     solderShapes.push_back(std::move(sd));
                 }
             };
@@ -14841,7 +14842,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
             }
         }
-        out.push_back({cond, p.name, std::move(partNames)});
+        out.push_back({cond, p.name, std::move(partNames), Role::Turn});   // ABT #1169
         // PORT SURFACES for full-wave / FEM: the two free ends of a continuous round conductor are
         // its only PLANAR faces (the swept lateral surface is a cylinder/torus/BSpline, the elbows
         // are spheres/tori) -- MVB++ caps them flat precisely so a solver can put a port BC there.
@@ -14895,7 +14896,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                           << " of '" << p.name << "' -- the FEM port surface will be missing\n";
                 continue;
             }
-            out.push_back({bestFace, p.name + " terminal " + std::to_string(k)});
+            out.push_back({bestFace, p.name + " terminal " + std::to_string(k), Role::Terminal});
         }
     }
     // The foil terminals' solder bodies, beside the copper they join.
