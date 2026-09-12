@@ -421,7 +421,21 @@ std::vector<mvb::NamedShape> build_core_shell(const std::string& json_str, int p
 
     auto shape = shapeJson.get<MAS::CoreShape>();
     if (shape.get_family() != MAS::CoreShapeFamily::DRUM_SEMISHIELDED) {
-        return {};
+        // Not a semishielded drum, so there is no magnetic-epoxy cap -- but the core may
+        // declare an insulating COATING, which is the same kind of product: a layer over the
+        // core, drawn translucently on top of it. It has to come from HERE rather than from
+        // drawCore, because the 3D viewers do not call drawMagnetic at all -- they compose the
+        // assembly product by product (drawCore + drawCoreShell + drawBobbin + drawTurns), and
+        // a coating fused into the core solid could not be shaded as the separate layer it is.
+        const double thickness = mvb::MagneticBuilder::declaredCoreCoatingThickness(
+            coreJson.get<MAS::MagneticCore>());
+        if (thickness <= 0.0) return {};
+        std::vector<mvb::NamedShape> coatings;
+        for (const auto& piece : build_core(json_str, polygonSegments)) {
+            auto shell = mvb::MagneticBuilder::buildCoreCoatingShell(piece.shape, thickness);
+            if (!shell.IsNull()) coatings.push_back({shell, piece.name + " coating"});
+        }
+        return coatings;
     }
     auto dimsOpt = shape.get_dimensions();
     if (!dimsOpt) return {};
@@ -553,7 +567,13 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
         return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
                                /*wireSeg=*/0, polygonSegments, paintCoating,
                                /*emitCoatingShells=*/false, /*includeInsulation=*/false,
-                               /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true,
+                               // The declared core coating, drawn as its own solid. This binding
+                               // reaches buildAllNamed directly, so it has to make the same call
+                               // MagneticBuilder::drawMagnetic makes -- otherwise a coated core
+                               // draws bare in every consumer that goes through the bindings,
+                               // which is every 3D viewer.
+                               mvb::MagneticBuilder::declaredCoreCoatingThickness(magnetic.get_core()),
+                               /*useRealWindingGeometry=*/true,
                                femReady);
     }
     auto magnetic = j.get<MAS::Magnetic>();
@@ -562,7 +582,12 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
     if (turnsOpt.has_value()) numTurns = turnsOpt->size();
     const int wireSeg = adaptive_wire_segments(polygonSegments, numTurns);
     return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
-                            wireSeg, polygonSegments, paintCoating);
+                            wireSeg, polygonSegments, paintCoating,
+                            /*emitCoatingShells=*/false, /*includeInsulation=*/false,
+                            // Same call as the real-winding branch above: a declared core
+                            // coating is drawn on both paths, or the drawing depends on which
+                            // winding mode the caller happened to ask for.
+                            mvb::MagneticBuilder::declaredCoreCoatingThickness(magnetic.get_core().value()));
 }
 
 std::string draw_view_impl(const std::string& json_str,

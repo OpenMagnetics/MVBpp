@@ -278,7 +278,13 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
         return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
                                polygonSegments, polygonSegments, paintCoating,
                                /*emitCoatingShells=*/false, /*includeInsulation=*/false,
-                               /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true,
+                               // The declared core coating, drawn as its own solid. This binding
+                               // reaches buildAllNamed directly, so it has to make the same call
+                               // MagneticBuilder::drawMagnetic makes -- otherwise a coated core
+                               // draws bare in every consumer that goes through the bindings,
+                               // which is every 3D viewer.
+                               mvb::MagneticBuilder::declaredCoreCoatingThickness(magnetic.get_core()),
+                               /*useRealWindingGeometry=*/true,
                                femReady);
     }
     auto magnetic = j.get<MAS::Magnetic>();

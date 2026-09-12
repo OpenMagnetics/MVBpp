@@ -128,6 +128,34 @@ public:
     std::vector<ConductorBuilder::PathPolyline> buildRealWindingPaths(
         const OpenMagnetics::Magnetic& magnetic) const;
 
+    // The core-coating thickness to DRAW for this core, in metres, or 0 for "no coating layer".
+    //
+    // Only a coating the design DECLARES is drawn. MKF's Core::get_coating_thickness() also
+    // invents a default jacket for any uncoated toroid -- right for the winding-to-core
+    // dielectric path it exists for, wrong to put on screen for a design whose author never
+    // mentioned a coating. Presence is decided from functionalDescription.coating; the
+    // thickness itself is still resolved by MKF, which is what turns the name-only form
+    // ("epoxy") into a datasheet number.
+    //
+    // MAGNETIC_EPOXY returns 0: that is the powder-loaded shield cap moulded over the WINDING
+    // of a semishielded drum, drawn separately (and translucently) by drawCoreShell, not an
+    // insulating jacket on the ferrite surface.
+    //
+    // Public because every entry point that assembles a magnetic has to make the same call --
+    // drawMagnetic here, and the WASM/Python bindings, which reach buildAllNamed directly and
+    // are what every 3D viewer actually goes through.
+    static double declaredCoreCoatingThickness(const MAS::MagneticCore& core);
+
+    // The coating layer itself: the core surface offset outward by `thickness`, minus the
+    // core, i.e. a uniform-thickness conformal wrap (outer, inner, top and bottom). Returns a
+    // null shape when the offset or the cut fails -- a sharp-cornered core OCCT cannot offset
+    // -- and the caller then draws nothing rather than fabricating a layer.
+    //
+    // Public for the same reason: the 3D viewers do not call drawMagnetic, they compose the
+    // assembly from drawCore / drawCoreShell / drawBobbin / drawTurns, so the coating has to
+    // be reachable as its own product.
+    static TopoDS_Shape buildCoreCoatingShell(const TopoDS_Shape& core, double thickness);
+
     std::vector<NamedShape> buildAllNamed(const MAS::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,

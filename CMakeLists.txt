@@ -286,6 +286,7 @@ add_executable(mvb_tests
     tests/test_step_comparison.cpp
     tests/test_integration.cpp
     tests/test_json_integration.cpp
+    tests/test_core_coating.cpp
     tests/test_symmetry.cpp
     tests/test_mas_battery.cpp
     tests/test_toroidal_topview.cpp
