@@ -47,6 +47,11 @@
           "isolationSide": "primary",
           "wire": {
             "type": "rectangular",
+            "standard": "IEC 60317",
+            "coating": {
+              "type": "enamelled",
+              "grade": 1
+            },
             "conductingWidth": {
               "nominal": 0.005
             },
