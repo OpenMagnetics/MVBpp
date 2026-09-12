@@ -910,7 +910,13 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                 for (size_t j = jStart; j < B.prims.size(); ++j) {
                     const auto& pa = A.prims[i];
                     const auto& pb = B.prims[j];
-                    if (ci == cj &&
+                    // Adjacent turn ordinals of one conductor touch by construction. The two
+                    // TERMINALS of a one- or two-turn conductor share those ordinals yet run
+                    // independently (a toroid's entrance and exit drops can sit at the same
+                    // azimuth), so a pair tagged with different terminals is never exempt.
+                    const bool crossTerminal =
+                        pa.terminal >= 0 && pb.terminal >= 0 && pa.terminal != pb.terminal;
+                    if (ci == cj && !crossTerminal &&
                         (pa.turnOrdinal > pb.turnOrdinal ? pa.turnOrdinal - pb.turnOrdinal
                                                          : pb.turnOrdinal - pa.turnOrdinal) <= 1) {
                         continue;
@@ -6930,64 +6936,101 @@ double pointSegDistance2d(const gp_XY& p, const gp_XY& a, const gp_XY& b) {
 // ---------------------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------------------
-// TOROID TERMINAL TIPS ON ONE PLANE (ABT #1155, Alf 2026-09-11). Each parallel's leads leave
-// the ring radially at their own crossing azimuth with the same run length, so the tips of a
-// 3-parallel winding sit on a CIRCLE (buck_inductor_complete: x = -7.17 / -6.68 / -5.74 mm at
-// 7.5 / 22.5 / 37.5 deg). A FEM port is a planar box face: OMFEM snaps it to the first tip, cuts
-// two leads correctly, trims two short and leaves two tips 0.77 mm inside the air -- floating
-// strands. Under MVB_FAN_TERMINALS_ON_PLANE (the same switch that anchors the concentric fan
-// on the plane) every toroidal lead's radial run is LENGTHENED along its own direction until
-// its tip lies on the axis-aligned plane through the farthest tip (axis = the box axis closest
-// to the mean exit direction). Only the stub lengths change (< 1.5 mm here); the crossings,
-// azimuths and levels stay MKF's. The collision gate runs on the result.
-static void pinToroidLeadTipsToPlane(std::vector<ConductorPath>& paths) {
-    struct Tip { ConductorPath* path; size_t prim; bool atA; gp_Pnt tip; gp_XYZ u; };
-    std::vector<Tip> tips;
+// TOROID TERMINALS END ON ONE XZ PLANE BELOW THE PART (Alf, 2026-09-12; ABT #1159, supersedes
+// the #1155 x/z tip pinning). Every toroidal terminal lead now finishes with a DROP: after its
+// radial run past the outer diameter it bends 90 degrees and runs in -Y, the way a real toroid's
+// leads are dressed down to the board. emitToroLead emits each drop with a provisional length;
+// this pass, the first point where EVERY conductor's copper is known, sets the common plane
+// below the lowest copper surface of the whole component (the drops themselves excluded) by
+// max(2 OD of the THINNEST wire, 1 OD of the THICKEST) -- Alf's rule of 2026-09-12: short drops
+// on uniform parts, while on a mixed-wire part (a 4 mm bar primary with a 0.3 mm secondary) the
+// FEM port face, snapped half a cap radius inside the thick cap, still stays clear of the thick
+// lead's own rim corner -- and lengthens or shortens every drop's straight leg so its tip lies
+// exactly on it. Only the tip moves, along the drop's own -Y direction --
+// crossings, azimuths, levels and the corner fillets stay as emitted. Every tip then shares one
+// plane and one outward direction (0,-1,0), so the FEM air-box face that becomes the port slices
+// all of them at once (MasMesher's port snap), and the collision gate that runs next sees the
+// now-parallel drops against each other and against every other conductor.
+static void dropToroidLeadTipsToPlane(std::vector<ConductorPath>& paths) {
+    struct Drop { ConductorPath* path; size_t prim; bool atA; };
+    std::vector<Drop> drops;
+    std::set<std::pair<const ConductorPath*, size_t>> dropPrims;
+    double odMax = 0.0, odMin = std::numeric_limits<double>::max();
+    const std::string dropSuffix = " lead drop";
+    auto isDropLabel = [&](const std::string& l) {
+        return l.size() >= dropSuffix.size() &&
+               l.compare(l.size() - dropSuffix.size(), dropSuffix.size(), dropSuffix) == 0;
+    };
     for (auto& p : paths) {
         if (!p.toroidal || p.prims.size() < 2) continue;
-        auto freeEnd = [&](size_t i, size_t nb, Tip& t) -> bool {
+        auto freeEnd = [&](size_t i, size_t nb) {
             const Primitive& pr = p.prims[i];
-            if (pr.kind != Primitive::SEG || !pr.isLead) return false;
+            if (!(pr.kind == Primitive::SEG && pr.isLead && isDropLabel(pr.label))) {
+                throw std::runtime_error("ConductorBuilder: toroidal conductor '" + p.name +
+                                         "' ends in '" + pr.label +
+                                         "', not in a terminal drop; every toroid terminal must "
+                                         "finish with its -Y drop");
+            }
             auto [na, nb2] = primEndpoints(p.prims[nb]);
             const bool aShared = pr.seg.a.Distance(na) < 1e-9 || pr.seg.a.Distance(nb2) < 1e-9;
             const bool bShared = pr.seg.b.Distance(na) < 1e-9 || pr.seg.b.Distance(nb2) < 1e-9;
-            if (aShared == bShared) return false;
-            t.path = &p; t.prim = i; t.atA = !aShared;
-            t.tip = t.atA ? pr.seg.a : pr.seg.b;
-            gp_XYZ u = t.tip.XYZ() - (t.atA ? pr.seg.b : pr.seg.a).XYZ();
-            if (u.Modulus() < 1e-12) return false;
-            t.u = u / u.Modulus();
-            return true;
+            if (aShared == bShared) {
+                throw std::runtime_error("ConductorBuilder: terminal drop '" + pr.label +
+                                         "' of '" + p.name + "' is not a free end of its chain");
+            }
+            drops.push_back({&p, i, !aShared});
+            dropPrims.insert({&p, i});
         };
-        Tip t0, t1;
-        if (freeEnd(0, 1, t0)) tips.push_back(t0);
-        if (freeEnd(p.prims.size() - 1, p.prims.size() - 2, t1)) tips.push_back(t1);
+        freeEnd(0, 1);
+        freeEnd(p.prims.size() - 1, p.prims.size() - 2);
+        odMax = std::max(odMax, 2.0 * p.wireRadius);
+        odMin = std::min(odMin, 2.0 * p.wireRadius);
     }
-    if (tips.size() < 2) return;
-    gp_XYZ mean(0, 0, 0);
-    for (const auto& t : tips) mean += t.u;
-    int axis = std::abs(mean.X()) >= std::abs(mean.Z()) ? 0 : 2;   // leads run in the ring plane (xz)
-    auto comp = [axis](const gp_XYZ& v) { return axis == 0 ? v.X() : v.Z(); };
-    const double sgn = comp(mean) >= 0 ? 1.0 : -1.0;
-    double target = -std::numeric_limits<double>::max();
-    for (const auto& t : tips) target = std::max(target, sgn * comp(t.tip.XYZ()));
-    for (auto& t : tips) {
-        const double ua = sgn * comp(t.u);
-        if (ua < 0.1) {
-            throw std::runtime_error("ConductorBuilder: toroidal lead of " + t.path->name +
-                                     " runs nearly parallel to the common terminal plane (direction "
-                                     "component " + std::to_string(ua) + "); its tip cannot be pinned "
-                                     "to the plane -- the parallels' exit azimuths spread too far");
+    if (drops.empty()) return;
+    // The lowest copper surface of the whole component, drops excluded: sampled centrelines
+    // minus the (coated) envelope radius, over every conductor -- toroidal or not.
+    double lowest = std::numeric_limits<double>::max();
+    for (const auto& p : paths) {
+        for (size_t i = 0; i < p.prims.size(); ++i) {
+            if (dropPrims.count({&p, i})) continue;
+            for (const gp_Pnt& q : samplePrim(p.prims[i], p.wireRadius))
+                lowest = std::min(lowest, q.Y() - p.wireRadius);
         }
-        const double ext = (target - sgn * comp(t.tip.XYZ())) / ua;
-        if (ext <= 1e-12) continue;
-        gp_Pnt np(t.tip.XYZ() + t.u * ext);
-        Primitive& pr = t.path->prims[t.prim];
-        if (t.atA) pr.seg.a = np; else pr.seg.b = np;
+    }
+    if (lowest == std::numeric_limits<double>::max()) {
+        throw std::runtime_error("ConductorBuilder: no copper to measure the terminal plane from");
+    }
+    const double clearance = std::max(2.0 * odMin, odMax);
+    const double plane = lowest - clearance;
+    for (auto& d : drops) {
+        Primitive& pr = d.path->prims[d.prim];
+        gp_Pnt& tip = d.atA ? pr.seg.a : pr.seg.b;
+        const gp_Pnt& root = d.atA ? pr.seg.b : pr.seg.a;
+        const gp_XYZ u = tip.XYZ() - root.XYZ();
+        const double len = u.Modulus();
+        if (len < 1e-12 || std::fabs(u.X()) > 1e-9 * len || std::fabs(u.Z()) > 1e-9 * len ||
+            u.Y() >= 0.0) {
+            throw std::runtime_error("ConductorBuilder: terminal drop '" + pr.label + "' of '" +
+                                     d.path->name + "' does not run along -Y (direction " +
+                                     std::to_string(u.X() / len) + ", " +
+                                     std::to_string(u.Y() / len) + ", " +
+                                     std::to_string(u.Z() / len) + ")");
+        }
+        // The plane lies at least one OD below every non-drop surface, and the drop's root is
+        // the corner fillet's tangent point on this very lead, so a straight leg always remains.
+        if (plane > root.Y() - 0.5 * d.path->wireRadius) {
+            throw std::runtime_error("ConductorBuilder: terminal plane at y = " +
+                                     std::to_string(plane * 1e3) + " mm leaves no straight drop on '" +
+                                     pr.label + "' of '" + d.path->name + "' (root y = " +
+                                     std::to_string(root.Y() * 1e3) + " mm)");
+        }
+        const double before = tip.Y();
+        tip.SetY(plane);
         if (std::getenv("MVB_DIAG"))
-            std::cerr << "[toro-tip] " << t.path->name << " '" << pr.label << "' lengthened by "
-                      << ext * 1e3 << " mm onto the terminal plane (" << (axis == 0 ? "x" : "z")
-                      << " = " << sgn * target * 1e3 << " mm)\n";
+            std::cerr << "[toro-drop] " << d.path->name << " '" << pr.label << "' tip y "
+                      << before * 1e3 << " -> " << plane * 1e3 << " mm (lowest copper surface "
+                      << lowest * 1e3 << " mm, clearance max(2 OD_thin, 1 OD_thick) = "
+                      << clearance * 1e3 << " mm, " << drops.size() << " terminal(s) on the plane)\n";
     }
 }
 
@@ -11294,6 +11337,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 dir.Divide(crossR);
                 gp_Pnt pCross(cross.pin.X(), 0, cross.pin.Y());
                 gp_Pnt pOut(dir.X() * beyondR, level, dir.Y() * beyondR);
+                // THE DROP (Alf, 2026-09-12): past the rim the lead bends 90 degrees and runs in
+                // -Y, as a real toroid's leads are dressed down to the board, so every terminal
+                // of the part ends on ONE XZ plane below it. The plane itself is only known once
+                // every conductor is built (dropToroidLeadTipsToPlane sets it, two ODs under the
+                // lowest copper); here the drop gets a provisional length that already clears
+                // this component's face envelope so far and leaves room for its rim fillet.
+                const double dropY = -(toroLeadEnvelopeBot + 3.0 * od);
+                auto tipOf = [&](const gp_Pnt& out) { return gp_Pnt(out.X(), dropY, out.Z()); };
                 // route = pOut -> elbow -> pCross (entrance) or reversed (exit); validate the
                 // two legs against every emitted primitive except those that TOUCH pCross
                 // (the lead is their continuation).
@@ -11329,8 +11380,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 const double bareOwn = path.condRadius > 0 ? path.condRadius : wireRadius;
                 auto routeWorst2 = [&](const gp_Pnt& elbow, const gp_Pnt& out) {
                     double worst = std::numeric_limits<double>::max();
-                    const gp_Pnt* poly[3] = {&out, &elbow, &pCross};
-                    for (int k = 0; k < 2; ++k)
+                    const gp_Pnt tip = tipOf(out);
+                    const gp_Pnt* poly[4] = {&tip, &out, &elbow, &pCross};
+                    for (int k = 0; k < 3; ++k)
                         for (const auto& o : obst)
                             for (size_t q = 0; q + 1 < o.pts.size(); ++q) {
                                 const double d = segSegDistance(*poly[k], *poly[k + 1],
@@ -11349,6 +11401,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     return worst;   // >= 0 means clear under the gate's criterion
                 };
                 auto routeWorst = [&](const gp_Pnt& elbow) { return routeWorst2(elbow, pOut); };
+                auto legName = [](int k) { return k == 0 ? "drop" : k == 1 ? "radial" : "axial"; };
                 const gp_Pnt elbowA(cross.pin.X(), level, cross.pin.Y());
                 // MVB_LEAD_NO_VALIDATE=1: DIAGNOSTIC ONLY -- emit the classic 90-degree drop
                 // without route validation, so a layout the router refuses can still be
@@ -11372,12 +11425,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         pr.label = who + std::string(" ") + wh;
                         pr.turnOrdinal = ordinal;
                         pr.isLead = true;
+                        pr.terminal = isExit ? 1 : 0;
                         path.prims.push_back(std::move(pr));
                     };
+                    const gp_Pnt tipA = tipOf(pOut);
                     if (isExit) {
                         pushLeadSegR(pCross, elbowA, "lead axial");
                         pushLeadSegR(elbowA, pOut, "lead radial");
+                        pushLeadSegR(pOut, tipA, "lead drop");
                     } else {
+                        pushLeadSegR(tipA, pOut, "lead drop");
                         pushLeadSegR(pOut, elbowA, "lead radial");
                         pushLeadSegR(elbowA, pCross, "lead axial");
                     }
@@ -11388,7 +11445,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (toroDiag)
                     std::cerr << "[toro]   lead '" << who << "' routeA worst=" << worstA
                               << " culprit=" << worstWhat << " turn=" << worstTurn
-                              << " leg=" << (worstLeg == 0 ? "radial" : "axial") << "\n";
+                              << " leg=" << legName(worstLeg) << "\n";
                 gp_Pnt elbow;
                 bool routed = false;
                 double bestShort = worstA;   // least-bad shortfall, for the error message
@@ -11429,15 +11486,48 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         if (routed) break;
                     }
                 }
+                if (!routed) {
+                    // RIM SIDE-STEP (Alf, 2026-09-12, with the drops). The OTHER terminal's drop
+                    // can stand exactly at this azimuth: a one-turn bore-through conductor's
+                    // entrance and exit share the crossing, so the exit's drop from the top face
+                    // would run straight down the entrance's drop (current_transformer_complete:
+                    // 4.03 mm of overlap, and the hole-centre ladder never starts on a wire that
+                    // thick). Real parts dress the two ends side by side. The axial leg and the
+                    // elbow stay put; the rim leg swings sideways by whole drop pitches (two ODs of
+                    // centre separation at the rim radius) until the route -- rim leg AND drop --
+                    // validates against everything already emitted.
+                    const double rimPitch = 2.0 * od / beyondR;
+                    for (int k : {1, -1, 2, -2, 3, -3}) {
+                        const double ca = std::cos(k * rimPitch), sa = std::sin(k * rimPitch);
+                        const gp_XY dirR(dir.X() * ca - dir.Y() * sa, dir.X() * sa + dir.Y() * ca);
+                        const gp_Pnt outR(dirR.X() * beyondR, level, dirR.Y() * beyondR);
+                        const double worstR = routeWorst2(elbowA, outR);
+                        if (toroDiag)
+                            std::cerr << "[toro]     rim side-step k=" << k << " worst=" << worstR
+                                      << " culprit=" << worstWhat << " turn=" << worstTurn << "\n";
+                        bestShort = std::max(bestShort, worstR);
+                        if (worstR >= 0.0) {
+                            elbow = elbowA;
+                            pOut = outR;
+                            routed = true;
+                            if (std::getenv("MVB_DIAG"))
+                                std::cerr << "[toro-drop] '" << who << "' rim leg side-stepped by "
+                                          << k << " drop pitch(es) (" << k * rimPitch * 180.0 / kPi
+                                          << " deg) so its drop clears the other terminal's\n";
+                            break;
+                        }
+                    }
+                }
                 if (!routed)
                     throw std::runtime_error(
                         "ConductorBuilder: no clear terminal-lead route for '" + who +
-                        "': the straight 90-degree drop interferes with the winding by " +
+                        "': the classic 90-degree route interferes with the winding by " +
                         std::to_string(-worstA) +
-                        " m and every hole-centre slant depth by >= " + std::to_string(-bestShort) +
+                        " m and every hole-centre slant depth and rim side-step by >= " +
+                        std::to_string(-bestShort) +
                         " m (last-checked worst obstacle: " + worstWhat + " of turn " +
                         std::to_string(worstTurn) + " vs " +
-                        (worstLeg == 0 ? "radial" : "axial") +
+                        legName(worstLeg) +
                         " leg; bare-copper envelopes). The layout reserves no lead corridor "
                         "(dense/multi-layer toroid hole); turn positions are never moved -- "
                         "fix the winding data or the MKF blocking (MKF ABT #187).");
@@ -11449,68 +11539,82 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     pr.label = who + std::string(" ") + wh;
                     pr.turnOrdinal = ordinal;
                     pr.isLead = true;
+                    pr.terminal = isExit ? 1 : 0;
                     path.prims.push_back(std::move(pr));
                 };
-                // ROUND corner at the elbow, like every wrap corner: shorten both legs by the
-                // fillet's tangent length and bend through an exact arc (works for the slanted
-                // drop candidates too -- the fillet is generic in the two leg directions). The
-                // old bare two-seg corner left a 90-degree junction for the mitre machinery,
-                // whose trim on the short lead stubs sometimes fell back to flush overlapping
-                // tubes instead of a clean joint.
-                auto pushLeadRun = [&](const gp_Pnt& start, const gp_Pnt& mid, const gp_Pnt& end,
-                                       const char* whA, const char* whB) {
-                    gp_Vec inVec(start, mid), outVec(mid, end);
-                    const double lenIn = inVec.Magnitude(), lenOut = outVec.Magnitude();
-                    if (lenIn < 1e-12 || lenOut < 1e-12) {
-                        pushLeadSeg(start, mid, whA);
-                        pushLeadSeg(mid, end, whB);
-                        return;
+                // ROUND corners, like every wrap corner: at the elbow (axial -> radial) and at
+                // the rim (radial -> drop), each leg shortened by the fillet's tangent length and
+                // bent through an exact arc. The fillet is generic in the two leg directions, so
+                // the slanted drop candidates get the same corners. The old bare two-seg corner
+                // left a 90-degree junction for the mitre machinery, whose trim on the short lead
+                // stubs sometimes fell back to flush overlapping tubes instead of a clean joint.
+                // NOTE (Alf, 2026-08-27, "can we have ALL of them respect the setting?"):
+                // TRIED and MEASURED WORSE. Forcing the lead elbows to plain-seg mitres under
+                // toroidMitreCorners regressed 05_pfc from 141/227 meshed volumes to 1/225
+                // ("Invalid boundary mesh (overlapping facets)" in the lead region), so the
+                // lead corners KEEP the round fillet (with its built-in no-room mitre
+                // fallback) even in mitre-corner mode until the lead-region interaction is
+                // understood. The wrap corners obey the setting; that is where the 140x
+                // improvement lives.
+                // > wireRadius, never == : an equal-radius corner is a horn torus (the tube
+                // touches its own revolution axis) and OCC rejects the solid.
+                auto pushLeadChain = [&](const std::vector<gp_Pnt>& pts,
+                                         const std::vector<const char*>& legs) {
+                    gp_Pnt segStart = pts.front();
+                    for (size_t v = 1; v + 1 < pts.size(); ++v) {
+                        const gp_Pnt& prev = pts[v - 1];
+                        const gp_Pnt& mid = pts[v];
+                        const gp_Pnt& next = pts[v + 1];
+                        gp_Vec inVec(prev, mid), outVec(mid, next);
+                        const double lenIn = inVec.Magnitude(), lenOut = outVec.Magnitude();
+                        if (lenIn < 1e-12 || lenOut < 1e-12) {
+                            pushLeadSeg(segStart, mid, legs[v - 1]);
+                            segStart = mid;
+                            continue;
+                        }
+                        const gp_XYZ u = inVec.XYZ() / lenIn, w = outVec.XYZ() / lenOut;
+                        const double cosTurn = u.Dot(w);
+                        const double b = opts.effectiveBend(1.5 * wireRadius);
+                        const double tangentLen =
+                            b * std::sqrt(std::max(0.0, (1.0 - cosTurn) / (1.0 + cosTurn)));
+                        // Room is judged on the FULL legs: a leg shared by two corners gives at
+                        // most 0.49 of itself to each, so a straight piece always remains between.
+                        if (cosTurn > 1.0 - 1e-9 || tangentLen > 0.49 * std::min(lenIn, lenOut)) {
+                            pushLeadSeg(segStart, mid, legs[v - 1]);   // straight or no room
+                            segStart = mid;
+                            continue;
+                        }
+                        const gp_Pnt tangentA(mid.XYZ() - u * tangentLen);
+                        const gp_Pnt tangentB(mid.XYZ() + w * tangentLen);
+                        gp_XYZ normal = w - u * cosTurn;
+                        normal /= normal.Modulus();
+                        const gp_Pnt center(tangentA.XYZ() + normal * b);
+                        pushLeadSeg(segStart, tangentA, legs[v - 1]);
+                        {
+                            Primitive pr;
+                            pr.kind = Primitive::ARC3;
+                            pr.arc.c = center;
+                            gp_XYZ axis = u.Crossed(w);
+                            pr.arc.axis = axis / axis.Modulus();
+                            pr.arc.v0 = tangentA.XYZ() - center.XYZ();
+                            pr.arc.sweep = std::acos(std::clamp(cosTurn, -1.0, 1.0));
+                            pr.label = who + std::string(" lead corner");
+                            pr.turnOrdinal = ordinal;
+                            pr.isLead = true;
+                            pr.terminal = isExit ? 1 : 0;
+                            path.prims.push_back(std::move(pr));
+                        }
+                        segStart = tangentB;
                     }
-                    const gp_XYZ u = inVec.XYZ() / lenIn, v = outVec.XYZ() / lenOut;
-                    const double cosTurn = u.Dot(v);
-                    // NOTE (Alf, 2026-08-27, "can we have ALL of them respect the setting?"):
-                    // TRIED and MEASURED WORSE. Forcing the lead elbows to plain-seg mitres under
-                    // toroidMitreCorners regressed 05_pfc from 141/227 meshed volumes to 1/225
-                    // ("Invalid boundary mesh (overlapping facets)" in the lead region), so the
-                    // lead corners KEEP the round fillet (with its built-in no-room mitre
-                    // fallback) even in mitre-corner mode until the lead-region interaction is
-                    // understood. The wrap corners obey the setting; that is where the 140x
-                    // improvement lives.
-                    // > wireRadius, never == : an equal-radius corner is a horn torus (the tube
-                    // touches its own revolution axis) and OCC rejects the solid.
-                    const double b = opts.effectiveBend(1.5 * wireRadius);
-                    const double tangentLen =
-                        b * std::sqrt(std::max(0.0, (1.0 - cosTurn) / (1.0 + cosTurn)));
-                    if (cosTurn > 1.0 - 1e-9 || tangentLen > 0.49 * std::min(lenIn, lenOut)) {
-                        pushLeadSeg(start, mid, whA);   // straight or no room: plain segs
-                        pushLeadSeg(mid, end, whB);
-                        return;
-                    }
-                    const gp_Pnt tangentA(mid.XYZ() - u * tangentLen);
-                    const gp_Pnt tangentB(mid.XYZ() + v * tangentLen);
-                    gp_XYZ normal = v - u * cosTurn;
-                    normal /= normal.Modulus();
-                    const gp_Pnt center(tangentA.XYZ() + normal * b);
-                    pushLeadSeg(start, tangentA, whA);
-                    {
-                        Primitive pr;
-                        pr.kind = Primitive::ARC3;
-                        pr.arc.c = center;
-                        gp_XYZ axis = u.Crossed(v);
-                        pr.arc.axis = axis / axis.Modulus();
-                        pr.arc.v0 = tangentA.XYZ() - center.XYZ();
-                        pr.arc.sweep = std::acos(std::clamp(cosTurn, -1.0, 1.0));
-                        pr.label = who + std::string(" lead corner");
-                        pr.turnOrdinal = ordinal;
-                        pr.isLead = true;
-                        path.prims.push_back(std::move(pr));
-                    }
-                    pushLeadSeg(tangentB, end, whB);
+                    pushLeadSeg(segStart, pts.back(), legs.back());
                 };
-                if (isExit) {   // crossing -> up out of the hole -> radial out
-                    pushLeadRun(pCross, elbow, pOut, "lead axial", "lead radial");
-                } else {        // radial in -> down into the hole -> crossing (feeds turn 0)
-                    pushLeadRun(pOut, elbow, pCross, "lead radial", "lead axial");
+                const gp_Pnt pTip = tipOf(pOut);
+                if (isExit) {   // crossing -> out of the hole -> radial out -> down to the plane
+                    pushLeadChain({pCross, elbow, pOut, pTip},
+                                  {"lead axial", "lead radial", "lead drop"});
+                } else {        // plane -> up -> radial in -> into the hole -> crossing (turn 0)
+                    pushLeadChain({pTip, pOut, elbow, pCross},
+                                  {"lead drop", "lead radial", "lead axial"});
                 }
             };
 
@@ -14445,7 +14549,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
     }
 
-    if (std::getenv("MVB_FAN_TERMINALS_ON_PLANE")) pinToroidLeadTipsToPlane(paths);
+    dropToroidLeadTipsToPlane(paths);
     if (opts.diagnosticSkipCollisionCheck) {
         // Loud on purpose: a build that skipped this gate produces overlapping copper and
         // must not be mistaken for a valid part further downstream.

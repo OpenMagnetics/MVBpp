@@ -1293,12 +1293,12 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
             return swept;
         }
         if (std::getenv("MVB_DIAG"))
-            std::cerr << "[sweep-fail] MakePipeShell status=" << (int)ps.GetStatus()
+            std::cerr << "[sweep-fail] '" << pr.label << "' MakePipeShell status=" << (int)ps.GetStatus()
                       << " isDone=" << ps.IsDone() << " segments=" << segments
                       << " r=" << r << "\n";
     } catch (const Standard_Failure& f) {
         if (std::getenv("MVB_DIAG"))
-            std::cerr << "[sweep-fail] OCC exception: "
+            std::cerr << "[sweep-fail] '" << pr.label << "' OCC exception: "
                       << (f.GetMessageString() ? f.GetMessageString() : "(null)") << "\n";
     }
     return {};

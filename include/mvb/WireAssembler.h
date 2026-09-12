@@ -134,6 +134,12 @@ struct Primitive {
     // meets its neighbouring wraps at 90-degree corners, so it is isolated into its own run
     // and swept piecewise (cylinder + sphere elbows) rather than through the pipe-shell.
     bool isConnection = false;
+    // Which TERMINAL a lead primitive belongs to: 0 = entrance, 1 = exit, -1 = not a terminal
+    // lead (turn copper, connections, concentric leads that do not tag themselves). The
+    // collision gate exempts same-conductor pairs of adjacent turn ordinals (they touch by
+    // construction); the two terminals of a one- or two-turn conductor share those ordinals
+    // yet are NOT each other's continuation, so a tagged pair of different terminals is gated.
+    int terminal = -1;
 };
 
 // THE TWO APPROVED CORNER CONSTRUCTIONS (Alf, ABT #685: "any corner can be made in two

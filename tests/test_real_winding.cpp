@@ -41,6 +41,11 @@
 #include <TopoDS.hxx>
 #include <gp_Pnt.hxx>
 #include <cmath>
+#include <array>
+#include <cstdlib>
+#include <limits>
+#include <map>
+#include <string>
 #include <memory>
 #include <fstream>
 #include <sstream>
@@ -1676,4 +1681,100 @@ TEST_CASE("Real winding: faceted mode revolves tight arcs exactly, and only tigh
     CHECK(minorMax - minorMin < 1e-9);
     CHECK(minorMin > 0.05e-3);
     CHECK(minorMax < 1.0e-3);
+}
+
+// ---------------------------------------------------------------------------------------
+// TOROID TERMINALS DROP TO ONE PLANE (Alf, 2026-09-12; ABT #1159, superseding the #1155 x/z tip
+// pinning). Every toroidal terminal lead ends with a -Y drop past the rim, and every tip of the
+// component lies on ONE XZ plane below the lowest copper surface by max(2 OD of the thinnest
+// wire, 1 OD of the thickest) -- like a real toroid dressed for the board. Under the old rule the tips pointed
+// radially from their own crossing azimuths, sat on a circle, and common_mode_choke_complete was
+// refused outright ("runs nearly parallel to the common terminal plane").
+namespace {
+struct ToroidPlaneReport { size_t tips; double planeY; double lowestCopperY; double clearance; };
+
+ToroidPlaneReport requireToroidTerminalsOnOnePlane(const std::string& fixture) {
+    auto magneticJson = loadFixture(fixture);
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    std::vector<mvb::ConductorBuilder::PathPolyline> paths;
+    // Includes the collision gate: the now-parallel drops are checked against each other.
+    REQUIRE_NOTHROW(paths = builder.buildRealWindingPaths(enriched));
+    REQUIRE(!paths.empty());
+
+    struct Tip { std::string owner; std::array<double, 3> p, u; };
+    std::vector<Tip> tips;
+    double odMax = 0.0, odMin = std::numeric_limits<double>::max();
+    for (const auto& path : paths) {
+        tips.push_back({path.name + " end0", path.end0, path.dir0});
+        tips.push_back({path.name + " end1", path.end1, path.dir1});
+        odMax = std::max(odMax, 2.0 * path.wireRadius);
+        odMin = std::min(odMin, 2.0 * path.wireRadius);
+    }
+    const double clearance = std::max(2.0 * odMin, odMax);
+    double planeLo = std::numeric_limits<double>::max(), planeHi = std::numeric_limits<double>::lowest();
+    for (const auto& t : tips) {
+        INFO(fixture << ": " << t.owner << " at (" << t.p[0] * 1e3 << ", " << t.p[1] * 1e3 << ", "
+                     << t.p[2] * 1e3 << ") mm dir (" << t.u[0] << ", " << t.u[1] << ", " << t.u[2] << ")");
+        // Every terminal points straight down: the port normal is -Y for all of them.
+        CHECK(std::fabs(t.u[0]) < 1e-9);
+        CHECK(std::fabs(t.u[2]) < 1e-9);
+        CHECK(t.u[1] < -(1.0 - 1e-9));
+        planeLo = std::min(planeLo, t.p[1]);
+        planeHi = std::max(planeHi, t.p[1]);
+    }
+    INFO(fixture << ": tip plane y spans [" << planeLo * 1e3 << ", " << planeHi * 1e3 << "] mm");
+    CHECK(planeHi - planeLo < 1e-9);
+
+    // The plane sits `clearance` below the lowest copper that is NOT a drop. A sampled point
+    // whose envelope reaches below (plane + clearance) must belong to a drop: same (x, z) as a tip.
+    double lowest = std::numeric_limits<double>::max();
+    for (const auto& path : paths) {
+        for (const auto& prim : path.prims) {
+            for (const auto& q : prim) {
+                bool onDrop = false;
+                for (const auto& t : tips)
+                    if (std::hypot(q[0] - t.p[0], q[2] - t.p[2]) < 1e-6) { onDrop = true; break; }
+                if (onDrop) continue;
+                lowest = std::min(lowest, q[1] - path.wireRadius);
+            }
+        }
+    }
+    INFO(fixture << ": lowest non-drop copper surface " << lowest * 1e3 << " mm, plane "
+                 << planeLo * 1e3 << " mm, clearance max(2 OD_thin, 1 OD_thick) = "
+                 << clearance * 1e3 << " mm");
+    CHECK(planeLo <= lowest - clearance + 1e-9);
+    // ... and not gratuitously lower. The lowest non-drop copper is the rim fillet's underside,
+    // and the consumer polyline samples that arc coarsely enough to miss its extremum by ~10 % of
+    // an OD (measured 0.12 / 0.06 / 0.40 mm on CMC / buck / CT), so the bound carries a
+    // quarter-OD (of the thickest wire) of slack; the builder measures the same arcs finer.
+    CHECK(planeLo >= lowest - clearance - 0.25 * odMax);
+    return {tips.size(), planeLo, lowest, clearance};
+}
+} // namespace
+
+TEST_CASE("Real winding: CMC toroid terminals all drop to one plane below the part (ABT #1159)",
+          "[realwinding][toroidtips]") {
+    // Two windings on opposite sides of the ring: under the radial-tip rule no common plane
+    // could hold their four tips. Now all four drop in -Y onto one plane.
+    const auto r = requireToroidTerminalsOnOnePlane("common_mode_choke_complete.json");
+    CHECK(r.tips == 4);
+}
+
+TEST_CASE("Real winding: the 3-parallel buck toroid's six terminals share one plane (ABT #1155)",
+          "[realwinding][toroidtips]") {
+    // Six leads at six azimuths, six drops, one plane, and the gate proves the parallel drops
+    // clear each other.
+    const auto r = requireToroidTerminalsOnOnePlane("buck_inductor_complete.json");
+    CHECK(r.tips == 6);
+}
+
+TEST_CASE("Real winding: single-turn toroid primary drops both terminals without collision",
+          "[realwinding][toroidtips]") {
+    // A one-turn bore-through conductor: entrance and exit share the crossing azimuth, so the
+    // exit's drop from the top face would run straight through the entrance lead below unless
+    // the router moves it -- and the gate must SEE that pair (same turn ordinal, different
+    // terminals).
+    const auto r = requireToroidTerminalsOnOnePlane("current_transformer_complete.json");
+    CHECK(r.tips >= 4);
 }
