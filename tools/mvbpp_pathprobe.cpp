@@ -90,5 +90,27 @@ int main(int argc, char** argv) {
                   << worst * 1e6 << " um"
                   << (worstTurn.empty() ? "" : " (" + worstTurn + ")") << "\n";
     }
+
+    // ABT #1215: the terminal-lead pieces of the same centreline (bare copper, femReady -- the
+    // settings buildRealWindingPaths uses), one line each, so the per-winding total can be summed
+    // by hand from the printed geometry.
+    const auto leads = builder.measureTerminalLeadLengths(enriched, /*paintCoating=*/false,
+                                                          /*femReady=*/true);
+    std::cout << std::setprecision(17);   // round-trips: a hand sum to 1e-9 m needs every digit
+    for (const auto& [winding, t] : leads) {
+        std::cout << "LEADS '" << winding << "': total " << t.total_m << " m, parallels "
+                  << t.parallels << "\n";
+        for (const auto& e : t.per_end) {
+            std::cout << "  parallel " << e.parallel << " " << e.end << ": " << e.length_m << " m\n";
+            for (const auto& pc : e.pieces) {
+                std::cout << "    " << pc.kind << " len " << pc.length_m << " m  a=(" << pc.start[0]
+                          << "," << pc.start[1] << "," << pc.start[2] << ") b=(" << pc.end[0] << ","
+                          << pc.end[1] << "," << pc.end[2] << ")";
+                if (pc.kind != "SEG")
+                    std::cout << " R=" << pc.radius_m << " sweep=" << pc.sweep_rad;
+                std::cout << "  '" << pc.label << "'\n";
+            }
+        }
+    }
     return 0;
 }

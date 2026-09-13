@@ -1,5 +1,7 @@
 #include "mvb/MagneticBuilder.h"
 #include "mvb/StepExporter.h"
+#include <map>
+#include <optional>
 #include "mvb/Utils.h"
 #include "MAS.hpp"
 #include "Magnetic.h"
@@ -28,7 +30,9 @@ static void printUsage(const char* prog) {
               << "  --no-mkf              Skip MKF enrichment\n"
               << "  --real                Real winding: continuous conductor per (winding, parallel)\n"
               << "  --fem                 FEM geometry: one-piece / conformal conductors (slow); "
-                 "default is the fast drawing compound\n"
+                 "default is the fast drawing compound.\n"
+                 "                        With --real, also writes <output>.leads.json: the\n"
+                 "                        terminal-lead copper length per winding (ABT #1215)\n"
               << "  --segments <N>        Wire AND core polygon segments (0 = exact analytic\n"
               << "                        curves). The two facet in LOCKSTEP: a faceted wire\n"
               << "                        against an exact core wall touches at every polygon\n"
@@ -119,6 +123,9 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
         const int symmetryPlanes       = 0;
 
         std::string result;
+        // ABT #1215: the FEM product's terminal-lead lengths, measured with the settings the
+        // conductors were drawn with, written next to the STEP once it has its final name.
+        std::optional<std::map<std::string, mvb::ConductorBuilder::TerminalLeadLength>> leads;
         if (useRealWinding) {
             // Real winding requires the MKF wind (turn blocking on); no fallback.
             auto enriched = mvb::magnetic_autocomplete_safe(magnetic, true);
@@ -174,6 +181,12 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
             if (coreSegments >= 0)      cfg.corePolygonSegments = coreSegments;
             else if (segments >= 0)     cfg.corePolygonSegments = segments;
             result = builder.drawMagnetic(enriched, outputPath.parent_path().string(), cfg);
+            if (femReady && !result.empty()) {
+                leads = builder.measureTerminalLeadLengths(
+                    enriched, cfg.paintCoating, cfg.femReady, cfg.wirePolygonSegments,
+                    cfg.corePolygonSegments,
+                    mvb::MagneticBuilder::declaredCoreCoatingThickness(enriched.get_core()));
+            }
         } else if (useMkf) {
             try {
                 // Use MVB++'s safe MKF wrapper to avoid Coil::wind() crashes on raw MAS files
@@ -198,6 +211,11 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
                 fs::rename(generated, outputPath);
             }
             std::cout << "Generated: " << outputPath << "\n";
+            if (leads) {
+                const std::string sidecar =
+                    mvb::MagneticBuilder::writeTerminalLeadSidecar(*leads, outputPath.string());
+                std::cout << "Terminal leads: " << sidecar << "\n";
+            }
             paintProjections(magnetic, useRealWinding, outputPath);
             return true;
         } else {

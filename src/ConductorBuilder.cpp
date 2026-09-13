@@ -524,6 +524,12 @@ constexpr double kPlaneAz = kPi / 2.0;
 
 struct ConductorPath {
     std::string name;
+    // ABT #1215: the MAS identity of this conductor, set where it is constructed, so the lead
+    // measurement never parses `name`. leadOnlyTerminal: -1 for a conductor that carries turns;
+    // 0/1 for a conductor that is ENTIRELY one terminal's lead (a foil's soldered lead wire).
+    std::string winding;
+    size_t parallel = 0;
+    int leadOnlyTerminal = -1;
     double wireRadius = 0.0;
     // Bare-COPPER (conducting) envelope, independent of paintCoating. The collision gate uses THIS, not
     // the (possibly insulated) wireRadius: two turns whose enamel touches on a tight winding are
@@ -7093,7 +7099,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                      // re-deriving them from turn coordinates.
                                      const OpenMagnetics::ConnectionLayout& connectionLayout,
                                      const ConductorBuilder::Options& opts,
-                                     std::vector<ConductorBuilder::PathPolyline>* polyOut = nullptr) {
+                                     std::vector<ConductorBuilder::PathPolyline>* polyOut = nullptr,
+                                     // ABT #1215: finished centrelines, no solids (see polyOut).
+                                     std::vector<ConductorPath>* centrelineOut = nullptr) {
     // ABT #685 (Alf, 2026-08-17): WHAT a connection IS comes from MKF, not from a threshold here.
     // isZReturn() used to answer it from turn coordinates -- a median pitch, a filar-count bound,
     // a sign-of-advance rule -- and every one of those had a comment naming the design it had been
@@ -11065,6 +11073,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
         ConductorPath path;
         path.name = ct.winding + " parallel " + std::to_string(ct.parallel);
+        path.winding = ct.winding;
+        path.parallel = static_cast<size_t>(ct.parallel);
         path.wireRadius = wireRadius;
         path.condRadius = rectWire ? 0.5 * std::hypot(copW, copH) : std::min(copW, copH) / 2.0;
         path.condWidth = copW; path.condHeight = copH;
@@ -13347,6 +13357,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                 double yJointEnd, const std::string& nm) {
                 ConductorPath L;
                 L.name = nm;
+                L.winding = ct.winding;
+                L.parallel = static_cast<size_t>(ct.parallel);
+                L.leadOnlyTerminal = entrance ? 0 : 1;
                 L.wireRadius = leadRw;
                 L.condRadius = 0.5 * leadBare;
                 L.condWidth = leadBare; L.condHeight = leadBare;
@@ -14702,6 +14715,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         checkWindowContainment(paths, windowBoundsPerPath);
     }
 
+    // Centreline capture mode (ABT #1215): the same finished paths, handed back whole.
+    if (centrelineOut) {
+        *centrelineOut = paths;
+        return {};
+    }
+
     // Polyline capture mode: everything above ran (assembly, seam aiming, end-run planning,
     // the collision gate) but NO solid is built -- return the sampled centrelines instead.
     if (polyOut) {
@@ -14926,6 +14945,149 @@ std::vector<NamedShape> ConductorBuilder::buildAll(
     auto spaces = coilCopy.get_connection_reserved_spaces();
     return buildAllImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, bobbin, isToroidal,
                                                                   std::move(spaces), layout, opts);
+}
+
+std::map<std::string, ConductorBuilder::TerminalLeadLength>
+ConductorBuilder::measureTerminalLeadLengths(const OpenMagnetics::Coil& coil,
+                                             const MAS::CoreBobbinProcessedDescription& bobbin,
+                                             bool isToroidal, const Options& opts) {
+    OpenMagnetics::Coil coilCopy = coil;
+    auto layout = coilCopy.get_connection_layout();
+    auto spaces = coilCopy.get_connection_reserved_spaces();
+    std::vector<ConductorPath> paths;
+    buildAllImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, bobbin, isToroidal,
+                                                           std::move(spaces), layout, opts,
+                                                           /*polyOut=*/nullptr, &paths);
+    if (paths.empty())
+        throw std::runtime_error("measureTerminalLeadLengths: the conductor builder produced no "
+                                 "paths");
+    static const char* kKindName[] = {"SEG", "ARC3", "SPIRAL", "BLEND"};
+    auto isLeadPiece = [](const Primitive& pr) { return pr.isLead || pr.terminalFillet; };
+
+    std::map<std::string, TerminalLeadLength> out;
+    // (winding, parallel, end) -> accumulated end, so a foil parallel's two lead-wire conductors
+    // and a turn conductor's own ends land in one table.
+    std::map<std::string, std::map<std::pair<size_t, int>, TerminalLeadEnd>> ends;
+    std::map<std::string, std::set<size_t>> parallelsSeen;
+    for (const ConductorPath& p : paths) {
+        if (p.winding.empty())
+            throw std::runtime_error("measureTerminalLeadLengths: conductor '" + p.name +
+                                     "' carries no winding identity");
+        parallelsSeen[p.winding].insert(p.parallel);
+        const size_t n = p.prims.size();
+        // Position of the conductor's turn copper: the first and last non-lead primitive.
+        size_t firstBody = n, lastBody = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (isLeadPiece(p.prims[i])) continue;
+            if (firstBody == n) firstBody = i;
+            lastBody = i;
+        }
+        if (p.leadOnlyTerminal >= 0 && firstBody != n)
+            throw std::runtime_error("measureTerminalLeadLengths: '" + p.name +
+                                     "' is built as a lead-only conductor but carries non-lead "
+                                     "primitive '" + p.prims[firstBody].label + "'");
+        if (p.leadOnlyTerminal < 0 && firstBody == n)
+            throw std::runtime_error("measureTerminalLeadLengths: '" + p.name +
+                                     "' has no turn copper, so its lead pieces cannot be assigned "
+                                     "to an end");
+        // The emitters that do NOT sweep the centreline as measured: the rectangular-wire
+        // strategies (the whole-spine sweep fillets every sharp junction, the per-primitive
+        // emitter inserts elbows between two straight lead legs) and the drawing-mode toroid
+        // compound. On those a sharp junction touching a lead is re-shaped after this point, so
+        // the length reported here would not be the length of the copper.
+        const bool conformalEmission = !p.isRectangular && (!p.toroidal || p.femReady);
+        if (!conformalEmission) {
+            for (size_t i = 0; i + 1 < n; ++i) {
+                const Primitive& a = p.prims[i];
+                const Primitive& b = p.prims[i + 1];
+                if (!(isLeadPiece(a) || isLeadPiece(b))) continue;
+                if (primFwdEnd(a, p.wireRadius).Angle(primFwdStart(b, p.wireRadius)) < 0.05)
+                    continue;
+                throw std::runtime_error(
+                    "measureTerminalLeadLengths: '" + p.name + "' is emitted by a strategy that "
+                    "re-shapes the sharp lead junction between '" + a.label + "' and '" + b.label +
+                    "' after the centreline is final (rectangular wire, or a toroid drawn without "
+                    "femReady); its lead copper length is not the centreline's -- not measured");
+            }
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const Primitive& pr = p.prims[i];
+            if (!isLeadPiece(pr)) continue;
+            int end = -1;
+            if (p.leadOnlyTerminal >= 0) {
+                end = p.leadOnlyTerminal;
+            }
+            else {
+                const int byPosition = i < firstBody ? 0 : (i > lastBody ? 1 : -1);
+                if (byPosition < 0)
+                    throw std::runtime_error(
+                        "measureTerminalLeadLengths: lead piece '" + pr.label + "' of '" + p.name +
+                        "' sits between turn copper (index " + std::to_string(i) + ", turns span " +
+                        std::to_string(firstBody) + ".." + std::to_string(lastBody) +
+                        "); it belongs to neither terminal");
+                if (pr.terminal >= 0 && pr.terminal != byPosition)
+                    throw std::runtime_error(
+                        "measureTerminalLeadLengths: lead piece '" + pr.label + "' of '" + p.name +
+                        "' is tagged terminal " + std::to_string(pr.terminal) +
+                        " but lies at the other end of the conductor");
+                end = byPosition;
+            }
+            const double len = primLength(pr);
+            TerminalLeadEnd& e = ends[p.winding][{p.parallel, end}];
+            e.parallel = p.parallel;
+            e.end = end == 0 ? "entrance" : "exit";
+            e.length_m += len;
+            TerminalLeadEnd::Piece piece;
+            piece.label = pr.label;
+            piece.kind = kKindName[pr.kind];
+            piece.length_m = len;
+            const auto [pa, pb] = primEndpoints(pr);
+            piece.start = {pa.X(), pa.Y(), pa.Z()};
+            piece.end = {pb.X(), pb.Y(), pb.Z()};
+            if (pr.kind == Primitive::ARC3) {
+                const gp_XYZ axis = pr.arc.axis / pr.arc.axis.Modulus();
+                piece.radius_m = (pr.arc.v0 - axis * axis.Dot(pr.arc.v0)).Modulus();
+                piece.sweep_rad = std::abs(pr.arc.sweep);
+            }
+            else if (pr.kind == Primitive::SPIRAL) {
+                piece.radius_m = pr.spiral.r0;
+                piece.sweep_rad = std::abs(pr.spiral.az1 - pr.spiral.az0);
+            }
+            e.pieces.push_back(std::move(piece));
+        }
+    }
+
+    // Parallel count from the MAS, cross-checked against the conductors actually built.
+    for (const auto& fd : coil.get_functional_description()) {
+        const std::string& w = fd.get_name();
+        const size_t np = static_cast<size_t>(fd.get_number_parallels());
+        if (!parallelsSeen.count(w))
+            throw std::runtime_error("measureTerminalLeadLengths: winding '" + w +
+                                     "' produced no conductor");
+        if (parallelsSeen.at(w).size() != np || *parallelsSeen.at(w).rbegin() + 1 != np)
+            throw std::runtime_error("measureTerminalLeadLengths: winding '" + w + "' declares " +
+                                     std::to_string(np) + " parallels but " +
+                                     std::to_string(parallelsSeen.at(w).size()) +
+                                     " were built");
+        TerminalLeadLength& t = out[w];
+        t.parallels = np;
+        for (size_t k = 0; k < np; ++k) {
+            for (int end : {0, 1}) {
+                auto it = ends[w].find({k, end});
+                if (it == ends[w].end())
+                    throw std::runtime_error("measureTerminalLeadLengths: '" + w + " parallel " +
+                                             std::to_string(k) + "' has no " +
+                                             (end == 0 ? "entrance" : "exit") +
+                                             " lead primitive -- every drawn terminal has one");
+                t.total_m += it->second.length_m;
+                t.per_end.push_back(std::move(it->second));
+            }
+        }
+    }
+    if (out.size() != parallelsSeen.size())
+        throw std::runtime_error("measureTerminalLeadLengths: conductors were built for a winding "
+                                 "the coil's functional description does not declare");
+    return out;
 }
 
 std::vector<ConductorBuilder::PathPolyline> ConductorBuilder::buildAllPaths(

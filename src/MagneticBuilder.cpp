@@ -22,6 +22,9 @@
 #include <GProp_GProps.hxx>
 #include <BRepGProp.hxx>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <limits>
 #include <stdexcept>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
@@ -1187,25 +1190,18 @@ NamedShape MagneticBuilder::buildBobbinNamedFromBobbin(const MAS::Bobbin& bobbin
     return NamedShape{s, name, Role::Bobbin};
 }
 
-// The ONE place real-winding conductors are emitted. buildAllNamed (whole assembly, one
-// call) and buildRealWindingTurnsNamed (turns only, for a viewer that draws core, bobbin
-// and turns as separate meshes) both come through here, so the two can never drift into
-// drawing different copper for the same magnetic.
-std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
-    const OpenMagnetics::Magnetic& magnetic,
-    const std::vector<NamedShape>& coreShapes,
-    int wirePolygonSegments,
-    bool paintCoating,
-    bool emitCoatingShells,
-    bool femReady,
-    bool diagnosticSkipCollisionCheck) const {
-    auto bobbinPd = getBobbinProcessed(magnetic.get_coil());
+// The conductor options every real-winding consumer builds from, so the emitted conductors and
+// the lead-length measurement (ABT #1215) can never be planned with different inputs.
+ConductorBuilder::Options MagneticBuilder::realWindingConductorOptions(
+    const OpenMagnetics::Magnetic& magnetic, const std::vector<NamedShape>& coreShapes,
+    int wirePolygonSegments, bool femReady, MAS::CoreBobbinProcessedDescription& bobbinPd,
+    bool& toroidalCore) const {
+    bobbinPd = getBobbinProcessed(magnetic.get_coil());
     patchBobbinDimensions(bobbinPd, magnetic.get_core());
-    const bool toroidalCore = isCoreToroidal(magnetic.get_core());
+    toroidalCore = isCoreToroidal(magnetic.get_core());
     ConductorBuilder::Options copts;
     copts.wirePolygonSegments = wirePolygonSegments;
     copts.femReady = femReady;   // OM drawing -> fast compound; FEM export -> one-piece/conformal
-    copts.diagnosticSkipCollisionCheck = diagnosticSkipCollisionCheck;
     // Hand the CORE solids to the conductor builder so it can aim the terminal leads at
     // the true window opening (classified from the real geometry -- column metadata
     // under-describes cores like PQ whose plates wrap most of the perimeter; measured on
@@ -1218,6 +1214,100 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
     // resolved here, with the same resolver the ideal turn path already uses.
     copts.woundColumnPerSection =
         resolveWoundColumnsPerSection(magnetic.get_coil(), magnetic.get_core(), bobbinPd);
+    return copts;
+}
+
+std::map<std::string, ConductorBuilder::TerminalLeadLength>
+MagneticBuilder::measureTerminalLeadLengths(const OpenMagnetics::Magnetic& magnetic,
+                                            bool paintCoating, bool femReady,
+                                            int wirePolygonSegments, int corePolygonSegments,
+                                            double coreCoatingThickness) const {
+    // The obstacles buildAllNamed hands the conductor builder: the core pieces, plus their
+    // coating shells when a coating is drawn.
+    auto obstacles = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
+    if (coreCoatingThickness > 0.0) {
+        std::vector<NamedShape> coatings;
+        for (auto& ns : obstacles) {
+            auto shell = buildCoreCoatingShell(ns.shape, coreCoatingThickness);
+            if (!shell.IsNull()) coatings.push_back({shell, ns.name + " coating", Role::CoreCoating});
+        }
+        for (auto& c : coatings) obstacles.push_back(std::move(c));
+    }
+    MAS::CoreBobbinProcessedDescription bobbinPd;
+    bool toroidalCore = false;
+    ConductorBuilder::Options copts = realWindingConductorOptions(
+        magnetic, obstacles, wirePolygonSegments, femReady, bobbinPd, toroidalCore);
+    copts.paintCoating = paintCoating;
+    return ConductorBuilder::measureTerminalLeadLengths(magnetic.get_coil(), bobbinPd,
+                                                        toroidalCore, copts);
+}
+
+nlohmann::json MagneticBuilder::terminalLeadLengthsToJson(
+    const std::map<std::string, ConductorBuilder::TerminalLeadLength>& leads) {
+    nlohmann::json j = nlohmann::json::object();
+    for (const auto& [winding, t] : leads) {
+        nlohmann::json ends = nlohmann::json::array();
+        for (const auto& e : t.per_end) {
+            nlohmann::json pieces = nlohmann::json::array();
+            for (const auto& pc : e.pieces)
+                pieces.push_back({{"label", pc.label},
+                                  {"kind", pc.kind},
+                                  {"length_m", pc.length_m},
+                                  {"start_m", pc.start},
+                                  {"end_m", pc.end},
+                                  {"radius_m", pc.radius_m},
+                                  {"sweep_rad", pc.sweep_rad}});
+            ends.push_back({{"parallel", e.parallel},
+                            {"end", e.end},
+                            {"length_m", e.length_m},
+                            {"pieces", std::move(pieces)}});
+        }
+        j["winding_" + winding] = {{"terminal_lead_length_m", t.total_m},
+                                   {"parallels", t.parallels},
+                                   {"ends", std::move(ends)}};
+    }
+    return j;
+}
+
+std::string MagneticBuilder::terminalLeadSidecarPath(const std::string& stepPath) {
+    std::filesystem::path p(stepPath);
+    p.replace_extension(".leads.json");
+    return p.string();
+}
+
+std::string MagneticBuilder::writeTerminalLeadSidecar(
+    const std::map<std::string, ConductorBuilder::TerminalLeadLength>& leads,
+    const std::string& stepPath) {
+    const std::string path = terminalLeadSidecarPath(stepPath);
+    std::ofstream f(path);
+    if (!f)
+        throw std::runtime_error("writeTerminalLeadSidecar: cannot open '" + path + "' for writing");
+    // max_digits10: the lengths round-trip bit-exactly, so a consumer's 1e-9 m comparison is
+    // against the number MVB++ computed, not a printed approximation of it.
+    f << std::setprecision(std::numeric_limits<double>::max_digits10)
+      << terminalLeadLengthsToJson(leads).dump(2) << "\n";
+    if (!f)
+        throw std::runtime_error("writeTerminalLeadSidecar: write to '" + path + "' failed");
+    return path;
+}
+
+// The ONE place real-winding conductors are emitted. buildAllNamed (whole assembly, one
+// call) and buildRealWindingTurnsNamed (turns only, for a viewer that draws core, bobbin
+// and turns as separate meshes) both come through here, so the two can never drift into
+// drawing different copper for the same magnetic.
+std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
+    const OpenMagnetics::Magnetic& magnetic,
+    const std::vector<NamedShape>& coreShapes,
+    int wirePolygonSegments,
+    bool paintCoating,
+    bool emitCoatingShells,
+    bool femReady,
+    bool diagnosticSkipCollisionCheck) const {
+    MAS::CoreBobbinProcessedDescription bobbinPd;
+    bool toroidalCore = false;
+    ConductorBuilder::Options copts = realWindingConductorOptions(
+        magnetic, coreShapes, wirePolygonSegments, femReady, bobbinPd, toroidalCore);
+    copts.diagnosticSkipCollisionCheck = diagnosticSkipCollisionCheck;
 
     std::vector<NamedShape> out;
     auto emitConductors = [&](bool coat, const std::string& suffix) {

@@ -132,6 +132,61 @@ public:
         std::array<double, 3> end0{}, end1{};   // free ends (terminal port centres)
         std::array<double, 3> dir0{}, dir1{};   // OUTWARD end tangents (port normals)
     };
+    // TERMINAL-LEAD COPPER LENGTH (ABT #1215). What MVB++ actually draws beyond the turns, per
+    // winding, measured on the SAME finished centreline the conductor solids are swept from (the
+    // whole buildAll pipeline runs -- assembly, lead routing, terminal fillets, the toroid
+    // drop-to-plane, the collision gate -- and stops before any solid is built).
+    //
+    // WHAT COUNTS AS LEAD (one rule, flags only, no label matching):
+    //   - every primitive with Primitive::isLead: the toroid lead chain (axial stub out of the
+    //     hole, its round corner, the radial leg -- side-stepped at the rim when the router had
+    //     to -- the second round corner, the -Y drop to the terminal plane), the concentric exit
+    //     polylines and their fan legs, the concentric "lead corner" spirals and runs, foil
+    //     lead wires;
+    //   - every primitive with Primitive::terminalFillet: the fillet arcs TerminalFillet puts
+    //     where a concentric wrap's terminal stub meets its lead (they replace a piece of the
+    //     stub and a piece of the lead, and exist only because the lead is there).
+    // NOT lead: turn copper (wraps, terminal stubs, bumps), isConnection primitives (inter-layer
+    // links and their smoothing arcs, U/Z returns).
+    //
+    // WHICH END: a primitive's `terminal` tag (0 entrance, 1 exit) where the router set one
+    // (toroids); otherwise its position -- a lead primitive before the conductor's first
+    // non-lead primitive belongs to the entrance, after its last one to the exit. A lead piece
+    // between two turn pieces, or a tag that contradicts the position, THROWS. A conductor that
+    // is nothing but lead (a foil's soldered lead wire) takes its end from its construction.
+    //
+    // Lengths are exact (primLength); a lead piece without a closed-form length throws. A
+    // conductor whose emission re-shapes its lead corners after this measurement (the
+    // rectangular-wire per-primitive emitter inserts elbows between two straight lead legs)
+    // throws instead of reporting a number the solid does not have.
+    struct TerminalLeadEnd {
+        size_t parallel = 0;
+        std::string end;              // "entrance" | "exit"
+        double length_m = 0.0;
+        // One centreline primitive of this end, in path (current-flow) order, for audit: its
+        // label, kind ("SEG" | "ARC3" | "SPIRAL"), exact length, endpoints (metres, MVB++ frame),
+        // and for an ARC3 its bend radius and sweep (radians); both 0 for a SEG.
+        struct Piece {
+            std::string label;
+            std::string kind;
+            double length_m = 0.0;
+            std::array<double, 3> start{}, end{};
+            double radius_m = 0.0, sweep_rad = 0.0;
+        };
+        std::vector<Piece> pieces;
+    };
+    struct TerminalLeadLength {
+        double total_m = 0.0;         // summed over both ends of every parallel
+        size_t parallels = 0;
+        std::vector<TerminalLeadEnd> per_end;   // parallel ascending, entrance before exit
+    };
+    // Keyed by winding name. `opts` must be the options the conductors are (or were) built with:
+    // paintCoating changes the wire radius every bend is sized from, femReady changes which
+    // corners are filleted.
+    static std::map<std::string, TerminalLeadLength> measureTerminalLeadLengths(
+        const OpenMagnetics::Coil& coil, const MAS::CoreBobbinProcessedDescription& bobbin,
+        bool isToroidal, const Options& opts = {});
+
     static std::vector<PathPolyline> buildAllPaths(const OpenMagnetics::Coil& coil,
                                                    const MAS::CoreBobbinProcessedDescription& bobbin,
                                                    bool isToroidal,

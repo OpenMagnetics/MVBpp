@@ -237,6 +237,48 @@ std::pair<gp_Pnt, gp_Pnt> primEndpoints(const Primitive& p) {
     return {p.seg.a, p.seg.b};
 }
 
+double primLength(const Primitive& p) {
+    switch (p.kind) {
+        case Primitive::SEG:
+            return p.seg.a.Distance(p.seg.b);
+        case Primitive::ARC3: {
+            // P(t) = c + rot(axis, t) v0: the point runs on a circle whose radius is v0's
+            // component perpendicular to the (unit) axis, at unit angular rate.
+            const double axisNorm = p.arc.axis.Modulus();
+            if (!(axisNorm > 0.0))
+                throw std::runtime_error("primLength: ARC3 '" + p.label + "' has a zero axis");
+            const gp_XYZ axis = p.arc.axis / axisNorm;
+            const gp_XYZ radial = p.arc.v0 - axis * axis.Dot(p.arc.v0);
+            return radial.Modulus() * std::abs(p.arc.sweep);
+        }
+        case Primitive::SPIRAL: {
+            const Spiral& sp = p.spiral;
+            if (sp.blend)
+                throw std::runtime_error(
+                    "primLength: '" + p.label + "' is a BLENDED spiral, whose length has no closed "
+                    "form; refusing to return an estimate");
+            // r(t) = r0 + dr t, y(t) = y0 + dy t, az(t) = az0 + daz t, t in [0, 1]:
+            // |P'(t)|^2 = dr^2 + dy^2 + (daz r(t))^2.
+            const double dr = sp.r1 - sp.r0, dy = sp.y1 - sp.y0, daz = std::abs(sp.az1 - sp.az0);
+            const double a = dr * dr + dy * dy;
+            if (daz == 0.0) return std::sqrt(a);
+            if (dr == 0.0) return std::sqrt(a + daz * daz * sp.r0 * sp.r0);
+            // u = daz r, dt = du / (daz dr), and a > 0 because dr != 0:
+            // integral sqrt(a + u^2) du = u/2 sqrt(a + u^2) + a/2 asinh(u / sqrt(a)).
+            auto F = [&](double r) {
+                const double u = daz * r;
+                return 0.5 * u * std::sqrt(a + u * u) + 0.5 * a * std::asinh(u / std::sqrt(a));
+            };
+            return (F(sp.r1) - F(sp.r0)) / (daz * dr);
+        }
+        case Primitive::BLEND:
+            throw std::runtime_error(
+                "primLength: '" + p.label + "' is a BLEND (cosine S-curve), whose length has no "
+                "closed form; refusing to return an estimate");
+    }
+    throw std::runtime_error("primLength: unknown primitive kind on '" + p.label + "'");
+}
+
 // --- geometry emission ------------------------------------------------------------------
 // The section frame every round profile must share. gp_Ax2(center, normal) lets OCC pick the X
 // direction, so two primitives meeting with the SAME tangent can still get sections rotated

@@ -140,6 +140,12 @@ struct Primitive {
     // construction); the two terminals of a one- or two-turn conductor share those ordinals
     // yet are NOT each other's continuation, so a tagged pair of different terminals is gated.
     int terminal = -1;
+    // ABT #1215 — MEASUREMENT TAG ONLY, read by nothing that builds geometry. True on the arcs
+    // filletTerminalCorners inserts where a concentric wrap's terminal stub meets its lead. They
+    // are copied from the stub (so they carry isLead = false and must keep it: isLead changes how
+    // a run is split and emitted), yet they exist only because the lead leaves the wrap there, so
+    // the terminal-lead length measurement counts them as lead copper.
+    bool terminalFillet = false;
 };
 
 // THE TWO APPROVED CORNER CONSTRUCTIONS (Alf, ABT #685: "any corner can be made in two
@@ -176,6 +182,11 @@ int curveSampleCount(double radius, double azSpan, double wireRadius);
 int spiralSampleCount(const Spiral& sp, double wireRadius);
 std::vector<gp_Pnt> samplePrim(const Primitive& p, double wireRadius);
 std::pair<gp_Pnt, gp_Pnt> primEndpoints(const Primitive& p);
+// EXACT centreline arc length of one piece, metres (ABT #1215). SEG: chord; ARC3: the radius
+// perpendicular to the axis times |sweep|; linear SPIRAL: the closed form of
+// integral sqrt(dr^2 + dy^2 + (r(t) daz)^2) dt. A BLENDED spiral and a BLEND have no closed form
+// (their length is an elliptic integral) and THROW — no quadrature estimate is returned.
+double primLength(const Primitive& p);
 gp_Dir primFwdStart(const Primitive& p, double r);
 gp_Dir primFwdEnd(const Primitive& p, double r);
 

@@ -128,6 +128,36 @@ public:
     std::vector<ConductorBuilder::PathPolyline> buildRealWindingPaths(
         const OpenMagnetics::Magnetic& magnetic) const;
 
+    // ---- ABT #1215: terminal-lead copper length per winding ------------------------------
+    // The lead copper the real-winding conductors carry beyond their turns, measured on the
+    // finished centreline (see ConductorBuilder::measureTerminalLeadLengths for exactly which
+    // primitives count and how they are split into entrance/exit). Pass the SAME settings the
+    // conductors are built with -- buildAllNamed(..., paintCoating, ..., coreCoatingThickness,
+    // useRealWindingGeometry=true, femReady) -- because the bend radii follow the drawn wire
+    // radius and femReady decides which corners are filleted. With emitCoatingShells the
+    // conductor that carries current is the bare one: pass paintCoating=false.
+    // The magnetic must already be enriched through MKF's real-winding autocomplete.
+    // Runs the conductor path planning once more (no solids), so it costs a fraction of a build.
+    std::map<std::string, ConductorBuilder::TerminalLeadLength> measureTerminalLeadLengths(
+        const OpenMagnetics::Magnetic& magnetic,
+        bool paintCoating = false,
+        bool femReady = true,
+        int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
+        int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
+        double coreCoatingThickness = 0.0) const;
+    // {"winding_<name>": {"terminal_lead_length_m": x, "parallels": n,
+    //                     "ends": [{"parallel": k, "end": "entrance"|"exit", "length_m": l,
+    //                               "pieces": [{"label", "kind", "length_m", "start_m", "end_m",
+    //                                           "radius_m", "sweep_rad"}, ...]}, ...]}}
+    static nlohmann::json terminalLeadLengthsToJson(
+        const std::map<std::string, ConductorBuilder::TerminalLeadLength>& leads);
+    // The sidecar sits next to the STEP with the extension swapped: out/design.step ->
+    // out/design.leads.json. Returns the path written; throws when it cannot be written.
+    static std::string terminalLeadSidecarPath(const std::string& stepPath);
+    static std::string writeTerminalLeadSidecar(
+        const std::map<std::string, ConductorBuilder::TerminalLeadLength>& leads,
+        const std::string& stepPath);
+
     // The core-coating thickness to DRAW for this core, in metres, or 0 for "no coating layer".
     //
     // Only a coating the design DECLARES is drawn. MKF's Core::get_coating_thickness() also
@@ -269,6 +299,11 @@ public:
                                const AccessoryOptions& opts) const;
 
   private:
+    // Shared by buildRealWindingConductorsNamed and measureTerminalLeadLengths.
+    ConductorBuilder::Options realWindingConductorOptions(
+        const OpenMagnetics::Magnetic& magnetic, const std::vector<NamedShape>& coreShapes,
+        int wirePolygonSegments, bool femReady, MAS::CoreBobbinProcessedDescription& bobbinPd,
+        bool& toroidalCore) const;
     // Single implementation of real-winding conductor emission, shared by buildAllNamed
     // and buildRealWindingTurnsNamed so the assembly and the viewer cannot drift apart.
     // coreShapes are handed to ConductorBuilder as lead-aiming obstacles (ignored for

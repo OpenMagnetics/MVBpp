@@ -532,6 +532,32 @@ Notes
           py::arg("useRealWindingGeometry") = false,
           py::arg("femReady") = false);
 
+    // ABT #1215: terminal-lead copper length per winding, measured on the finished real-winding
+    // centreline (same enrichment and settings as drawMagnetic(useRealWindingGeometry=True)).
+    // Returns {"winding_<name>": {"terminal_lead_length_m", "parallels", "ends": [...]}}; with
+    // outputPath (the STEP path) it also writes the <stem>.leads.json sidecar next to it.
+    m.def("measureTerminalLeadLengths",
+          [](const std::string& json_str, py::object outputPath, int polygonSegments,
+             bool paintCoating, bool femReady) {
+              auto j = json::parse(json_str);
+              mvb::MagneticBuilder b;
+              auto magnetic = mvb::magnetic_autocomplete_safe(j, /*useRealWindingGeometry=*/true);
+              const auto leads = b.measureTerminalLeadLengths(
+                  magnetic, paintCoating, femReady, polygonSegments, polygonSegments,
+                  mvb::MagneticBuilder::declaredCoreCoatingThickness(magnetic.get_core()));
+              if (!outputPath.is_none())
+                  mvb::MagneticBuilder::writeTerminalLeadSidecar(
+                      leads, py::str(outputPath).cast<std::string>());
+              return py::module_::import("json").attr("loads")(
+                  mvb::MagneticBuilder::terminalLeadLengthsToJson(leads).dump());
+          },
+          py::arg("json_str"),
+          py::arg("outputPath") = py::none(),
+          py::kw_only(),
+          py::arg("polygonSegments") = mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+          py::arg("paintCoating") = false,
+          py::arg("femReady") = true);
+
     // drawWinding takes an extra positional `windingName`.
     m.def("drawWinding",
           [](const std::string& coil_json,

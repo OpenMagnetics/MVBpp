@@ -767,7 +767,15 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
             else        { s2.az0 = az; s2.r0 = r; s2.y0 = y; }
         };
         std::vector<Primitive> arcs;
-        for (const auto& ao : best->arcs) { Primitive q = ao.pr; q.isConnection = false; arcs.push_back(q); }
+        // ABT #1215: a terminal corner's arcs are tagged for the lead-length measurement (and only
+        // for it); a wrap-to-layer-link corner (MVB_LINK_FILLET) is not a terminal and stays untagged.
+        const bool terminalCorner = isStub(sp);
+        for (const auto& ao : best->arcs) {
+            Primitive q = ao.pr;
+            q.isConnection = false;
+            q.terminalFillet = terminalCorner;
+            arcs.push_back(q);
+        }
         // Apply. Order of operations keeps indices valid: shorten pieces in place first, then
         // erase consumed pieces from the higher index down, then insert the arcs at the joint.
         if (exitCorner) sg.seg.a = P2; else sg.seg.b = P1;
