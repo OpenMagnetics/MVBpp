@@ -14704,6 +14704,23 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     }
 
     dropToroidLeadTipsToPlane(paths);
+    // ABT #1173 (WP4): report the common terminal plane the drops now end on, read back from the
+    // finished tips (the drop construction above is not touched). A toroid base is drawn with its top
+    // face on it (BaseBuilder.h). Every toroidal conductor's two free ends lie on it; anything else throws.
+    if (opts.toroidTerminalPlaneOut) {
+        double plane = std::numeric_limits<double>::quiet_NaN();
+        for (const auto& p : paths) {
+            if (!p.toroidal || p.prims.size() < 2) continue;
+            for (const gp_Pnt& tip : {primEndpoints(p.prims.front()).first, primEndpoints(p.prims.back()).second}) {
+                if (std::isnan(plane)) plane = tip.Y();
+                if (std::abs(tip.Y() - plane) > 1e-12)
+                    throw std::runtime_error("ConductorBuilder: toroidal terminal tips of '" + p.name +
+                                             "' are not on one plane (y " + std::to_string(tip.Y()) + " vs " +
+                                             std::to_string(plane) + ")");
+            }
+        }
+        *opts.toroidTerminalPlaneOut = plane;
+    }
     if (opts.diagnosticSkipCollisionCheck) {
         // Loud on purpose: a build that skipped this gate produces overlapping copper and
         // must not be mistaken for a valid part further downstream.

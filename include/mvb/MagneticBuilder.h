@@ -1,4 +1,5 @@
 #pragma once
+#include <limits>
 
 #include "MAS.hpp"
 #include "Utils.h"
@@ -290,6 +291,10 @@ public:
         bool paintCoating           = true;
         bool useRealWindingGeometry = false;
         bool femReady               = false;
+        // ABT #1173 (WP4): the real-winding toroid terminal plane of the conductors this assembly
+        // drew (ConductorBuilder::Options::toroidTerminalPlaneOut); NaN when there is none. A
+        // toroid base is drawn with its top face on it (BaseBuilder.h).
+        double toroidTerminalPlaneY = std::numeric_limits<double>::quiet_NaN();
     };
     void appendAccessorySolids(std::vector<NamedShape>& all,
                                const MAS::Magnetic& magnetic,
@@ -315,7 +320,10 @@ public:
         bool paintCoating,
         bool emitCoatingShells,
         bool femReady,
-        bool diagnosticSkipCollisionCheck = false) const;
+        bool diagnosticSkipCollisionCheck = false,
+        // ABT #1173: receives the LOWEST toroid terminal plane over the conductor builds emitted
+        // (bare and coating shells lay their leads at their own radii); NaN when none.
+        double* toroidTerminalPlaneOut = nullptr) const;
 };
 
 } // namespace mvb

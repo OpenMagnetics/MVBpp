@@ -11,6 +11,7 @@
 #include "mvb/SpacerBuilder.h"   // ABT #1170 (WP1)
 #include "mvb/PinBuilder.h"      // ABT #1171 (WP2)
 #include "mvb/ShuntBuilder.h"    // ABT #1176 (WP7)
+#include "mvb/BaseBuilder.h"     // ABT #1173 (WP4)
 #include "mvb/FR4Builder.h"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/CorePiece.h"
@@ -990,9 +991,18 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     // ABT #685: per-solid names, kept alongside the shape/name vectors this path splits things
     // into. Indexed like turnShapes/turnNames; empty for anything that has none.
     std::vector<std::vector<std::string>> turnPartNames;
+    double toroidTerminalPlane = std::numeric_limits<double>::quiet_NaN();   // ABT #1173
+    // ABT #1173: a base this assembly cannot draw is refused before any copper is built.
+    if (includeBobbin) {
+        if (const auto base = BaseBuilder::baseOf<OpenMagnetics::Bobbin>(magnetic.get_coil().get_bobbin()))
+            BaseBuilder::requireDrawableMounting(
+                base.value(), getBobbinNameT<OpenMagnetics::Bobbin>(magnetic.get_coil().get_bobbin(), "Bobbin"));
+    }
     if (useRealWindingGeometry) {
         for (auto& ns : buildRealWindingConductorsNamed(magnetic, all, wirePolygonSegments,
-                                                        paintCoating, emitCoatingShells, femReady)) {
+                                                        paintCoating, emitCoatingShells, femReady,
+                                                        /*diagnosticSkipCollisionCheck=*/false,
+                                                        &toroidTerminalPlane)) {
             turnShapes.push_back(ns.shape);
             turnNames.push_back(ns.name);
             turnPartNames.push_back(std::move(ns.partNames));
@@ -1040,7 +1050,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     appendAccessorySolids(all, magnetic,
                           AccessoryOptions{includeBobbin, wirePolygonSegments,
                                            corePolygonSegments, paintCoating,
-                                           useRealWindingGeometry, femReady});
+                                           useRealWindingGeometry, femReady,
+                                           toroidTerminalPlane});
 
     // Append the already-built turns (no second build).
     for (std::size_t i = 0; i < turnShapes.size(); ++i) {
@@ -1074,6 +1085,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     }
 
     checkShuntCollisions(all);   // ABT #1176: on the finished assembly, before rotation/symmetry
+    checkBaseCollisions(all);    // ABT #1173: likewise for a toroid base
 
     // MKF's geometricalDescription rotates the toroid by {pi/2, pi/2, 0} (Core.cpp), tipping
     // the ring out of the MAS XY plane: it lands in XZ with the hole axis along world Y, and
@@ -1122,6 +1134,14 @@ void MagneticBuilder::appendAccessorySolids(std::vector<NamedShape>& all,
     // states no footprint: nothing to draw and nothing to guess.
     if (opts.includeBobbin) {
         const MAS::Coil coil = magnetic.get_coil().value();
+        // ABT #1173 (WP4): a toroid base sits under the real-winding terminal plane, which only the
+        // MKF-enriched build knows; a magnetic arriving with its geometry already described has none.
+        if (BaseBuilder::baseOf<MAS::Bobbin>(coil.get_bobbin()))
+            throw std::runtime_error(
+                "appendAccessorySolids: bobbin '" + getBobbinNameT<MAS::Bobbin>(coil.get_bobbin(), "Bobbin") +
+                "' is a toroid base, which is drawn only from the MKF-enriched magnetic with real winding "
+                "geometry (its top face is the terminal plane of the real-winding leads). Pass the functional "
+                "design without geometricalDescription and set useRealWindingGeometry.");
         for (auto& pin : PinBuilder::buildPinsNamed(getBobbinProcessed(coil),
                                                     getBobbinNameT<MAS::Bobbin>(coil.get_bobbin(), "Bobbin")))
             all.push_back(std::move(pin));
@@ -1137,6 +1157,20 @@ void MagneticBuilder::appendAccessorySolids(std::vector<NamedShape>& all,
     // ABT #1171 (WP2): see the MAS overload.
     if (opts.includeBobbin) {
         const auto& coil = magnetic.get_coil();
+        const std::string bobbinName = getBobbinNameT<OpenMagnetics::Bobbin>(coil.get_bobbin(), "Bobbin");
+        // ABT #1173 (WP4): a toroid base and ITS pins (BaseBuilder.h: top face on the terminal plane,
+        // MKF's pins moved along Y onto its bottom face), instead of the pins at MKF's bare-ring height.
+        if (BaseBuilder::baseOf<OpenMagnetics::Bobbin>(coil.get_bobbin())) {
+            if (!opts.useRealWindingGeometry || std::isnan(opts.toroidTerminalPlaneY))
+                throw std::runtime_error(
+                    "appendAccessorySolids: bobbin '" + bobbinName + "' is a toroid base; it is drawn only "
+                    "with real winding geometry, whose terminal plane its top face sits on.");
+            const auto functional = std::get<OpenMagnetics::Bobbin>(coil.get_bobbin()).get_functional_description();
+            for (auto& solid : BaseBuilder::buildBaseNamed(functional.value(), getBobbinProcessed(coil),
+                                                           opts.toroidTerminalPlaneY, bobbinName))
+                all.push_back(std::move(solid));
+            return;
+        }
         for (auto& pin : PinBuilder::buildPinsNamed(getBobbinProcessed(coil),
                                                     getBobbinNameT<OpenMagnetics::Bobbin>(coil.get_bobbin(), "Bobbin")))
             all.push_back(std::move(pin));
@@ -1323,18 +1357,26 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
     bool paintCoating,
     bool emitCoatingShells,
     bool femReady,
-    bool diagnosticSkipCollisionCheck) const {
+    bool diagnosticSkipCollisionCheck,
+    double* toroidTerminalPlaneOut) const {
     MAS::CoreBobbinProcessedDescription bobbinPd;
     bool toroidalCore = false;
     ConductorBuilder::Options copts = realWindingConductorOptions(
         magnetic, coreShapes, wirePolygonSegments, femReady, bobbinPd, toroidalCore);
     copts.diagnosticSkipCollisionCheck = diagnosticSkipCollisionCheck;
+    if (toroidTerminalPlaneOut) *toroidTerminalPlaneOut = std::numeric_limits<double>::quiet_NaN();
 
     std::vector<NamedShape> out;
     auto emitConductors = [&](bool coat, const std::string& suffix) {
         copts.paintCoating = coat;
-        for (auto& ns : ConductorBuilder::buildAll(magnetic.get_coil(), bobbinPd,
-                                                   toroidalCore, copts)) {
+        double plane = std::numeric_limits<double>::quiet_NaN();
+        copts.toroidTerminalPlaneOut = &plane;
+        auto built = ConductorBuilder::buildAll(magnetic.get_coil(), bobbinPd, toroidalCore, copts);
+        copts.toroidTerminalPlaneOut = nullptr;
+        if (toroidTerminalPlaneOut && !std::isnan(plane) &&
+            (std::isnan(*toroidTerminalPlaneOut) || plane < *toroidTerminalPlaneOut))
+            *toroidTerminalPlaneOut = plane;
+        for (auto& ns : built) {
             // Carry the per-solid names through (ABT #685) — rebuilding the NamedShape from
             // {shape, name} alone silently dropped them, and the STEP went back to one unnamed
             // multi-solid product.

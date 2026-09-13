@@ -24,10 +24,10 @@ enum class Role {
     Turn,         // conductor: per-turn loop, or one continuous real-winding parallel
     TurnCoating,  // the insulated outer footprint of a conductor (enamel/serving/tape)
     Insulation,   // an insulation layer between sections/layers
-    Bobbin,       // the former (tube + flanges), or a toroid base
+    Bobbin,       // the former (tube + flanges)
     Pin,          // a bobbin/base terminal pin
     Divider,      // a chamber wall inside a multi-chamber bobbin
-    Base,         // reserved: a standoff base that is not the former itself
+    Base,         // a toroid base ("<bobbin> base", BaseBuilder, ABT #1173)
     Spacer,       // a core spacer (additive gap)
     Shunt,        // a magnetic shunt
     Sleeve,       // insulating sleeve over a lead run

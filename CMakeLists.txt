@@ -224,6 +224,7 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/ProjectionDrawing.cpp
     src/SpacerBuilder.cpp
     src/PinBuilder.cpp
+    src/BaseBuilder.cpp
     src/ShuntBuilder.cpp
     src/FR4Builder.cpp
     src/StepExporter.cpp
@@ -301,6 +302,7 @@ add_executable(mvb_tests
     tests/test_pins.cpp
     tests/test_shunts.cpp
     tests/test_named_roles.cpp
+    tests/test_toroid_base.cpp
 )
 
 target_compile_definitions(mvb_tests PRIVATE

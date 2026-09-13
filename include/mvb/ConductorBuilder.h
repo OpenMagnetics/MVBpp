@@ -113,6 +113,10 @@ public:
         // wrap the main column at the origin, which is every single-window design, so an
         // empty map is byte-identical to the pre-#871 builder.
         std::map<std::string, TurnBuilder::WoundColumnSpec> woundColumnPerSection;
+        // ABT #1173 (WP4): when non-null, a toroidal build writes the y of its common terminal
+        // plane here (NaN when the build has no toroidal conductor). A toroid on a base draws the
+        // base with its top face on that plane (BaseBuilder.h).
+        double* toroidTerminalPlaneOut = nullptr;
     };
 
     // REAL-PATH POLYLINES: the fully-assembled, collision-checked conductor centrelines
