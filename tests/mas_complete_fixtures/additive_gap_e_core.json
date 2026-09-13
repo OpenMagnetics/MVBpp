@@ -1,0 +1,79 @@
+{
+    "inputs": {
+        "designRequirements": {
+            "name": "Spacer-gapped E 42/21/15 inductor (ABT #1170, WP1)",
+            "magnetizingInductance": {
+                "nominal": 0.00025
+            },
+            "turnsRatios": []
+        },
+        "operatingPoints": [
+            {
+                "name": "Nominal",
+                "conditions": {
+                    "ambientTemperature": 25
+                },
+                "excitationsPerWinding": [
+                    {
+                        "name": "Primary",
+                        "frequency": 100000,
+                        "current": {
+                            "processed": {
+                                "label": "triangular",
+                                "peakToPeak": 2.0,
+                                "offset": 0,
+                                "dutyCycle": 0.5
+                            }
+                        },
+                        "voltage": {
+                            "processed": {
+                                "label": "rectangular",
+                                "peakToPeak": 100,
+                                "offset": 0,
+                                "dutyCycle": 0.5
+                            }
+                        }
+                    }
+                ]
+            }
+        ]
+    },
+    "magnetic": {
+        "core": {
+            "name": "E 42/21/15 N87 additive 0.5 mm",
+            "functionalDescription": {
+                "type": "twoPieceSet",
+                "material": "N87",
+                "shape": "E 42/21/15",
+                "gapping": [
+                    {
+                        "type": "additive",
+                        "length": 0.0005
+                    },
+                    {
+                        "type": "additive",
+                        "length": 0.0005
+                    },
+                    {
+                        "type": "additive",
+                        "length": 0.0005
+                    }
+                ],
+                "numberStacks": 1
+            }
+        },
+        "coil": {
+            "bobbin": "Basic",
+            "functionalDescription": [
+                {
+                    "name": "Primary",
+                    "numberTurns": 20,
+                    "numberParallels": 1,
+                    "isolationSide": "primary",
+                    "wire": "Round 0.63 - Grade 1"
+                }
+            ]
+        }
+    },
+    "outputs": []
+}

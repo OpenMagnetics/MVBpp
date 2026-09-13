@@ -75,6 +75,11 @@ struct NamedShape {
     // this makes exportSTEP write the compound as an assembly with a real name on every part.
     // Empty (the default) keeps the previous single-product behaviour exactly.
     std::vector<std::string> partNames;
+    // ABT #1170 (WP1): the MAS material this solid is made of, when MAS names one — today the
+    // `insulationMaterial` of a spacer. `role` (WP0) says WHAT the solid is; this says what it
+    // is MADE OF, so OMFEM can look the dielectric constant and the thermal conductivity up
+    // instead of assuming air for everything that is not core. Empty when MAS names nothing.
+    std::string materialName;
     // ABT #1169: what this solid is. Set by every producer; carried through cuts, symmetry and
     // sectioning. NOT exported to STEP (names are the only channel that survives that).
     Role role = Role::Core;

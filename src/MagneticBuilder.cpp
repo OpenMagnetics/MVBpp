@@ -8,6 +8,7 @@
 #include "mvb/TurnBuilder.h"
 #include "mvb/ConductorBuilder.h"
 #include "mvb/BobbinBuilder.h"
+#include "mvb/SpacerBuilder.h"   // ABT #1170 (WP1)
 #include "mvb/FR4Builder.h"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/CorePiece.h"
@@ -1083,13 +1084,16 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
 void MagneticBuilder::appendAccessorySolids(std::vector<NamedShape>& all,
                                             const MAS::Magnetic& magnetic,
                                             const AccessoryOptions& opts) const {
-    (void)all; (void)magnetic; (void)opts;
+    (void)opts;
+    // buildAllNamed has already refused a magnetic without a core, so this is engaged.
+    appendSpacerSolids(all, magnetic.get_core().value());  // ABT #1170 (WP1)
 }
 
 void MagneticBuilder::appendAccessorySolids(std::vector<NamedShape>& all,
                                             const OpenMagnetics::Magnetic& magnetic,
                                             const AccessoryOptions& opts) const {
-    (void)all; (void)magnetic; (void)opts;
+    (void)opts;
+    appendSpacerSolids(all, magnetic.get_core());          // ABT #1170 (WP1)
 }
 
 // ---- Standalone builders for the unified bindings API ---------------------

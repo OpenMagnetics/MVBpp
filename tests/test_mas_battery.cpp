@@ -383,7 +383,14 @@ CaseResult run_one(const fs::path& path) {
         fail("autocomplete left geometricalDescription empty");
         return r;
     }
-    const size_t expectedPieces = gd->size();
+    // ABT #1170: a geometricalDescription also lists the SPACER elements of an additive gap.
+    // Those are not core pieces -- buildCoreNamed draws only the pieces, and the shims arrive
+    // through the accessory hook as Spacer_<i> -- so they are excluded from the expected count.
+    // (No fixture had an additive gap before additive_gap_e_core.json, so the count never saw one.)
+    const size_t expectedPieces = static_cast<size_t>(std::count_if(gd->begin(), gd->end(),
+        [](const MAS::CoreGeometricalDescriptionElement& element) {
+            return element.get_type() != MAS::CoreGeometricalDescriptionElementType::SPACER;
+        }));
 
     // -- 3. Build core / bobbin / turns ------------------------------------
     mvb::MagneticBuilder builder;

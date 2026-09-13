@@ -21,6 +21,7 @@
 
 #include "mvb/MagneticBuilder.h"
 #include "mvb/SectionBuilder.h"
+#include "mvb/SpacerBuilder.h"   // ABT #1170
 #include "mvb/SectionDrawing.h"
 #include "mvb/StepExporter.h"
 #include "mvb/Symmetry.h"
@@ -200,6 +201,28 @@ std::vector<mvb::NamedShape> build_core(const std::string& json_str, int polygon
     return b.buildCoreNamed(core, polygonSegments);
 }
 
+// ABT #1170 (WP1): mirrors bindings/wasm/mvbpp_wasm.cpp's build_spacer, so the plastic shims
+// of an additive-gapped core can be drawn/exported from Python too — until now they existed
+// only in the WASM build.
+std::vector<mvb::NamedShape> build_spacer(const std::string& json_str, int /*polygonSegments*/) {
+    auto j = json::parse(json_str);
+    auto core = j.get<MAS::MagneticCore>();
+    auto gdOpt = core.get_geometrical_description();
+    if (!gdOpt || gdOpt->empty()) {
+        throw std::runtime_error(
+            "drawSpacer: MagneticCore.geometricalDescription is required. "
+            "Run MKF magnetic_autocomplete on the parent Magnetic first.");
+    }
+    std::vector<mvb::NamedShape> out;
+    mvb::appendSpacerSolids(out, core);
+    if (out.empty()) {
+        throw std::runtime_error(
+            "drawSpacer: this core has no spacers. Spacers exist only on an ADDITIVE "
+            "(spacer) gapping; a ground/distributed/residual gap has none.");
+    }
+    return out;
+}
+
 std::vector<mvb::NamedShape> build_core_piece(const std::string& json_str, int polygonSegments) {
     auto j = json::parse(json_str);
     auto shape = j.get<MAS::CoreShape>();
@@ -358,6 +381,7 @@ Inputs are MAS-1.0 JSON strings.
 3D/2D draw functions
 --------------------
     mvbpp.drawCore       (core_json,        outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
+    mvbpp.drawSpacer     (core_json,        outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawCorePiece  (core_shape_json,  outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawBobbin     (bobbin_json,      outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawTurns      (turns_json,       outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
@@ -466,6 +490,7 @@ Notes
     };
 
     def_draw("drawCore",       &build_core);
+    def_draw("drawSpacer",     &build_spacer);   // ABT #1170
     def_draw("drawCorePiece",  &build_core_piece);
     def_draw("drawBobbin",     &build_bobbin);
     def_draw_paint("drawTurns",    &build_turns);
