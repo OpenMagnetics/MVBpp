@@ -9,6 +9,7 @@
 #include "mvb/ConductorBuilder.h"
 #include "mvb/BobbinBuilder.h"
 #include "mvb/SpacerBuilder.h"   // ABT #1170 (WP1)
+#include "mvb/PinBuilder.h"      // ABT #1171 (WP2)
 #include "mvb/FR4Builder.h"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/CorePiece.h"
@@ -900,6 +901,9 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                 std::vector<TopoDS_Shape> cutters;
                 for (const auto& ns : all) cutters.push_back(ns.shape);
                 cutters.insert(cutters.end(), turnShapes.begin(), turnShapes.end());
+                // ABT #1171: a pin owns the flange volume it passes through (see PinBuilder.h).
+                for (auto& pinShape : PinBuilder::buildPins(getBobbinProcessed(coil)))
+                    cutters.push_back(std::move(pinShape));
                 bobbin.shape = cut_bobbin(bobbin.shape, cutters);
                 if (!bobbin.shape.IsNull()) all.push_back(bobbin);
             }
@@ -1010,6 +1014,9 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
             } else {
                 cutters.insert(cutters.end(), turnShapes.begin(), turnShapes.end());
             }
+            // ABT #1171: a pin owns the flange volume it passes through (see PinBuilder.h).
+            for (auto& pinShape : PinBuilder::buildPins(getBobbinProcessed(magnetic.get_coil())))
+                cutters.push_back(std::move(pinShape));
             bobbin.shape = cut_bobbin(bobbin.shape, cutters);
             if (!bobbin.shape.IsNull()) all.push_back(bobbin);
         }
@@ -1084,16 +1091,32 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
 void MagneticBuilder::appendAccessorySolids(std::vector<NamedShape>& all,
                                             const MAS::Magnetic& magnetic,
                                             const AccessoryOptions& opts) const {
-    (void)opts;
-    // buildAllNamed has already refused a magnetic without a core, so this is engaged.
+    // buildAllNamed has already refused a magnetic without a core or a coil, so both are engaged.
     appendSpacerSolids(all, magnetic.get_core().value());  // ABT #1170 (WP1)
+
+    // ABT #1171 (WP2): the bobbin's solder pins, exactly where MKF placed them. They belong to
+    // the former, so they are drawn only with it. Absent `pins` means the catalogue record
+    // states no footprint: nothing to draw and nothing to guess.
+    if (opts.includeBobbin) {
+        const MAS::Coil coil = magnetic.get_coil().value();
+        for (auto& pin : PinBuilder::buildPinsNamed(getBobbinProcessed(coil),
+                                                    getBobbinNameT<MAS::Bobbin>(coil.get_bobbin(), "Bobbin")))
+            all.push_back(std::move(pin));
+    }
 }
 
 void MagneticBuilder::appendAccessorySolids(std::vector<NamedShape>& all,
                                             const OpenMagnetics::Magnetic& magnetic,
                                             const AccessoryOptions& opts) const {
-    (void)opts;
     appendSpacerSolids(all, magnetic.get_core());          // ABT #1170 (WP1)
+
+    // ABT #1171 (WP2): see the MAS overload.
+    if (opts.includeBobbin) {
+        const auto& coil = magnetic.get_coil();
+        for (auto& pin : PinBuilder::buildPinsNamed(getBobbinProcessed(coil),
+                                                    getBobbinNameT<OpenMagnetics::Bobbin>(coil.get_bobbin(), "Bobbin")))
+            all.push_back(std::move(pin));
+    }
 }
 
 // ---- Standalone builders for the unified bindings API ---------------------
