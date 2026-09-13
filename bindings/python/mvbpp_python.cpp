@@ -22,6 +22,7 @@
 #include "mvb/MagneticBuilder.h"
 #include "mvb/SectionBuilder.h"
 #include "mvb/SpacerBuilder.h"   // ABT #1170
+#include "mvb/ShuntBuilder.h"    // ABT #1176
 #include "mvb/SectionDrawing.h"
 #include "mvb/StepExporter.h"
 #include "mvb/Symmetry.h"
@@ -223,6 +224,20 @@ std::vector<mvb::NamedShape> build_spacer(const std::string& json_str, int /*pol
     return out;
 }
 
+// ABT #1176 (WP7): the magnetic shunts of a Magnetic, drawn as the assembly draws them
+// (Shunt_<i>, Shunt_<i>_<k> per segment; MKF validates every sheet and its exceptions propagate).
+// Shunts live on the Magnetic, not on the core, so this takes a Magnetic JSON, and the core must
+// be processed (columns and gap coordinates) because MKF's shunt model reads them.
+std::vector<mvb::NamedShape> build_shunt(const std::string& json_str, int /*polygonSegments*/) {
+    auto j = json::parse(json_str);
+    OpenMagnetics::Magnetic magnetic(j.get<MAS::Magnetic>());
+    auto out = mvb::ShuntBuilder::buildShuntsNamed(magnetic);
+    if (out.empty()) {
+        throw std::runtime_error("drawShunt: this magnetic has no shunts (magnetic.shunts is absent or empty).");
+    }
+    return out;
+}
+
 std::vector<mvb::NamedShape> build_core_piece(const std::string& json_str, int polygonSegments) {
     auto j = json::parse(json_str);
     auto shape = j.get<MAS::CoreShape>();
@@ -382,6 +397,7 @@ Inputs are MAS-1.0 JSON strings.
 --------------------
     mvbpp.drawCore       (core_json,        outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawSpacer     (core_json,        outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
+    mvbpp.drawShunt      (magnetic_json,    outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawCorePiece  (core_shape_json,  outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawBobbin     (bobbin_json,      outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawTurns      (turns_json,       outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
@@ -491,6 +507,7 @@ Notes
 
     def_draw("drawCore",       &build_core);
     def_draw("drawSpacer",     &build_spacer);   // ABT #1170
+    def_draw("drawShunt",      &build_shunt);    // ABT #1176
     def_draw("drawCorePiece",  &build_core_piece);
     def_draw("drawBobbin",     &build_bobbin);
     def_draw_paint("drawTurns",    &build_turns);

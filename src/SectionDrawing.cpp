@@ -2,6 +2,7 @@
 #include "mvb/SectionBuilder.h"
 #include "mvb/MagneticBuilder.h"
 #include "mvb/SpacerBuilder.h"   // ABT #1170
+#include "mvb/ShuntBuilder.h"    // ABT #1176
 #include "mvb/Utils.h"
 #include "constructive_models/Magnetic.h"
 
@@ -715,6 +716,10 @@ static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnet
     // straddles y = 0) must not be able to win that pick.
     std::vector<NamedShape> spacers;
     appendSpacerSolids(spacers, magnetic.get_core());
+    // ABT #1176 (WP7): the magnetic shunts, validated by MKF exactly as the 3D assembly does.
+    // Sectioned on their own (not fused) in the FRONT view so a sheet held inside a shimmed gap
+    // keeps its outline instead of merging into the shim's.
+    const auto shunts = ShuntBuilder::buildShuntsNamed(magnetic);
 
     // Sample edges → polylines in mm; collect bbox.
     std::vector<std::vector<std::pair<double,double>>> polylines;
@@ -805,6 +810,14 @@ static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnet
             auto edges = SectionBuilder::sectionCore(core, SectionPlane::XY);
             if (edges.IsNull()) throw std::runtime_error("SectionDrawing: front section returned nothing");
             collectEdges(edges, ViewKind::FRONT);
+            for (const auto& shunt : shunts) {
+                auto shuntEdges = SectionBuilder::sectionCore(shunt.shape, SectionPlane::XY);
+                // Null only when the boolean failed; a sheet that does not reach z = 0 sections
+                // to an empty compound and simply draws nothing.
+                if (shuntEdges.IsNull())
+                    throw std::runtime_error("SectionDrawing: front section of " + shunt.name + " failed");
+                collectEdges(shuntEdges, ViewKind::FRONT);
+            }
         }
     } else if (view == ViewKind::TOP && [&]{
                   auto geo = magnetic.get_core().get_geometrical_description();

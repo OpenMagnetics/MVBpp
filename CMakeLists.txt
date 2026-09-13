@@ -224,6 +224,7 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/ProjectionDrawing.cpp
     src/SpacerBuilder.cpp
     src/PinBuilder.cpp
+    src/ShuntBuilder.cpp
     src/FR4Builder.cpp
     src/StepExporter.cpp
     src/Symmetry.cpp
@@ -298,6 +299,7 @@ add_executable(mvb_tests
     tests/test_section_projection.cpp
     tests/test_spacers.cpp
     tests/test_pins.cpp
+    tests/test_shunts.cpp
     tests/test_named_roles.cpp
 )
 

@@ -10,6 +10,7 @@
 #include "mvb/BobbinBuilder.h"
 #include "mvb/SpacerBuilder.h"   // ABT #1170 (WP1)
 #include "mvb/PinBuilder.h"      // ABT #1171 (WP2)
+#include "mvb/ShuntBuilder.h"    // ABT #1176 (WP7)
 #include "mvb/FR4Builder.h"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/CorePiece.h"
@@ -907,6 +908,9 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                 // ABT #1171: a pin owns the flange volume it passes through (see PinBuilder.h).
                 for (auto& pinShape : PinBuilder::buildPins(getBobbinProcessed(coil)))
                     cutters.push_back(std::move(pinShape));
+                // ABT #1176: a magnetic shunt owns the former volume it passes through.
+                for (auto& shunt : ShuntBuilder::buildShuntsNamed(magnetic))
+                    cutters.push_back(std::move(shunt.shape));
                 bobbin.shape = cut_bobbin(bobbin.shape, cutters);
                 if (!bobbin.shape.IsNull()) all.push_back(bobbin);
             }
@@ -938,10 +942,15 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
             patchBobbinDimensions(bobbinPd, core);
             auto fr4 = FR4Builder::buildFR4Board(*groupsOpt, bobbinPd);
             if (!fr4.IsNull()) {
-                all.emplace_back(fr4, "FR4Board", Role::FR4);
+                // ABT #1176: the board is one slab over the whole group height (the copper sits
+                // inside it); a sheet laid in the stack takes its volume out of the board.
+                NamedShape board{fr4, "FR4Board", Role::FR4};
+                cutByShunts(board, all);
+                all.push_back(std::move(board));
             }
         }
 
+        checkShuntCollisions(all);   // ABT #1176: on the finished assembly, before symmetry
         return apply_symmetry(std::move(all), symmetryPlanes);
     }
 
@@ -1020,6 +1029,9 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
             // ABT #1171: a pin owns the flange volume it passes through (see PinBuilder.h).
             for (auto& pinShape : PinBuilder::buildPins(getBobbinProcessed(magnetic.get_coil())))
                 cutters.push_back(std::move(pinShape));
+            // ABT #1176: a magnetic shunt owns the former volume it passes through.
+            for (auto& shunt : ShuntBuilder::buildShuntsNamed(magnetic))
+                cutters.push_back(std::move(shunt.shape));
             bobbin.shape = cut_bobbin(bobbin.shape, cutters);
             if (!bobbin.shape.IsNull()) all.push_back(bobbin);
         }
@@ -1054,9 +1066,14 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         patchBobbinDimensions(bobbinPd, magnetic.get_core());
         auto fr4 = FR4Builder::buildFR4Board(*groupsOpt, bobbinPd);
         if (!fr4.IsNull()) {
-            all.emplace_back(fr4, "FR4Board", Role::FR4);
+            // ABT #1176: see the MAS overload.
+            NamedShape board{fr4, "FR4Board", Role::FR4};
+            cutByShunts(board, all);
+            all.push_back(std::move(board));
         }
     }
+
+    checkShuntCollisions(all);   // ABT #1176: on the finished assembly, before rotation/symmetry
 
     // MKF's geometricalDescription rotates the toroid by {pi/2, pi/2, 0} (Core.cpp), tipping
     // the ring out of the MAS XY plane: it lands in XZ with the hole axis along world Y, and
@@ -1096,6 +1113,9 @@ void MagneticBuilder::appendAccessorySolids(std::vector<NamedShape>& all,
                                             const AccessoryOptions& opts) const {
     // buildAllNamed has already refused a magnetic without a core or a coil, so both are engaged.
     appendSpacerSolids(all, magnetic.get_core().value());  // ABT #1170 (WP1)
+    // ABT #1176 (WP7): magnetic shunts, after the spacers so a sheet held in an additive gap cuts
+    // its shims. See ShuntBuilder.h for the MKF validation contract and the naming decision.
+    appendShuntSolids(all, magnetic);
 
     // ABT #1171 (WP2): the bobbin's solder pins, exactly where MKF placed them. They belong to
     // the former, so they are drawn only with it. Absent `pins` means the catalogue record
@@ -1112,6 +1132,7 @@ void MagneticBuilder::appendAccessorySolids(std::vector<NamedShape>& all,
                                             const OpenMagnetics::Magnetic& magnetic,
                                             const AccessoryOptions& opts) const {
     appendSpacerSolids(all, magnetic.get_core());          // ABT #1170 (WP1)
+    appendShuntSolids(all, magnetic);                      // ABT #1176 (WP7): see the MAS overload
 
     // ABT #1171 (WP2): see the MAS overload.
     if (opts.includeBobbin) {
