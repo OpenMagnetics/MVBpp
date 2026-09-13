@@ -42,6 +42,8 @@
 #include <Standard_Failure.hxx>
 #include <iostream>
 #include <BRepBndLib.hxx>
+#include <BRepAlgoAPI_Common.hxx>
+#include <Bnd_Box.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <numbers>
@@ -430,6 +432,50 @@ std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
     return result;
 }
 
+// ABT #1249: MKF's pin rails for the coil's bobbin (empty for a bobbin without pins). The MAS
+// variant is wrapped without re-processing, so the rails are read from exactly the processed
+// description (and pins) the rest of the build draws.
+static std::vector<OpenMagnetics::Bobbin::PinRailBlock> getPinRails(const MAS::Coil& coil) {
+    if (const auto* bobbin = std::get_if<MAS::Bobbin>(&coil.get_bobbin())) {
+        return OpenMagnetics::Bobbin(*bobbin).get_pin_rails();
+    }
+    return {};
+}
+
+static std::vector<OpenMagnetics::Bobbin::PinRailBlock> getPinRails(const OpenMagnetics::Coil& coil) {
+    if (const auto* bobbin = std::get_if<OpenMagnetics::Bobbin>(&coil.get_bobbin())) {
+        return bobbin->get_pin_rails();
+    }
+    return {};
+}
+
+// ABT #1249 collision gate: a pin rail shares no volume with a core piece or a conductor. It runs
+// BEFORE cut_bobbin, which would otherwise carve a rail that runs into the core away without a word.
+static void checkPinRailCollisions(const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& rails,
+                                   const std::string& bobbinName,
+                                   const std::vector<std::pair<std::string, TopoDS_Shape>>& obstacles) {
+    if (rails.empty()) return;
+    for (const auto& rail : BobbinBuilder::buildPinRailsNamed(rails, bobbinName)) {
+        Bnd_Box railBox;
+        BRepBndLib::Add(rail.shape, railBox);
+        for (const auto& [name, obstacle] : obstacles) {
+            if (obstacle.IsNull()) continue;
+            Bnd_Box box;
+            BRepBndLib::Add(obstacle, box);
+            if (railBox.IsOut(box)) continue;
+            BRepAlgoAPI_Common common(rail.shape, obstacle);
+            if (!common.IsDone())
+                throw std::runtime_error("checkPinRailCollisions: boolean common of '" + rail.name + "' and '" + name + "' failed");
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(common.Shape(), props);
+            if (props.Mass() > 1e-15)
+                throw std::runtime_error("Pin rail '" + rail.name + "' overlaps '" + name + "' by " +
+                                         std::to_string(props.Mass() * 1e9) + " mm^3: MKF's rail geometry and the " +
+                                         "core/winding disagree, and cutting the rail away would hide it (ABT #1249)");
+        }
+    }
+}
+
 // Internal bobbin builder. Public surface goes through buildBobbinNamed().
 template<typename CoilT>
 TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& core,
@@ -461,7 +507,8 @@ TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& c
     // actual winding-window cross-section, or BobbinBuilder is using the
     // wrong flange topology. Either way, the fix belongs upstream (in
     // BobbinBuilder or in MAS), not in a silent post-hoc cut here.
-    return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments);
+    return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments,
+                                      getPinRails(coil));   // ABT #1249
 }
 
 // ---- Multi-column placement resolution -------------------------------------------------------
@@ -906,6 +953,13 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                 std::vector<TopoDS_Shape> cutters;
                 for (const auto& ns : all) cutters.push_back(ns.shape);
                 cutters.insert(cutters.end(), turnShapes.begin(), turnShapes.end());
+                {   // ABT #1249: rails vs core and copper, before the cut could hide an overlap.
+                    std::vector<std::pair<std::string, TopoDS_Shape>> obstacles;
+                    for (const auto& ns : all) obstacles.emplace_back(ns.name, ns.shape);
+                    for (std::size_t i = 0; i < turnShapes.size(); ++i)
+                        obstacles.emplace_back(i < turnNames.size() ? turnNames[i] : "Turn_" + std::to_string(i), turnShapes[i]);
+                    checkPinRailCollisions(getPinRails(coil), bobbin.name, obstacles);
+                }
                 // ABT #1171: a pin owns the flange volume it passes through (see PinBuilder.h).
                 for (auto& pinShape : PinBuilder::buildPins(getBobbinProcessed(coil)))
                     cutters.push_back(std::move(pinShape));
@@ -1017,6 +1071,13 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         if (!bobbin.shape.IsNull()) {
             std::vector<TopoDS_Shape> cutters;
             for (const auto& ns : all) cutters.push_back(ns.shape);
+            {   // ABT #1249: rails vs core and copper, before the cut could hide an overlap.
+                std::vector<std::pair<std::string, TopoDS_Shape>> obstacles;
+                for (const auto& ns : all) obstacles.emplace_back(ns.name, ns.shape);
+                for (std::size_t i = 0; i < turnShapes.size(); ++i)
+                    obstacles.emplace_back(i < turnNames.size() ? turnNames[i] : "Turn_" + std::to_string(i), turnShapes[i]);
+                checkPinRailCollisions(getPinRails(magnetic.get_coil()), bobbin.name, obstacles);
+            }
             // The bobbin is ALWAYS cut with the OUTER (coated) envelope. When the product
             // paints bare copper, cutting with the copper solids makes every lead
             // pass-through slot EXACTLY tangent to the conductor -- measured on 10_emi

@@ -4,7 +4,8 @@
 // MKF's Bobbin::expand_pinout turns a record's pinout (count, rows, pitches, pinDescription,
 // orientation) into processedDescription.pins[]; MVB++'s PinBuilder only turns each MAS::Pin into
 // a solid. The fixture is boost_inductor_complete.json, whose "Bobbin PQ 26/25" is one of the
-// catalogue records with a complete footprint (12 round THT pins, 6+6, row distance 12.7 mm).
+// catalogue records with a complete footprint (12 round THT pins, 6+6, row distance 25.4 mm since MAS 901af03, ABT #1209;
+// the rails holding them are drawn since ABT #1249, see test_pinrail.cpp).
 // flyback_transformer_complete.json's "Bobbin ETD 34" states no footprint, so MKF places no pins
 // there and none may be drawn -- MVB++ must not invent any.
 #include <catch2/catch_test_macros.hpp>

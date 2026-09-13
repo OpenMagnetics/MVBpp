@@ -94,7 +94,25 @@ static void checkIsDone(const BRepAlgoAPI_Fuse& op, const char* ctx) {
     if (!op.IsDone()) throw std::runtime_error(std::string("BobbinBuilder: Fuse failed: ") + ctx);
 }
 
-TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescription& bobbin, double flangeThickness, bool axisIsY, int polygonSegments) {
+std::vector<NamedShape> BobbinBuilder::buildPinRailsNamed(const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails,
+                                                          const std::string& bobbinName) {
+    std::vector<NamedShape> out;
+    for (const auto& rail : pinRails) {
+        if (rail.centre.size() != 3 || rail.halfExtents.size() != 3 ||
+            !(rail.halfExtents[0] > 0.0) || !(rail.halfExtents[1] > 0.0) || !(rail.halfExtents[2] > 0.0))
+            throw std::invalid_argument("BobbinBuilder: pin rail '" + rail.name + "' of bobbin '" + bobbinName +
+                                        "' is not a box with three positive half extents");
+        gp_Pnt corner(rail.centre[0] - rail.halfExtents[0], rail.centre[1] - rail.halfExtents[1],
+                      rail.centre[2] - rail.halfExtents[2]);
+        out.emplace_back(BRepPrimAPI_MakeBox(corner, 2.0 * rail.halfExtents[0], 2.0 * rail.halfExtents[1],
+                                             2.0 * rail.halfExtents[2]).Shape(),
+                         bobbinName + " " + rail.name, Role::Bobbin);
+    }
+    return out;
+}
+
+TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescription& bobbin, double flangeThickness, bool axisIsY, int polygonSegments,
+                                        const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails) {
     if (flangeThickness < 0.0 || std::isnan(flangeThickness)) {
         throw std::invalid_argument("BobbinBuilder: flangeThickness is invalid");
     }
@@ -283,6 +301,48 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         gp_Trsf rot;
         rot.SetRotation(gp_Ax1(gp_Pnt(0,0,0), gp_Dir(1,0,0)), -std::numbers::pi / 2.0);
         bobbinShape = BRepBuilderAPI_Transform(bobbinShape, rot).Shape();
+    }
+
+    if (!pinRails.empty()) {
+        // ABT #1249: fuse MKF's pin rails with the bottom flange (see BobbinBuilder.h).
+        if (!axisIsY || !hasFlanges || bobbinShape.IsNull())
+            throw std::invalid_argument("BobbinBuilder: pin rails need a Y-axis former with flanges to hang from");
+        const double flangeFace = -(height / 2.0 + flangeThickness);
+        std::vector<TopoDS_Shape> solids;
+        for (TopExp_Explorer exp(bobbinShape, TopAbs_SOLID); exp.More(); exp.Next()) solids.push_back(exp.Current());
+        if (solids.size() != 3)
+            throw std::runtime_error("BobbinBuilder: expected body, top flange and bottom flange, got " +
+                                     std::to_string(solids.size()) + " solids");
+        TopTools_ListOfShape arguments, tools;
+        arguments.Append(solids[2]);
+        for (const auto& rail : pinRails) {
+            const double railTop = rail.centre[1] + rail.halfExtents[1];
+            if (std::abs(railTop - flangeFace) > 1e-9)
+                throw std::invalid_argument("BobbinBuilder: pin rail '" + rail.name + "' tops out at y = " +
+                                            std::to_string(railTop) + " m, not on the drawn bottom flange face y = " +
+                                            std::to_string(flangeFace) + " m");
+        }
+        for (auto& railShape : buildPinRailsNamed(pinRails, "rail")) tools.Append(railShape.shape);
+        BRepAlgoAPI_Fuse fuse;
+        fuse.SetArguments(arguments);
+        fuse.SetTools(tools);
+        fuse.Build();
+        checkIsDone(fuse, "bottom flange + pin rails");
+        std::size_t fusedSolids = 0;
+        for (TopExp_Explorer exp(fuse.Shape(), TopAbs_SOLID); exp.More(); exp.Next()) ++fusedSolids;
+        if (fusedSolids != 1)
+            throw std::runtime_error("BobbinBuilder: the bottom flange and its " + std::to_string(pinRails.size()) +
+                                     " pin rail block(s) fuse into " + std::to_string(fusedSolids) +
+                                     " solids; a rail that does not touch its flange would float in the model");
+        TopoDS_Shape fusedFlange;
+        for (TopExp_Explorer exp(fuse.Shape(), TopAbs_SOLID); exp.More(); exp.Next()) fusedFlange = exp.Current();
+        TopoDS_Compound comp;
+        BRep_Builder bld;
+        bld.MakeCompound(comp);
+        bld.Add(comp, solids[0]);
+        bld.Add(comp, solids[1]);
+        bld.Add(comp, fusedFlange);
+        bobbinShape = comp;
     }
 
     return bobbinShape;
