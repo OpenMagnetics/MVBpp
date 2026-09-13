@@ -15,6 +15,7 @@
 #include "MAS.hpp"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/Core.h"
+#include "support/Exceptions.h"
 #include <nlohmann/json.hpp>
 #include <Standard_Failure.hxx>
 #include <BRepGProp.hxx>
@@ -32,13 +33,39 @@ using json = nlohmann::json;
 #endif
 
 // Families whose gaps are STRUCTURAL, not user-specified, so a user gapping template is invalid
-// for them by definition -- not a build failure. "drumRing" joined this list when ShapeDrum
-// registered the family: before that it was unknown to the factory and skipped as unrecognised, so
-// the two DR+SRI shapes were never attempted. Now they are, and MVB++ correctly rejects them with
-// "drumRing cores cannot carry user gapping: their two annular clearance gaps are structural,
-// derived from A/K/D/F". Classify it alongside the others rather than letting a declared property
-// read as a regression.
-static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t", "drumRing"};
+// for them by definition -- not a build failure.
+//
+// ABT #1191: this list no longer carries "drumRing", and it deliberately never gained
+// "drumSemiShielded". Alf's rationale: a semi-shielded drum (DRS) is a drum core with
+// ferromagnetic plastic cast around it, so it CANNOT be gapped by construction -- there are no
+// mating surfaces to grind -- and MKF's refusal (ABT #362) is correct, not a defect. The same
+// holds for drumRing (ABT #366), whose two annular clearances are derived from A/K/D/F. A skip
+// keyed on the FAMILY NAME is the wrong instrument for that: it goes stale the moment MKF changes
+// its mind, and it swallows every OTHER way a shape of that family can fail. So the refusal is
+// recognised below by the exception MKF throws -- its type and the identity of its message -- and
+// this list is reserved for families this test never even attempts.
+static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t"};
+
+// ABT #1191: is this MKF's deliberate "this family cannot carry user gapping at all" refusal?
+//
+// Matched on the exception's TYPE (GapException, so an OCCT failure or any std::exception can
+// never be mistaken for one) plus the identity of the refusal message emitted by
+// Core::process_gap. The single-argument GapException constructor stamps every one of these with
+// ErrorCode::GAP_INVALID_DIMENSIONS, the same code a genuinely malformed gap gets, so the code
+// alone cannot separate them -- the message is the only identity MKF offers today. Anything else,
+// including a NotImplementedException from the very same block (drumRing with asymmetric
+// flanges), is a real failure and is reported as one.
+static bool is_construction_gap_refusal(const OpenMagnetics::GapException& e) {
+    static const std::vector<std::string> refusals = {
+        "Semi-shielded drums cannot be gapped",       // ABT #362, family drumSemiShielded
+        "drumRing cores cannot carry user gapping",   // ABT #366, family drumRing
+        "Molded cores cannot be gapped",              // ABT #357, family molded
+        "Toroids cannot be gapped",                   // family t (also in EXCLUDED)
+    };
+    for (const auto& refusal : refusals)
+        if (e.message().rfind(refusal, 0) == 0) return true;
+    return false;
+}
 
 namespace {
 
@@ -55,6 +82,7 @@ double total_volume(const std::vector<mvb::NamedShape>& pieces) {
 
 struct GappingResult {
     bool ok = false;
+    bool refusedByConstruction = false;  // ABT #1191: MKF says this family cannot be gapped
     int n_pieces = 0;
     double volume = 0.0;
     std::string error;
@@ -98,6 +126,11 @@ GappingResult build_with_gapping(const json& shape, const json& gapping,
                               " vol=" + std::to_string(r.volume);
     } catch (const Standard_Failure& e) {
         r.error = std::string("OCCT: ") + e.GetMessageString();
+    } catch (const OpenMagnetics::GapException& e) {
+        // ABT #1191: before the generic handler, so a by-construction refusal is separated from
+        // every other gap fault by MKF's own exception rather than by this test's shape list.
+        r.error = e.what();
+        r.refusedByConstruction = is_construction_gap_refusal(e);
     } catch (const std::exception& e) {
         r.error = e.what();
     } catch (...) {
@@ -128,6 +161,7 @@ void run_gap_test(const std::string& label, const json& gappingTemplate,
         // Apply the gapping template — MKF computes per-column coordinates
         // during enrichment, so we just hand it the lengths/types.
         auto result = build_with_gapping(shape, gappingTemplate, numberStacks);
+        if (!result.ok && result.refusedByConstruction) { ++skipped; continue; }  // ABT #1191
         if (!result.ok) failures.push_back(name + ": " + result.error);
         ++total;
     }
