@@ -8,6 +8,7 @@
 #include "Mas.h"
 #include "Utils.h"
 #include "support/Painter.h"
+#include "support/Settings.h"
 #include <BRepBuilderAPI_Transform.hxx>
 #include <OSD_ThreadPool.hxx>
 #include <gp_Pnt.hxx>
@@ -41,6 +42,9 @@ static void printUsage(const char* prog) {
               << "  --min-bend-radius <m> Minimum radius for ANY drawn corner/fillet, in metres\n"
               << "                        (also via MVB_MIN_BEND_RADIUS). Floors every corner's\n"
               << "                        policy radius; never tightens one.\n"
+              << "  --toroid-mounting <vertical|horizontal>  How a toroid is mounted (ABT #1248;\n"
+              << "                        sets MKF Settings toroid_mounting, default vertical; a\n"
+              << "                        toroid base record's base.mounting still overrides it)\n"
               << "  -h, --help            Show this help\n";
 }
 
@@ -301,6 +305,17 @@ int main(int argc, char* argv[]) {
                 // flag reaches every construction site without threading a parameter through
                 // four signatures. setenv BEFORE any Options is constructed.
                 setenv("MVB_MIN_BEND_RADIUS", argv[i], 1);
+            }
+        } else if (arg == "--toroid-mounting") {
+            if (++i >= argc) { printUsage(argv[0]); return 1; }
+            const std::string m = argv[i];
+            if (m == "vertical")
+                OpenMagnetics::Settings::GetInstance().set_toroid_mounting(MAS::OrientationEnum::VERTICAL);
+            else if (m == "horizontal")
+                OpenMagnetics::Settings::GetInstance().set_toroid_mounting(MAS::OrientationEnum::HORIZONTAL);
+            else {
+                std::cerr << "Error: --toroid-mounting takes vertical or horizontal, got '" << m << "'\n";
+                return 1;
             }
         } else if (arg == "--segments") {
             if (++i < argc) segments = std::stoi(argv[i]);

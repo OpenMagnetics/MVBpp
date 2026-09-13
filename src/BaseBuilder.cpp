@@ -57,9 +57,9 @@ void BaseBuilder::requireDrawableMounting(const MAS::BobbinBase& base, const std
             "drawing is not implemented for vertical bases without data (the slot that holds the ring on "
             "edge is not described, and inventing one would put a body through the ring).");
     throw std::runtime_error(
-        "BaseBuilder: toroid base '" + bobbinName + "' is mounted vertically; drawing is not implemented "
-        "for vertical bases: the on-edge ring's board normal is -Z, while every toroid terminal drop runs "
-        "along -Y (the toroid terminal-orientation rework decides that frame).");
+        "BaseBuilder: toroid base '" + bobbinName + "' is mounted vertically; drawing a vertical base (the "
+        "boat that holds the ring on edge, board normal -Y under the standing ring since ABT #1248) is not "
+        "implemented yet.");
 }
 
 std::vector<NamedShape> BaseBuilder::buildBaseNamed(const MAS::BobbinFunctionalDescription& functional,

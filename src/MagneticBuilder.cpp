@@ -44,6 +44,7 @@
 #include <BRepBndLib.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 #include <Bnd_Box.hxx>
+#include "support/Settings.h"
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <numbers>
@@ -117,6 +118,55 @@ static MAS::CoreBobbinProcessedDescription getBobbinProcessedT(const VariantT& b
         if (pd) return *pd;
     }
     return MAS::CoreBobbinProcessedDescription();
+}
+
+// ---- ABT #1248: toroid mounting -------------------------------------------------------------
+template<typename BobbinT, typename VariantT>
+static ConductorBuilder::ToroidMounting toroidMountingT(const VariantT& bobbinVar) {
+    // A toroid BASE record states how the ring sits on it; that overrides the global setting.
+    if (const BobbinT* bobbin = std::get_if<BobbinT>(&bobbinVar)) {
+        const auto& fd = bobbin->get_functional_description();
+        if (fd && fd->get_family() == MAS::BobbinFamily::T && fd->get_base()) {
+            return fd->get_base()->get_mounting() == MAS::OrientationEnum::HORIZONTAL
+                       ? ConductorBuilder::ToroidMounting::Horizontal
+                       : ConductorBuilder::ToroidMounting::Vertical;
+        }
+    }
+    return OpenMagnetics::Settings::GetInstance().get_toroid_mounting() == MAS::OrientationEnum::HORIZONTAL
+               ? ConductorBuilder::ToroidMounting::Horizontal
+               : ConductorBuilder::ToroidMounting::Vertical;
+}
+
+static bool isCoreToroidal(const MAS::MagneticCore& core);
+
+// Depth of the core (with its coating shells) along the build-frame lead direction: rotate the
+// solids so `down` is -Y and read the tight bounding box (AddOptimal: a ring's rim is exact).
+static double coreDepthAlongDown(const std::vector<NamedShape>& coreShapes,
+                                 const std::array<double, 3>& down) {
+    const gp_Vec from(down[0], down[1], down[2]);
+    const gp_Vec to(0.0, -1.0, 0.0);
+    gp_Trsf align;
+    const gp_Vec axis = from.Crossed(to);
+    if (axis.Magnitude() > 1e-12) {
+        align.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(axis)), from.AngleWithRef(to, axis));
+    }
+    else if (from.Dot(to) < 0.0) {
+        align.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)), std::numbers::pi);
+    }
+    Bnd_Box box;
+    bool any = false;
+    for (const auto& ns : coreShapes) {
+        if (ns.role != Role::Core && ns.role != Role::CoreCoating) continue;
+        if (ns.shape.IsNull()) continue;
+        BRepBndLib::AddOptimal(BRepBuilderAPI_Transform(ns.shape, align, true).Shape(), box,
+                               /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+        any = true;
+    }
+    if (!any || box.IsVoid())
+        throw std::runtime_error("coreDepthAlongDown: the toroid has no core solid to measure");
+    double xmin, ymin, zmin, xmax, ymax, zmax;
+    box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    return -ymin;
 }
 
 static MAS::CoreBobbinProcessedDescription getBobbinProcessed(const MAS::Coil& coil) {
@@ -1006,6 +1056,13 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
         }
 
         checkShuntCollisions(all);   // ABT #1176: on the finished assembly, before symmetry
+        // ABT #1248: a toroid is placed for its mounting, exactly as in the MKF-enriched overload.
+        if (isCoreToroidal(core)) {
+            const auto frame = toroidMountingFrameOf(magnetic);
+            if (frame.mounting == ConductorBuilder::ToroidMounting::Vertical)
+                for (auto& ns : all)
+                    ns.shape = BRepBuilderAPI_Transform(ns.shape, frame.toExported).Shape();
+        }
         return apply_symmetry(std::move(all), symmetryPlanes);
     }
 
@@ -1161,8 +1218,14 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
             if (p.get_type() == MAS::CoreGeometricalDescriptionElementType::TOROIDAL) return true;
         return false;
     }();
-    if (isToroidal)
-        for (auto& ns : all) ns.shape = rotate_shape(ns.shape, -std::numbers::pi / 2.0, 0.0, 0.0);
+    // ABT #1248: that counter-rotation is now the mounting. HORIZONTAL keeps MKF's frame (hole
+    // axis Y, the ring flat, every terminal lead dropping in -Y); VERTICAL stands the ring on its
+    // rim (hole axis Z) turned so the terminals are at the bottom and their leads run in -Y.
+    if (isToroidal) {
+        const auto frame = toroidMountingFrameOf(magnetic);
+        if (frame.mounting == ConductorBuilder::ToroidMounting::Vertical)
+            for (auto& ns : all) ns.shape = BRepBuilderAPI_Transform(ns.shape, frame.toExported).Shape();
+    }
 
     // FEM product: the periodic-surface -> B-spline re-expression (ABT #490 class) is NOT done
     // here any more. It has to run in the frame the STEP is written in, so it lives in
@@ -1316,6 +1379,10 @@ ConductorBuilder::Options MagneticBuilder::realWindingConductorOptions(
     patchBobbinDimensions(bobbinPd, magnetic.get_core());
     toroidalCore = isCoreToroidal(magnetic.get_core());
     ConductorBuilder::Options copts;
+    if (toroidalCore) {   // ABT #1248
+        copts.toroidMounting = toroidMountingFrameOf(magnetic);
+        copts.toroidCoreDepthAlongDown = coreDepthAlongDown(coreShapes, copts.toroidMounting->down);
+    }
     copts.wirePolygonSegments = wirePolygonSegments;
     copts.femReady = femReady;   // OM drawing -> fast compound; FEM export -> one-piece/conformal
     // Hand the CORE solids to the conductor builder so it can aim the terminal leads at
@@ -1354,8 +1421,24 @@ MagneticBuilder::measureTerminalLeadLengths(const OpenMagnetics::Magnetic& magne
     ConductorBuilder::Options copts = realWindingConductorOptions(
         magnetic, obstacles, wirePolygonSegments, femReady, bobbinPd, toroidalCore);
     copts.paintCoating = paintCoating;
-    return ConductorBuilder::measureTerminalLeadLengths(magnetic.get_coil(), bobbinPd,
-                                                        toroidalCore, copts);
+    auto leads = ConductorBuilder::measureTerminalLeadLengths(magnetic.get_coil(), bobbinPd,
+                                                              toroidalCore, copts);
+    // ABT #1248: into the exported frame (lengths, radii and sweeps are invariant).
+    if (toroidalCore) {
+        const gp_Trsf& t = copts.toroidMounting->toExported;
+        auto move = [&](std::array<double, 3>& p) {
+            gp_Pnt q(p[0], p[1], p[2]);
+            q.Transform(t);
+            p = {q.X(), q.Y(), q.Z()};
+        };
+        for (auto& [winding, lead] : leads)
+            for (auto& e : lead.per_end)
+                for (auto& pc : e.pieces) {
+                    move(pc.start);
+                    move(pc.end);
+                }
+    }
+    return leads;
 }
 
 nlohmann::json MagneticBuilder::terminalLeadLengthsToJson(
@@ -1502,13 +1585,81 @@ std::vector<ConductorBuilder::PathPolyline> MagneticBuilder::buildRealWindingPat
     ConductorBuilder::Options copts;
     copts.femReady = true;
     copts.paintCoating = false;   // centrelines + copper radius; coating handled by the consumer
+    auto cores = buildCoreNamed(magnetic.get_core(), DEFAULT_CORE_POLYGON_SEGMENTS);
     if (!toroidalCore) {
-        auto cores = buildCoreNamed(magnetic.get_core(), DEFAULT_CORE_POLYGON_SEGMENTS);
         for (const auto& ns : cores) copts.coreObstacles.push_back(ns.shape);
+    }
+    else {   // ABT #1248
+        copts.toroidMounting = toroidMountingFrameOf(magnetic);
+        copts.toroidCoreDepthAlongDown = coreDepthAlongDown(cores, copts.toroidMounting->down);
     }
     copts.woundColumnPerSection =
         resolveWoundColumnsPerSection(magnetic.get_coil(), magnetic.get_core(), bobbinPd);
-    return ConductorBuilder::buildAllPaths(magnetic.get_coil(), bobbinPd, toroidalCore, copts);
+    auto paths = ConductorBuilder::buildAllPaths(magnetic.get_coil(), bobbinPd, toroidalCore, copts);
+    if (toroidalCore) {   // ABT #1248: into the exported frame
+        const gp_Trsf& t = copts.toroidMounting->toExported;
+        for (auto& pl : paths) {
+            auto movePoint = [&](std::array<double, 3>& p) {
+                gp_Pnt q(p[0], p[1], p[2]);
+                q.Transform(t);
+                p = {q.X(), q.Y(), q.Z()};
+            };
+            auto moveDir = [&](std::array<double, 3>& d) {
+                gp_Vec v(d[0], d[1], d[2]);
+                v.Transform(t);
+                d = {v.X(), v.Y(), v.Z()};
+            };
+            for (auto& prim : pl.prims)
+                for (auto& q : prim) movePoint(q);
+            movePoint(pl.end0);
+            movePoint(pl.end1);
+            moveDir(pl.dir0);
+            moveDir(pl.dir1);
+        }
+    }
+    return paths;
+}
+
+ConductorBuilder::ToroidMounting MagneticBuilder::toroidMountingOf(
+    const OpenMagnetics::Magnetic& magnetic) {
+    if (!isCoreToroidal(magnetic.get_core()))
+        throw std::runtime_error("toroidMountingOf: the core is not a toroid");
+    return toroidMountingT<OpenMagnetics::Bobbin>(magnetic.get_coil().get_bobbin());
+}
+
+ConductorBuilder::ToroidMounting MagneticBuilder::toroidMountingOf(const MAS::Magnetic& magnetic) {
+    if (!magnetic.get_core() || !magnetic.get_coil())
+        throw std::runtime_error("toroidMountingOf: the magnetic needs a core and a coil");
+    if (!isCoreToroidal(*magnetic.get_core()))
+        throw std::runtime_error("toroidMountingOf: the core is not a toroid");
+    return toroidMountingT<MAS::Bobbin>(magnetic.get_coil()->get_bobbin());
+}
+
+template<typename FunctionalDescriptionT>
+static std::vector<std::string> windingOrderOf(const FunctionalDescriptionT& fd) {
+    std::vector<std::string> order;
+    for (const auto& w : fd) order.push_back(w.get_name());
+    return order;
+}
+
+ConductorBuilder::ToroidMountingFrame MagneticBuilder::toroidMountingFrameOf(
+    const OpenMagnetics::Magnetic& magnetic) {
+    const auto mounting = toroidMountingOf(magnetic);
+    const auto& coil = magnetic.get_coil();
+    const auto turns = coil.get_turns_description();
+    return ConductorBuilder::resolveToroidMountingFrame(
+        mounting, turns ? *turns : std::vector<MAS::Turn>{},
+        windingOrderOf(coil.get_functional_description()));
+}
+
+ConductorBuilder::ToroidMountingFrame MagneticBuilder::toroidMountingFrameOf(
+    const MAS::Magnetic& magnetic) {
+    const auto mounting = toroidMountingOf(magnetic);
+    const MAS::Coil coil = magnetic.get_coil().value();
+    const auto turns = coil.get_turns_description();
+    return ConductorBuilder::resolveToroidMountingFrame(
+        mounting, turns ? *turns : std::vector<MAS::Turn>{},
+        windingOrderOf(coil.get_functional_description()));
 }
 
 } // namespace mvb

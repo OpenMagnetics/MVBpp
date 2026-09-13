@@ -297,6 +297,7 @@ add_executable(mvb_tests
     tests/test_oblong_planar_turn.cpp
     tests/test_real_winding.cpp
     tests/test_terminal_lead_lengths.cpp
+    tests/test_toroid_mounting.cpp
     tests/test_section_projection.cpp
     tests/test_spacers.cpp
     tests/test_pins.cpp

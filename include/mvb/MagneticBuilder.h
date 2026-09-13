@@ -126,10 +126,25 @@ public:
     // Real-winding conductor CENTRELINES (sampled, collision-checked, seam-aimed), for
     // implicit/level-set winding meshing. No solids are built. See
     // ConductorBuilder::PathPolyline.
+    // ABT #1248: a toroid's centrelines are returned in the EXPORTED frame (the frame
+    // buildAllNamed's assembly and its STEP are in), so their terminal tips and directions are the
+    // caps OMFEM sees. Other cores are unaffected.
     std::vector<ConductorBuilder::PathPolyline> buildRealWindingPaths(
         const OpenMagnetics::Magnetic& magnetic) const;
 
+    // ---- ABT #1248: toroid mounting ------------------------------------------------------------
+    // The mounting a toroid is built with: its bobbin's base.mounting when the bobbin is a toroid
+    // base, otherwise MKF Settings toroid_mounting (default VERTICAL). Throws for a non-toroid.
+    static ConductorBuilder::ToroidMounting toroidMountingOf(const OpenMagnetics::Magnetic& magnetic);
+    static ConductorBuilder::ToroidMounting toroidMountingOf(const MAS::Magnetic& magnetic);
+    // The full frame (mounting, build-frame lead direction, build -> exported rigid motion).
+    // The magnetic must carry its wound turns (see ConductorBuilder::resolveToroidMountingFrame).
+    static ConductorBuilder::ToroidMountingFrame toroidMountingFrameOf(
+        const OpenMagnetics::Magnetic& magnetic);
+    static ConductorBuilder::ToroidMountingFrame toroidMountingFrameOf(const MAS::Magnetic& magnetic);
+
     // ---- ABT #1215: terminal-lead copper length per winding ------------------------------
+    // ABT #1248: a toroid's lead piece endpoints are in the exported frame, like the paths.
     // The lead copper the real-winding conductors carry beyond their turns, measured on the
     // finished centreline (see ConductorBuilder::measureTerminalLeadLengths for exactly which
     // primitives count and how they are split into entrance/exit). Pass the SAME settings the

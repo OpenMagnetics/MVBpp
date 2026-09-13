@@ -11,6 +11,8 @@
 #include "mvb/StepExporter.h"
 #include "constructive_models/Magnetic.h"
 #include "json.hpp"
+#include "support/Settings.h"
+#include <BRepBuilderAPI_Transform.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
@@ -837,8 +839,16 @@ TEST_CASE("Real winding: oblong-column EP core stadium conductor", "[realwinding
 
 TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer crossings",
           "[realwinding]") {
+    for (auto mounting : {MAS::OrientationEnum::VERTICAL, MAS::OrientationEnum::HORIZONTAL}) {
+    OpenMagnetics::SettingsGuard<MAS::OrientationEnum> mountingGuard(
+        OpenMagnetics::Settings::GetInstance(), &OpenMagnetics::Settings::get_toroid_mounting,
+        &OpenMagnetics::Settings::set_toroid_mounting, mounting);
     auto magneticJson = loadFixture("realwinding_toroid.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    const auto mountFrame = mvb::MagneticBuilder::toroidMountingFrameOf(enriched);
+    auto placed = [&](double cx, double cy) { return gp_Pnt(cx, 0.0, cy).Transformed(mountFrame.toExported); };
+    const gp_Dir inPlaneA = gp_Dir(1, 0, 0).Transformed(mountFrame.toExported);
+    const gp_Dir inPlaneB = gp_Dir(0, 0, 1).Transformed(mountFrame.toExported);
 
     mvb::MagneticBuilder builder;
     // Exact core (segments=0): the wall-adjacent ring's tubes touch the bore tangentially
@@ -851,10 +861,11 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
                                        /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
 
-    // The assembly is counter-rotated to the MAS frame (ring in XY, hole axis Z), so a
-    // hole-plane crossing (cx, cy) must lie on the copper at (cx, cy, 0) — the inner
-    // crossing of every turn, the outer (additionalCoordinates) of every wrapped turn
-    // (the last crossing entry's outer is not wrapped through).
+    // ABT #1248: the assembly is placed for its mounting. A hole-plane crossing (cx, cy) is the build
+    // point (cx, 0, cy) moved by the mounting's rigid motion (VERTICAL default: the MAS frame, ring in
+    // XY, turned about Z so the terminals sit at the bottom; before #1248 it was always the MAS frame
+    // with no turn, (cx, cy, 0)). Checked in both mountings: the inner crossing of every turn, the
+    // outer (additionalCoordinates) of every wrapped turn (the last entry's outer is not wrapped).
     auto turnsOpt = enriched.get_coil().get_turns_description();
     REQUIRE(turnsOpt.has_value());
     const auto& turns = *turnsOpt;
@@ -862,16 +873,16 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
         const auto& c = turns[i].get_coordinates();
         REQUIRE(c.size() >= 2);
         double wr = turnWireRadius(turns[i]);
-        requireCrossingOnCenterline(conductor->shape, gp_Pnt(c[0], c[1], 0.0), wr,
-                                    gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+        requireCrossingOnCenterline(conductor->shape, placed(c[0], c[1]), wr,
+                                    inPlaneA, inPlaneB,
                                     "turn " + turns[i].get_name() + " inner crossing");
         if (i + 1 < turns.size()) {
             auto add = turns[i].get_additional_coordinates();
             REQUIRE(add.has_value());
             REQUIRE(!add->empty());
             requireCrossingOnCenterline(conductor->shape,
-                                        gp_Pnt((*add)[0][0], (*add)[0][1], 0.0), wr,
-                                        gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+                                        placed((*add)[0][0], (*add)[0][1]), wr,
+                                        inPlaneA, inPlaneB,
                                         "turn " + turns[i].get_name() + " outer crossing");
         }
     }
@@ -894,6 +905,7 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
     }
     INFO("planar (terminal) faces on the conductor = " << planarFaces);
     REQUIRE(planarFaces >= 2);
+    }
 }
 
 TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[realwinding]") {
@@ -901,8 +913,16 @@ TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[rea
     // solids (prisms + revolved poloidal elbows) oriented on the local AZIMUTHAL axis, then fused.
     // Every MKF inner/outer crossing must still lie on the copper (the section's inscribed circle
     // is min(w,h)/2 = turnWireRadius, so the 0.99*r probes stay inside whatever the orientation).
+    for (auto mounting : {MAS::OrientationEnum::VERTICAL, MAS::OrientationEnum::HORIZONTAL}) {
+    OpenMagnetics::SettingsGuard<MAS::OrientationEnum> mountingGuard(
+        OpenMagnetics::Settings::GetInstance(), &OpenMagnetics::Settings::get_toroid_mounting,
+        &OpenMagnetics::Settings::set_toroid_mounting, mounting);
     auto magneticJson = loadFixture("realwinding_toroid_rect.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    const auto mountFrame = mvb::MagneticBuilder::toroidMountingFrameOf(enriched);
+    auto placed = [&](double cx, double cy) { return gp_Pnt(cx, 0.0, cy).Transformed(mountFrame.toExported); };
+    const gp_Dir inPlaneA = gp_Dir(1, 0, 0).Transformed(mountFrame.toExported);
+    const gp_Dir inPlaneB = gp_Dir(0, 0, 1).Transformed(mountFrame.toExported);
 
     mvb::MagneticBuilder builder;
     auto named = builder.buildAllNamed(enriched, true, 0,
@@ -920,16 +940,16 @@ TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[rea
         const auto& c = turns[i].get_coordinates();
         REQUIRE(c.size() >= 2);
         double wr = turnWireRadius(turns[i]);
-        requireCrossingOnCenterline(conductor->shape, gp_Pnt(c[0], c[1], 0.0), wr,
-                                    gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+        requireCrossingOnCenterline(conductor->shape, placed(c[0], c[1]), wr,
+                                    inPlaneA, inPlaneB,
                                     "turn " + turns[i].get_name() + " inner crossing");
         if (i + 1 < turns.size()) {
             auto add = turns[i].get_additional_coordinates();
             REQUIRE(add.has_value());
             REQUIRE(!add->empty());
             requireCrossingOnCenterline(conductor->shape,
-                                        gp_Pnt((*add)[0][0], (*add)[0][1], 0.0), wr,
-                                        gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+                                        placed((*add)[0][0], (*add)[0][1]), wr,
+                                        inPlaneA, inPlaneB,
                                         "turn " + turns[i].get_name() + " outer crossing");
         }
     }
@@ -939,6 +959,7 @@ TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[rea
     // mm^3) geometric artifact of flat wire on a curved bore, not an interference to fix, so the
     // core<->conductor tolerance here is looser than the round-wire toroid's exact-tangency 1e-12.
     requireNoPairwiseOverlap(named, 1e-9);
+    }
 }
 
 // Count the solids in a named conductor body.
@@ -1685,7 +1706,11 @@ TEST_CASE("Real winding: faceted mode revolves tight arcs exactly, and only tigh
 
 // ---------------------------------------------------------------------------------------
 // TOROID TERMINALS DROP TO ONE PLANE (Alf, 2026-09-12; ABT #1159, superseding the #1155 x/z tip
-// pinning). Every toroidal terminal lead ends with a -Y drop past the rim, and every tip of the
+// pinning). ABT #1248 moved these checks to the EXPORTED frame (buildRealWindingPaths now returns
+// it, the frame of the STEP) and runs them in BOTH mountings: before #1248 the paths came back in
+// the build frame, where the drops ran -Y while the STEP showed them along +Z. The -Y direction
+// and the one-plane assertions are unchanged; the "not gratuitously lower" bound now also accepts
+// a plane set by the CORE (a standing ring's bare rim can reach below the copper). Every toroidal terminal lead ends with a -Y drop past the rim, and every tip of the
 // component lies on ONE XZ plane below the lowest copper surface by max(2 OD of the thinnest
 // wire, 1 OD of the thickest) -- like a real toroid dressed for the board. Under the old rule the tips pointed
 // radially from their own crossing azimuths, sat on a circle, and common_mode_choke_complete was
@@ -1693,7 +1718,11 @@ TEST_CASE("Real winding: faceted mode revolves tight arcs exactly, and only tigh
 namespace {
 struct ToroidPlaneReport { size_t tips; double planeY; double lowestCopperY; double clearance; };
 
-ToroidPlaneReport requireToroidTerminalsOnOnePlane(const std::string& fixture) {
+ToroidPlaneReport requireToroidTerminalsOnOnePlane(const std::string& fixture,
+                                                   MAS::OrientationEnum mounting) {
+    OpenMagnetics::SettingsGuard<MAS::OrientationEnum> mountingGuard(
+        OpenMagnetics::Settings::GetInstance(), &OpenMagnetics::Settings::get_toroid_mounting,
+        &OpenMagnetics::Settings::set_toroid_mounting, mounting);
     auto magneticJson = loadFixture(fixture);
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
     mvb::MagneticBuilder builder;
@@ -1740,10 +1769,22 @@ ToroidPlaneReport requireToroidTerminalsOnOnePlane(const std::string& fixture) {
             }
         }
     }
-    INFO(fixture << ": lowest non-drop copper surface " << lowest * 1e3 << " mm, plane "
+    // The core in the exported frame: the plane clears it too (ABT #1248).
+    Bnd_Box coreBox;
+    const auto frame = mvb::MagneticBuilder::toroidMountingFrameOf(enriched);
+    for (const auto& ns : builder.buildCoreNamed(enriched.get_core()))
+        BRepBndLib::AddOptimal(BRepBuilderAPI_Transform(ns.shape, frame.toExported, true).Shape(),
+                               coreBox, false, false);
+    REQUIRE_FALSE(coreBox.IsVoid());
+    const double coreBottom = coreBox.CornerMin().Y();
+    INFO(fixture << (mounting == MAS::OrientationEnum::VERTICAL ? " VERTICAL" : " HORIZONTAL")
+                 << ": lowest non-drop copper surface " << lowest * 1e3 << " mm, core bottom "
+                 << coreBottom * 1e3 << " mm, plane "
                  << planeLo * 1e3 << " mm, clearance max(2 OD_thin, 1 OD_thick) = "
                  << clearance * 1e3 << " mm");
     CHECK(planeLo <= lowest - clearance + 1e-9);
+    CHECK(planeLo <= coreBottom - clearance + 1e-9);
+    lowest = std::min(lowest, coreBottom);
     // ... and not gratuitously lower. The lowest non-drop copper is the rim fillet's underside,
     // and the consumer polyline samples that arc coarsely enough to miss its extremum by ~10 % of
     // an OD (measured 0.12 / 0.06 / 0.40 mm on CMC / buck / CT), so the bound carries a
@@ -1757,16 +1798,20 @@ TEST_CASE("Real winding: CMC toroid terminals all drop to one plane below the pa
           "[realwinding][toroidtips]") {
     // Two windings on opposite sides of the ring: under the radial-tip rule no common plane
     // could hold their four tips. Now all four drop in -Y onto one plane.
-    const auto r = requireToroidTerminalsOnOnePlane("common_mode_choke_complete.json");
-    CHECK(r.tips == 4);
+    for (auto m : {MAS::OrientationEnum::VERTICAL, MAS::OrientationEnum::HORIZONTAL}) {
+        const auto r = requireToroidTerminalsOnOnePlane("common_mode_choke_complete.json", m);
+        CHECK(r.tips == 4);
+    }
 }
 
 TEST_CASE("Real winding: the 3-parallel buck toroid's six terminals share one plane (ABT #1155)",
           "[realwinding][toroidtips]") {
     // Six leads at six azimuths, six drops, one plane, and the gate proves the parallel drops
     // clear each other.
-    const auto r = requireToroidTerminalsOnOnePlane("buck_inductor_complete.json");
-    CHECK(r.tips == 6);
+    for (auto m : {MAS::OrientationEnum::VERTICAL, MAS::OrientationEnum::HORIZONTAL}) {
+        const auto r = requireToroidTerminalsOnOnePlane("buck_inductor_complete.json", m);
+        CHECK(r.tips == 6);
+    }
 }
 
 TEST_CASE("Real winding: single-turn toroid primary drops both terminals without collision",
@@ -1775,6 +1820,8 @@ TEST_CASE("Real winding: single-turn toroid primary drops both terminals without
     // exit's drop from the top face would run straight through the entrance lead below unless
     // the router moves it -- and the gate must SEE that pair (same turn ordinal, different
     // terminals).
-    const auto r = requireToroidTerminalsOnOnePlane("current_transformer_complete.json");
-    CHECK(r.tips >= 4);
+    for (auto m : {MAS::OrientationEnum::VERTICAL, MAS::OrientationEnum::HORIZONTAL}) {
+        const auto r = requireToroidTerminalsOnOnePlane("current_transformer_complete.json", m);
+        CHECK(r.tips >= 4);
+    }
 }

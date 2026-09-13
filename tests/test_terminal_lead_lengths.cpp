@@ -195,8 +195,9 @@ TEST_CASE("Terminal leads: the 3-parallel buck toroid reports its six drawn lead
         CHECK(tip[1] < root[1]);
         if (std::isnan(planeY)) planeY = tip[1];
         CHECK(std::fabs(tip[1] - planeY) < 1e-9);
-        // The chain the router builds: drop, corner, radial, corner, axial (a corner with no room
-        // is a sharp junction instead, so at least the three legs).
+        // The chain the router builds in the default VERTICAL mounting (ABT #1248; pieces are in the
+        // exported frame): drop, corner, axial. Before #1248 (the ring flat, a radial run over the
+        // face) it was drop, corner, radial, corner, axial, and this asserted the same >= 3.
         CHECK(e.pieces.size() >= 3);
     }
 }

@@ -10,8 +10,10 @@
 //   - CMC: common_mode_choke_complete's T 25.3/14.8/10 coated exceeds every HTM base's 25.4 mm limit,
 //     so the CMC case is that fixture on a T 16/9.6/6.3 N30 with two windings of 10 turns of Round 0.80
 //     (the design is derived for the test and says so): HTM600-6.
-// Geometry frame: the builder's toroid frame (ring axis Y, ring in XZ, drops along -Y). buildAllNamed
-// rotates a toroidal assembly by -pi/2 about X at the end; the solids are rotated back here.
+// Geometry frame: the builder's toroid frame (ring axis Y, ring in XZ, drops along -Y). Since ABT #1248
+// that IS the exported frame of a horizontally mounted toroid (a horizontal base's base.mounting selects
+// HORIZONTAL), so buildAllNamed's solids and buildRealWindingPaths' centrelines are compared as they come.
+// (Before #1248 buildAllNamed rotated every toroid by -pi/2 about X and this test rotated it back.)
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
@@ -126,7 +128,7 @@ void require_seated(const json& magneticJson, size_t expectedPins, size_t expect
                                                 /*paintCoating=*/false, /*emitCoatingShells=*/false,
                                                 /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
                                                 /*useRealWindingGeometry=*/true, /*femReady=*/true));
-    for (auto& ns : all) ns.shape = mvb::rotate_shape(ns.shape, std::numbers::pi / 2.0, 0.0, 0.0);
+    REQUIRE(mvb::MagneticBuilder::toroidMountingOf(enriched) == mvb::ConductorBuilder::ToroidMounting::Horizontal);
 
     const mvb::NamedShape* baseSolid = nullptr;
     std::map<std::string, const mvb::NamedShape*> pinSolids;

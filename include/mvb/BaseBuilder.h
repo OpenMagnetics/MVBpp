@@ -33,8 +33,8 @@ namespace mvb {
 // standoff; with one, height - pocketDepth must equal the standoff. Anything else throws.
 //
 // VERTICAL MOUNTING is not drawn: with boatWidth absent the boat is not described at all, and with
-// it present the board normal of an on-edge ring (-Z) belongs to the toroid terminal-orientation
-// rework. Both throw.
+// it present drawing the boat under the standing ring (board normal -Y since ABT #1248, which stands a
+// base.mounting = vertical ring on its rim) is not implemented. Both throw.
 //
 // NOT HERE: the terminal drops are not re-aimed at the pins (moved to the terminal-orientation
 // ticket); they keep landing on the terminal plane at their own rim azimuths.

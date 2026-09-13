@@ -7006,7 +7006,13 @@ double pointSegDistance2d(const gp_XY& p, const gp_XY& a, const gp_XY& b) {
 // plane and one outward direction (0,-1,0), so the FEM air-box face that becomes the port slices
 // all of them at once (MasMesher's port snap), and the collision gate that runs next sees the
 // now-parallel drops against each other and against every other conductor.
-static void dropToroidLeadTipsToPlane(std::vector<ConductorPath>& paths) {
+// ABT #1248 (mountings): "down" is the build-frame direction the drops run along -- (0, -1, 0)
+// for a HORIZONTAL ring, the in-plane `down` of ToroidMountingFrame for a VERTICAL one; both map
+// to -Y of the exported frame. Depths are measured along it (p . down), the plane is the set of
+// points at one depth, and the CORE's own depth along it (coreDepth) bounds the plane too: a
+// standing ring's bare rim next to a terminal gap reaches lower than the copper beside it.
+static void dropToroidLeadTipsToPlane(std::vector<ConductorPath>& paths, const gp_XYZ& down,
+                                      double coreDepth) {
     struct Drop { ConductorPath* path; size_t prim; bool atA; };
     std::vector<Drop> drops;
     std::set<std::pair<const ConductorPath*, size_t>> dropPrims;
@@ -7024,7 +7030,7 @@ static void dropToroidLeadTipsToPlane(std::vector<ConductorPath>& paths) {
                 throw std::runtime_error("ConductorBuilder: toroidal conductor '" + p.name +
                                          "' ends in '" + pr.label +
                                          "', not in a terminal drop; every toroid terminal must "
-                                         "finish with its -Y drop");
+                                         "finish with its drop to the terminal plane");
             }
             auto [na, nb2] = primEndpoints(p.prims[nb]);
             const bool aShared = pr.seg.a.Distance(na) < 1e-9 || pr.seg.a.Distance(nb2) < 1e-9;
@@ -7042,49 +7048,61 @@ static void dropToroidLeadTipsToPlane(std::vector<ConductorPath>& paths) {
         odMin = std::min(odMin, 2.0 * p.wireRadius);
     }
     if (drops.empty()) return;
-    // The lowest copper surface of the whole component, drops excluded: sampled centrelines
-    // minus the (coated) envelope radius, over every conductor -- toroidal or not.
-    double lowest = std::numeric_limits<double>::max();
+    // The deepest copper surface of the whole component along `down`, drops excluded: sampled
+    // centrelines plus the (coated) envelope radius, over every conductor -- toroidal or not.
+    if (std::fabs(down.Modulus() - 1.0) > 1e-12) {
+        throw std::runtime_error("ConductorBuilder: terminal drop direction is not a unit vector");
+    }
+    if (!std::isfinite(coreDepth)) {
+        throw std::runtime_error("ConductorBuilder: a toroid needs the core's depth along the "
+                                 "terminal drop direction (Options::toroidCoreDepthAlongDown)");
+    }
+    double deepest = std::numeric_limits<double>::lowest();
     for (const auto& p : paths) {
         for (size_t i = 0; i < p.prims.size(); ++i) {
             if (dropPrims.count({&p, i})) continue;
             for (const gp_Pnt& q : samplePrim(p.prims[i], p.wireRadius))
-                lowest = std::min(lowest, q.Y() - p.wireRadius);
+                deepest = std::max(deepest, q.XYZ().Dot(down) + p.wireRadius);
         }
     }
-    if (lowest == std::numeric_limits<double>::max()) {
+    if (deepest == std::numeric_limits<double>::lowest()) {
         throw std::runtime_error("ConductorBuilder: no copper to measure the terminal plane from");
     }
+    const double copperDeepest = deepest;
+    deepest = std::max(deepest, coreDepth);
     const double clearance = std::max(2.0 * odMin, odMax);
-    const double plane = lowest - clearance;
+    const double plane = deepest + clearance;   // a depth along `down`
     for (auto& d : drops) {
         Primitive& pr = d.path->prims[d.prim];
         gp_Pnt& tip = d.atA ? pr.seg.a : pr.seg.b;
         const gp_Pnt& root = d.atA ? pr.seg.b : pr.seg.a;
         const gp_XYZ u = tip.XYZ() - root.XYZ();
         const double len = u.Modulus();
-        if (len < 1e-12 || std::fabs(u.X()) > 1e-9 * len || std::fabs(u.Z()) > 1e-9 * len ||
-            u.Y() >= 0.0) {
+        if (len < 1e-12 || (u / len - down).Modulus() > 1e-9) {
             throw std::runtime_error("ConductorBuilder: terminal drop '" + pr.label + "' of '" +
-                                     d.path->name + "' does not run along -Y (direction " +
+                                     d.path->name + "' does not run along the drop direction (" +
+                                     std::to_string(down.X()) + ", " + std::to_string(down.Y()) +
+                                     ", " + std::to_string(down.Z()) + "); its direction is (" +
                                      std::to_string(u.X() / len) + ", " +
                                      std::to_string(u.Y() / len) + ", " +
                                      std::to_string(u.Z() / len) + ")");
         }
         // The plane lies at least one OD below every non-drop surface, and the drop's root is
         // the corner fillet's tangent point on this very lead, so a straight leg always remains.
-        if (plane > root.Y() - 0.5 * d.path->wireRadius) {
-            throw std::runtime_error("ConductorBuilder: terminal plane at y = " +
+        const double rootDepth = root.XYZ().Dot(down);
+        if (plane < rootDepth + 0.5 * d.path->wireRadius) {
+            throw std::runtime_error("ConductorBuilder: terminal plane at depth " +
                                      std::to_string(plane * 1e3) + " mm leaves no straight drop on '" +
-                                     pr.label + "' of '" + d.path->name + "' (root y = " +
-                                     std::to_string(root.Y() * 1e3) + " mm)");
+                                     pr.label + "' of '" + d.path->name + "' (root depth " +
+                                     std::to_string(rootDepth * 1e3) + " mm)");
         }
-        const double before = tip.Y();
-        tip.SetY(plane);
+        const double before = tip.XYZ().Dot(down);
+        tip = gp_Pnt(root.XYZ() + down * (plane - rootDepth));
         if (std::getenv("MVB_DIAG"))
-            std::cerr << "[toro-drop] " << d.path->name << " '" << pr.label << "' tip y "
-                      << before * 1e3 << " -> " << plane * 1e3 << " mm (lowest copper surface "
-                      << lowest * 1e3 << " mm, clearance max(2 OD_thin, 1 OD_thick) = "
+            std::cerr << "[toro-drop] " << d.path->name << " '" << pr.label << "' tip depth "
+                      << before * 1e3 << " -> " << plane * 1e3 << " mm (deepest copper surface "
+                      << copperDeepest * 1e3 << " mm, core " << coreDepth * 1e3
+                      << " mm, clearance max(2 OD_thin, 1 OD_thick) = "
                       << clearance * 1e3 << " mm, " << drops.size() << " terminal(s) on the plane)\n";
     }
 }
@@ -7419,6 +7437,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
     double toroLeadEnvelopeTop = 0.0, toroLeadEnvelopeBot = 0.0;
     double wwRadialHeight = 0.0;
+    if (isToroidal && !opts.toroidMounting) {
+        throw std::runtime_error(
+            "ConductorBuilder: a toroid needs its mounting (Options::toroidMounting, ABT #1248) -- "
+            "the terminal leads are routed for it");
+    }
     if (isToroidal) {
         const auto& wws = bobbinPd.get_winding_windows();
         if (wws.empty() || !wws[0].get_radial_height()) {
@@ -7460,6 +7483,56 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 std::max(toroLeadEnvelopeBot,
                          maxTube + double(ringBuckets.empty() ? 0 : ringBuckets.size() - 1) * envelopeOd +
                              reach + envelopeRadius);
+        }
+    }
+
+    // ABT #1248: VERTICAL MOUNTING LEAD LEVELS. A standing ring's leads leave their crossing's axial
+    // leg and run straight along `down` over the face, so a lead from a HIGHER crossing passes the
+    // axial legs of every lower crossing on the same face. It clears them only when it flies
+    // further out, so on each face the levels are handed out in order of crossing height (lowest
+    // first, one exact touch above the face envelope, then one exact touch above the previous
+    // lead). The two faces never meet: exits leave over +Y of the build frame, entrances under -Y.
+    // Key: (conductor name, isExit).
+    std::map<std::pair<std::string, bool>, double> verticalLeadLevel;
+    // The face copper envelopes before any lead raises them: the top surface of every conductor's
+    // over-core copper (+Y) and the bottom surface of its under-core copper (-Y).
+    const double toroFaceEnvelopeTop = toroLeadEnvelopeTop, toroFaceEnvelopeBot = toroLeadEnvelopeBot;
+    const auto conductorEnvelopeRadius = [&](const ConductorTurns& c) {
+        // The same envelope the conductor loop below sizes the lead from (wireRadius there).
+        const MAS::Wire& w = wireMap.at(c.winding);
+        const MAS::WireType wt = w.get_type();
+        const bool foil = wt == MAS::WireType::FOIL &&
+                          !(std::getenv("MVB_FOIL_AS_RECT") &&
+                            std::string(std::getenv("MVB_FOIL_AS_RECT")) == "0");
+        const bool rect = wt == MAS::WireType::RECTANGULAR || wt == MAS::WireType::PLANAR || foil;
+        auto [ww, wh] = TurnBuilder::wireDimensions(w, *c.turns.front(), opts.paintCoating);
+        return foil ? 0.5 * ww : (rect ? 0.5 * std::hypot(ww, wh) : std::min(ww, wh) / 2.0);
+    };
+    if (isToroidal && opts.toroidMounting->mounting == ConductorBuilder::ToroidMounting::Vertical) {
+        const gp_XY downXZ(opts.toroidMounting->down[0], opts.toroidMounting->down[2]);
+        struct LeadSlot { std::string name; bool isExit; double height; double radius; };
+        std::vector<LeadSlot> slots;
+        for (const auto& c : conductors) {
+            const double r = conductorEnvelopeRadius(c);
+            const std::string name = c.winding + " parallel " + std::to_string(c.parallel);
+            for (bool isExit : {false, true}) {
+                const auto& xy = (isExit ? c.turns.back() : c.turns.front())->get_coordinates();
+                // Height in the exported frame (Y) of the crossing: minus its depth along down.
+                slots.push_back({name, isExit, -(xy[0] * downXZ.X() + xy[1] * downXZ.Y()), r});
+            }
+        }
+        for (bool face : {false, true}) {
+            std::vector<const LeadSlot*> onFace;
+            for (const auto& sl : slots)
+                if (sl.isExit == face) onFace.push_back(&sl);
+            std::stable_sort(onFace.begin(), onFace.end(),
+                             [](const LeadSlot* a, const LeadSlot* b) { return a->height < b->height; });
+            double envelope = face ? toroLeadEnvelopeTop : toroLeadEnvelopeBot;
+            for (const LeadSlot* sl : onFace) {
+                const double level = envelope + sl->radius;
+                envelope = level + sl->radius;
+                verticalLeadLevel[{sl->name, sl->isExit}] = face ? level : -level;
+            }
         }
     }
 
@@ -11380,14 +11453,37 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                     const std::string& who) {
                 double crossR = cross.pin.Modulus();
                 if (crossR < 1e-9) return;
+                // ABT #1248: the mounting decides the route.
+                //   VERTICAL: crossing -> axial leg out of the hole to the lead's level -> straight
+                //     along `down` to the terminal plane (no radial run: a standing ring's leads
+                //     come straight down). Levels were handed out by crossing height
+                //     (verticalLeadLevel), so a lead from a higher crossing flies over the axial
+                //     legs of the lower ones.
+                //   HORIZONTAL entrance (Alf, 2026-09-13): the lead enters in the middle -- one
+                //     straight segment prolonging the first turn's inner axial leg along the hole
+                //     axis to the plane below; no radial run, no rim corner, no outside drop.
+                //   HORIZONTAL exit: the classic route below (axial, radial over the face, rim
+                //     corner, drop outside the rim), side-stepped at the rim when it would land on
+                //     something already emitted -- the straight entrance included.
+                const ConductorBuilder::ToroidMountingFrame& mount = *opts.toroidMounting;
+                const bool verticalMount =
+                    mount.mounting == ConductorBuilder::ToroidMounting::Vertical;
+                const bool straightEntrance = !verticalMount && !isExit;
+                const gp_XYZ downDir(mount.down[0], mount.down[1], mount.down[2]);
                 // ABT #885 (Alf): layer-height bookkeeping. Take the face's current height,
                 // sit one exact touch above it, and raise the face to this lead's top surface
                 // so the next terminal lands above this one.
-                double level;
-                if (isExit) {
+                double level = 0.0;
+                if (verticalMount) {
+                    const auto found = verticalLeadLevel.find({path.name, isExit});
+                    if (found == verticalLeadLevel.end())
+                        throw std::runtime_error("ConductorBuilder: no vertical-mount lead level was "
+                                                 "assigned to '" + who + "'");
+                    level = found->second;
+                } else if (isExit) {
                     level = toroLeadEnvelopeTop + wireRadius;
                     toroLeadEnvelopeTop = level + wireRadius;
-                } else {
+                } else if (!straightEntrance) {
                     level = -(toroLeadEnvelopeBot + wireRadius);
                     toroLeadEnvelopeBot = -level + wireRadius;
                 }
@@ -11425,26 +11521,36 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     for (const MAS::Turn* t : turns)
                         if ((toroCrossRaw(t).pin - pxy).Modulus() < 1e-9) { own = true; break; }
                     if (own) continue;
-                    obst.push_back({{gp_Pnt(pxy.X(), -(windingBot + od), pxy.Y()),
-                                     gp_Pnt(pxy.X(), windingTop + od, pxy.Y())},
+                    // ABT #1248: a vertical-mount lead flies over the face at a level handed out
+                    // above the face ENVELOPE of every conductor, so another winding's tube there is
+                    // bounded by that envelope (its surface reaches it at most), not by THIS
+                    // conductor's own chord heights -- which on a multi-winding ring can sit lower
+                    // than the other winding's and made the capsule poke through a lead that clears
+                    // it (realwinding_cmc_3w_2layer: 0.37 mm phantom interference).
+                    const double capTop = verticalMount ? toroFaceEnvelopeTop - r : windingTop + od;
+                    const double capBot = verticalMount ? toroFaceEnvelopeBot - r : windingBot + od;
+                    obst.push_back({{gp_Pnt(pxy.X(), -capBot, pxy.Y()),
+                                     gp_Pnt(pxy.X(), capTop, pxy.Y())},
                                     r, "other-winding tube", std::numeric_limits<size_t>::max()});
                 }
                 std::string worstWhat;
                 size_t worstTurn = 0;
                 int worstLeg = -1;
+                std::string worstLegName;
                 // Clearance basis = the collision gate's own criterion: the exact BARE-radii
                 // sum, credited with the sampled obstacles' sag bound (their chords cut inside
                 // true arcs by their sagitta). There is exactly ONE definition of a collision
                 // in this builder (checkCollisions).
                 const double bareOwn = path.condRadius > 0 ? path.condRadius : wireRadius;
-                auto routeWorst2 = [&](const gp_Pnt& elbow, const gp_Pnt& out) {
+                // Validates a route given tip-first (tip, ..., pCross) with one name per leg.
+                auto routeWorstPoly = [&](const std::vector<gp_Pnt>& poly,
+                                          const std::vector<const char*>& legNames) {
                     double worst = std::numeric_limits<double>::max();
-                    const gp_Pnt tip = tipOf(out);
-                    const gp_Pnt* poly[4] = {&tip, &out, &elbow, &pCross};
-                    for (int k = 0; k < 3; ++k)
+                    for (size_t k = 0; k + 1 < poly.size(); ++k) {
+                        if (poly[k].Distance(poly[k + 1]) < 1e-12) continue;
                         for (const auto& o : obst)
                             for (size_t q = 0; q + 1 < o.pts.size(); ++q) {
-                                const double d = segSegDistance(*poly[k], *poly[k + 1],
+                                const double d = segSegDistance(poly[k], poly[k + 1],
                                                                 o.pts[q], o.pts[q + 1]);
                                 const double bareObst = std::min(o.r, bareOwn + (o.r - wireRadius));
                                 const double required = gateMinSeparation(bareOwn, bareObst) -
@@ -11454,14 +11560,83 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                     worst = d - required;
                                     worstWhat = o.what;
                                     worstTurn = o.turnIdx;
-                                    worstLeg = k;
+                                    worstLeg = static_cast<int>(k);
+                                    worstLegName = legNames[k];
                                 }
                             }
+                    }
                     return worst;   // >= 0 means clear under the gate's criterion
+                };
+                auto routeWorst2 = [&](const gp_Pnt& elbow, const gp_Pnt& out) {
+                    return routeWorstPoly({tipOf(out), out, elbow, pCross},
+                                          {"drop", "radial", "axial"});
                 };
                 auto routeWorst = [&](const gp_Pnt& elbow) { return routeWorst2(elbow, pOut); };
                 auto legName = [](int k) { return k == 0 ? "drop" : k == 1 ? "radial" : "axial"; };
                 const gp_Pnt elbowA(cross.pin.X(), level, cross.pin.Y());
+                // ABT #1248: the two routes with no radial run. Their drop gets a provisional
+                // length that already reaches past the core and this conductor's copper along
+                // `down`; dropToroidLeadTipsToPlane sets the real plane once everything is built.
+                const bool noValidateEarly = std::getenv("MVB_LEAD_NO_VALIDATE") != nullptr;
+                auto pushStraightLeadSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* wh) {
+                    if (a.Distance(b) < 1e-12) return;
+                    Primitive pr;
+                    pr.kind = Primitive::SEG;
+                    pr.seg = {a, b};
+                    pr.label = who + std::string(" ") + wh;
+                    pr.turnOrdinal = ordinal;
+                    pr.isLead = true;
+                    pr.terminal = isExit ? 1 : 0;
+                    path.prims.push_back(std::move(pr));
+                };
+                std::optional<std::array<gp_Pnt, 2>> verticalRoute;   // {tip, elbow}
+                if (straightEntrance) {
+                    const gp_Pnt tipS(cross.pin.X(), dropY, cross.pin.Y());
+                    if (!(path.isRectangular || noValidateEarly)) {
+                        const double worstS = routeWorstPoly({tipS, pCross}, {"straight entrance"});
+                        if (worstS < 0.0)
+                            throw std::runtime_error(
+                                "ConductorBuilder: the straight entrance lead of '" + who +
+                                "' (horizontal mounting: the prolongation of the first turn's inner "
+                                "axial leg along the hole axis) interferes with " + worstWhat +
+                                " of turn " + std::to_string(worstTurn) + " by " +
+                                std::to_string(-worstS) + " m (bare-copper envelopes); the "
+                                "entrance is never re-routed -- fix the winding data");
+                    }
+                    pushStraightLeadSeg(tipS, pCross, "lead drop");
+                    return;
+                }
+                if (verticalMount) {
+                    const double provisionalDepth =
+                        std::max(opts.toroidCoreDepthAlongDown, maxOuterR) + 3.0 * od;
+                    const double elbowDepth = elbowA.XYZ().Dot(downDir);
+                    const gp_Pnt tipV(elbowA.XYZ() +
+                                      downDir * std::max(provisionalDepth - elbowDepth, 3.0 * od));
+                    if (!(path.isRectangular || noValidateEarly)) {
+                        const double worstV =
+                            routeWorstPoly({tipV, elbowA, pCross}, {"drop", "axial"});
+                        if (worstV < 0.0)
+                            throw std::runtime_error(
+                                "ConductorBuilder: no clear vertical-mount terminal lead for '" + who +
+                                "': its " + worstLegName + " leg interferes with " + worstWhat +
+                                " of turn " + std::to_string(worstTurn) + " by " +
+                                std::to_string(-worstV) + " m (bare-copper envelopes); a standing "
+                                "ring's leads run straight down from their crossings and are never "
+                                "moved sideways -- fix the winding data or the mounting");
+                    }
+                    if (path.isRectangular || noValidateEarly) {
+                        // Same sharp-corner emission as the rectangular classic route below.
+                        if (isExit) {
+                            pushStraightLeadSeg(pCross, elbowA, "lead axial");
+                            pushStraightLeadSeg(elbowA, tipV, "lead drop");
+                        } else {
+                            pushStraightLeadSeg(tipV, elbowA, "lead drop");
+                            pushStraightLeadSeg(elbowA, pCross, "lead axial");
+                        }
+                        return;
+                    }
+                    verticalRoute = std::array<gp_Pnt, 2>{tipV, elbowA};
+                }
                 // MVB_LEAD_NO_VALIDATE=1: DIAGNOSTIC ONLY -- emit the classic 90-degree drop
                 // without route validation, so a layout the router refuses can still be
                 // exported to STEP and inspected by eye. Never a production path: the emitted
@@ -11475,7 +11650,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // false interference on the rect-toroid fixture); the downstream collision gate
                 // checks rect pairs with the correct axial/in-plane split and still guards the
                 // emitted geometry.
-                if (path.isRectangular || leadNoValidate) {
+                if (!verticalRoute && (path.isRectangular || leadNoValidate)) {
                     auto pushLeadSegR = [&](const gp_Pnt& a, const gp_Pnt& b, const char* wh) {
                         if (a.Distance(b) < 1e-12) return;
                         Primitive pr;
@@ -11500,7 +11675,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     return;
                 }
                 const bool toroDiag = std::getenv("MVB_TORO_DIAG") != nullptr;
-                const double worstA = routeWorst(elbowA);
+                // A vertical route was validated above; it takes the elbow as is.
+                const double worstA = verticalRoute ? 0.0 : routeWorst(elbowA);
                 if (toroDiag)
                     std::cerr << "[toro]   lead '" << who << "' routeA worst=" << worstA
                               << " culprit=" << worstWhat << " turn=" << worstTurn
@@ -11667,6 +11843,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     }
                     pushLeadSeg(segStart, pts.back(), legs.back());
                 };
+                if (verticalRoute) {   // ABT #1248: axial leg, round corner, straight along down
+                    const gp_Pnt tipV = (*verticalRoute)[0];
+                    if (isExit)
+                        pushLeadChain({pCross, elbow, tipV}, {"lead axial", "lead drop"});
+                    else
+                        pushLeadChain({tipV, elbow, pCross}, {"lead drop", "lead axial"});
+                    return;
+                }
                 const gp_Pnt pTip = tipOf(pOut);
                 if (isExit) {   // crossing -> out of the hole -> radial out -> down to the plane
                     pushLeadChain({pCross, elbow, pOut, pTip},
@@ -14703,19 +14887,31 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
     }
 
-    dropToroidLeadTipsToPlane(paths);
+    if (isToroidal) {
+        const auto& frame = *opts.toroidMounting;   // presence checked where the build starts
+        dropToroidLeadTipsToPlane(paths, gp_XYZ(frame.down[0], frame.down[1], frame.down[2]),
+                                  opts.toroidCoreDepthAlongDown);
+    }
     // ABT #1173 (WP4): report the common terminal plane the drops now end on, read back from the
     // finished tips (the drop construction above is not touched). A toroid base is drawn with its top
     // face on it (BaseBuilder.h). Every toroidal conductor's two free ends lie on it; anything else throws.
+    // ABT #1248: the plane is a depth along the mounting's lead direction; it is reported as the y of
+    // the EXPORTED frame, -(tip . down), which for a horizontal ring (down = -Y, build frame = exported
+    // frame) is the tip's own y.
     if (opts.toroidTerminalPlaneOut) {
         double plane = std::numeric_limits<double>::quiet_NaN();
+        const gp_XYZ down = opts.toroidMounting
+                                ? gp_XYZ(opts.toroidMounting->down[0], opts.toroidMounting->down[1],
+                                         opts.toroidMounting->down[2])
+                                : gp_XYZ(0.0, -1.0, 0.0);
         for (const auto& p : paths) {
             if (!p.toroidal || p.prims.size() < 2) continue;
             for (const gp_Pnt& tip : {primEndpoints(p.prims.front()).first, primEndpoints(p.prims.back()).second}) {
-                if (std::isnan(plane)) plane = tip.Y();
-                if (std::abs(tip.Y() - plane) > 1e-12)
+                const double y = -tip.XYZ().Dot(down);
+                if (std::isnan(plane)) plane = y;
+                if (std::abs(y - plane) > 1e-12)
                     throw std::runtime_error("ConductorBuilder: toroidal terminal tips of '" + p.name +
-                                             "' are not on one plane (y " + std::to_string(tip.Y()) + " vs " +
+                                             "' are not on one plane (y " + std::to_string(y) + " vs " +
                                              std::to_string(plane) + ")");
             }
         }
@@ -15003,7 +15199,20 @@ ConductorBuilder::measureTerminalLeadLengths(const OpenMagnetics::Coil& coil,
             throw std::runtime_error("measureTerminalLeadLengths: '" + p.name +
                                      "' is built as a lead-only conductor but carries non-lead "
                                      "primitive '" + p.prims[firstBody].label + "'");
-        if (p.leadOnlyTerminal < 0 && firstBody == n)
+        // A toroid's one-turn bore-through conductor is nothing but its two terminal leads meeting
+        // at the crossing (ABT #1248 measured it: current_transformer_complete's primary). Its
+        // router tagged every piece with its terminal, and the tags are the whole answer there.
+        bool allTagged = n > 0;
+        for (size_t i = 0; i < n; ++i)
+            if (p.prims[i].terminal < 0) allTagged = false;
+        const bool endsByTag = p.leadOnlyTerminal < 0 && firstBody == n && allTagged;
+        if (endsByTag) {
+            for (size_t i = 0; i + 1 < n; ++i)
+                if (p.prims[i].terminal > p.prims[i + 1].terminal)
+                    throw std::runtime_error("measureTerminalLeadLengths: '" + p.name +
+                                             "' has an exit lead piece before an entrance one");
+        }
+        if (p.leadOnlyTerminal < 0 && firstBody == n && !endsByTag)
             throw std::runtime_error("measureTerminalLeadLengths: '" + p.name +
                                      "' has no turn copper, so its lead pieces cannot be assigned "
                                      "to an end");
@@ -15033,6 +15242,9 @@ ConductorBuilder::measureTerminalLeadLengths(const OpenMagnetics::Coil& coil,
             int end = -1;
             if (p.leadOnlyTerminal >= 0) {
                 end = p.leadOnlyTerminal;
+            }
+            else if (endsByTag) {
+                end = pr.terminal;
             }
             else {
                 const int byPosition = i < firstBody ? 0 : (i > lastBody ? 1 : -1);
@@ -15105,6 +15317,78 @@ ConductorBuilder::measureTerminalLeadLengths(const OpenMagnetics::Coil& coil,
         throw std::runtime_error("measureTerminalLeadLengths: conductors were built for a winding "
                                  "the coil's functional description does not declare");
     return out;
+}
+
+ConductorBuilder::ToroidMountingFrame ConductorBuilder::resolveToroidMountingFrame(
+    ToroidMounting mounting, const std::vector<MAS::Turn>& turns,
+    const std::vector<std::string>& windingOrder) {
+    ToroidMountingFrame frame;
+    frame.mounting = mounting;
+    if (mounting == ToroidMounting::Horizontal) {
+        frame.down = {0.0, -1.0, 0.0};   // the build frame IS the exported frame
+        return frame;
+    }
+    if (turns.empty())
+        throw std::runtime_error("resolveToroidMountingFrame: a vertically mounted toroid is turned "
+                                 "about its hole axis to put its terminals at the bottom, which "
+                                 "needs the wound turns (coil.turnsDescription is empty)");
+    auto unitOf = [](const MAS::Turn& t) {
+        const auto& c = t.get_coordinates();
+        if (c.size() < 2)
+            throw std::runtime_error("resolveToroidMountingFrame: turn '" + t.get_name() +
+                                     "' has fewer than 2 coordinates");
+        const gp_XY v(c[0], c[1]);
+        if (v.Modulus() < 1e-12)
+            throw std::runtime_error("resolveToroidMountingFrame: turn '" + t.get_name() +
+                                     "' sits on the hole axis; it has no azimuth");
+        return v / v.Modulus();
+    };
+    // First and last turn of every (winding, parallel), in turnsDescription (electrical) order.
+    std::map<std::pair<std::string, int64_t>, std::pair<const MAS::Turn*, const MAS::Turn*>> ends;
+    for (const auto& t : turns) {
+        auto [it, inserted] = ends.try_emplace({t.get_winding(), t.get_parallel()}, &t, &t);
+        if (!inserted) it->second.second = &t;
+    }
+    gp_XY sum(0.0, 0.0);
+    for (const auto& [key, fl] : ends) sum += unitOf(*fl.first) + unitOf(*fl.second);
+    const double terminals = 2.0 * static_cast<double>(ends.size());
+    gp_XY down;
+    if (sum.Modulus() > 1e-9 * terminals) {
+        down = sum / sum.Modulus();
+    }
+    else {
+        if (windingOrder.empty())
+            throw std::runtime_error("resolveToroidMountingFrame: the coil declares no windings");
+        gp_XY centroid(0.0, 0.0);
+        double n = 0.0;
+        for (const auto& t : turns) {
+            if (t.get_winding() != windingOrder.front()) continue;
+            centroid += unitOf(t);
+            n += 1.0;
+        }
+        if (n == 0.0 || centroid.Modulus() <= 1e-9 * n)
+            throw std::runtime_error(
+                "resolveToroidMountingFrame: cannot orient the vertically mounted toroid -- its "
+                "terminal azimuths cancel out and winding '" + windingOrder.front() +
+                "' is spread evenly round the ring, so no rotation about the hole axis puts the "
+                "terminals at the bottom");
+        centroid /= centroid.Modulus();
+        down = gp_XY(-centroid.Y(), centroid.X());   // the first winding's centroid ends up at -X
+    }
+    frame.down = {down.X(), 0.0, down.Y()};   // MAS (x, y) is build (x, 0, y)
+    // Build -> MAS frame (x, y, z) -> (x, z, -y), then about the hole axis until down is -Y.
+    gp_Trsf toMas;
+    toMas.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)), -kPi / 2.0);
+    gp_Trsf aboutAxis;
+    aboutAxis.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)),
+                          -kPi / 2.0 - std::atan2(down.Y(), down.X()));
+    frame.toExported = aboutAxis.Multiplied(toMas);
+    const gp_XYZ check = gp_Vec(frame.down[0], frame.down[1], frame.down[2])
+                             .Transformed(frame.toExported).XYZ();
+    if ((check - gp_XYZ(0, -1, 0)).Modulus() > 1e-12)
+        throw std::runtime_error("resolveToroidMountingFrame: internal error -- the mounting "
+                                 "rotation does not send the lead direction to -Y");
+    return frame;
 }
 
 std::vector<ConductorBuilder::PathPolyline> ConductorBuilder::buildAllPaths(

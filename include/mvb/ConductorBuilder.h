@@ -5,10 +5,12 @@
 #include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
 #include <TopoDS_Shape.hxx>
+#include <gp_Trsf.hxx>
 #include <array>
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -34,6 +36,35 @@ namespace mvb {
 // the exit bends is undefined until specified).
 class ConductorBuilder {
 public:
+    // ---- ABT #1248: HOW A WOUND TOROID IS MOUNTED -------------------------------------------
+    // The conductor builder works in the BUILD frame MKF's geometricalDescription gives a toroid:
+    // hole axis along +Y, ring in the XZ plane, a MAS crossing (cx, cy) at build (cx, 0, cy).
+    // The exported assembly is that frame moved rigidly by `toExported`:
+    //   HORIZONTAL: identity. The ring lies flat (hole axis Y). Every terminal lead drops in -Y.
+    //   VERTICAL (MKF Settings toroid_mounting default): the ring stands on its rim, hole axis Z,
+    //     ring plane XY with Y up: Rx(-pi/2) (build (x, y, z) -> (x, z, -y), the MAS frame)
+    //     followed by Rz(phi) about the hole axis, phi chosen so the build-frame `down` maps to -Y.
+    //     Every terminal lead leaves its crossing's axial leg straight along `down`.
+    // Either way every terminal cap ends up in one XZ plane of the exported frame, normal -Y.
+    enum class ToroidMounting { Vertical, Horizontal };
+    struct ToroidMountingFrame {
+        ToroidMounting mounting = ToroidMounting::Vertical;
+        std::array<double, 3> down{0.0, -1.0, 0.0};   // build frame, unit
+        gp_Trsf toExported;                           // build frame -> exported frame
+    };
+    // `down` for VERTICAL: the part is turned about the hole axis so its terminals sit at the
+    // bottom -- `down` is the direction of the sum of the unit vectors of every conductor's first
+    // and last turn crossing (the rotation that minimises the summed height of the terminals, so
+    // the total drop copper). When that sum vanishes (a mirror-symmetric multi-winding part, e.g.
+    // a 2-winding CMC whose terminals sit in the two gaps between its windings, where every
+    // rotation gives the same total) the tie is broken by the windings: the first winding's
+    // centroid goes to the LEFT (-X), so a 2-winding CMC shows one winding on each side with the
+    // gaps top and bottom. A part with neither a terminal side nor a winding side throws.
+    // `windingOrder` is coil.functionalDescription order; `turns` is coil.turnsDescription.
+    static ToroidMountingFrame resolveToroidMountingFrame(ToroidMounting mounting,
+                                                          const std::vector<MAS::Turn>& turns,
+                                                          const std::vector<std::string>& windingOrder);
+
     struct Options {
         Options() {
             if (std::getenv("MVB_TOROID_MITRE_CORNERS")) toroidMitreCorners = true;
@@ -117,6 +148,15 @@ public:
         // plane here (NaN when the build has no toroidal conductor). A toroid on a base draws the
         // base with its top face on that plane (BaseBuilder.h).
         double* toroidTerminalPlaneOut = nullptr;
+        // ABT #1248: REQUIRED for a toroid (building one without it throws): the mounting the
+        // terminal leads are routed for. MagneticBuilder resolves it from MKF Settings
+        // toroid_mounting, overridden by a toroid base record's own base.mounting.
+        std::optional<ToroidMountingFrame> toroidMounting;
+        // ABT #1248: REQUIRED for a toroid: how deep the CORE (with its coating shell, when one is
+        // drawn) reaches along toroidMounting->down in the build frame, max over the core of p.down.
+        // The common terminal plane stays below it as well as below the copper: a standing ring's
+        // bare rim can sit lower than the copper next to its terminal gap.
+        double toroidCoreDepthAlongDown = std::numeric_limits<double>::quiet_NaN();
     };
 
     // REAL-PATH POLYLINES: the fully-assembled, collision-checked conductor centrelines
