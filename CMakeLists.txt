@@ -124,15 +124,12 @@ set(INCLUDE_PYMKF     OFF CACHE BOOL "" FORCE)
 set(ENABLE_MATPLOTPP  OFF CACHE BOOL "" FORCE)
 set(ENABLE_NGSPICE    OFF CACHE BOOL "" FORCE)
 
-# MKF main on GitHub depends on a MAS commit that is local-only (not yet pushed).
-# Use file:// clones from the local repos so FetchContent pulls the exact working
-# versions.  Switch both to https://github.com/OpenMagnetics/{MAS,MKF}.git once
-# the pending MAS commit is pushed.
-set(_MAS_LOCAL "file:///home/alf/OpenMagnetics/MAS")
-# MKF's drum-family commits (dc046242..) are local-only too: they need the MAS
-# openShape schema, whose push is blocked on the MAS LFS budget (ABT #296).
-# Switch back to https://github.com/OpenMagnetics/MKF.git once both are pushed.
-set(_MKF_LOCAL "file:///home/alf/OpenMagnetics/MKF")
+# Both repos are fetched from GitHub: the commits MVB++ needs (MAS febef0f with
+# the bobbin base/divider schema, MKF 6b23d51a with Bobbin::get_pin_rails and
+# Coil::terminal_exit_slots) are pushed, so the build no longer has to read the
+# developer's local clones -- which may be dirty or mid-rebase in a shared box.
+set(_MAS_LOCAL "https://github.com/OpenMagnetics/MAS.git")
+set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
 
 FetchContent_Declare(
     MAS
