@@ -81,11 +81,11 @@ void drop_null_shapes(std::vector<mvb::NamedShape>& named) {
                 named.end());
 }
 
-// paintCoating arrives from JS as an optional trailing argument. To keep the
-// long-standing default (turns drawn at the OUTER/insulation diameter), an
-// omitted/undefined value MUST resolve to true — existing callers pass no such
-// argument and must keep getting the insulation footprint. Pass false to draw
-// the CONDUCTING (copper) cross-section for FEM winding-loss meshing.
+// paintCoating arrives from JS as an optional trailing argument. THE BROWSER IS THE ONE
+// PLACE THAT DRAWS THE COATED FOOTPRINT (Alf, 2026-09-17: "use CD for Ansys, and always use
+// CD as default. We will use OD in the web browser."), so an omitted/undefined value resolves
+// to true here and ONLY here — every C++/Python entry point now defaults to the CONDUCTING
+// cross-section (ABT #1261). Pass false from JS to get the copper for FEM meshing.
 bool resolvePaintCoating(const val& v) {
     if (v.isUndefined() || v.isNull()) return true;
     return v.as<bool>();

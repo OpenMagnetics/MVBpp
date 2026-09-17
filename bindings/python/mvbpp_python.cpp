@@ -545,7 +545,9 @@ Notes
           py::arg("polygonSegments") = mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
           py::arg("symmetry") = std::string("none"),
           py::arg("side") = std::string("+X+Y+Z"),
-          py::arg("paintCoating") = true,
+          // ABT #1261 (Alf, 2026-09-17): CD is the default everywhere; only the web
+          // browser asks for the coated footprint, and it does so explicitly.
+          py::arg("paintCoating") = false,
           py::arg("useRealWindingGeometry") = false,
           py::arg("femReady") = false);
 

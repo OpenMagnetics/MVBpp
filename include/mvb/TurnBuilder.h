@@ -42,8 +42,8 @@ public:
     static bool fuseTurnParts();
 
     // paintCoating: true  → turn solid drawn at the OUTER (insulation) footprint
-    //                       (default; unchanged behaviour for visualisation).
-    //               false → turn solid drawn at the CONDUCTING (copper) footprint
+    //                       (the web viewer asks for this explicitly).
+    //               false → turn solid drawn at the CONDUCTING (copper) footprint (DEFAULT)
     //                       — what FEM winding-loss extraction must mesh. For
     //                       LITZ this is the bare bundle treated as a single
     //                       solid conductor (diameter from MKF).
@@ -54,7 +54,7 @@ public:
                                   bool isToroidal,
                                   int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                   int wireRevolutionSegments = DEFAULT_WIRE_REVOLUTION_SEGMENTS,
-                                  bool paintCoating = true,
+                                  bool paintCoating = false,
                                   const std::optional<WoundColumnSpec>& woundColumn = std::nullopt);
 
     // Build a turn using ONLY the data on the Turn itself: coordinates,

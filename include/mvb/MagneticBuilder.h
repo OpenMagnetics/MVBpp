@@ -26,10 +26,10 @@ struct DrawConfig {
     int         symmetryPlanes        = 0;       // 0=full, 1=half, 2=quarter
     int         wirePolygonSegments    = DEFAULT_WIRE_POLYGON_SEGMENTS;
     int         corePolygonSegments    = DEFAULT_CORE_POLYGON_SEGMENTS;
-    // true  → turns drawn at the OUTER (insulation) diameter (visualisation).
-    // false → turns drawn at the CONDUCTING (copper) diameter — required for
-    //         FEM winding-loss meshing (LITZ → bare bundle as a solid).
-    bool        paintCoating           = true;
+    // true  → turns drawn at the OUTER (insulation) diameter (the web viewer).
+    // false → turns drawn at the CONDUCTING (copper) diameter — DEFAULT (ABT #1261),
+    //         and what FEM winding-loss meshing requires (LITZ → bare bundle as a solid).
+    bool        paintCoating           = false;
     // true → real winding: ONE continuous conductor per (winding, parallel) instead of
     //        independent per-turn loops; MKF enriches with real-winding turn blocking on.
     bool        useRealWindingGeometry = false;
@@ -98,11 +98,11 @@ public:
     std::vector<NamedShape> buildTurnsNamed(const MAS::Coil& coil,
                                             const MAS::MagneticCore& core,
                                             int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
-                                            bool paintCoating = true) const;
+                                            bool paintCoating = false) const;
     std::vector<NamedShape> buildTurnsNamed(const OpenMagnetics::Coil& coil,
                                             const MAS::MagneticCore& core,
                                             int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
-                                            bool paintCoating = true) const;
+                                            bool paintCoating = false) const;
     NamedShape buildBobbinNamed(const MAS::Coil& coil,
                                 const MAS::MagneticCore& core,
                                 int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
@@ -207,7 +207,7 @@ public:
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
-                                          bool paintCoating = true,
+                                          bool paintCoating = false,
                                           bool emitCoatingShells = false,
                                           bool includeInsulation = false,
                                           double coreCoatingThickness = 0.0,
@@ -218,7 +218,7 @@ public:
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
-                                          bool paintCoating = true,
+                                          bool paintCoating = false,
                                           bool emitCoatingShells = false,
                                           bool includeInsulation = false,
                                           // >0: build the core's insulating coating as a conformal
@@ -276,7 +276,7 @@ public:
         const OpenMagnetics::Magnetic& magnetic,
         int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
         int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
-        bool paintCoating = true,
+        bool paintCoating = false,
         bool femReady = false,
         bool diagnosticSkipCollisionCheck = false) const;
 
@@ -303,7 +303,7 @@ public:
         bool includeBobbin          = false;
         int  wirePolygonSegments    = DEFAULT_WIRE_POLYGON_SEGMENTS;
         int  corePolygonSegments    = DEFAULT_CORE_POLYGON_SEGMENTS;
-        bool paintCoating           = true;
+        bool paintCoating           = false;
         bool useRealWindingGeometry = false;
         bool femReady               = false;
         // ABT #1173 (WP4): the real-winding toroid terminal plane of the conductors this assembly

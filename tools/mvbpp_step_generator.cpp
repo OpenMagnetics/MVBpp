@@ -34,6 +34,11 @@ static void printUsage(const char* prog) {
                  "default is the fast drawing compound.\n"
                  "                        With --real, also writes <output>.leads.json: the\n"
                  "                        terminal-lead copper length per winding (ABT #1215)\n"
+              << "  --coated              Draw conductors at the OUTER (insulation) envelope.\n"
+                 "                        DEFAULT IS THE CONDUCTING (copper) footprint (ABT #1261):\n"
+                 "                        true copper cross-section, and the enamel MKF's one-OD\n"
+                 "                        turn pitch reserves becomes real air between neighbours.\n"
+                 "                        --copper is accepted and ignored (it is the default now).\n"
               << "  --segments <N>        Wire AND core polygon segments (0 = exact analytic\n"
               << "                        curves). The two facet in LOCKSTEP: a faceted wire\n"
               << "                        against an exact core wall touches at every polygon\n"
@@ -95,7 +100,7 @@ static void paintProjections(const MAS::Magnetic& rawMagnetic, bool useRealWindi
 }
 
 static bool processFile(const fs::path& inputPath, const fs::path& outputPath, bool useMkf,
-                        bool useRealWinding, int segments, int coreSegments, bool copperFootprint = false,
+                        bool useRealWinding, int segments, int coreSegments, bool coatedFootprint = false,
                         bool femReady = false) {
     try {
         // Read JSON
@@ -163,7 +168,7 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
             }
             mvb::DrawConfig cfg{format, includeBobbin, scale, symmetryPlanes};
             cfg.useRealWindingGeometry = true;
-            cfg.paintCoating = !copperFootprint;  // --copper => bare CONDUCTING footprint (FEM)
+            cfg.paintCoating = coatedFootprint;   // CD by default (ABT #1261); --coated => OUTER envelope
             cfg.femReady = femReady;              // --fem => slow one-piece/conformal meshable geometry
             if (segments >= 0) cfg.wirePolygonSegments = segments;
             // --core-segments defaults to EXACT for the FEM product. Faceting the core is not
@@ -270,7 +275,9 @@ int main(int argc, char* argv[]) {
     fs::path outputDir;
     bool useMkf = true;
     bool useRealWinding = false;
-    bool copperFootprint = false;
+    // ABT #1261: the conductor is drawn at its CONDUCTING footprint by default. --coated asks
+    // for the OUTER (insulation) envelope, which is what the web viewer draws.
+    bool coatedFootprint = false;
     bool femReady = false;
     int segments = -1;  // -1 = builder default; 0 = exact analytic curves
     int coreSegments = -1;  // -1 = follow --segments (drawing) / stay EXACT (--fem)
@@ -293,7 +300,9 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--real") {
             useRealWinding = true;
         } else if (arg == "--copper") {
-            copperFootprint = true;
+            // Kept so existing scripts keep working: the copper footprint is now the default.
+        } else if (arg == "--coated") {
+            coatedFootprint = true;
         } else if (arg == "--fem") {
             femReady = true;
         } else if (arg == "--core-segments") {
@@ -339,6 +348,6 @@ int main(int argc, char* argv[]) {
     }
     
     bool success = processFile(inputPath, outputPath, useMkf, useRealWinding, segments, coreSegments,
-                               copperFootprint, femReady);
+                               coatedFootprint, femReady);
     return success ? 0 : 1;
 }

@@ -74,9 +74,15 @@ public:
             }
         }
         int  wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS;
-        // true  -> conductor swept at the OUTER (insulation) footprint (visualisation)
-        // false -> swept at the CONDUCTING (copper) footprint (FEM)
-        bool paintCoating = true;
+        // true  -> conductor swept at the OUTER (insulation) footprint (the web viewer)
+        // false -> swept at the CONDUCTING (copper) footprint (DEFAULT, ABT #1261).
+        // Alf, 2026-09-17: "use CD for Ansys, and always use CD as default. We will use OD
+        // in the web browser." The copper is what carries the current, and drawing it at the
+        // coated envelope both fattens every conductor (0.430 mm against a 0.400 mm wire on
+        // 02_flyback: 1.156x the area) and leaves neighbouring wires EXACTLY tangent, because
+        // MKF lays turns at a pitch of one OD. At the conducting footprint the enamel that
+        // pitch reserves becomes real air between the solids.
+        bool paintCoating = false;
         // ABT #685 (Alf, 2026-08-15): the TWO standard corner constructions for lead/connection
         // polylines, selected here. false (DEFAULT) -> BISECTION MITRE: plain segments meeting at
         // the waypoint, the conformal assembler slicing both sides on the angle-bisector plane —
