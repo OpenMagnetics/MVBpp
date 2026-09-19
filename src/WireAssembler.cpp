@@ -3365,7 +3365,18 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             // analysis per conductor run instead of hundreds, and the remedy needs no repair:
             // fall back to the pieces we already hold, unwelded -- exactly the shape every
             // green design's weld-refusal path produces.
-            if (accPieces.size() > 1) {
+            // ABT #1265 (Alf, 2026-09-19: "I would replace it with a real test, and make sure it
+            // doesn't run with each STEP"). The gate below is a PROXY for the defect that
+            // actually matters: a solid that is BRepCheck-valid in memory and INVALID once the
+            // STEP round-trip reconstructs it (06_llc's 'Primary parallel 0 [solid 25]'). Paying
+            // BOPAlgo_ArgumentAnalyzer on every build to approximate that is the single most
+            // expensive step in the assembler -- 1094 s of 02_flyback's 1632 s at --segments 12,
+            // 590 s of it on one conductor. The real condition is now asserted where it belongs,
+            // once, by tests/test_step_roundtrip.cpp ([stepvalidity]): build, export, RE-READ,
+            // and require every solid valid. Set MVB_WELD_SELFINT_GATE=1 to run the in-build
+            // proxy again (it still refuses a bad weld by emitting the pieces unwelded).
+            static const bool selfIntGate = std::getenv("MVB_WELD_SELFINT_GATE") != nullptr;
+            if (selfIntGate && accPieces.size() > 1) {
                 bool selfInt = false;
                 const auto tSi0 = std::chrono::steady_clock::now();
                 try {

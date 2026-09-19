@@ -17,7 +17,9 @@
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <BRep_Tool.hxx>
+#include <BRepTools.hxx>
 #include <BRepCheck_Analyzer.hxx>
+#include <BRepCheck_Status.hxx>
 #include <BRepCheck_Result.hxx>
 #include <BRepCheck_ListOfStatus.hxx>
 #include <Geom_BezierCurve.hxx>
@@ -7107,6 +7109,9 @@ static void dropToroidLeadTipsToPlane(std::vector<ConductorPath>& paths, const g
                       << clearance * 1e3 << " mm, " << drops.size() << " terminal(s) on the plane)\n";
     }
 }
+
+// ABT #1265: defined below, beside the other assembly-closing helpers.
+static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::string& name);
 
 template <typename CoilT, typename WireT>
 std::vector<NamedShape> buildAllImpl(const CoilT& coil,
@@ -14988,6 +14993,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         std::vector<size_t> primIndexPerSolid;
         TopoDS_Shape cond =
             emitConductor(p, opts.wirePolygonSegments, &primIndexPerSolid, opts.cutterOnly);
+        // ABT #1265: one object per wire for the FEM product -- leads included.
+        if (opts.femReady && opts.oneBodyPerConductor && !opts.cutterOnly) {
+            const TopoDS_Shape one = fuseConductorToOneBody(cond, p.name);
+            if (!one.IsNull()) {
+                cond = one;
+                // The per-solid mapping described the ASSEMBLY; one body has one name, and a
+                // stale mapping would make the naming below index past the end.
+                primIndexPerSolid.clear();
+            }
+        }
         // ABT #685: name every SOLID of the conductor, so a STEP viewer shows what each piece is
         // instead of numbering the compound's parts itself. Each solid is matched to the primitive
         // whose midpoint it is centred on — not by index, because degenerate slivers are pruned and
@@ -15136,6 +15151,152 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // The foil terminals' solder bodies, beside the copper they join.
     for (auto& sd : solderShapes) out.push_back(std::move(sd));
     return out;
+}
+
+
+// ABT #1265: close a conductor into ONE body. The conformal assembly ends as several solids that
+// ABUT on exactly coincident faces -- the lead/wrap mitres by construction, the chain wherever a
+// weld was refused -- which is precisely the input class OCC's gluing options are specified for
+// ("shapes with partial coincidence ... no real intersections between their sub-shapes"). A
+// single glued N-way fuse therefore closes the whole conductor without asking the boolean to
+// intersect anything.
+//
+// STRICTLY AN OFFER. It is accepted only when the result is ONE valid solid whose volume is the
+// sum of the parts to within the two bounds the assembler uses everywhere else (it cannot be
+// smaller than the largest part -- OCC dropped an operand -- nor larger than their sum -- copper
+// invented). Anything else returns a null shape and the caller keeps the assembly untouched.
+// Returning the pieces is always safe; welding a bad fuse is not.
+static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::string& name) {
+    std::vector<TopoDS_Shape> solids;
+    for (TopExp_Explorer e(cond, TopAbs_SOLID); e.More(); e.Next()) solids.push_back(e.Current());
+    if (solids.size() < 2) return {};
+    double sum = 0.0, mx = 0.0;
+    for (const auto& sh : solids) {
+        GProp_GProps g;
+        BRepGProp::VolumeProperties(sh, g);
+        sum += g.Mass();
+        mx = std::max(mx, g.Mass());
+    }
+    // WHAT WENT IN, before blaming what came out. OCC raising NCollection_DataMap::Iterator::Value
+    // from inside a fuse says the algorithm hit something it did not expect in its own maps, and
+    // the two candidates are an INVALID operand and a DUPLICATED one (the same TShape appended
+    // twice). Both are properties of the input, visible here, and neither is visible in the
+    // exception text.
+    if (std::getenv("MVB_WELD_DEBUG")) {
+        int invalid = 0;
+        std::set<const void*> seen;
+        int duplicated = 0;
+        for (const auto& sh : solids) {
+            if (!BRepCheck_Analyzer(sh).IsValid()) ++invalid;
+            if (!seen.insert(sh.TShape().get()).second) ++duplicated;
+        }
+        std::cerr << "[one-body] '" << name << "': " << solids.size() << " input bodies, "
+                  << invalid << " invalid, " << duplicated << " duplicated\n";
+    }
+    // TWO RUNGS. Gluing is right when every contact is an exact coincidence, which is what the
+    // conformal assembly builds at EXACT surfaces -- measured on 02_flyback at --segments 0, all
+    // four conductors close into one body. FACETED geometry is where it breaks down (the same
+    // design at --segments 12): neighbouring facet planes meet at a fraction of a degree, which
+    // is no longer "coincident, no real intersection", and OCC either raises or returns the
+    // pieces. So when the glued rung fails, fall back to the GENERAL boolean, which is allowed
+    // to compute those intersections -- slower, but it is the algorithm for that input.
+    for (int rung = 0; rung < 2; ++rung) {
+    try {
+        BRepAlgoAPI_Fuse fu;
+        TopTools_ListOfShape args, tools;
+        args.Append(solids.front());
+        for (size_t i = 1; i < solids.size(); ++i) tools.Append(solids[i]);
+        fu.SetArguments(args);
+        fu.SetTools(tools);
+        if (rung == 0) fu.SetGlue(BOPAlgo_GlueShift);
+        fu.SetRunParallel(true);
+        fu.Build();
+        if (!fu.IsDone() || fu.Shape().IsNull()) {
+            if (std::getenv("MVB_WELD_DEBUG"))
+                std::cerr << "[one-body] '" << name << "': " << (rung == 0 ? "glued" : "general")
+                          << " fuse did not complete\n";
+            continue;
+        }
+        int ns = 0;
+        for (TopExp_Explorer e(fu.Shape(), TopAbs_SOLID); e.More(); e.Next()) ++ns;
+        if (ns != 1) {
+            if (std::getenv("MVB_WELD_DEBUG"))
+                std::cerr << "[one-body] '" << name << "': the "
+                          << (rung == 0 ? "glued" : "general") << " fuse of " << solids.size()
+                          << " bodies returned " << ns << " solids\n";
+            continue;
+        }
+        if (!BRepCheck_Analyzer(fu.Shape()).IsValid()) {
+            // SAY WHAT IS WRONG, not just that something is. "invalid" sends the next reader
+            // guessing; the analyzer already knows which sub-shape and which status, and the
+            // status is what says whether this is a fuse that can be made to work (a wire
+            // orientation OCC can fix) or geometry that must not be welded at all (a genuine
+            // self-intersection).
+            if (std::getenv("MVB_WELD_DEBUG")) {
+                BRepCheck_Analyzer an(fu.Shape());
+                std::map<int, int> statusCount;
+                int faulty = 0;
+                for (int pass = 0; pass < 3; ++pass) {
+                    const TopAbs_ShapeEnum what = pass == 0   ? TopAbs_FACE
+                                                  : pass == 1 ? TopAbs_WIRE
+                                                              : TopAbs_EDGE;
+                    for (TopExp_Explorer e(fu.Shape(), what); e.More(); e.Next()) {
+                        const Handle(BRepCheck_Result) res = an.Result(e.Current());
+                        if (res.IsNull()) continue;
+                        for (const auto& st : res->StatusOnShape()) {
+                            if (st == BRepCheck_NoError) continue;
+                            ++statusCount[static_cast<int>(st)];
+                            ++faulty;
+                        }
+                    }
+                }
+                std::cerr << "[one-body] '" << name << "': fused body is INVALID after gluing "
+                          << solids.size() << " bodies -- " << faulty
+                          << " faulty sub-shapes; BRepCheck statuses:";
+                for (const auto& [st, n] : statusCount) std::cerr << " " << st << "x" << n;
+                std::cerr << " (see BRepCheck_Status)\n";
+            }
+            continue;
+        }
+        GProp_GProps gf;
+        BRepGProp::VolumeProperties(fu.Shape(), gf);
+        if (gf.Mass() > sum * (1.0 + 1e-3) || gf.Mass() < mx * (1.0 - 1e-3)) {
+            std::cerr << "[one-body] '" << name << "': the fused body carries " << gf.Mass() * 1e9
+                      << " mm^3 against " << sum * 1e9 << " mm^3 of parts; refusing it\n";
+            continue;
+        }
+        if (std::getenv("MVB_WELD_DEBUG"))
+            std::cerr << "[one-body] '" << name << "': " << solids.size() << " bodies -> 1 solid"
+                      << (rung == 0 ? " (glued)" : " (general boolean)") << "\n";
+        return fu.Shape();
+    } catch (const Standard_Failure& e) {
+        // A raise is a RESULT, not a silence: it is how OCC reports that this input is outside
+        // what the chosen algorithm can do, and it is the difference between "the glue was the
+        // wrong tool here" and "this copper cannot be one body".
+        if (std::getenv("MVB_WELD_DEBUG"))
+            std::cerr << "[one-body] '" << name << "': " << (rung == 0 ? "glued" : "general")
+                      << " fuse raised: " << e.GetMessageString() << "\n";
+    }
+    }
+    // BOTH RUNGS FAILED. If asked, leave the exact operands on disk: OCC raising
+    // Standard_NoSuchObject from inside its own DataMap is an internal invariant violation --
+    // an algorithm that cannot do an input is supposed to say so through IsDone/errors, not
+    // raise on an empty map -- so it is worth reporting upstream, and a report needs a
+    // reproducer. This writes the operands as ONE compound, which is what a standalone
+    // BRepAlgoAPI_Fuse test needs. MVB_ONE_BODY_DUMP=<dir>.
+    if (const char* dir = std::getenv("MVB_ONE_BODY_DUMP")) {
+        TopoDS_Compound dump;
+        BRep_Builder db;
+        db.MakeCompound(dump);
+        for (const auto& sh : solids) db.Add(dump, sh);
+        std::string file = std::string(dir) + "/onebody_";
+        for (char c : name) file += (c == ' ' || c == '/') ? '_' : c;
+        file += ".brep";
+        if (BRepTools::Write(dump, file.c_str()))
+            std::cerr << "[one-body] '" << name << "': wrote the " << solids.size()
+                      << " operands to " << file << "\n";
+    }
+    return {};
 }
 
 std::vector<NamedShape> ConductorBuilder::buildAll(

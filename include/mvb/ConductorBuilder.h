@@ -116,6 +116,20 @@ public:
         // certification and may overlap itself"), and the weld is the most expensive step in
         // the build.
         bool cutterOnly = false;
+        // ABT #1265 (Alf, 2026-09-19: "try to actually have an object per wire to simulate in
+        // FEM ... making sure the proper connection sections are identified correctly").
+        // ONE SOLID PER (winding, parallel), LEADS INCLUDED. The conformal assembly leaves a
+        // conductor as several abutting bodies -- its lead segments always (a lead meets its
+        // wrap at a MITRE, and mitres are never bridged) and its chain wherever a weld was
+        // refused. A real wire is one piece of copper, and an FEM solver wants one current
+        // path, so the emitter closes the assembly with a single glued fuse over every solid of
+        // the conductor. Offered, never forced: the result must be ONE valid solid conserving
+        // volume, or the conductor stays exactly as the assembler built it.
+        // The terminal caps survive this by construction -- the port faces are matched to the
+        // PATH's two free ends over the faces of the finished shape, not to separate solids, so
+        // fusing the bodies does not move or remove them.
+        // FEM product only; a viewer gains nothing from it and a cutting tool even less.
+        bool oneBodyPerConductor = true;
         double effectiveBend(double policyBend) const {
             return policyBend < minBendRadius ? minBendRadius : policyBend;
         }
