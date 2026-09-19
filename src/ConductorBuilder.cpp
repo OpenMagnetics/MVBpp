@@ -15265,21 +15265,70 @@ static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::
                           << " bodies returned " << ns << " solids\n";
             continue;
         }
-        if (!BRepCheck_Analyzer(fu.Shape()).IsValid()) {
+        const TopoDS_Shape fusedRaw =
+            BRepBuilderAPI_Transform(fu.Shape(), down, Standard_True).Shape();
+        TopoDS_Shape fused = fusedRaw;
+        if (!BRepCheck_Analyzer(fused).IsValid()) {
+            // REPAIR THE SLIVERS before reporting failure. Root cause, measured 2026-09-20 with a
+            // two-solid reproducer: where two faceted profiles meet out of phase by half a facet
+            // (15.000 deg on a 12-gon) the boolean must cut the shared cap into 24 needle
+            // triangles of height R(1-cos 15 deg) = 0.034 R, and where one operand ALSO carries an
+            // inflated tolerance -- 7-9 um against an 8.5 um needle, and only ever on the
+            // 45-degree MITRE pieces -- the needle is thinner than its own tolerance. That is a
+            // self-intersecting wire by definition, and BRepCheck is right.
+            // ShapeFix repairs exactly this, with the self-intersection and small-area-wire modes
+            // on and the precision at the sliver scale. Measured on both failing conductors of
+            // 02_flyback at --segments 12: valid afterwards, volume unchanged to every printed
+            // digit, face count unchanged (2288 -> 2288, 13628 -> 13628) and tolerances unchanged
+            // -- a topological repair, not a tolerance relaxation that swallows the sliver. The
+            // volume guard below still has the last word.
+            // The REAL fixes are upstream of here (ABT #1266): emit consecutive facet profiles in
+            // the same angular phase, and stop the mitre construction inflating tolerances.
+            bool repaired = false;
+            try {
+                ShapeFix_Shape sf(fused);
+                sf.SetPrecision(2e-5);
+                sf.SetMaxTolerance(1e-4);
+                sf.FixSolidTool()->FixShellTool()->FixFaceTool()->FixWireTool()
+                  ->FixSelfIntersectionMode() = 1;
+                sf.FixSolidTool()->FixShellTool()->FixFaceTool()->FixSmallAreaWireMode() = 1;
+                sf.Perform();
+                const TopoDS_Shape out = sf.Shape();
+                if (!out.IsNull() && BRepCheck_Analyzer(out).IsValid()) {
+                    GProp_GProps g0, g1;
+                    BRepGProp::VolumeProperties(fused, g0);
+                    BRepGProp::VolumeProperties(out, g1);
+                    if (g0.Mass() > 0 && std::abs(g1.Mass() - g0.Mass()) <= 1e-3 * g0.Mass()) {
+                        fused = out;
+                        repaired = true;
+                        if (std::getenv("MVB_WELD_DEBUG"))
+                            std::cerr << "[one-body] '" << name << "': slivers repaired\n";
+                    } else {
+                        std::cerr << "[one-body] '" << name << "': the sliver repair moved copper "
+                                  << g0.Mass() * 1e9 << " -> " << g1.Mass() * 1e9
+                                  << " mm^3; refusing it\n";
+                    }
+                }
+            } catch (const Standard_Failure& e) {
+                if (std::getenv("MVB_WELD_DEBUG"))
+                    std::cerr << "[one-body] '" << name << "': sliver repair raised: "
+                              << e.GetMessageString() << "\n";
+            }
+            if (!repaired) {
             // SAY WHAT IS WRONG, not just that something is. "invalid" sends the next reader
             // guessing; the analyzer already knows which sub-shape and which status, and the
             // status is what says whether this is a fuse that can be made to work (a wire
             // orientation OCC can fix) or geometry that must not be welded at all (a genuine
             // self-intersection).
             if (std::getenv("MVB_WELD_DEBUG")) {
-                BRepCheck_Analyzer an(fu.Shape());
+                BRepCheck_Analyzer an(fused);
                 std::map<int, int> statusCount;
                 int faulty = 0;
                 for (int pass = 0; pass < 3; ++pass) {
                     const TopAbs_ShapeEnum what = pass == 0   ? TopAbs_FACE
                                                   : pass == 1 ? TopAbs_WIRE
                                                               : TopAbs_EDGE;
-                    for (TopExp_Explorer e(fu.Shape(), what); e.More(); e.Next()) {
+                    for (TopExp_Explorer e(fused, what); e.More(); e.Next()) {
                         const Handle(BRepCheck_Result) res = an.Result(e.Current());
                         if (res.IsNull()) continue;
                         // Status(), NOT the no-argument StatusOnShape(): the latter reads a CURSOR
@@ -15306,9 +15355,8 @@ static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::
                 std::cerr << " (see BRepCheck_Status)\n";
             }
             continue;
+            }
         }
-        const TopoDS_Shape fused =
-            BRepBuilderAPI_Transform(fu.Shape(), down, Standard_True).Shape();
         GProp_GProps gf;
         BRepGProp::VolumeProperties(fused, gf);
         if (gf.Mass() > sum * (1.0 + 1e-3) || gf.Mass() < mx * (1.0 - 1e-3)) {
