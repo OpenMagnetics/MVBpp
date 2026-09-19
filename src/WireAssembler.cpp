@@ -3529,19 +3529,19 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                             // smaller than its largest input (OCC dropped an operand) nor
                             // larger than their sum (invented copper). One solid, or the weld
                             // did not happen and there is nothing to gain.
-                            // ACCEPTANCE. The two volume bounds are the same ones the pairwise
-                            // path uses. The solid count only has to show that the glue WELDED:
-                            // one body is the ideal, but a run whose chain is genuinely
-                            // interrupted -- a piece that touches neither neighbour -- cannot
-                            // become one body by any means, and the pairwise ladder does not
-                            // manage it either. Measured on 02_flyback's secondaries: the glued
-                            // fuse of 63 pieces returned 2 solids conserving volume to 0.003 %
-                            // in 4.5 s; refusing it sent the run through 171 pairwise fuse
-                            // attempts that ended with SIX named solids for that winding. So
-                            // accept anything that strictly reduces the piece count, and leave
-                            // the rest to flush()'s validity and self-intersection gates.
-                            if (ns >= 1 && ns < (int)gs.size() &&
-                                gf.Mass() <= sum * (1.0 + 1e-3) &&
+                            // ACCEPTANCE: ONE valid solid, conserving volume within the same
+                            // two bounds the pairwise path uses. The one-solid requirement is
+                            // not fastidiousness -- it was RELAXED on 2026-09-19 to "strictly
+                            // fewer solids than pieces", on the reasoning that a run whose
+                            // chain is interrupted cannot become one body by any means, and
+                            // the measurement said otherwise: 02_flyback at --segments 12 went
+                            // from 28 solids / 20616 faces in 1632 s to 90 solids / 19254 faces
+                            // in 2076 s. Accepting a partially welded glued result PRE-EMPTS
+                            // the pairwise ladder, which welds those interrupted runs further
+                            // than one glued fuse does -- worse geometry AND slower. So: take
+                            // the glued fuse when it delivers the whole run as one body, and
+                            // otherwise let the ladder do its work.
+                            if (ns == 1 && gf.Mass() <= sum * (1.0 + 1e-3) &&
                                 gf.Mass() >= mx * (1.0 - 1e-3)) {
                                 runFused[s0] = {e0, fu.Shape()};
                                 if (ns > 1 && std::getenv("MVB_WELD_DEBUG"))
