@@ -558,6 +558,12 @@ struct ConductorPath {
     // primitive is built as its own rect solid -- straights as prisms, corners as REVOLVED rect
     // (annular wedges, clean at any corner radius) -- and the solids fused (useRectSolids).
     bool isRectangular = false;
+    // ABT #1265: a FOIL sheet and its round lead wires are joined by a SOLDER FILM that must stay
+    // a gap -- 0.05 mm under a 0.501 mm wire, measured, and the reason the mesher's PLC error went
+    // away ([realwinding][foil] asserts the soldered run is NOT tangent to the sheet). Closing a
+    // foil conductor into one body puts the sheet's body in contact with that run and the film
+    // measures zero, so the one-body close skips foil.
+    bool isFoil = false;
     bool useRectSolids = false;
     // ROUND wire on a toroid / rect column also goes through the per-primitive analytic path (SEG ->
     // cylinder, ARC3 -> torus segment), because unioning the swept BSpline pipes of the per-run
@@ -11155,6 +11161,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         path.winding = ct.winding;
         path.parallel = static_cast<size_t>(ct.parallel);
         path.wireRadius = wireRadius;
+        path.isFoil = foilWire;
         path.condRadius = rectWire ? 0.5 * std::hypot(copW, copH) : std::min(copW, copH) / 2.0;
         path.condWidth = copW; path.condHeight = copH;
         path.isRectangular = rectWire;
@@ -13554,6 +13561,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 L.condRadius = 0.5 * leadBare;
                 L.condWidth = leadBare; L.condHeight = leadBare;
                 L.isRectangular = false;
+                L.isFoil = true;   // ABT #1265: a foil lead keeps its solder film (see isFoil)
                 L.wireWidth = leadOD; L.wireHeight = leadOD;
                 L.femReady = opts.femReady;
                 L.singleBodyCapable = false;
@@ -14994,7 +15002,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         TopoDS_Shape cond =
             emitConductor(p, opts.wirePolygonSegments, &primIndexPerSolid, opts.cutterOnly);
         // ABT #1265: one object per wire for the FEM product -- leads included.
-        if (opts.femReady && opts.oneBodyPerConductor && !opts.cutterOnly) {
+        static const bool noOneBody = std::getenv("MVB_NO_ONE_BODY") != nullptr;
+        if (opts.femReady && opts.oneBodyPerConductor && !opts.cutterOnly && !noOneBody &&
+            !p.isFoil) {
             const TopoDS_Shape one = fuseConductorToOneBody(cond, p.name);
             if (!one.IsNull()) {
                 cond = one;
@@ -15193,19 +15203,48 @@ static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::
         std::cerr << "[one-body] '" << name << "': " << solids.size() << " input bodies, "
                   << invalid << " invalid, " << duplicated << " duplicated\n";
     }
+    // PRISTINE OPERANDS, written BEFORE any boolean runs. BRepAlgoAPI_BuilderAlgo defaults to
+    // myNonDestructive = false, so BOPAlgo raises the input sub-shapes' tolerances IN PLACE --
+    // a dump taken after a failed fuse records the booleans' own damage, not what they were
+    // given (found 2026-09-20). MVB_ONE_BODY_DUMP=<dir>.
+    if (const char* dir = std::getenv("MVB_ONE_BODY_DUMP")) {
+        TopoDS_Compound dump;
+        BRep_Builder db;
+        db.MakeCompound(dump);
+        for (const auto& sh : solids) db.Add(dump, sh);
+        std::string file = std::string(dir) + "/onebody_";
+        for (char c : name) file += (c == ' ' || c == '/') ? '_' : c;
+        file += ".brep";
+        if (BRepTools::Write(dump, file.c_str()))
+            std::cerr << "[one-body] '" << name << "': wrote the " << solids.size()
+                      << " pristine operands to " << file << "\n";
+    }
     // TWO RUNGS. Gluing is right when every contact is an exact coincidence, which is what the
     // conformal assembly builds at EXACT surfaces -- measured on 02_flyback at --segments 0, all
     // four conductors close into one body. FACETED geometry is where it breaks down (the same
     // design at --segments 12): neighbouring facet planes meet at a fraction of a degree, which
-    // is no longer "coincident, no real intersection", and OCC either raises or returns the
-    // pieces. So when the glued rung fails, fall back to the GENERAL boolean, which is allowed
-    // to compute those intersections -- slower, but it is the algorithm for that input.
+    // is no longer "coincident, no real intersection". So when the glued rung fails, fall back to
+    // the GENERAL boolean, which is allowed to compute those intersections -- slower, but it is
+    // the algorithm for that input.
+    //
+    // AND FUSE IN MILLIMETRES. OCCT's absolute tolerances -- Precision::Confusion() == 1e-7 --
+    // are calibrated for millimetre models, and MVB++ works in METRES: a 0.13 mm facet edge is
+    // 1.3e-4 in this frame, only ~1300x Confusion instead of ~1.3e6x, which is the regime where
+    // IntTools_ShrunkRange gives up. Measured on a failing conductor's operands: 4x
+    // BOPAlgo_AlertBadPositioning out of AnalyzeShrunkData, vertex tolerances reaching 2.9e-5
+    // against 1.3e-4 edges, and a fused body carrying SelfIntersectingWire + UnorientableShape.
+    // WireAssembler's half-revolution fuse already scales x1000 for exactly this reason. A
+    // similarity moves no point relative to its neighbours; the result scales straight back.
+    gp_Trsf up, down;
+    up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+    down.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
     for (int rung = 0; rung < 2; ++rung) {
     try {
         BRepAlgoAPI_Fuse fu;
         TopTools_ListOfShape args, tools;
-        args.Append(solids.front());
-        for (size_t i = 1; i < solids.size(); ++i) tools.Append(solids[i]);
+        args.Append(BRepBuilderAPI_Transform(solids.front(), up, Standard_True).Shape());
+        for (size_t i = 1; i < solids.size(); ++i)
+            tools.Append(BRepBuilderAPI_Transform(solids[i], up, Standard_True).Shape());
         fu.SetArguments(args);
         fu.SetTools(tools);
         if (rung == 0) fu.SetGlue(BOPAlgo_GlueShift);
@@ -15243,7 +15282,17 @@ static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::
                     for (TopExp_Explorer e(fu.Shape(), what); e.More(); e.Next()) {
                         const Handle(BRepCheck_Result) res = an.Result(e.Current());
                         if (res.IsNull()) continue;
-                        for (const auto& st : res->StatusOnShape()) {
+                        // Status(), NOT the no-argument StatusOnShape(): the latter reads a CURSOR
+                        // (BRepCheck_Result's own map iterator) that is only positioned between
+                        // InitContextIterator() and MoreShapeInContext(). Calling it on a fresh
+                        // Result dereferences an unpositioned iterator and raises
+                        // Standard_NoSuchObject "NCollection_DataMap::Iterator::Value" -- which is
+                        // exactly the exception this diagnostic then reported as if it had come
+                        // from the FUSE. It had not: the fuse completes (IsDone=1, one solid), and
+                        // the raise was the instrumentation's own. Found 2026-09-20 by gdb
+                        // backtrace: the throw frame sits in fuseConductorToOneBody with no OCCT
+                        // frame beneath it. Status() returns this sub-shape's own list, no cursor.
+                        for (const auto& st : res->Status()) {
                             if (st == BRepCheck_NoError) continue;
                             ++statusCount[static_cast<int>(st)];
                             ++faulty;
@@ -15258,8 +15307,10 @@ static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::
             }
             continue;
         }
+        const TopoDS_Shape fused =
+            BRepBuilderAPI_Transform(fu.Shape(), down, Standard_True).Shape();
         GProp_GProps gf;
-        BRepGProp::VolumeProperties(fu.Shape(), gf);
+        BRepGProp::VolumeProperties(fused, gf);
         if (gf.Mass() > sum * (1.0 + 1e-3) || gf.Mass() < mx * (1.0 - 1e-3)) {
             std::cerr << "[one-body] '" << name << "': the fused body carries " << gf.Mass() * 1e9
                       << " mm^3 against " << sum * 1e9 << " mm^3 of parts; refusing it\n";
@@ -15268,7 +15319,7 @@ static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::
         if (std::getenv("MVB_WELD_DEBUG"))
             std::cerr << "[one-body] '" << name << "': " << solids.size() << " bodies -> 1 solid"
                       << (rung == 0 ? " (glued)" : " (general boolean)") << "\n";
-        return fu.Shape();
+        return fused;
     } catch (const Standard_Failure& e) {
         // A raise is a RESULT, not a silence: it is how OCC reports that this input is outside
         // what the chosen algorithm can do, and it is the difference between "the glue was the
@@ -15277,24 +15328,6 @@ static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::
             std::cerr << "[one-body] '" << name << "': " << (rung == 0 ? "glued" : "general")
                       << " fuse raised: " << e.GetMessageString() << "\n";
     }
-    }
-    // BOTH RUNGS FAILED. If asked, leave the exact operands on disk: OCC raising
-    // Standard_NoSuchObject from inside its own DataMap is an internal invariant violation --
-    // an algorithm that cannot do an input is supposed to say so through IsDone/errors, not
-    // raise on an empty map -- so it is worth reporting upstream, and a report needs a
-    // reproducer. This writes the operands as ONE compound, which is what a standalone
-    // BRepAlgoAPI_Fuse test needs. MVB_ONE_BODY_DUMP=<dir>.
-    if (const char* dir = std::getenv("MVB_ONE_BODY_DUMP")) {
-        TopoDS_Compound dump;
-        BRep_Builder db;
-        db.MakeCompound(dump);
-        for (const auto& sh : solids) db.Add(dump, sh);
-        std::string file = std::string(dir) + "/onebody_";
-        for (char c : name) file += (c == ' ' || c == '/') ? '_' : c;
-        file += ".brep";
-        if (BRepTools::Write(dump, file.c_str()))
-            std::cerr << "[one-body] '" << name << "': wrote the " << solids.size()
-                      << " operands to " << file << "\n";
     }
     return {};
 }
