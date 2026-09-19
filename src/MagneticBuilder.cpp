@@ -1113,6 +1113,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
         for (auto& ns : buildRealWindingConductorsNamed(magnetic, all, wirePolygonSegments,
                                                         paintCoating, emitCoatingShells, femReady,
                                                         /*diagnosticSkipCollisionCheck=*/false,
+                                                        /*cutterOnly=*/false,
                                                         &toroidTerminalPlane)) {
             turnShapes.push_back(ns.shape);
             turnNames.push_back(ns.name);
@@ -1148,7 +1149,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                 for (auto& ns : buildRealWindingConductorsNamed(
                          magnetic, all, wirePolygonSegments,
                          /*paintCoating=*/true, /*emitCoatingShells=*/false,
-                         /*femReady=*/false)) {
+                         /*femReady=*/false, /*diagnosticSkipCollisionCheck=*/false,
+                         /*cutterOnly=*/true)) {
                     cutters.push_back(ns.shape);
                 }
             } else {
@@ -1502,12 +1504,14 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
     bool emitCoatingShells,
     bool femReady,
     bool diagnosticSkipCollisionCheck,
+    bool cutterOnly,
     double* toroidTerminalPlaneOut) const {
     MAS::CoreBobbinProcessedDescription bobbinPd;
     bool toroidalCore = false;
     ConductorBuilder::Options copts = realWindingConductorOptions(
         magnetic, coreShapes, wirePolygonSegments, femReady, bobbinPd, toroidalCore);
     copts.diagnosticSkipCollisionCheck = diagnosticSkipCollisionCheck;
+    copts.cutterOnly = cutterOnly;
     if (toroidTerminalPlaneOut) *toroidTerminalPlaneOut = std::numeric_limits<double>::quiet_NaN();
 
     std::vector<NamedShape> out;

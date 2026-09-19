@@ -110,6 +110,12 @@ public:
         // Configure via ConductorBuilder::Options, the MVB_MIN_BEND_RADIUS env (metres), or the
         // step generator's --min-bend-radius flag.
         double minBendRadius = 0.0;
+        // ABT #1265: build the conductor for use as a CUTTING TOOL -- the conformal assembler
+        // emits its pieces unwelded. A cutter carves the same volume whether or not its pieces
+        // are one solid (this file's own note: "a cutting tool needs no welds, no mitre
+        // certification and may overlap itself"), and the weld is the most expensive step in
+        // the build.
+        bool cutterOnly = false;
         double effectiveBend(double policyBend) const {
             return policyBend < minBendRadius ? minBendRadius : policyBend;
         }

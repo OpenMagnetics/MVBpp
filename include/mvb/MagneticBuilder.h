@@ -336,6 +336,9 @@ public:
         bool emitCoatingShells,
         bool femReady,
         bool diagnosticSkipCollisionCheck = false,
+        // ABT #1265: this build is only a cutting tool for the bobbin's lead slots, so its
+        // pieces need not be welded into one body.
+        bool cutterOnly = false,
         // ABT #1173: receives the LOWEST toroid terminal plane over the conductor builds emitted
         // (bare and coating shells lay their leads at their own radii); NaN when none.
         double* toroidTerminalPlaneOut = nullptr) const;

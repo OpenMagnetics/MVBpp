@@ -105,6 +105,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <chrono>
 #include <map>
 #include <numbers>
 #include <optional>
@@ -2225,7 +2226,7 @@ static bool capDiscAt(const TopoDS_Shape& s, const gp_Pnt& j, const gp_Dir& n, d
 
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wireRadius,
                           int segments, CornerStyle corners,
-                          std::vector<size_t>* primIndexPerSolid) {
+                          std::vector<size_t>* primIndexPerSolid, bool skipWeld) {
     // WHEN IS A JUNCTION A CORNER? ABT #685 (Alf, 2026-08-18). Not "below 3 degrees", which was
     // another chosen number. A junction that is NOT mitred is BRIDGED: the earlier piece grows
     // flush past the joint until it fills the wedge the direction change opens on the outer side
@@ -2358,6 +2359,12 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     // Pieces grouped per primitive + whether each primitive is BRIDGED onto its predecessor.
     std::vector<std::vector<TopoDS_Shape>> perPrimSolids;
     std::vector<bool> bridgedToPrev;
+    // ABT #1265: whether that bridge is a TANGENT one -- the two pieces abut on an exactly
+    // coincident disc with NO real intersection. That is the only input class OCC's gluing
+    // options are specified for, so only runs made entirely of these may take the fast
+    // N-way glued fuse below; an overlapping (angS > 0) junction must stay on the general
+    // boolean, where an intersection is what the algorithm is actually asked to compute.
+    std::vector<bool> tangentToPrev;
     // A joint sphere spans the junction it fills: half of it lies in the piece it is fused into
     // and half in the NEXT piece. Those two must therefore end up as ONE solid, or the sphere
     // simply becomes copper overlapping its own neighbour -- which is exactly what chunk 7
@@ -3179,6 +3186,9 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // cap (see the projected-radius test above). Fix the cap, not the topology.
         bridgedToPrev.push_back((i > 0 && !bentS && (weldAll || angS > 1e-12)) ||
                                 sphereAtPrevJunction);
+        // A joint sphere genuinely interpenetrates both neighbours, so a run carrying one is
+        // not glue-eligible either.
+        tangentToPrev.push_back(i > 0 && !bentS && angS <= 1e-12 && !sphereAtPrevJunction);
         sphereAtPrevJunction = false;
         if (std::getenv("MVB_CAP_DEBUG"))
             std::cerr << "[cap-debug] junction " << i << " angS=" << angS << " bentS=" << bentS
@@ -3334,7 +3344,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     // step that fails simply ends the accumulation -- pieces are kept, never dropped.
     // MVB_ALLOW_WELD_LENS=1 restores the old overlapping pieces.
     {
-        const bool keepLens = std::getenv("MVB_ALLOW_WELD_LENS") != nullptr;
+        const bool keepLens = skipWeld || std::getenv("MVB_ALLOW_WELD_LENS") != nullptr;
         TopoDS_Shape acc;            // accumulated weld
         double accVol = 0.0;
         int accOwner = 0;
@@ -3357,15 +3367,24 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             // green design's weld-refusal path produces.
             if (accPieces.size() > 1) {
                 bool selfInt = false;
+                const auto tSi0 = std::chrono::steady_clock::now();
                 try {
                     BOPAlgo_ArgumentAnalyzer an;
                     an.SetShape1(acc);
                     an.ArgumentTypeMode() = Standard_True;
                     an.SelfInterMode() = Standard_True;
+                    // ABT #1265: the analyzer is a BOPAlgo_Options, so it takes the same
+                    // parallel flag the booleans use. Measured on 01_etd34 at --segments 4:
+                    // this gate alone was 79 s of a 232 s build (the glued fuse was 22 s).
+                    an.SetRunParallel(Standard_True);
                     an.Perform();
                     selfInt = an.HasFaulty();
                 } catch (const Standard_Failure&) {
                 }
+                if (std::getenv("MVB_WELD_DEBUG"))
+                    std::cerr << "[weld-time] self-intersection gate: "
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - tSi0).count() << " ms\n";
                 if (selfInt) {
                     std::cerr << "[weld-selfint] '"
                               << (accOwner < (int)ptrs.size() ? ptrs[accOwner]->label
@@ -3431,9 +3450,144 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             accVol = 0.0;
             accPieces.clear();
         };
+        // ---------------------------------------------------------------------------------
+        // ABT #1265 FAST PATH: ONE GLUED N-WAY FUSE PER TANGENT RUN.
+        // The pairwise ladder below fuses piece-by-piece into an accumulator that keeps
+        // growing, and tries up to six booleans per junction (exact, fuzzy 1e-7, fuzzy 1e-6,
+        // each in both operand orders). With MVB_WELD_ALL=1 -- which welds EVERY bridged
+        // junction, tangent ones included -- that is hundreds of fuses against an operand that
+        // ends up carrying the whole conductor: 02_flyback at --segments 12 took 10288 s.
+        //
+        // A tangent junction is precisely the input OCC's gluing options are specified for:
+        // "shapes with partial coincidence ... may be overlapping but do not have real
+        // intersections between their sub-shapes", where SetGlue skips the face-face
+        // intersection entirely (OCCT boolean spec; ~90 % of a fuse's time in OCC's own
+        // example). The conformal mitre assembly builds exactly that -- neighbours share
+        // IDENTICAL faces by construction -- and this file already glues its half-revolution
+        // fuse for the same reason.
+        //
+        // Why an N-way union is safe HERE when the comment above rightly refuses it in
+        // general: the 135-piece run that came back with 0 mm^3 was a GENERAL fuse, asked to
+        // intersect every face pair. Glued, there is nothing to intersect. It is still only an
+        // OFFER: the result must be ONE valid solid conserving volume, or the run falls
+        // through to the pairwise ladder unchanged. MVB_NO_GLUE_FUSE=1 disables it.
+        auto groupAt = [&](size_t k) -> TopoDS_Shape {
+            if (perPrimSolids[k].size() == 1) return perPrimSolids[k].front();
+            TopoDS_Compound c; BRep_Builder gb; gb.MakeCompound(c);
+            for (const auto& sh : perPrimSolids[k]) gb.Add(c, sh);
+            return c;
+        };
+        std::map<size_t, std::pair<size_t, TopoDS_Shape>> runFused;   // start -> {end, welded}
+        static const bool noGlueFast = std::getenv("MVB_NO_GLUE_FUSE") != nullptr;
+        if (std::getenv("MVB_WELD_DEBUG")) {
+            size_t nb = 0, nt = 0;
+            for (size_t q = 0; q < bridgedToPrev.size(); ++q) if (bridgedToPrev[q]) ++nb;
+            for (size_t q = 0; q < tangentToPrev.size(); ++q) if (tangentToPrev[q]) ++nt;
+            std::cerr << "[weld-stats] pieces=" << perPrimSolids.size() << " bridged=" << nb
+                      << " tangent=" << nt << " keepLens=" << keepLens << "\n";
+        }
+        if (!keepLens && !noGlueFast) {
+            for (size_t s0 = 0; s0 < perPrimSolids.size();) {
+                size_t e0 = s0;
+                bool allTangent = true;
+                while (e0 + 1 < perPrimSolids.size() && e0 + 1 < bridgedToPrev.size() &&
+                       bridgedToPrev[e0 + 1]) {
+                    if (e0 + 1 >= tangentToPrev.size() || !tangentToPrev[e0 + 1])
+                        allTangent = false;
+                    ++e0;
+                }
+                if (e0 > s0 && allTangent) {
+                    std::vector<TopoDS_Shape> gs;
+                    double sum = 0.0, mx = 0.0;
+                    for (size_t k = s0; k <= e0; ++k) {
+                        gs.push_back(groupAt(k));
+                        GProp_GProps gp;
+                        BRepGProp::VolumeProperties(gs.back(), gp);
+                        sum += gp.Mass();
+                        mx = std::max(mx, gp.Mass());
+                    }
+                    const auto tGlue0 = std::chrono::steady_clock::now();
+                    try {
+                        BRepAlgoAPI_Fuse fu;
+                        TopTools_ListOfShape fargs, ftools;
+                        fargs.Append(gs.front());
+                        for (size_t i2 = 1; i2 < gs.size(); ++i2) ftools.Append(gs[i2]);
+                        fu.SetArguments(fargs);
+                        fu.SetTools(ftools);
+                        fu.SetGlue(BOPAlgo_GlueShift);
+                        fu.SetRunParallel(true);
+                        fu.Build();
+                        if (fu.IsDone() && !fu.Shape().IsNull() &&
+                            BRepCheck_Analyzer(fu.Shape()).IsValid()) {
+                            int ns = 0;
+                            for (TopExp_Explorer px(fu.Shape(), TopAbs_SOLID); px.More();
+                                 px.Next())
+                                ++ns;
+                            GProp_GProps gf;
+                            BRepGProp::VolumeProperties(fu.Shape(), gf);
+                            // Same two bounds the pairwise path uses: a union can be neither
+                            // smaller than its largest input (OCC dropped an operand) nor
+                            // larger than their sum (invented copper). One solid, or the weld
+                            // did not happen and there is nothing to gain.
+                            // ACCEPTANCE. The two volume bounds are the same ones the pairwise
+                            // path uses. The solid count only has to show that the glue WELDED:
+                            // one body is the ideal, but a run whose chain is genuinely
+                            // interrupted -- a piece that touches neither neighbour -- cannot
+                            // become one body by any means, and the pairwise ladder does not
+                            // manage it either. Measured on 02_flyback's secondaries: the glued
+                            // fuse of 63 pieces returned 2 solids conserving volume to 0.003 %
+                            // in 4.5 s; refusing it sent the run through 171 pairwise fuse
+                            // attempts that ended with SIX named solids for that winding. So
+                            // accept anything that strictly reduces the piece count, and leave
+                            // the rest to flush()'s validity and self-intersection gates.
+                            if (ns >= 1 && ns < (int)gs.size() &&
+                                gf.Mass() <= sum * (1.0 + 1e-3) &&
+                                gf.Mass() >= mx * (1.0 - 1e-3)) {
+                                runFused[s0] = {e0, fu.Shape()};
+                                if (ns > 1 && std::getenv("MVB_WELD_DEBUG"))
+                                    std::cerr << "[glue-fuse] run " << s0 << ".." << e0
+                                              << " welded " << gs.size() << " pieces into " << ns
+                                              << " solids (chain interrupted)\n";
+                            } else if (std::getenv("MVB_WELD_DEBUG")) {
+                                std::cerr << "[glue-fuse] run " << s0 << ".." << e0
+                                          << " refused: solids=" << ns << " vol=" << gf.Mass()
+                                          << " sum=" << sum << " max=" << mx << "\n";
+                            }
+                        }
+                    } catch (const Standard_Failure&) {
+                    }
+                    if (std::getenv("MVB_WELD_DEBUG"))
+                        std::cerr << "[weld-time] glued fuse of " << gs.size() << " pieces: "
+                                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - tGlue0).count()
+                                  << " ms\n";
+                }
+                s0 = e0 + 1;
+            }
+            if (std::getenv("MVB_WELD_DEBUG"))
+                std::cerr << "[weld-stats] glued runs=" << runFused.size() << "\n";
+        }
+        // ---------------------------------------------------------------------------------
         for (size_t k = 0; k < perPrimSolids.size(); ++k) {
             // One primitive may have been fragmented into several solids by its own mitre trim;
             // treat that group as a unit.
+            // ABT #1265: this run was already welded in one glued fuse above.
+            {
+                auto itRun = runFused.find(k);
+                if (itRun != runFused.end()) {
+                    flush();
+                    acc = itRun->second.second;
+                    GProp_GProps gAcc;
+                    BRepGProp::VolumeProperties(acc, gAcc);
+                    accVol = gAcc.Mass();
+                    accOwner = (int)k;
+                    accPieces.clear();
+                    for (size_t j = k; j <= itRun->second.first; ++j)
+                        accPieces.push_back(groupAt(j));   // undo material for the flush gate
+                    k = itRun->second.first;
+                    continue;
+                }
+            }
             TopoDS_Shape group;
             if (perPrimSolids[k].size() == 1) {
                 group = perPrimSolids[k].front();

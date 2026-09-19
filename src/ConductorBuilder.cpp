@@ -3309,7 +3309,8 @@ TopoDS_Shape sweepRunChunked(const Primitive* const* prims, size_t count, double
 // index or centroid. Left EMPTY by every other emission path (single-body sweeps, rect fuses),
 // whose solids do not correspond one-to-one to primitives at all; a caller must check.
 TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
-                           std::vector<size_t>* primIndexPerSolid = nullptr) {
+                           std::vector<size_t>* primIndexPerSolid = nullptr,
+                           bool cutterOnly = false) {
     if (std::getenv("MVB_DIAG"))
         std::cerr << "[emitConductor] '" << path.name << "' prims=" << path.prims.size()
                   << " useRectSolids=" << path.useRectSolids << " roundProfile="
@@ -3347,7 +3348,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
         // NO prune: the conformal assembler runs no booleans, so it cannot make slivers --
         // every solid is a swept primitive, and it throws rather than dropping any.
         return assembleWire(cptrs, path.wireRadius, wirePolygonSegments,
-                            CornerStyle::BisectionMitre, primIndexPerSolid);
+                            CornerStyle::BisectionMitre, primIndexPerSolid, cutterOnly);
     }
     // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
     // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
@@ -3750,7 +3751,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
     // cannot build a valid solid for the tight-bore poloidal corner at exact surfaces.
     if (path.toroidal && path.femReady) {
         return assembleWire(ptrs, path.wireRadius, wirePolygonSegments,
-                        CornerStyle::BisectionMitre, primIndexPerSolid);
+                        CornerStyle::BisectionMitre, primIndexPerSolid, cutterOnly);
     }
 
     BRep_Builder builder;
@@ -14985,7 +14986,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // reconstructing it afterwards. Empty for the emission paths whose solids are not one
         // per primitive (single-body sweeps, rect fuses) — those keep the centroid match.
         std::vector<size_t> primIndexPerSolid;
-        TopoDS_Shape cond = emitConductor(p, opts.wirePolygonSegments, &primIndexPerSolid);
+        TopoDS_Shape cond =
+            emitConductor(p, opts.wirePolygonSegments, &primIndexPerSolid, opts.cutterOnly);
         // ABT #685: name every SOLID of the conductor, so a STEP viewer shows what each piece is
         // instead of numbering the compound's parts itself. Each solid is matched to the primitive
         // whose midpoint it is centred on — not by index, because degenerate slivers are pruned and

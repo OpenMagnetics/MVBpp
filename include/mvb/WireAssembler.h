@@ -170,9 +170,15 @@ enum class CornerStyle {
 // index into `centreline` of the piece that solid was built from. That is the only correct way to
 // name the parts -- a solid count can exceed the primitive count (a mitre trim may fragment a
 // piece), so neither an index nor a centroid match is reliable.
+// `skipWeld` (ABT #1265): emit the pieces UNWELDED, as the weld-lens fallback already does.
+// For a cutting tool -- the coated-envelope build that carves the bobbin's lead slots -- the
+// weld is pure waste: overlapping pieces cut exactly the same volume, and that build was
+// costing as much as the product one (measured on 01_etd34 at --segments 4: two identical
+// conformal assemblies, 126 s total).
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& centreline, double wireRadius,
                           int polygonSegments, CornerStyle corners = CornerStyle::BisectionMitre,
-                          std::vector<size_t>* primIndexPerSolid = nullptr);
+                          std::vector<size_t>* primIndexPerSolid = nullptr,
+                          bool skipWeld = false);
 
 // Sampling / geometry queries on a centreline piece, shared by the chunk builders and the
 // collision gate. Pure measurement — they build no copper.
