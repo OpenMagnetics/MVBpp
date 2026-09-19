@@ -1102,6 +1102,10 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     // ABT #685: per-solid names, kept alongside the shape/name vectors this path splits things
     // into. Indexed like turnShapes/turnNames; empty for anything that has none.
     std::vector<std::vector<std::string>> turnPartNames;
+    // ABT #1245: the role each conductor solid was built with. The real-winding builder emits
+    // terminal caps (Role::Terminal) and foil solder bodies (Role::Solder) beside the copper;
+    // re-deriving the role from the name at the append below turned all of them into Turn.
+    std::vector<Role> turnRoles;
     double toroidTerminalPlane = std::numeric_limits<double>::quiet_NaN();   // ABT #1173
     // ABT #1173: a base this assembly cannot draw is refused before any copper is built.
     if (includeBobbin) {
@@ -1118,10 +1122,14 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
             turnShapes.push_back(ns.shape);
             turnNames.push_back(ns.name);
             turnPartNames.push_back(std::move(ns.partNames));
+            turnRoles.push_back(ns.role);
         }
     } else {
         turnShapes = buildTurnsImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(
             magnetic.get_coil(), magnetic.get_core(), &turnNames, wirePolygonSegments, paintCoating, emitCoatingShells);
+        // Per-turn loops carry no role of their own; the " coating" suffix is the one distinction.
+        for (std::size_t i = 0; i < turnShapes.size(); ++i)
+            turnRoles.push_back(turn_role_for(i < turnNames.size() ? turnNames[i] : std::string()));
     }
 
     if (includeBobbin) {
@@ -1179,10 +1187,10 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                 ? turnNames[i]
                                 : "Turn_" + std::to_string(i);
         if (i < turnPartNames.size() && !turnPartNames[i].empty()) {
-            all.emplace_back(turnShapes[i], n, turnPartNames[i], turn_role_for(n));   // ABT #685
+            all.emplace_back(turnShapes[i], n, turnPartNames[i], turnRoles.at(i));   // ABT #685
         }
         else {
-            all.emplace_back(turnShapes[i], n, turn_role_for(n));
+            all.emplace_back(turnShapes[i], n, turnRoles.at(i));
         }
     }
 
@@ -1531,7 +1539,11 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
             // ABT #1169: the conductor builder already roled each solid (Turn / Terminal /
             // Solder); the coating pass re-draws the SAME conductors at their outer footprint,
             // so only a Turn becomes a TurnCoating — a terminal cap or a solder body does not.
-            const Role r = (coat && ns.role == Role::Turn) ? Role::TurnCoating : ns.role;
+            // ABT #1245: only the SHELL pass (emitCoatingShells, " coating" suffix) is a coating.
+            // A conductor painted at its outer diameter (paintCoating alone, the web viewer) is
+            // still THE conductor and stays a Turn, as on the per-turn path.
+            const bool shellPass = !suffix.empty();
+            const Role r = (shellPass && ns.role == Role::Turn) ? Role::TurnCoating : ns.role;
             out.push_back({ns.shape, ns.name + suffix, std::move(ns.partNames), r});
         }
     };

@@ -301,6 +301,7 @@ add_executable(mvb_tests
     tests/test_pinrail.cpp
     tests/test_shunts.cpp
     tests/test_named_roles.cpp
+    tests/test_conducting_default.cpp
     tests/test_toroid_base.cpp
 )
 

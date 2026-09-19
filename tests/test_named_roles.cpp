@@ -73,14 +73,17 @@ std::string bobbin_name_of(const OpenMagnetics::Magnetic& m) {
 // BobbinTDataProcessor is a zero-thickness virtual bobbin and buildBobbinNamed returns a null
 // shape for it (the gap WP4/D1 fills with a real toroid base). Stated per fixture rather than
 // assumed, so the count stays a real assertion instead of a guess.
-void check_roles(const std::string& fixture, int expectedBobbins, bool accessories = false) {
+// realWinding: the femReady real-winding build (ABT #1245), the only path that emits terminal caps
+// (and, for a foil, solder joints) beside the copper. Drawn without a bobbin, as OMFEM builds it.
+void check_roles(const std::string& fixture, int expectedBobbins, bool accessories = false,
+                 bool realWinding = false, bool expectSolder = false) {
     const std::filesystem::path path = std::filesystem::path(MAS_COMPLETE_DIR) / fixture;
     REQUIRE(std::filesystem::exists(path));
     std::ifstream in(path);
     json mas; in >> mas;
     const json magneticJson = mas.contains("magnetic") ? mas.at("magnetic") : mas;
 
-    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson);
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/realWinding);
     const std::string bobbinName = bobbin_name_of(enriched);
 
     mvb::MagneticBuilder builder;
@@ -88,7 +91,14 @@ void check_roles(const std::string& fixture, int expectedBobbins, bool accessori
     // core-coating shell, the per-turn coating shells and the insulation layers. Without it the
     // test would only ever see Core/Turn/Bobbin and could not catch a producer that forgot to
     // set the role on a coating or an insulation layer.
-    auto all = accessories
+    auto all = realWinding
+        ? builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                /*useRealWindingGeometry=*/true, /*femReady=*/true)
+        : accessories
         ? builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
                                 mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
                                 mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
@@ -99,6 +109,7 @@ void check_roles(const std::string& fixture, int expectedBobbins, bool accessori
     REQUIRE(all.size() > 1);
 
     int cores = 0, turns = 0, bobbins = 0, coreCoatings = 0, turnCoatings = 0;
+    int terminals = 0, solders = 0;
     for (const auto& ns : all) {
         const mvb::Role expected = role_from_name(ns.name, bobbinName);
         INFO(fixture << ": solid '" << ns.name << "' role=" << mvb::role_name(ns.role)
@@ -109,6 +120,15 @@ void check_roles(const std::string& fixture, int expectedBobbins, bool accessori
         if (ns.role == mvb::Role::Bobbin) ++bobbins;
         if (ns.role == mvb::Role::CoreCoating) ++coreCoatings;
         if (ns.role == mvb::Role::TurnCoating) ++turnCoatings;
+        if (ns.role == mvb::Role::Terminal) ++terminals;
+        if (ns.role == mvb::Role::Solder)   ++solders;
+    }
+    if (realWinding) {
+        // Two caps per (winding, parallel) conductor. Demanding them makes the name cross-check
+        // above bite: with none present it could not see a cap mislabelled as a Turn.
+        CHECK(terminals > 0);
+        CHECK(terminals == 2 * turns);
+        if (expectSolder) CHECK(solders > 0);
     }
     if (accessories) {
         CHECK(coreCoatings == cores);    // one conformal shell per core piece
@@ -134,6 +154,18 @@ TEST_CASE("flyback_transformer_complete: every solid carries its role", "[roles]
 TEST_CASE("buck_inductor_complete: coating shells and insulation layers carry their roles",
           "[roles][abt1169]") {
     check_roles("buck_inductor_complete.json", /*expectedBobbins=*/0, /*accessories=*/true);
+}
+
+TEST_CASE("buck_inductor_complete real winding: terminal caps are Terminal, not Turn",
+          "[roles][abt1245]") {
+    check_roles("buck_inductor_complete.json", /*expectedBobbins=*/0, /*accessories=*/false,
+                /*realWinding=*/true);
+}
+
+TEST_CASE("two_switch_forward real winding: foil solder joints are Solder, caps are Terminal",
+          "[roles][abt1245]") {
+    check_roles("two_switch_forward_transformer_complete.json", /*expectedBobbins=*/0,
+                /*accessories=*/false, /*realWinding=*/true, /*expectSolder=*/true);
 }
 
 TEST_CASE("role_name covers every Role", "[roles][abt1169]") {
