@@ -14315,6 +14315,36 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // is still a full revolution: lay the ring at its own station, exactly as the lone-turn
         // and last-turn cases above do for a turn no transition delivered. This is a foil's whole
         // winding (8 parallels of one turn), and it is equally right for any one-turn conductor.
+        // ROUND/OBLONG COLUMN, ONE TURN (ABT #1260). The branch below fixed this for the
+        // rectangular family only, and rectFamily is a COLUMN predicate -- so a one-turn
+        // conductor on a ROUND column fell through both and shipped with NO TURN COPPER AT ALL:
+        // 000_debug (PQ 20/16, 1 turn, round 2.588 mm) emitted two lead primitives and nothing
+        // else, and the STEP held two straight stubs with no ring anywhere -- ~235 mm^3 of
+        // copper missing at the turn radius 7.1185 mm. The only thing that noticed was
+        // measureTerminalLeadLengths refusing to assign ends to a conductor with no turn copper.
+        //
+        // Lay the ring at the turn's own station: s == n, so appendRoundWrap's layer-link branch
+        // cannot be taken (it tests |n.x - s.x|), radiusAtAz and heightAtAz are constant, and the
+        // sweep runs from the entrance slot to the exit slot with the end stub closing at
+        // azE + 2*pi -- exactly one revolution, which is what a lone turn is. Both stubs are
+        // asked for because both leads attach to this single ring.
+        // NOTE azEntrance/azExit rather than crossAz: with nEmit == 1 its front and back are the
+        // SAME element, so crossAz[0] holds azExit alone and the entrance azimuth is lost.
+        if (effectivelyRound && nEmit == 1) {
+            const PlanePt s0 = station(turns[0]);
+            PlanePt sWrap = s0;
+            if (!std::isnan(entranceAttachY)) sWrap.y = entranceAttachY;
+            appendRoundWrap(path, sWrap, s0, wireRadius,
+                            "'" + turns[0]->get_name() + "' (lone-turn conductor)", 0,
+                            bumpsForTurn(s0.x), azEntrance, azExit, bumpsForTurn(s0.x),
+                            ct.parallels, /*stubAtStart=*/true, /*stubAtEnd=*/true,
+                            /*endYOverride=*/std::numeric_limits<double>::quiet_NaN(),
+                            /*steepFinal=*/false, translateSiblingIn, translateSiblingOut,
+                            stubCapIn.count(ci) ? stubCapIn.at(ci)
+                                                : std::numeric_limits<double>::infinity(),
+                            stubCapOut.count(ci) ? stubCapOut.at(ci)
+                                                 : std::numeric_limits<double>::infinity());
+        }
         if (rectFamily && nEmit == 1) {
             const RectStation rs1 =
                 rectStation(station(turns[0]), rectHalfW, rectHalfD, minBend,
