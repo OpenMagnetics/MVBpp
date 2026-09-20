@@ -304,6 +304,7 @@ add_executable(mvb_tests
     tests/test_conducting_default.cpp
     tests/test_toroid_base.cpp
     tests/test_step_roundtrip.cpp
+    tests/test_sleeves.cpp
 )
 
 target_compile_definitions(mvb_tests PRIVATE

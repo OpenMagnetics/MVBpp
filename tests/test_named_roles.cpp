@@ -179,3 +179,34 @@ TEST_CASE("role_name covers every Role", "[roles][abt1169]") {
         CHECK(std::string(mvb::role_name(r)) != "unknown");
     }
 }
+
+// The real-winding assembly: the conductor builder roles every solid it emits (the conductor, its
+// FEM terminal caps, a foil's solder bodies, a lead's sleeve), and buildAllNamed must hand those
+// roles through. It used to re-derive them from the name, so every terminal cap reached the
+// assembly as a Turn (found on ABT #1172) -- and a sleeve would have been meshed as copper.
+TEST_CASE("flyback_transformer_complete real winding: terminal caps keep Role::Terminal", "[roles][abt1169][abt1174]") {
+    const std::filesystem::path path = std::filesystem::path(MAS_COMPLETE_DIR) / "flyback_transformer_complete.json";
+    REQUIRE(std::filesystem::exists(path));
+    std::ifstream in(path);
+    json mas; in >> mas;
+    const json magneticJson = mas.contains("magnetic") ? mas.at("magnetic") : mas;
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    const std::string bobbinName = bobbin_name_of(enriched);
+
+    mvb::MagneticBuilder builder;
+    auto all = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                     mvb::DEFAULT_WIRE_POLYGON_SEGMENTS, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                     /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                     /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                     /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    int terminals = 0, turns = 0;
+    for (const auto& ns : all) {
+        const mvb::Role expected = role_from_name(ns.name, bobbinName);
+        INFO("solid '" << ns.name << "' role=" << mvb::role_name(ns.role) << " expected=" << mvb::role_name(expected));
+        CHECK(ns.role == expected);
+        if (ns.role == mvb::Role::Terminal) ++terminals;
+        if (ns.role == mvb::Role::Turn) ++turns;
+    }
+    CHECK(turns > 0);
+    CHECK(terminals == 2 * turns);   // two FEM port caps per conductor
+}
