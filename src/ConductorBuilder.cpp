@@ -12,6 +12,7 @@
 #include "support/Utils.h"
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepBuilderAPI_NurbsConvert.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <TopExp.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
@@ -15362,6 +15363,34 @@ static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::
         if (gf.Mass() > sum * (1.0 + 1e-3) || gf.Mass() < mx * (1.0 - 1e-3)) {
             std::cerr << "[one-body] '" << name << "': the fused body carries " << gf.Mass() * 1e9
                       << " mm^3 against " << sum * 1e9 << " mm^3 of parts; refusing it\n";
+            continue;
+        }
+        // THE CLOSE MUST SURVIVE WHAT THE EXPORT WILL DO TO IT. The FEM product re-expresses
+        // periodic surfaces as B-splines so gmsh does not route them to its periodic mesher
+        // (StepExporter::nurbsConvertPeriodicSolidsMm), and a body that is valid now but invalid
+        // after that conversion fails the export -- taking the whole STEP with it, far from here.
+        // Measured on 06_llc_xfmr_eq4128_3c97: the fuse leaves ~5 needle triangles per primary
+        // parallel, 0.43 mm long and 2.9 um wide, one at the same junction of every turn. They
+        // are VALID planes (tolerance 1e-7 against a 2.9 um width), so no validity check here
+        // sees them; NurbsConvert then re-approximates their trimming curves, the two long edges'
+        // pcurves cross, and the face comes back SelfIntersectingWire + UnorientableShape. No
+        // standard repair fixes it -- ShapeFix at seven precisions, FixSmallFace and
+        // UnifySameDomain were all measured and none produces a convertible body.
+        // So: convert a copy here, and if it will not survive, DO NOT CLOSE. The multi-body
+        // assembly exports cleanly, which is what that design did before the close existed.
+        // The needles themselves are ABT #1266's to remove at the source.
+        try {
+            BRepBuilderAPI_NurbsConvert probe(fused, /*Copy=*/Standard_True);
+            const TopoDS_Shape asBSpline = probe.Shape();
+            if (asBSpline.IsNull() || !BRepCheck_Analyzer(asBSpline).IsValid()) {
+                std::cerr << "[one-body] '" << name
+                          << "': the closed body does not survive the export's B-spline "
+                             "conversion; keeping the assembly (ABT #1266)\n";
+                continue;
+            }
+        } catch (const Standard_Failure& e) {
+            std::cerr << "[one-body] '" << name << "': B-spline conversion probe raised: "
+                      << e.GetMessageString() << "; keeping the assembly\n";
             continue;
         }
         if (std::getenv("MVB_WELD_DEBUG"))
