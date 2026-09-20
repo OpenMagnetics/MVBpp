@@ -6916,35 +6916,88 @@ void appendToroTransitionBand(ConductorPath& path, const ToroCross& c0, const To
     // on the radial lines and tangency angles on the circle are exact.
     const double d1 = std::asin(bf / (rMid + bf)), rt1 = std::sqrt((rMid + bf) * (rMid + bf) - bf * bf);
     const double d2 = std::asin(bf / (rMid - bf)), rt2 = std::sqrt((rMid - bf) * (rMid - bf) - bf * bf);
-    if (rOut0 - b <= rt1 || rIn1 + b >= rt2 || std::abs(dAz) <= d1 + d2)
+    // THE AZIMUTH THE DRAGBACK COSTS. Getting onto the central circle from a radial leg and off
+    // it again spends d1 + d2 of azimuth on the two fillet tangencies -- about 2*bf of arc at
+    // rMid, i.e. three bend radii, a wire diameter and a half. That is a price only a LONG hop
+    // can pay. A ring transition under a physically correct U turnaround cannot: the winding
+    // turns around BESIDE its last turn, so the source rim crossing and the destination bore
+    // crossing sit within roughly one turn pitch of each other (0.98 deg against a required
+    // 8.33 deg on the 3-winding CMC -- MKF ABT #1253 wound the rings as Z, which opened the
+    // next ring a whole ring away and handed this construction a large azimuth for free;
+    // MVB++ ABT #1268).
+    //
+    // When there is no azimuth to spend there is also nothing to drag back OVER: the two
+    // crossings are at essentially the same angle, so the wire simply returns under the core
+    // from rim to bore, the plain poloidal return every intra-ring wrap already makes. It is
+    // the SHORTEST route between the two crossings and stays inside the wedge they span, so it
+    // cannot sweep across the face past the turns the central-circle route was invented to
+    // avoid -- that hazard belongs to the long diagonal, and this run is not one.
+    //
+    // So the azimuth decides the SHAPE, not whether the transition can be built. The radial
+    // legs and fillets are only the central-circle route's problem; the direct return needs
+    // neither, so its feasibility is tested on its own terms (the chord must be longer than the
+    // two corner arcs it joins).
+    const bool viaCentralCircle = std::abs(dAz) > d1 + d2;
+    if (std::getenv("MVB_TORO_DIAG"))
+        std::cerr << "[toro]   " << label << " band: dAz = " << dAz * 180.0 / kPi
+                  << " deg, the two fillets need " << (d1 + d2) * 180.0 / kPi << " deg at rMid = "
+                  << rMid * 1e3 << " mm -> "
+                  << (viaCentralCircle ? "central-circle dragback" : "direct under-core return")
+                  << "\n";
+    if (viaCentralCircle && (rOut0 - b <= rt1 || rIn1 + b >= rt2))
         throw std::runtime_error(
             "ConductorBuilder: ring-transition dragback of " + label +
             " cannot follow the core's central radius (r=" + std::to_string(rMid) +
             " m): the source outer / destination inner crossings leave no room for the "
             "radial legs and fillets");
 
-    // ---- descend at the source azimuth ----
-    gp_XY e0xy = c0.pout;
-    e0xy.Divide(-rOut0);   // radial inward unit at az0
-    gp_XYZ e0(e0xy.X(), 0, e0xy.Y());
     pushSeg(P(c0.pout, t0), P(c0.pout, -tb), "outer tube down");
-    pushArc90(P(c0.pout + e0xy * b, -tb), e0.Crossed(yHat), e0 * (-b), "bottom outer corner");
 
-    // ---- the 5-piece dragback along the core's central circle ----
-    pushSeg(P(c0.pout + e0xy * b, -rhb), P(pol(rt1, az0), -rhb), "dragback out leg");
-    pushArcH(pol(rMid + bf, az0 + sg * d1), -rhb, pol(rt1, az0), pol(rMid, az0 + sg * d1),
-             "dragback outer fillet");
-    pushArcH(gp_XY(0, 0), -rhb, pol(rMid, az0 + sg * d1), pol(rMid, az1 - sg * d2),
-             "dragback central arc");
-    pushArcH(pol(rMid - bf, az1 - sg * d2), -rhb, pol(rMid, az1 - sg * d2), pol(rt2, az1),
-             "dragback inner fillet");
-    gp_XY eIxy = c1.pin;
-    eIxy.Divide(-rIn1);   // radial inward unit at az1 (direction of travel)
-    gp_XYZ eI(eIxy.X(), 0, eIxy.Y());
-    pushSeg(P(pol(rt2, az1), -rhb), P(c1.pin - eIxy * b, -rhb), "dragback in leg");
+    if (viaCentralCircle) {
+        // ---- descend at the source azimuth ----
+        gp_XY e0xy = c0.pout;
+        e0xy.Divide(-rOut0);   // radial inward unit at az0
+        gp_XYZ e0(e0xy.X(), 0, e0xy.Y());
+        pushArc90(P(c0.pout + e0xy * b, -tb), e0.Crossed(yHat), e0 * (-b), "bottom outer corner");
 
-    // ---- arrive at the destination turn ----
-    pushArc90(P(c1.pin - eIxy * b, -tb), eI.Crossed(yHat), yHat * (-b), "bottom inner corner");
+        // ---- the 5-piece dragback along the core's central circle ----
+        pushSeg(P(c0.pout + e0xy * b, -rhb), P(pol(rt1, az0), -rhb), "dragback out leg");
+        pushArcH(pol(rMid + bf, az0 + sg * d1), -rhb, pol(rt1, az0), pol(rMid, az0 + sg * d1),
+                 "dragback outer fillet");
+        pushArcH(gp_XY(0, 0), -rhb, pol(rMid, az0 + sg * d1), pol(rMid, az1 - sg * d2),
+                 "dragback central arc");
+        pushArcH(pol(rMid - bf, az1 - sg * d2), -rhb, pol(rMid, az1 - sg * d2), pol(rt2, az1),
+                 "dragback inner fillet");
+        gp_XY eIxy = c1.pin;
+        eIxy.Divide(-rIn1);   // radial inward unit at az1 (direction of travel)
+        gp_XYZ eI(eIxy.X(), 0, eIxy.Y());
+        pushSeg(P(pol(rt2, az1), -rhb), P(c1.pin - eIxy * b, -rhb), "dragback in leg");
+
+        // ---- arrive at the destination turn ----
+        pushArc90(P(c1.pin - eIxy * b, -tb), eI.Crossed(yHat), yHat * (-b), "bottom inner corner");
+    }
+    else {
+        // ---- the turnaround return: rim -> bore straight under the core, at the band depth ----
+        // Both corners bend into the SAME direction (the chord's), so the three pieces meet
+        // tangentially exactly as the central-circle route's do; the band depth (extraDepth) is
+        // untouched, so this transition still nests under the rings and beside the other
+        // parallels' runs the way the dragback did.
+        gp_XY dBotXY = c1.pin - c0.pout;
+        const double lBot = dBotXY.Modulus();
+        if (lBot <= 2.0 * b)
+            throw std::runtime_error(
+                "ConductorBuilder: ring-transition return of " + label +
+                " has its rim and bore crossings " + std::to_string(lBot) +
+                " m apart, closer than the two corner arcs (" + std::to_string(2.0 * b) +
+                " m) that join it to the tubes -- no room for the under-core run");
+        dBotXY.Divide(lBot);
+        const gp_XYZ dBot(dBotXY.X(), 0, dBotXY.Y());
+        pushArc90(P(c0.pout + dBotXY * b, -tb), dBot.Crossed(yHat), dBot * (-b),
+                  "bottom outer corner");
+        pushSeg(P(c0.pout + dBotXY * b, -rhb), P(c1.pin - dBotXY * b, -rhb), "turnaround return");
+        pushArc90(P(c1.pin - dBotXY * b, -tb), dBot.Crossed(yHat), yHat * (-b),
+                  "bottom inner corner");
+    }
     pushSeg(P(c1.pin, -tb), P(c1.pin, 0), "inner tube up to crossing");
 }
 
