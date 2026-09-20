@@ -48,6 +48,12 @@ constexpr double kMaxSagFraction = 0.02;
 // choke, a 1.5 factor put the poloidal corner 0.5 * wireRadius = 219 um into the entrance
 // lead's corridor and the router (correctly) refused the design.
 constexpr double kRoundCornerBendFactor = 1.05;
+// A DRAGBACK corner's fillet radius, as a multiple of the dragback's own bend radius (not of the
+// wire radius). Strictly above 1 for the same horn-torus reason as above; 1.5 rather than the
+// buildable floor because real wire cannot bend to its own radius without crushing the inner
+// fibre, and a dragback is a formed bend in the finished part. Named here, not repeated as a bare
+// literal at the site (Alf, 2026-09-19: no magic numbers); the value is unchanged from the site's.
+constexpr double kDragbackFilletBendFactor = 1.5;
 // FACETED MODE ONLY (segments > 0): an arc bent tighter than this many wire radii is revolved
 // on the EXACT round profile, not the polygon (ABT #1111, 2026-09-06; Alf's call: "do option
 // 1"). A 12-gon revolved about an axis 1.05 r away puts its innermost facet ~0.08 r from the

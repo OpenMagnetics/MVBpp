@@ -36,6 +36,33 @@ namespace mvb {
 // the exit bends is undefined until specified).
 class ConductorBuilder {
 public:
+    // ---- ABT #1172/#1237: THE BEND POLICY MKF PLANS PIN RUNS FOR ----------------------------
+    // MKF routes a lead to its pin as straight legs meeting at an obstacle edge, and offsets each
+    // leg off the faces (d >= R - (R - r) sin(theta/2)) for the centreline bend radius the CONSUMER
+    // declares. Declared by nobody, it plans SHARP corners, and MVB++ -- which must round every
+    // corner (OCC cannot sweep a bend at or under the wire radius) -- would cut the edge and put
+    // copper inside the pin rail.
+    //
+    // The routes are planned lazily, when someone asks the coil for its connection layout or
+    // reserved spaces. So the policy has to be declared FOR AS LONG AS THE COIL IS HELD, not once
+    // at enrichment: every ConductorBuilder entry point declares it for the duration of the build.
+    // A caller that reads MKF's routes ITSELF (to compare against what was drawn) must hold one of
+    // these over that read, or it will read sharp-planned routes and disagree with the drawing by
+    // the leg offset. RAII; restores the previous settings on every path out.
+    class LeadBendPolicy {
+    public:
+        explicit LeadBendPolicy(double minBendRadius = Options_minBendRadiusDefault());
+        ~LeadBendPolicy();
+        LeadBendPolicy(const LeadBendPolicy&) = delete;
+        LeadBendPolicy& operator=(const LeadBendPolicy&) = delete;
+    private:
+        std::optional<double> _previousFactor;
+        std::optional<double> _previousMinimum;
+    };
+    // The MVB_MIN_BEND_RADIUS floor Options() would pick up, without constructing one (Options is
+    // declared below).
+    static double Options_minBendRadiusDefault();
+
     // ---- ABT #1248: HOW A WOUND TOROID IS MOUNTED -------------------------------------------
     // The conductor builder works in the BUILD frame MKF's geometricalDescription gives a toroid:
     // hole axis along +Y, ring in the XZ plane, a MAS crossing (cx, cy) at build (cx, 0, cy).
@@ -68,10 +95,7 @@ public:
     struct Options {
         Options() {
             if (std::getenv("MVB_TOROID_MITRE_CORNERS")) toroidMitreCorners = true;
-            if (const char* v = std::getenv("MVB_MIN_BEND_RADIUS")) {
-                const double m = std::atof(v);
-                if (m > 0) minBendRadius = m;
-            }
+            minBendRadius = Options_minBendRadiusDefault();
         }
         int  wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS;
         // true  -> conductor swept at the OUTER (insulation) footprint (the web viewer)
@@ -199,6 +223,9 @@ public:
         // point-to-polyline capsule distance; per-prim grouping avoids phantom bridges
         // between non-contiguous runs.
         std::vector<std::vector<std::array<double, 3>>> prims;
+        // Parallel to prims: true for terminal-lead copper, by the ONE rule the lead-length report
+        // uses (Primitive::isLead or Primitive::terminalFillet, ABT #1215); false for turn copper.
+        std::vector<bool> primIsLead;
         std::array<double, 3> end0{}, end1{};   // free ends (terminal port centres)
         std::array<double, 3> dir0{}, dir1{};   // OUTWARD end tangents (port normals)
     };

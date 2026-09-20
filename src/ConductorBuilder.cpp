@@ -9,7 +9,9 @@
 #include <set>
 #include "constructive_models/Coil.h"
 #include "constructive_models/Wire.h"
+#include "advisers/Manufacturability.h"
 #include "support/Utils.h"
+#include "support/Settings.h"
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_NurbsConvert.hxx>
@@ -4057,6 +4059,323 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
     return {{station.x, station.y}, {station.x, edgeY}, {borderX, edgeY}};
 }
 
+// ---- ABT #1172 (WP3, RFC 0013): a terminal lead that ends on its assigned bobbin pin ----------
+//
+// MKF decides everything here: Coil::assign_pins writes the pin on connections[], and the terminal
+// ConnectionRoute of that end carries `pinName` plus `pinWaypoints`, the run from the window exit
+// to the pin BASE in this builder's concentric frame (column axis Y, leads on the -Z front face).
+// MVB++ replays those points and wraps the wire around the pin; it routes nothing of its own.
+struct PinLead {
+    const OpenMagnetics::ConnectionRoute* route = nullptr;
+    MAS::Pin pin;
+    int wrapTurns = 0;   // dfm_rules.json R4.wrapTurns, read through MKF
+};
+
+// The pin the connections[] of this conductor's END name, and MKF's route to it. nullopt when the
+// end has no pin (a bobbin without pins[], a legacy pinName without `end`, a tap). A pin named on
+// connections[] whose route carries no pin run THROWS: drawing the free-air terminal instead would
+// silently disagree with the design (the MAS::Coil round trip used to do exactly that).
+template <typename CoilT>
+std::optional<PinLead> terminalPinLeadFor(const CoilT& coil,
+                                          const OpenMagnetics::ConnectionLayout& layout,
+                                          const MAS::CoreBobbinProcessedDescription& bobbinPd,
+                                          const std::string& winding, int64_t parallel,
+                                          bool entrance, const std::string& who) {
+    // Settings coil_connect_leads_to_pins (MKF, off by default, ABT #1237): when off, every
+    // terminal stays the free-air lead on the common tip plane, exactly as before WP3, whatever
+    // connections[] or the routes say. The pin bodies are drawn either way.
+    if (!OpenMagnetics::settings.get_coil_connect_leads_to_pins()) return std::nullopt;
+    std::optional<std::string> assigned;
+    for (const auto& w : coil.get_functional_description()) {
+        // By value: the generated getter returns the optional by value, and a range-for over
+        // `.value()` of that temporary iterates a destroyed vector.
+        const auto connections = w.get_connections();
+        if (w.get_name() != winding || !connections) continue;
+        for (const auto& connection : *connections) {
+            if (!connection.get_pin_name() || !connection.get_end()) continue;
+            const MAS::End end = connection.get_end().value();
+            if (end != (entrance ? MAS::End::START : MAS::End::FINISH)) continue;
+            if (connection.get_parallel() && connection.get_parallel().value() != parallel) continue;
+            if (assigned && *assigned != connection.get_pin_name().value())
+                throw std::runtime_error(
+                    "ConductorBuilder: " + who + (entrance ? " entrance" : " exit") +
+                    " is assigned to two pins on connections[] ('" + *assigned + "' and '" +
+                    connection.get_pin_name().value() + "')");
+            assigned = connection.get_pin_name().value();
+        }
+    }
+    const auto wantKind = entrance ? OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE
+                                   : OpenMagnetics::ConnectionKind::TERMINAL_EXIT;
+    const OpenMagnetics::ConnectionRoute* route = nullptr;
+    for (const auto& r : layout.routes) {
+        if (r.kind != wantKind || r.winding != winding || r.parallel != parallel) continue;
+        if (route)
+            throw std::runtime_error("ConductorBuilder: MKF's connection layout carries two " +
+                                     std::string(entrance ? "entrance" : "exit") +
+                                     " routes for " + who);
+        route = &r;
+    }
+    if (!assigned) {
+        if (route && !route->pinName.empty())
+            throw std::runtime_error("ConductorBuilder: MKF routed " + who +
+                                     (entrance ? "'s entrance" : "'s exit") + " to pin '" +
+                                     route->pinName + "' but connections[] assigns it no pin");
+        return std::nullopt;
+    }
+    if (!route || route->pinName.empty()) {
+        throw std::runtime_error(
+            "ConductorBuilder: connections[] terminates " + who +
+            (entrance ? "'s start" : "'s finish") + " on pin '" + *assigned +
+            "', but MKF's connection layout carries no route to that pin" +
+            (route ? " (the terminal route has no pin run)" : " (no terminal route at all)") +
+            ". The lead cannot be drawn to the pin, and the free-air terminal would contradict "
+            "the design.");
+    }
+    if (route->pinName != *assigned)
+        throw std::runtime_error("ConductorBuilder: connections[] puts " + who +
+                                 (entrance ? "'s start" : "'s finish") + " on pin '" + *assigned +
+                                 "' but MKF routed it to pin '" + route->pinName + "'");
+    if (route->pinWaypoints.size() < 2)
+        throw std::runtime_error("ConductorBuilder: MKF's route of " + who + " to pin '" +
+                                 route->pinName + "' has " +
+                                 std::to_string(route->pinWaypoints.size()) + " pin waypoint(s)");
+    for (const auto& q : route->pinWaypoints)
+        if (q.size() != 3)
+            throw std::runtime_error("ConductorBuilder: MKF's pin waypoint of " + who +
+                                     " is not a 3D point");
+    PinLead out;
+    out.route = route;
+    bool found = false;
+    if (auto pins = bobbinPd.get_pins()) {
+        for (const auto& pin : *pins) {
+            if (pin.get_name() && *pin.get_name() == route->pinName) {
+                out.pin = pin;
+                found = true;
+            }
+        }
+    }
+    if (!found)
+        throw std::runtime_error("ConductorBuilder: " + who + " is routed to pin '" +
+                                 route->pinName + "', which the bobbin's pins[] does not hold");
+    static const double wrapTurns = [] {
+        const OpenMagnetics::Manufacturability manufacturability;   // named: get_rules() is a reference into it
+        const auto& rules = manufacturability.get_rules();
+        if (!rules.contains("R4") || !rules.at("R4").contains("wrapTurns"))
+            throw std::runtime_error("ConductorBuilder: MKF's dfm_rules.json has no R4.wrapTurns");
+        return rules.at("R4").at("wrapTurns").get<double>();
+    }();
+    if (wrapTurns < 1.0 || std::abs(wrapTurns - std::round(wrapTurns)) > 1e-9)
+        throw std::runtime_error("ConductorBuilder: R4.wrapTurns must be a whole number of turns >= 1");
+    out.wrapTurns = static_cast<int>(std::lround(wrapTurns));
+    return out;
+}
+
+// A round, VERTICAL pin (Bobbin::expand_pinout writes no rotation for one): its axis (x, z), its
+// radius and the y of its BASE (centre + length/2, where it leaves the bobbin). A horizontal pin
+// needs a wrap about Z, which the centreline vocabulary (SPIRAL is about Y) cannot draw yet: throw.
+struct PinAxis {
+    double x = 0, z = 0, radius = 0, baseY = 0, tipY = 0;
+};
+PinAxis pinAxisOf(const MAS::Pin& pin, const std::string& who) {
+    const std::string name = pin.get_name().value_or("?");
+    if (const auto rotation = pin.get_rotation()) {   // by value (see terminalPinLeadFor)
+        for (double a : *rotation)
+            if (std::abs(a) > 1e-9)
+                throw std::runtime_error("ConductorBuilder: " + who + " ends on pin '" + name +
+                                         "', which is not vertical; a wrap around a horizontal pin "
+                                         "is not modelled");
+    }
+    if (pin.get_shape() != MAS::PinShape::ROUND)
+        throw std::runtime_error("ConductorBuilder: " + who + " ends on pin '" + name +
+                                 "', which is not round; only a round pin is wrapped");
+    const auto c = pin.get_coordinates();
+    if (!c || c->size() < 3 || pin.get_dimensions().size() < 3)
+        throw std::runtime_error("ConductorBuilder: pin '" + name +
+                                 "' has no [x,y,z] coordinates or no [diameter, depth, length]");
+    PinAxis a;
+    a.x = (*c)[0];
+    a.z = (*c)[2];
+    a.radius = 0.5 * pin.get_dimensions()[0];
+    a.baseY = (*c)[1] + 0.5 * pin.get_dimensions()[2];
+    a.tipY = (*c)[1] - 0.5 * pin.get_dimensions()[2];
+    return a;
+}
+
+// A polyline in travel order with ROUND corners: the toroid terminal lead's construction (an exact
+// ARC3 of bend radius opts.effectiveBend(kRoundCornerBendFactor r) tangent to both legs, each leg giving at most 49%
+// of itself to a corner; a corner without room stays a sharp joint for the assembler's mitre).
+std::vector<Primitive> roundedLeadChain(const std::vector<gp_Pnt>& pts, double bend,
+                                        const std::string& label, size_t ordinal, int terminal) {
+    std::vector<Primitive> out;
+    auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b) {
+        Primitive pr;
+        pr.kind = Primitive::SEG;
+        pr.seg = {a, b};
+        pr.label = label + " seg " + std::to_string(out.size());
+        pr.turnOrdinal = ordinal;
+        pr.isLead = true;
+        pr.terminal = terminal;
+        out.push_back(std::move(pr));
+    };
+    gp_Pnt segStart = pts.front();
+    for (size_t v = 1; v + 1 < pts.size(); ++v) {
+        const gp_Pnt& prev = pts[v - 1];
+        const gp_Pnt& mid = pts[v];
+        const gp_Pnt& next = pts[v + 1];
+        gp_Vec inVec(prev, mid), outVec(mid, next);
+        const double lenIn = inVec.Magnitude(), lenOut = outVec.Magnitude();
+        if (lenIn < 1e-12 || lenOut < 1e-12)
+            throw std::runtime_error("ConductorBuilder: '" + label +
+                                     "' has a zero-length leg (coincident waypoints)");
+        const gp_XYZ u = inVec.XYZ() / lenIn, w = outVec.XYZ() / lenOut;
+        const double cosTurn = u.Dot(w);
+        const double tangentLen = bend * std::sqrt(std::max(0.0, (1.0 - cosTurn) / (1.0 + cosTurn)));
+        if (cosTurn > 1.0 - 1e-9 || tangentLen > 0.49 * std::min(lenIn, lenOut)) {
+            pushSeg(segStart, mid);
+            segStart = mid;
+            continue;
+        }
+        const gp_Pnt tangentA(mid.XYZ() - u * tangentLen);
+        const gp_Pnt tangentB(mid.XYZ() + w * tangentLen);
+        gp_XYZ normal = w - u * cosTurn;
+        normal /= normal.Modulus();
+        const gp_Pnt center(tangentA.XYZ() + normal * bend);
+        pushSeg(segStart, tangentA);
+        Primitive pr;
+        pr.kind = Primitive::ARC3;
+        pr.arc.c = center;
+        gp_XYZ axis = u.Crossed(w);
+        pr.arc.axis = axis / axis.Modulus();
+        pr.arc.v0 = tangentA.XYZ() - center.XYZ();
+        pr.arc.sweep = std::acos(std::clamp(cosTurn, -1.0, 1.0));
+        pr.label = label + " corner";
+        pr.turnOrdinal = ordinal;
+        pr.isLead = true;
+        pr.terminal = terminal;
+        out.push_back(std::move(pr));
+        segStart = tangentB;
+    }
+    pushSeg(segStart, pts.back());
+    return out;
+}
+
+// The WRAP: wrapTurns turns of the wire as a helix about the pin axis, radius pinRadius + r (the
+// coating touches the pin), pitch 2 r (each turn rests on the previous one), starting at `start`
+// (on the pin base plane, where the pin run arrives) and advancing along the pin, away from the
+// bobbin (-Y). Emitted as half-turn SPIRALs so no single piece closes a revolution; the free end
+// is the assembler's flat perpendicular cap, which buildAllImpl picks as the FEM terminal.
+// `reverse` emits it end -> start (an entrance travels pin -> winding).
+std::vector<Primitive> pinWrap(const PinAxis& axis, const gp_Pnt& start, double wireRadius,
+                               int wrapTurns, const std::string& label, size_t ordinal,
+                               int terminal, bool reverse) {
+    const double R = axis.radius + wireRadius;
+    const double pitch = 2.0 * wireRadius;
+    const double az0 = std::atan2(-(start.Z() - axis.z), start.X() - axis.x);
+    const double r0 = std::hypot(start.X() - axis.x, start.Z() - axis.z);
+    if (std::abs(r0 - R) > 1e-9)
+        throw std::runtime_error("ConductorBuilder: '" + label + "' starts " +
+                                 std::to_string(r0 * 1e3) + " mm from the pin axis, not on the " +
+                                 std::to_string(R * 1e3) + " mm wrap radius");
+    std::vector<Primitive> out;
+    const int halves = 2 * wrapTurns;
+    for (int k = 0; k < halves; ++k) {
+        Primitive pr;
+        pr.kind = Primitive::SPIRAL;
+        const double a0 = az0 + kPi * k, a1 = az0 + kPi * (k + 1);
+        const double y0 = start.Y() - 0.5 * pitch * k, y1 = start.Y() - 0.5 * pitch * (k + 1);
+        if (reverse)
+            pr.spiral = {axis.x, axis.z, R, y1, a1, R, y0, a0};
+        else
+            pr.spiral = {axis.x, axis.z, R, y0, a0, R, y1, a1};
+        pr.label = label;
+        pr.turnOrdinal = ordinal;
+        pr.isLead = true;
+        pr.terminal = terminal;
+        out.push_back(std::move(pr));
+    }
+    if (reverse) std::reverse(out.begin(), out.end());
+    return out;
+}
+
+// A pin lead recorded by the concentric emitter, stitched onto its conductor once every stage that
+// reads the lead copper has run (see the emitter's comment). Frame: the conductor's own, unrotated.
+struct PendingPinLead {
+    bool exit = false;
+    gp_Pnt oldTip;               // where the drawn run ends today (the common tip plane)
+    std::vector<gp_Pnt> run;     // travel order: window exit ... wrap start (exit order for both)
+    PinAxis axis;
+    int wrapTurns = 0;
+    std::string label;           // "<w> parallel <p> entrance lead" / "... exit lead"
+    size_t ordinal = 0;
+    std::string pinName;
+    // ABT #1172: the centreline bend radius MKF PLANNED this run's corners for
+    // (ConnectionRoute::plannedBendRadius): the legs are offset off each obstacle face so a bend of
+    // exactly this radius clears the edge. Equal to the lead's own coated radius = MKF planned
+    // SHARP corners (neither Settings::coil_lead_bend_radius_factor nor _minimum_bend_radius was
+    // set when the route was planned), and a rounded corner would cut the edge.
+    double plannedBend = 0;
+};
+
+// Cut the run back to MKF's window exit and continue it along the pin run into the wrap. The run is
+// the conductor's first (entrance) or last (exit) primitive, a straight SEG ending on the tip plane.
+void stitchPinLead(std::vector<Primitive>& prims, const PendingPinLead& pl, double wireRadius,
+                   double bend) {
+    if (prims.empty())
+        throw std::runtime_error("ConductorBuilder: " + pl.label + " has no copper to continue to pin '" +
+                                 pl.pinName + "'");
+    Primitive& tipSeg = pl.exit ? prims.back() : prims.front();
+    const gp_Pnt tipEnd = tipSeg.kind == Primitive::SEG ? (pl.exit ? tipSeg.seg.b : tipSeg.seg.a) : gp_Pnt();
+    if (tipSeg.kind != Primitive::SEG || !tipSeg.isLead || tipEnd.Distance(pl.oldTip) > 1e-12) {
+        std::ostringstream m;
+        m.precision(9);
+        m << "ConductorBuilder: " << pl.label << "'s run to the tip plane is not the conductor's "
+          << (pl.exit ? "last" : "first") << " primitive (it is '" << tipSeg.label
+          << "'); the lead to pin '" << pl.pinName << "' has nothing to continue from";
+        throw std::runtime_error(m.str());
+    }
+    const gp_Pnt inner = pl.exit ? tipSeg.seg.a : tipSeg.seg.b;   // the run's in-window end
+    const int terminal = pl.exit ? 1 : 0;
+    auto wrap = pinWrap(pl.axis, pl.run.back(), wireRadius, pl.wrapTurns, pl.label + " wrap",
+                        pl.ordinal, terminal, /*reverse=*/!pl.exit);
+    // MKF's exit at the in-window run's own end (the exit depth IS the lifted border): the run to
+    // the tip plane goes entirely, and the pin run starts at that corner.
+    if (inner.Distance(pl.run.front()) <= 1e-9) {
+        std::vector<gp_Pnt> chain(pl.run.begin(), pl.run.end());
+        chain.front() = inner;
+        if (!pl.exit) std::reverse(chain.begin(), chain.end());
+        auto runPrims = roundedLeadChain(chain, bend, pl.label + " pin run", pl.ordinal, terminal);
+        if (pl.exit) {
+            prims.pop_back();
+            prims.insert(prims.end(), runPrims.begin(), runPrims.end());
+            prims.insert(prims.end(), wrap.begin(), wrap.end());
+        } else {
+            prims.erase(prims.begin());
+            std::vector<Primitive> head(wrap.begin(), wrap.end());
+            head.insert(head.end(), runPrims.begin(), runPrims.end());
+            prims.insert(prims.begin(), head.begin(), head.end());
+        }
+        return;
+    }
+    std::vector<gp_Pnt> chain;
+    chain.push_back(inner);
+    chain.insert(chain.end(), pl.run.begin(), pl.run.end());
+    if (!pl.exit) std::reverse(chain.begin(), chain.end());
+    auto runPrims = roundedLeadChain(chain, bend, pl.label + " pin run", pl.ordinal, terminal);
+    if (pl.exit) {
+        // The chain's first segment IS the drawn run, shortened to the first corner.
+        const Primitive& shared = runPrims.front();
+        tipSeg.seg.b = shared.seg.b;
+        prims.insert(prims.end(), runPrims.begin() + 1, runPrims.end());
+        prims.insert(prims.end(), wrap.begin(), wrap.end());
+    } else {
+        const Primitive& shared = runPrims.back();
+        tipSeg.seg.a = shared.seg.a;
+        std::vector<Primitive> head(wrap.begin(), wrap.end());
+        head.insert(head.end(), runPrims.begin(), runPrims.end() - 1);
+        prims.insert(prims.begin(), head.begin(), head.end());
+    }
+}
+
 // Split one conductor's drawn terminal rects (MKF emission order: the ENTRANCE lead's
 // rects first, then the EXIT lead's, each as [vertical stub?, horizontal run] -- the run
 // closes its group) into the entrance and exit lead groups. With exactly two runs, every
@@ -5106,8 +5425,11 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
         return;
     }
     const size_t n = p.size();
-    const double bTarget = 1.5 * wireRadius;      // > wireRadius: never a horn torus
-    const double bFloor = 1.05 * wireRadius;      // below this a fillet is not buildable
+    // kRoundCornerBendFactor: the smallest buildable bend (> wireRadius: never a horn torus), the
+    // corner rule everywhere else -- target and floor are the same number (Alf, 2026-09-19: no
+    // magic numbers; the old 1.5 target was a bare literal).
+    const double bTarget = kRoundCornerBendFactor * wireRadius;
+    const double bFloor = kRoundCornerBendFactor * wireRadius;
 
     std::vector<gp_XYZ> dir(n - 1);
     std::vector<double> len(n - 1);
@@ -6896,9 +7218,8 @@ void appendToroTransitionBand(ConductorPath& path, const ToroCross& c0, const To
     // centreline radius equals the wire radius sweeps a HORN TORUS -- the tube touches its own
     // axis of revolution, so OCC returns a self-touching (invalid) solid and the conformal
     // assembler drops it, which is exactly the "missing dragback corner" seen in the STEP.
-    // 1.5x is also the more physical figure: real wire cannot bend to its own radius without
-    // crushing the inner fibre.
-    const double bf = 1.5 * bend;
+    // kDragbackFilletBendFactor (WireAssembler.h) says why it is 1.5 rather than the buildable floor.
+    const double bf = kDragbackFilletBendFactor * bend;
 
     // ---- source turn's top half (identical to a normal wrap's) ----
     gp_XY dH = c0.pout - c0.pin;
@@ -7184,6 +7505,70 @@ static void dropToroidLeadTipsToPlane(std::vector<ConductorPath>& paths, const g
 
 // ABT #1265: defined below, beside the other assembly-closing helpers.
 static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::string& name);
+
+// THE PIN GATE (ABT #1172). The copper gate knows only copper; a wrap and its run also live among
+// the pins, the core and each other's pins. Every centreline sample of every conductor keeps its
+// coated radius off every pin (the pin as the capsule of its axis segment: exact along the barrel,
+// conservative past its ends), so a wrap may TOUCH its own pin -- the coating on the pin is the
+// design -- and nothing may enter one. Pin runs and wraps (terminal-tagged lead copper past the
+// window exit) must also keep their copper out of the core. Throws with the deepest intrusion.
+void checkPinLeadClearance(const std::vector<ConductorPath>& paths,
+                           const MAS::CoreBobbinProcessedDescription& bobbinPd,
+                           const std::vector<TopoDS_Shape>& coreObstacles) {
+    std::vector<std::pair<std::string, PinAxis>> pins;
+    if (auto list = bobbinPd.get_pins())
+        for (const auto& pin : *list)
+            pins.emplace_back(pin.get_name().value_or("?"), pinAxisOf(pin, "the pin gate"));
+    double worst = 0.0;
+    std::string where;
+    for (const auto& p : paths) {
+        for (const auto& pr : p.prims) {
+            const auto pts = samplePrim(pr, p.wireRadius);
+            for (const auto& [name, a] : pins) {
+                for (const gp_Pnt& q : pts) {
+                    const double y = std::clamp(q.Y(), a.tipY, a.baseY);
+                    const double d = std::sqrt((q.X() - a.x) * (q.X() - a.x) +
+                                               (q.Y() - y) * (q.Y() - y) +
+                                               (q.Z() - a.z) * (q.Z() - a.z));
+                    const double depth = a.radius + p.wireRadius - d;
+                    if (depth > cert::kCoordinateGridHalf && depth > worst) {
+                        worst = depth;
+                        std::ostringstream w;
+                        w.precision(9);
+                        w << p.name << " '" << pr.label << "' reaches " << depth * 1e6
+                          << " um inside the coated clearance of pin '" << name << "' at ("
+                          << q.X() * 1e3 << ", " << q.Y() * 1e3 << ", " << q.Z() * 1e3 << ") mm";
+                        where = w.str();
+                    }
+                }
+            }
+            const bool pinRun = pr.terminal >= 0 && pr.label.find(" pin run") != std::string::npos;
+            const bool wrap = pr.terminal >= 0 && pr.label.size() >= 10 &&
+                              pr.label.compare(pr.label.size() - 10, 10, " lead wrap") == 0;
+            if (pinRun || wrap) {
+                auto hits = coreHits(coreObstacles, pts, copperEnvelopeOf(p), p.name + " '" + pr.label + "'", 1);
+                if (!hits.empty())
+                    throw std::runtime_error("ConductorBuilder: a lead to its pin runs through the core -- " +
+                                             hits.front());
+            }
+        }
+    }
+    if (worst > 0.0)
+        throw std::runtime_error("ConductorBuilder: copper inside a pin -- " + where);
+}
+
+// WHAT COUNTS AS TERMINAL-LEAD COPPER (ABT #1215): flags only, no label matching. Lead: every
+// Primitive::isLead piece and every Primitive::terminalFillet arc (it exists only because the lead
+// is there). Turn copper, stubs, bumps and isConnection links are not lead.
+static bool isTerminalLeadPiece(const Primitive& pr) { return pr.isLead || pr.terminalFillet; }
+
+// ABT #1172/#1237: MKF plans a pin run's corners for the bend radius THIS consumer will draw --
+// it offsets each leg d >= R - (R - r) sin(theta/2) off the obstacle faces (Settings::
+// lead_leg_clearance) -- and plans SHARP corners (R = r) when nothing declares one, which puts the
+// drawn copper inside the pin rail. MVB++ rounds every corner, so it declares its policy (the
+// corner rule and the user's minimum-bend floor, the two numbers Options draws with) for as long
+// as it holds the coil: the routes are computed HERE, when the builder asks the coil for its
+// connection layout and reserved spaces, not during the enrichment that produced the magnetic.
 
 template <typename CoilT, typename WireT>
 std::vector<NamedShape> buildAllImpl(const CoilT& coil,
@@ -7680,6 +8065,24 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     }
 
     std::vector<ConductorPath> paths;
+    // ABT #1172 (WP3): the terminal leads that end on a bobbin pin, by conductor name.
+    std::map<std::string, std::vector<PendingPinLead>> pendingPinLeads;
+    // ABT #1237: a terminal lead that ends on a pin leaves the window at MKF's exit x
+    // (Coil::terminal_exit_slots, the window end of route.pinWaypoints). The fan does not choose
+    // that lead's slot: it draws the run there, or throws. Keyed by (conductor index, entrance).
+    std::map<std::pair<size_t, bool>, double> mkfExitXOf;
+    if (!isToroidal) {
+        for (size_t c = 0; c < conductors.size(); ++c) {
+            const std::string who = conductors[c].winding + " parallel " + std::to_string(conductors[c].parallel);
+            for (bool entrance : {true, false}) {
+                const auto lead = terminalPinLeadFor(coil, connectionLayout, bobbinPd, conductors[c].winding,
+                                                     conductors[c].parallel, entrance, who);
+                if (!lead) continue;
+                const auto& q = entrance ? lead->route->pinWaypoints.back() : lead->route->pinWaypoints.front();
+                mkfExitXOf[{c, entrance}] = q[0];
+            }
+        }
+    }
     paths.reserve(conductors.size());
     // Solder bodies (foil terminals, ABT #970): raw solids emitted beside the conductors.
     std::vector<NamedShape> solderShapes;
@@ -10271,6 +10674,157 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // dodge. Every disagreement between the plan and the drawn copper then lands at the
             // certified gate as a named pair instead of being absorbed by an azimuth the rule
             // says the terminals should not need. Diagnostic campaign switch, default OFF.
+            // ABT #1237 (WP3): LEADS ON PINS START AT MKF'S SLOT. MKF plans the run to the pin from its
+            // own exit x (Coil::terminal_exit_slots); every member of this bundle that ends on a pin
+            // is drawn with its straight run AT that x -- the slot at which the run radius gives
+            // x -- and the placement is then PROVEN with the same checks the anchor search uses.
+            // MKF's lanes are 2-D and exactly one coated OD apart, with no margin, while the drawn
+            // lead is 3-D: a fillet bows sideways off its leg (boost p1's terminal-stub fillet,
+            // 4 nm towards p0 -> 0.54 nm inside the envelope) and the attach point sits on the
+            // helix at the slot azimuth, so its X at the attach radius is smaller than the run's
+            // (PQ 32/30 flyback exit, 0.505 vs 0.534 mm: 29 um into its own dragback). A member the
+            // proof refuses therefore moves OUTWARD from MKF's x to the proven-clear boundary, as the
+            // free-air fan does, and the stitch bridges its run back to MKF's exit along x
+            // (Alf, 2026-09-18). The move is capped at one coated wire radius: beyond that MKF's lane
+            // plan itself is wrong, and that still throws.
+            {
+                size_t pinnedMembers = 0;
+                std::vector<double> fixedX(group.size(), 0.0);
+                for (size_t g = 0; g < group.size(); ++g) {
+                    std::optional<double> xg;
+                    for (size_t m : verts[group[g]].cis) {
+                        auto found = mkfExitXOf.find({m, verts[group[g]].entrance});
+                        if (found == mkfExitXOf.end()) continue;
+                        if (xg && std::abs(*xg - found->second) > 1e-12)
+                            throw std::runtime_error(
+                                "ConductorBuilder: one lead slot of '" + verts[group[g]].wname +
+                                "' binds parallels MKF gives different exit x (" + std::to_string(*xg * 1e3) +
+                                " and " + std::to_string(found->second * 1e3) + " mm)");
+                        xg = found->second;
+                    }
+                    if (xg) {
+                        ++pinnedMembers;
+                        fixedX[g] = *xg;
+                    }
+                }
+                if (pinnedMembers > 0 && pinnedMembers != group.size())
+                    throw std::runtime_error(
+                        "ConductorBuilder: the " + std::string(verts[group[0]].entrance ? "entrance" : "exit") +
+                        " leads of '" + verts[group[0]].wname + "' are partly on pins; a bundle is drawn "
+                        "either at MKF's pin slots or by the fan, not both");
+                if (pinnedMembers > 0) {
+                    std::vector<double> fixedAz(group.size(), 0.0);
+                    std::string why;
+                    for (size_t g = 0; g < group.size() && why.empty(); ++g) {
+                        fixedAz[g] = slotAtX(verts[group[g]], fixedX[g], /*run=*/true);
+                        if (std::isnan(fixedAz[g])) why = "the exit x is beyond the lead's run radius";
+                    }
+                    if (why.empty()) {
+                        for (size_t g = 0; g < group.size(); ++g) {
+                            azCandSet[group[g]] = 1;
+                            azCand[group[g]] = fixedAz[g];
+                        }
+                        // Why member g at slot c is refused (empty: proven clear) against the rows,
+                        // every placed vertical and the members before it at their final slots.
+                        auto refusal = [&](size_t g, double c) {
+                            std::string w;
+                            azCand[group[g]] = c;
+                            if (!leadRowsClearAnyFillet(verts[group[g]], c, &w))
+                                return w.empty() ? std::string("its route crosses a wire row") : w;
+                            for (size_t j = 0; j < verts.size(); ++j)
+                                if (azAssigned[j] && !clears(verts[j], az[j], verts[group[g]], c))
+                                    return "it does not clear the vertical of conductor " +
+                                           conductors[verts[j].ci].winding + " parallel " +
+                                           std::to_string(conductors[verts[j].ci].parallel) + " (kind " +
+                                           std::to_string(verts[j].kind) + ")";
+                            for (size_t h = 0; h < g; ++h)
+                                if (!clears(verts[group[h]], fixedAz[h], verts[group[g]], c))
+                                    return "it does not clear its sibling lead at x " +
+                                           std::to_string(fixedX[h] * 1e3) + " mm";
+                            return std::string();
+                        };
+                        for (size_t g = 0; g < group.size() && why.empty(); ++g) {
+                            const Vert& me = verts[group[g]];
+                            const std::string atMkf = refusal(g, fixedAz[g]);
+                            if (atMkf.empty()) continue;
+                            // Outward = away from the terminal plane; a lead on the plane tries both
+                            // sides and keeps the smaller move.
+                            const double cap = me.rw;
+                            double bestD = kNaN, bestX = kNaN, bestAz = kNaN;
+                            for (double s : {1.0, -1.0}) {
+                                if (fixedX[g] > 0.0 && s < 0.0) continue;
+                                if (fixedX[g] < 0.0 && s > 0.0) continue;
+                                double dFail = 0.0, dPass = kNaN;
+                                for (double d = 1e-9; d <= cap; d *= 2.0) {
+                                    const double c = slotAtX(me, fixedX[g] + s * d, /*run=*/true);
+                                    if (std::isnan(c)) break;
+                                    if (refusal(g, c).empty()) { dPass = d; break; }
+                                    dFail = d;
+                                }
+                                if (std::isnan(dPass)) {
+                                    const double c = slotAtX(me, fixedX[g] + s * cap, /*run=*/true);
+                                    if (std::isnan(c) || !refusal(g, c).empty()) continue;
+                                    dPass = cap;
+                                }
+                                for (int it = 0; it < 60 && dPass - dFail > 1e-12; ++it) {
+                                    const double d = 0.5 * (dFail + dPass);
+                                    const double c = slotAtX(me, fixedX[g] + s * d, /*run=*/true);
+                                    if (!std::isnan(c) && refusal(g, c).empty()) dPass = d;
+                                    else dFail = d;
+                                }
+                                if (std::isnan(bestD) || dPass < bestD) {
+                                    bestD = dPass;
+                                    bestX = fixedX[g] + s * dPass;
+                                    bestAz = slotAtX(me, bestX, /*run=*/true);
+                                }
+                            }
+                            if (std::isnan(bestD)) {
+                                std::ostringstream w;
+                                w << "lead of conductor " << conductors[me.ci].winding << " parallel "
+                                  << conductors[me.ci].parallel << " at MKF's exit x " << fixedX[g] * 1e3
+                                  << " mm: " << atMkf << "; no move up to one wire radius (" << cap * 1e3
+                                  << " mm) off MKF's slot clears it";
+                                why = w.str();
+                                break;
+                            }
+                            // Re-proven at the value kept (the bisection's last pass is the kept one).
+                            const std::string kept = refusal(g, bestAz);
+                            if (!kept.empty())
+                                throw std::runtime_error("ConductorBuilder: pin lead nudge of " +
+                                                         conductors[me.ci].winding + " is not clear where it "
+                                                         "was proven: " + kept);
+                            if (std::getenv("MVB_LEAD_DIAG"))
+                                std::fprintf(stderr, "[pin-slot] %s parallel %zu %s: MKF x %.9f mm refused (%s); "
+                                             "drawn at %.9f mm (+%.9f mm)\n",
+                                             conductors[me.ci].winding.c_str(), (size_t)conductors[me.ci].parallel,
+                                             me.entrance ? "entrance" : "exit", fixedX[g] * 1e3, atMkf.c_str(),
+                                             bestX * 1e3, (bestX - fixedX[g]) * 1e3);
+                            fixedX[g] = bestX;
+                            fixedAz[g] = bestAz;
+                        }
+                        for (size_t g = 0; g < group.size(); ++g) azCand[group[g]] = fixedAz[g];
+                        for (size_t g = 0; g < group.size(); ++g) azCandSet[group[g]] = 0;
+                    }
+                    if (!why.empty()) {
+                        if (!filletRollsUnlocked) {
+                            filletRollsUnlocked = true;
+                            k = SIZE_MAX;
+                            continue;
+                        }
+                        throw std::runtime_error(
+                            "ConductorBuilder: the " + std::string(verts[group[0]].entrance ? "entrance" : "exit") +
+                            " leads of '" + verts[group[0]].wname + "' end on bobbin pins, and MKF's exit slot "
+                            "cannot be drawn clear -- " + why + ". MKF's lane plan is off by more than a "
+                            "wire radius: Coil::terminal_exit_slots, ABT #1237.");
+                    }
+                    for (size_t g = 0; g < group.size(); ++g) {
+                        az[group[g]] = fixedAz[g];
+                        azAssigned[group[g]] = 1;
+                        permSig += " P:" + std::to_string(group[g]);
+                    }
+                    continue;
+                }
+            }
             const bool forcePlane = std::getenv("MVB_FAN_TERMINALS_ON_PLANE") != nullptr;
             bool have = false;
             double best = 0.0;
@@ -10572,6 +11126,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             for (auto& [wnameOfBundle, members] : bundle) {
                 if (members.size() < 2) continue;
+                // ABT #1237: a bundle on pins holds MKF's slots, lead by lead.
+                bool onPins = false;
+                for (size_t k : members)
+                    for (size_t m : verts[k].cis)
+                        if (mkfExitXOf.count({m, verts[k].entrance})) onPins = true;
+                if (onPins) continue;
                 // The permutation is separation-neutral only while every member converts its
                 // slot to the SAME run X, i.e. while they share a radius (ABT #685: the
                 // clearance criterion for leads is X = -r sin(az), so swapping slots between
@@ -11888,7 +12448,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         }
                         const gp_XYZ u = inVec.XYZ() / lenIn, w = outVec.XYZ() / lenOut;
                         const double cosTurn = u.Dot(w);
-                        const double b = opts.effectiveBend(1.5 * wireRadius);
+                        const double b = opts.effectiveBend(kRoundCornerBendFactor * wireRadius);
                         const double tangentLen =
                             b * std::sqrt(std::max(0.0, (1.0 - cosTurn) / (1.0 + cosTurn)));
                         // Room is judged on the FULL legs: a leg shared by two corners gives at
@@ -12984,6 +13544,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // grouping is ambiguous when a crossing sits within a wire of the window edge.
         std::vector<const RSpace*> entranceGroup, exitGroup;
         std::tie(entranceGroup, exitGroup) = splitTerminalGroups(terminalRects, path.name, foilRadial);
+        // ABT #1172 (WP3): the pins MKF assigned this conductor's two ends to, with its routes.
+        const std::optional<PinLead> entrancePin = terminalPinLeadFor(
+            coil, connectionLayout, bobbinPd, ct.winding, ct.parallel, /*entrance=*/true, path.name);
+        const std::optional<PinLead> exitPin = terminalPinLeadFor(
+            coil, connectionLayout, bobbinPd, ct.winding, ct.parallel, /*entrance=*/false, path.name);
 
         // czRaise: how far the turn this lead attaches to has been lifted by the dragbacks it
         // rides over. The lead must meet the wire WHERE IT ACTUALLY IS, not at the nominal
@@ -13024,7 +13589,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                  // The level attach leg's length, from the fan (leadLegIn /
                                  // leadLegOut); NaN = the bare elbow leg.
                                  std::pair<double, double> attachLeg = {
-                                     std::numeric_limits<double>::quiet_NaN(), 0.0}) {
+                                     std::numeric_limits<double>::quiet_NaN(), 0.0},
+                                 // ABT #1172 (WP3): the pin this terminal ends on, or null for
+                                 // today's free-air terminal on the common tip plane.
+                                 const PinLead* pinLead = nullptr) {
             // Absorb intermediate waypoints closer than the wire radius to their
             // neighbour: a jog shorter than the wire's own radius lies entirely inside
             // the pipe body of the adjacent edge (and inside MKF's drawn rectangle,
@@ -13200,6 +13768,125 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             if (xShift != 0.0)
                 for (auto& q : leadPts) q.SetX(q.X() + xShift);
+            // ABT #1172 (WP3): A LEAD ASSIGNED TO A PIN. The lead is drawn exactly as above -- its
+            // straight parallel-Z run to the common tip plane included -- and every later stage
+            // (seam aim, end-run planning, link smoothing, terminal fillets) runs on that
+            // unchanged copper, so the winding cannot move because a pin exists. Only after them
+            // (stitchPinLeads) is the run cut back to MKF's window exit and continued along MKF's
+            // pin run into the wrap. What is recorded here is that continuation, in this frame.
+            if (pinLead) {
+                const bool isExitLead = stationAtFront;
+                const std::string who = path.name + " " + what;
+                if (rectWire)
+                    throw std::runtime_error("ConductorBuilder: " + who + " ends on pin '" +
+                                             pinLead->route->pinName +
+                                             "'; a rectangular/foil wire wrapped on a pin is not "
+                                             "modelled");
+                if (leadPts.size() < 2)
+                    throw std::runtime_error("ConductorBuilder: " + who +
+                                             " has no in-window run to continue to its pin");
+                const size_t tip = stationAtFront ? leadPts.size() - 1 : 0;
+                const size_t nb = stationAtFront ? tip - 1 : 1;
+                // MKF's pin run in travel order from the window exit (the entrance route is
+                // stored pin base first).
+                std::vector<gp_Pnt> run;
+                for (const auto& q : pinLead->route->pinWaypoints) run.emplace_back(q[0], q[1], q[2]);
+                if (!isExitLead) std::reverse(run.begin(), run.end());
+                // MKF's pin run is ABSOLUTE (ABT #1237: Coil::route_leads_to_pins plans every
+                // terminal run together, its exit slot and depth -- ride-over lift included -- chosen
+                // by MKF). It starts at MKF's window exit E on the lead's own row. The drawn run
+                // (parallel to Z at the fan slot x, towards the common tip plane) is cut where it
+                // reaches E's depth, and a level leg along x bridges the fan slot to E when the two
+                // differ. Nothing of MKF's route is moved.
+                const gp_Pnt exitPt = run.front();
+                // The common tip plane is a free-air notion: a lead on a pin ends where MKF's pin run
+                // starts. When MKF's exit lies beyond the plane (PQ 32/30 flyback: -14.096 vs
+                // -13.795 mm, the ride-over lift MKF adds), the straight run continues to it.
+                if (exitPt.Z() < leadPts[tip].Z() && leadPts[tip].Z() - leadPts[nb].Z() < 0.0)
+                    leadPts[tip].SetZ(exitPt.Z());
+                if (std::abs(leadPts[tip].X() - leadPts[nb].X()) > 1e-12 ||
+                    std::abs(exitPt.Y() - leadPts[tip].Y()) > 1e-9 ||
+                    std::abs(leadPts[nb].Y() - leadPts[tip].Y()) > 1e-9 ||
+                    exitPt.Z() > leadPts[nb].Z() + 1e-9 || exitPt.Z() < leadPts[tip].Z() - 1e-9) {
+                    std::ostringstream m;
+                    m.precision(9);
+                    m << "ConductorBuilder: " << who << " cannot reach MKF's window exit to pin '"
+                      << pinLead->route->pinName << "': the drawn run goes from ("
+                      << leadPts[nb].X() * 1e3 << ", " << leadPts[nb].Y() * 1e3 << ", "
+                      << leadPts[nb].Z() * 1e3 << ") to (" << leadPts[tip].X() * 1e3 << ", "
+                      << leadPts[tip].Y() * 1e3 << ", " << leadPts[tip].Z() * 1e3
+                      << ") mm, MKF's exit is (" << exitPt.X() * 1e3 << ", " << exitPt.Y() * 1e3
+                      << ", " << exitPt.Z() * 1e3 << ") mm";
+                    throw std::runtime_error(m.str());
+                }
+                const PinAxis axis = pinAxisOf(pinLead->pin, who);
+                // The route ends ON the pin axis, one wire radius or more under the pin's base (the
+                // rail underside; a second strand sharing the pin wraps lower): the wrap starts
+                // there.
+                const gp_Pnt pinEnd = run.back();
+                if (std::abs(pinEnd.X() - axis.x) > 1e-9 || std::abs(pinEnd.Z() - axis.z) > 1e-9 ||
+                    pinEnd.Y() > axis.baseY - wireRadius + 1e-9 || pinEnd.Y() < axis.tipY)
+                    throw std::runtime_error("ConductorBuilder: MKF's route of " + who +
+                                             " does not end on the axis of pin '" +
+                                             pinLead->route->pinName +
+                                             "' between a wire radius under its base and its tip");
+                // The fan drew this run at MKF's exit x, or moved it outward by at most one wire
+                // radius where the 3-D lead could not be proven clear there (ABT #1237). The run is
+                // cut at MKF's exit depth; a level leg along x bridges it to MKF's exit when the move
+                // is above a micrometre, and below that the first leg of MKF's run absorbs it (a
+                // sub-micrometre leg is a degenerate corner for the sweep).
+                const double dxExit = leadPts[tip].X() - exitPt.X();
+                if (std::abs(dxExit) > wireRadius + 1e-12) {
+                    std::ostringstream m;
+                    m.precision(12);
+                    m << "ConductorBuilder: " << who << "'s run is drawn at x = " << leadPts[tip].X() * 1e3
+                      << " mm but MKF's exit to pin '" << pinLead->route->pinName << "' is at x = "
+                      << exitPt.X() * 1e3 << " mm, more than a wire radius away";
+                    throw std::runtime_error(m.str());
+                }
+                const gp_Pnt runCut(leadPts[tip].X(), leadPts[tip].Y(), exitPt.Z());
+                if (std::abs(dxExit) > 1e-6) run.insert(run.begin(), runCut);
+                else run.front() = runCut;
+                if (run.size() < 2)
+                    throw std::runtime_error("ConductorBuilder: MKF's pin run of " + who + " is empty");
+                const gp_XYZ lastLeg = run.back().XYZ() - run[run.size() - 2].XYZ();
+                const double lastLen = lastLeg.Modulus();
+                const double wrapR = axis.radius + wireRadius;
+                for (size_t k = 0; k + 1 < run.size(); ++k) {
+                    const gp_Vec leg(run[k], run[k + 1]);
+                    bool bad = leg.Magnitude() < 1e-12;
+                    if (!bad && k + 2 < run.size()) {
+                        const gp_Vec next(run[k + 1], run[k + 2]);
+                        bad = next.Magnitude() < 1e-12 || leg.Angle(next) > 170.0 * kPi / 180.0;
+                    }
+                    if (bad) {
+                        std::ostringstream m;
+                        m.precision(9);
+                        m << "ConductorBuilder: " << who << "'s run to pin '" << pinLead->route->pinName
+                          << "' has a leg " << k << " that collapses or folds back on itself (fan slot "
+                          << leadPts[tip].X() * 1e3 << " mm, MKF exit x " << exitPt.X() * 1e3 << " mm)";
+                        throw std::runtime_error(m.str());
+                    }
+                }
+                if (std::abs(lastLeg.Y()) > 1e-12 || lastLen < wrapR + wireRadius)
+                    throw std::runtime_error("ConductorBuilder: " + who + " arrives at pin '" +
+                                             pinLead->route->pinName +
+                                             "' on a leg that is not level or is shorter than the "
+                                             "wrap radius plus a wire radius");
+                // The run stops where the wire meets the wrap circle, on the side it comes from.
+                run.back() = gp_Pnt(run.back().XYZ() - lastLeg / lastLen * wrapR);
+                PendingPinLead pending;
+                pending.exit = isExitLead;
+                pending.oldTip = leadPts[tip];
+                pending.run = std::move(run);
+                pending.axis = axis;
+                pending.wrapTurns = pinLead->wrapTurns;
+                pending.label = who;
+                pending.ordinal = ordinal;
+                pending.pinName = pinLead->route->pinName;
+                pending.plannedBend = pinLead->route->plannedBendRadius;
+                pendingPinLeads[path.name].push_back(std::move(pending));
+            }
             // The lead lies in its fan slot's axial plane and runs straight out radially, like
             // the dragback.
             if (!rectWire) {
@@ -14050,7 +14737,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               rectFamily && leadSlotOf.count(ci) ? -leadSlotOf.at(ci) : 0.0,
                               leadLegIn.count(ci) ? leadLegIn.at(ci)
                                                   : std::pair<double, double>{
-                                                        std::numeric_limits<double>::quiet_NaN(), 0.0});
+                                                        std::numeric_limits<double>::quiet_NaN(), 0.0},
+                              entrancePin ? &*entrancePin : nullptr);
             }
             if (entranceCorner)
                 rectLeadCornerPrim(*entranceCorner, entranceCornerRide,
@@ -14584,7 +15272,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               exitLane,
                               leadLegOut.count(ci) ? leadLegOut.at(ci)
                                                    : std::pair<double, double>{
-                                                         std::numeric_limits<double>::quiet_NaN(), 0.0});
+                                                         std::numeric_limits<double>::quiet_NaN(), 0.0},
+                              exitPin ? &*exitPin : nullptr);
             }
         }
 
@@ -14810,6 +15499,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // frame again. A no-op for main-column conductors, which is every conductor of every
         // single-window design.
         if (conductorAxisX[ci] != 0.0) {
+            if (pendingPinLeads.count(path.name))   // ABT #1172: MKF routes main-column pins only
+                throw std::runtime_error("ConductorBuilder: " + path.name +
+                                         " is wound on a lateral leg and ends on a bobbin pin; MKF's "
+                                         "pin run starts at the main column's front face, so no "
+                                         "route to the pin exists");
             translatePathX(path, conductorAxisX[ci]);
         }
         paths.push_back(std::move(path));
@@ -15027,6 +15721,49 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
         *opts.toroidTerminalPlaneOut = plane;
     }
+    // ABT #1172 (WP3): continue the pin-assigned terminal leads to their pins, now that nothing
+    // else reads the lead copper to place the winding (see the concentric emitter).
+    for (auto& p : paths) {
+        auto found = pendingPinLeads.find(p.name);
+        if (found == pendingPinLeads.end()) continue;
+        // MKF routes the pin run from the -Z front face of the main column. A conductor the seam
+        // aim rotated, or one wound on a lateral leg, leaves from somewhere else: no route exists.
+        if (std::abs(p.seamRot) > 1e-15)
+            throw std::runtime_error(
+                "ConductorBuilder: " + p.name + "'s leads were aimed " +
+                std::to_string(p.seamRot * 180.0 / kPi) +
+                " deg round the column (the core's window opening), but MKF routes its pin leads "
+                "from the -Z front face; the two disagree and no route to the pins exists");
+        for (const auto& pl : found->second) {
+            // DRAW NO WIDER THAN MKF PLANNED FOR (ABT #1172). MKF offsets a pin run's legs off
+            // the obstacle faces for a declared bend radius (d >= R - (R - r) sin(theta/2)), and a
+            // corner drawn wider than that R cuts the edge it turns around -- copper inside the pin
+            // rail. The route carries what was planned, so this does not trust the ambient Settings,
+            // which are out of scope by the time a saved design is drawn: a magnetic routed by a
+            // caller that declared no policy reports its own coated radius here (MKF planned SHARP
+            // corners), and any rounded corner then exceeds it and is refused rather than drawn.
+            const double drawnBend = opts.effectiveBend(kRoundCornerBendFactor * p.wireRadius);
+            if (pl.plannedBend <= 0.0)
+                throw std::runtime_error("ConductorBuilder: " + pl.label + "'s route to pin '" +
+                                         pl.pinName + "' carries no planned bend radius; MKF did not "
+                                         "record what its corners were planned for (ABT #1172)");
+            if (drawnBend > pl.plannedBend + 1e-12) {
+                std::ostringstream m;
+                m.precision(9);
+                m << "ConductorBuilder: " << pl.label << " would draw its run to pin '" << pl.pinName
+                  << "' with a bend of " << drawnBend * 1e3 << " mm, but MKF planned those corners for "
+                  << pl.plannedBend * 1e3 << " mm: the wider bend cuts the edge the legs were offset "
+                     "for. Declare the consumer's bend policy BEFORE the routes are planned "
+                     "(Settings::set_coil_lead_bend_radius_factor / set_coil_lead_minimum_bend_radius); "
+                     "a route planned with no policy reports the lead's own radius, i.e. sharp corners "
+                     "(ABT #1172, ABT #1237)";
+                throw std::runtime_error(m.str());
+            }
+            stitchPinLead(p.prims, pl, p.wireRadius, drawnBend);
+        }
+    }
+    if (!pendingPinLeads.empty() && !opts.diagnosticSkipCollisionCheck)
+        checkPinLeadClearance(paths, bobbinPd, opts.coreObstacles);
     if (opts.diagnosticSkipCollisionCheck) {
         // Loud on purpose: a build that skipped this gate produces overlapping copper and
         // must not be mistaken for a valid part further downstream.
@@ -15061,6 +15798,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 seg.reserve(pts.size());
                 for (const auto& q : pts) seg.push_back({q.X(), q.Y(), q.Z()});
                 pl.prims.push_back(std::move(seg));
+                pl.primIsLead.push_back(isTerminalLeadPiece(pr));
             }
             if (!p.prims.empty()) {
                 auto [a0, b0] = primEndpoints(p.prims.front());
@@ -15509,6 +16247,7 @@ std::vector<NamedShape> ConductorBuilder::buildAll(
     const Options& opts) {
     // The reserved-space computation lives on OpenMagnetics::Coil; rebuild one (without
     // winding — the descriptions are already present) to obtain the drawn routes.
+    ConductorBuilder::LeadBendPolicy bendPolicy(opts.minBendRadius);
     nlohmann::json cj;
     to_json(cj, coil);
     OpenMagnetics::Coil omCoil(cj, /*windInConstructor=*/false);
@@ -15521,6 +16260,7 @@ std::vector<NamedShape> ConductorBuilder::buildAll(
 std::vector<NamedShape> ConductorBuilder::buildAll(
     const OpenMagnetics::Coil& coil, const MAS::CoreBobbinProcessedDescription& bobbin,
     bool isToroidal, const Options& opts) {
+    ConductorBuilder::LeadBendPolicy bendPolicy(opts.minBendRadius);
     OpenMagnetics::Coil coilCopy = coil;
     auto layout = coilCopy.get_connection_layout();
     auto spaces = coilCopy.get_connection_reserved_spaces();
@@ -15532,6 +16272,7 @@ std::map<std::string, ConductorBuilder::TerminalLeadLength>
 ConductorBuilder::measureTerminalLeadLengths(const OpenMagnetics::Coil& coil,
                                              const MAS::CoreBobbinProcessedDescription& bobbin,
                                              bool isToroidal, const Options& opts) {
+    ConductorBuilder::LeadBendPolicy bendPolicy(opts.minBendRadius);
     OpenMagnetics::Coil coilCopy = coil;
     auto layout = coilCopy.get_connection_layout();
     auto spaces = coilCopy.get_connection_reserved_spaces();
@@ -15543,7 +16284,7 @@ ConductorBuilder::measureTerminalLeadLengths(const OpenMagnetics::Coil& coil,
         throw std::runtime_error("measureTerminalLeadLengths: the conductor builder produced no "
                                  "paths");
     static const char* kKindName[] = {"SEG", "ARC3", "SPIRAL", "BLEND"};
-    auto isLeadPiece = [](const Primitive& pr) { return pr.isLead || pr.terminalFillet; };
+    auto isLeadPiece = [](const Primitive& pr) { return isTerminalLeadPiece(pr); };
 
     std::map<std::string, TerminalLeadLength> out;
     // (winding, parallel, end) -> accumulated end, so a foil parallel's two lead-wire conductors
@@ -15762,6 +16503,7 @@ ConductorBuilder::ToroidMountingFrame ConductorBuilder::resolveToroidMountingFra
 std::vector<ConductorBuilder::PathPolyline> ConductorBuilder::buildAllPaths(
     const OpenMagnetics::Coil& coil, const MAS::CoreBobbinProcessedDescription& bobbin,
     bool isToroidal, const Options& opts) {
+    ConductorBuilder::LeadBendPolicy bendPolicy(opts.minBendRadius);
     OpenMagnetics::Coil coilCopy = coil;
     auto layout = coilCopy.get_connection_layout();
     auto spaces = coilCopy.get_connection_reserved_spaces();
@@ -15769,6 +16511,32 @@ std::vector<ConductorBuilder::PathPolyline> ConductorBuilder::buildAllPaths(
     buildAllImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, bobbin, isToroidal,
                                                            std::move(spaces), layout, opts, &out);
     return out;
+}
+
+
+// ABT #1172/#1237: see the declaration in ConductorBuilder.h for why this exists and why it must
+// be held for as long as the coil is, not just around the enrichment.
+double ConductorBuilder::Options_minBendRadiusDefault() {
+    if (const char* v = std::getenv("MVB_MIN_BEND_RADIUS")) {
+        const double m = std::atof(v);
+        if (m > 0) return m;
+    }
+    return 0.0;
+}
+
+ConductorBuilder::LeadBendPolicy::LeadBendPolicy(double minBendRadius) {
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    _previousFactor = settings.get_coil_lead_bend_radius_factor();
+    _previousMinimum = settings.get_coil_lead_minimum_bend_radius();
+    settings.set_coil_lead_bend_radius_factor(std::optional<double>(kRoundCornerBendFactor));
+    settings.set_coil_lead_minimum_bend_radius(minBendRadius > 0 ? std::optional<double>(minBendRadius)
+                                                                 : std::nullopt);
+}
+
+ConductorBuilder::LeadBendPolicy::~LeadBendPolicy() {
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.set_coil_lead_bend_radius_factor(_previousFactor);
+    settings.set_coil_lead_minimum_bend_radius(_previousMinimum);
 }
 
 } // namespace mvb
