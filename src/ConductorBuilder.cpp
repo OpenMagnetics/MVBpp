@@ -2217,12 +2217,23 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
                 return d;
             };
             const bool traceCap = std::getenv("MVB_RECT_TRACE") != nullptr;
-            // LEAD junctions only. A wrap's straights and corners are G1 by construction, so
-            // their caps already agree; it is the LEADS that carry MKF's terminal placement --
-            // 18_stacked's entrance lead drifts 20.3 um laterally over its run to reach the
-            // wrap entry, and that tilt is what leaves its cap non-parallel to the corner's.
-            // Restricting the shear to leads keeps the change to the pieces that need it.
-            if (i > 0 && trimStart[i] == 0.0 && pr.isLead && path.prims[i - 1].isLead) {
+            // ONE side a LEAD is enough (ABT #1271). Inside a wrap the straights and corners are
+            // G1 by construction, so their caps already agree and neither side asks for a shear --
+            // a wrap-to-wrap junction still never gets one, because neither piece is a lead. What
+            // does NOT agree is the boundary BETWEEN a lead piece and the wrap it joins, and
+            // requiring BOTH sides to be leads is exactly what kept the shear away from it:
+            // 18_stacked's entrance lead drifts 20.3 um laterally over its run (1.14 mrad, squared
+            // at the lead-to-lead joint), and its lead CORNER arc is then built FLAT (constant
+            // axial y) while the wrap straight it meets carries the helical advance
+            // (dy/ds = 6.394e-3). Those two caps, each square to its own axis, crossed at
+            // mid-thickness and opened a re-entrant 3.4 um wedge: the junction's single 1.000 mm
+            // thickness edge came out as TWO 0.500 mm halves, the section never closed into a
+            // W-T-W-T ring, and OMFEM's mapped-hex path refused the design (8 incomplete rings,
+            // 2 blocks of 12 faces). The corner arc itself has no cap to shear (it is REVOLVED),
+            // so the wrap SEG takes the corner's true end tangent instead. Every other condition
+            // is unchanged (no trim, SEG, rect section, below the 0.05 rad elbow threshold), no
+            // centreline point moves, and the section area changes by cos(6.4 mrad) = 1 - 2.0e-5.
+            if (i > 0 && trimStart[i] == 0.0 && (pr.isLead || path.prims[i - 1].isLead)) {
                 const gp_Dir nb = sameSense(trueDir(path.prims[i - 1], true));
                 const double a2 = nb.Angle(own);
                 if (traceCap)
@@ -2230,8 +2241,9 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
                                  pr.label.c_str(), a2);
                 if (a2 > 1e-9 && a2 < 0.05) { capA = nb; haveCapA = true; }
             }
-            if (i + 1 < path.prims.size() && trimEnd[i] == 0.0 && pr.isLead &&
-                path.prims[i + 1].isLead) {
+            // The END cap, same rule as the start cap above: one side a lead is enough.
+            if (i + 1 < path.prims.size() && trimEnd[i] == 0.0 &&
+                (pr.isLead || path.prims[i + 1].isLead)) {
                 const gp_Dir nb = sameSense(trueDir(path.prims[i + 1], false));
                 const double a2 = nb.Angle(own);
                 if (traceCap)

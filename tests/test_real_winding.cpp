@@ -25,7 +25,11 @@
 #include <BRepBndLib.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepAdaptor_Curve.hxx>
 #include <GeomAbs_SurfaceType.hxx>
+#include <GeomAbs_CurveType.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS_Edge.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Circ.hxx>
@@ -1012,6 +1016,73 @@ TEST_CASE("Real winding: rectangular-column RECTANGULAR wire builds", "[realwind
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
     REQUIRE(conductorSolidCount(conductor->shape) >= 1);
+}
+
+// ABT #1271. THE LEAD CORNER MUST CLOSE ONTO THE WRAP STRAIGHT IT MEETS.
+// The entrance/exit lead corner arc is built FLAT (constant axial coordinate) while the wrap
+// straight it joins carries the helical advance (dy/ds = 6.394e-3 on this design, 0.37 deg).
+// Each piece's cap is square to its OWN axis, so unless the coplanar-cap shear reaches this
+// junction the two cap planes cross at mid-thickness and leave a re-entrant wedge: the junction's
+// single 1.000 mm THICKNESS edge comes out as TWO 0.500 mm halves (twelve of them over the two
+// leads), the section never closes into a 4-curve W-T-W-T ring, and OMFEM's mapped-hex path
+// correctly refuses the design (8 incomplete rings, 2 blocks of 12 faces instead of 6).
+// The wedge is ~0.0043 mm^3 against a solid of tens of thousands, so a volume or
+// builds-without-throwing check CANNOT see it and passes with the shear reverted -- which is why
+// this asserts the junction CLOSES: no straight edge of the conductor measures half the wire
+// thickness. Fixture: realwinding_rect_wire_rect.json is 18_stacked itself (E 70/33/32 x2,
+// 30 turns of 5 x 1 mm rectangular wire), the design the defect was measured on.
+TEST_CASE("Real winding: the lead corner closes onto the wrap straight (no half-thickness edges)",
+          "[realwinding][abt1271]") {
+    auto magneticJson = loadFixture("realwinding_rect_wire_rect.json");
+    const double wireThickness = magneticJson.at("coil")
+                                     .at("functionalDescription")[0]
+                                     .at("wire")
+                                     .at("conductingHeight")
+                                     .at("nominal")
+                                     .get<double>();
+    REQUIRE(wireThickness == Catch::Approx(0.001));   // else the 0.5 mm signature below is wrong
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    // paintCoating=false: the CONDUCTING footprint, which is what the FEM product is drawn at
+    // (ABT #1261) and what the half-thickness signature below is stated in. Drawn at the coated
+    // envelope the same defect measures half of the OUTER height instead, and a 0.5 mm test would
+    // look green over it.
+    auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/false,
+                                       false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+    REQUIRE(shapeVolume(conductor->shape) > 0.0);
+
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(conductor->shape, TopAbs_EDGE, edges);
+    REQUIRE(edges.Extent() > 0);
+    std::ostringstream halves;
+    int halfCount = 0, fullCount = 0;
+    for (int i = 1; i <= edges.Extent(); ++i) {
+        const TopoDS_Edge& e = TopoDS::Edge(edges(i));
+        if (BRep_Tool::Degenerated(e)) continue;
+        BRepAdaptor_Curve curve(e);
+        if (curve.GetType() != GeomAbs_Line) continue;   // only the straight section edges
+        GProp_GProps lp;
+        BRepGProp::LinearProperties(e, lp);
+        // Whole thickness edges must dominate -- if the conductor were drawn at some other
+        // thickness (the coated envelope, say) the half-thickness signature below would be
+        // measured against the wrong number and the test would pass over the defect.
+        if (std::abs(lp.Mass() - wireThickness) < 2e-6) ++fullCount;
+        // Half the THICKNESS, to 2 um -- the split-thickness edge the crossing caps produce.
+        if (std::abs(lp.Mass() - wireThickness / 2.0) > 2e-6) continue;
+        ++halfCount;
+        const gp_Pnt c = lp.CentreOfMass();
+        halves << "\n  " << lp.Mass() * 1e3 << " mm edge at (" << c.X() * 1e3 << ","
+               << c.Y() * 1e3 << "," << c.Z() * 1e3 << ") mm";
+    }
+    INFO("conductor drawn with " << fullCount << " full-thickness ("
+                                 << wireThickness * 1e3 << " mm) straight edges");
+    REQUIRE(fullCount > 100);   // 30 turns x 4 corners: the section thickness edges are there
+    INFO("half-thickness (" << wireThickness / 2.0 * 1e3 << " mm) straight edges: " << halfCount
+                            << halves.str());
+    REQUIRE(halfCount == 0);
 }
 
 TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean",
