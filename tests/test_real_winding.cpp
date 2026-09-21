@@ -1004,7 +1004,10 @@ TEST_CASE("Real winding: round-column RECTANGULAR wire is ONE body", "[realwindi
 }
 
 TEST_CASE("Real winding: rectangular-column RECTANGULAR wire builds", "[realwinding]") {
-    // 18_stacked (E70, 5x1 mm): the per-turn racetrack solids. Its copper turns TOUCH, so the fuse
+    // 18_stacked (E70, 5x1 mm), on the custom former whose column corner radius (9.9925 mm) is
+    // the minimum its on-edge wire can be wound round under IEC 60317-0-2 (ABT #1303; the design
+    // on the 0 mm 'basic' former is refused by MKF ABT #1290 before any geometry is drawn).
+    // The per-turn racetrack solids: its copper turns TOUCH, so the fuse
     // would short them into a brick -- the per-turn compound is kept (correct), so it is multi-solid
     // BY DESIGN. Assert only that it builds valid positive-volume copper for every turn.
     auto magneticJson = loadFixture("realwinding_rect_wire_rect.json");
@@ -1020,7 +1023,8 @@ TEST_CASE("Real winding: rectangular-column RECTANGULAR wire builds", "[realwind
 
 // ABT #1271. THE LEAD CORNER MUST CLOSE ONTO THE WRAP STRAIGHT IT MEETS.
 // The entrance/exit lead corner arc is built FLAT (constant axial coordinate) while the wrap
-// straight it joins carries the helical advance (dy/ds = 6.394e-3 on this design, 0.37 deg).
+// straight it joins carries the helical advance (dy/ds = 5.88e-3 on this design, 0.34 deg; it was
+// 6.394e-3 on the 0 mm former the defect was first measured on).
 // Each piece's cap is square to its OWN axis, so unless the coplanar-cap shear reaches this
 // junction the two cap planes cross at mid-thickness and leave a re-entrant wedge: the junction's
 // single 1.000 mm THICKNESS edge comes out as TWO 0.500 mm halves (twelve of them over the two
@@ -1030,7 +1034,10 @@ TEST_CASE("Real winding: rectangular-column RECTANGULAR wire builds", "[realwind
 // builds-without-throwing check CANNOT see it and passes with the shear reverted -- which is why
 // this asserts the junction CLOSES: no straight edge of the conductor measures half the wire
 // thickness. Fixture: realwinding_rect_wire_rect.json is 18_stacked itself (E 70/33/32 x2,
-// 30 turns of 5 x 1 mm rectangular wire), the design the defect was measured on.
+// 30 turns of 5 x 1 mm rectangular wire), the design the defect was measured on, now on its
+// derived custom former (ABT #1303). Revert-checked on that former: with the shear gated back
+// to BOTH sides being leads, this test fails with 12 half-thickness (0.5 mm) edges at the two
+// lead-corner junctions (x = +-2.6005 mm), and passes with the gate as it is.
 TEST_CASE("Real winding: the lead corner closes onto the wrap straight (no half-thickness edges)",
           "[realwinding][abt1271]") {
     auto magneticJson = loadFixture("realwinding_rect_wire_rect.json");
