@@ -1388,6 +1388,19 @@ static TopoDS_Shape fromMitreFrame(const TopoDS_Shape& mm) {
     return metres;
 }
 
+// ABT #1266 MEASUREMENT (MVB_TOL_DIAG): the largest sub-shape tolerance a piece carries. Pieces
+// are built at Precision::Confusion(); anything above it was put there by an operation, and this
+// is how the operation that did it is found. Changes nothing.
+static double maxSubShapeTolerance(const TopoDS_Shape& s) {
+    double t = 0.0;
+    for (TopExp_Explorer e(s, TopAbs_VERTEX); e.More(); e.Next())
+        t = std::max(t, BRep_Tool::Tolerance(TopoDS::Vertex(e.Current())));
+    for (TopExp_Explorer e(s, TopAbs_EDGE); e.More(); e.Next())
+        t = std::max(t, BRep_Tool::Tolerance(TopoDS::Edge(e.Current())));
+    return t;
+}
+static bool tolDiag() { static const bool on = std::getenv("MVB_TOL_DIAG") != nullptr; return on; }
+
 // DID THE MITRE ACTUALLY HAPPEN? ABT #860 (2026-08-23). Every previous verdict on a mitre cut came
 // from the SAME boolean kernel that performs it -- 'removed' from the Cut, 'shouldRemove' from a
 // Common with the knife -- so when the kernel goes blind (above) it reports success AND reports
@@ -1470,6 +1483,28 @@ static double overhangBeyondPlane(const TopoDS_Shape& trimmed, const gp_Pnt& stu
 // bit-identical vertices and the glue merges the caps exactly. A mismatch beyond 100 nm means
 // the frames' phases differ at this corner -- adopting would twist the prism, so fall back to
 // the own projection (today's behaviour).
+TopoDS_Shape loftRuledPrism(const std::vector<gp_Pnt>& start, const std::vector<gp_Pnt>& end,
+                            std::string* why) {
+    auto refuse = [&](const char* r) { if (why) *why = r; return TopoDS_Shape(); };
+    if (start.size() < 3 || start.size() != end.size()) return refuse("polygon sizes differ");
+    BRepBuilderAPI_MakePolygon ws, we;
+    for (const auto& q : start) ws.Add(q.Transformed(mitreUpTrsf()));
+    ws.Close();
+    for (const auto& q : end) we.Add(q.Transformed(mitreUpTrsf()));
+    we.Close();
+    if (!ws.IsDone() || !we.IsDone()) return refuse("polygon wire failed");
+    BRepOffsetAPI_ThruSections loft(Standard_True /*solid*/, Standard_True /*ruled*/);
+    loft.AddWire(ws.Wire());
+    loft.AddWire(we.Wire());
+    loft.Build();
+    if (!loft.IsDone() || loft.Shape().IsNull()) return refuse("loft failed");
+    if (!BRepCheck_Analyzer(loft.Shape()).IsValid()) return refuse("loft invalid (BRepCheck)");
+    const TopoDS_Shape out = fromMitreFrame(loft.Shape());
+    if (out.IsNull() || !BRepCheck_Analyzer(out).IsValid())
+        return refuse("loft invalid after the return to metres (BRepCheck)");
+    return out;
+}
+
 static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double r, int segments,
                                      const gp_Pnt& Ps, const gp_XYZ& ns,
                                      const gp_Pnt& Pe, const gp_XYZ& ne,
@@ -1646,20 +1681,27 @@ static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double 
     // outward shell -- and every prism came back FAULTY from BOPAlgo_ArgumentAnalyzer (88
     // "self-intersections" on 05_pfc that were really orientation conflicts). Build the two
     // wires in the SAME vertex order; ruled lofting connects vertex i to vertex i.
+    // LOFTED IN THE MILLIMETRE FRAME (ABT #1266). Every side of this prism is an exact planar
+    // trapezoid -- vertex i of the start polygon is joined to its own translate along the axis
+    // -- so the loft has nothing to approximate, yet built in METRES it came back carrying
+    // 3.6-8.6 um edge and vertex tolerances on the faces beside a mitred cap (measured on
+    // 02_flyback --segments 12: dragback seg 2 at 3.632e-6, 'face -Z out' at 8.602e-6, the last
+    // wrap straight and the exit lead it mitres into both at 8.302e-6; every other piece at
+    // 1e-7). Rebuilt from the SAME two cap polygons, the metre loft reproduces those numbers to
+    // the last digit and the millimetre loft comes out at Precision::Confusion. OCC's
+    // approximation tolerances are absolute and calibrated for millimetre models; on a 0.25 mm
+    // wire in metres they are ~1000x too coarse -- the same miscalibration this file already
+    // routes MakePipeShell, the mitre knife and the one-body fuse around (see mitreUpTrsf).
+    // Those tolerances are what the one-body close then had to swallow: seeded here, grown to
+    // 14-26 um by the booleans that met them, "repaired" at 20 um, and exposed as four ~12 um
+    // BOPAlgo self-intersections the moment a STEP round trip dropped them.
+    // The factor is the metre->millimetre unit conversion, not a tuned value: pure scaling is
+    // an exact affine map both ways, and fromMitreFrame lifts the scaled-down tolerances back
+    // to confusion without inflating anything.
     try {
-        BRepBuilderAPI_MakePolygon ws, we;
-        for (const auto& q : vs) ws.Add(q);
-        ws.Close();
-        for (const auto& q : ve) we.Add(q);
-        we.Close();
-        if (!ws.IsDone() || !we.IsDone()) return {};
-        BRepOffsetAPI_ThruSections loft(Standard_True /*solid*/, Standard_True /*ruled*/);
-        loft.AddWire(ws.Wire());
-        loft.AddWire(we.Wire());
-        loft.Build();
-        if (!loft.IsDone() || loft.Shape().IsNull()) return refuse("loft failed");
-        const TopoDS_Shape out = loft.Shape();
-        if (!BRepCheck_Analyzer(out).IsValid()) return refuse("loft invalid (BRepCheck)");
+        std::string loftWhy;
+        const TopoDS_Shape out = loftRuledPrism(vs, ve, &loftWhy);
+        if (out.IsNull()) return refuse(loftWhy);
         // SUB-RESOLUTION SLIVER GUARD. "> 0" let through prisms whose two end planes almost
         // coincide: positive volume below what the B-Rep can represent (measured on the
         // mitre-corner toroid: 18-face solids at 0.000000 mm3, flagged DEFECTIVE by stage A).
@@ -3087,11 +3129,22 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         const bool capsProvablyShared = (prismDone && startCapAdopted && !staggerHereForAudit)
                                      || (segments > 0 && !bentS && receivedCap)
                                      || roundCapsShared;
+        const double tolBuilt = tolDiag() ? maxSubShapeTolerance(solid) : 0.0;
+        const double tolPrevBefore = (tolDiag() && !prevBuilt.IsNull()) ? maxSubShapeTolerance(prevBuilt) : 0.0;
         if (i > 0 && (bentS || (angS <= 1e-12 && dpS <= 1e-9))) {
             if (capsProvablyShared) ++abutChecked;   // verdict: shared face, zero lens, by construction
             else checkMitredAbutment(prevBuilt, solid,
                                 std::string(bentS ? "" : "tangent ") + "'" + ptrs[i - 1]->label +
                                     "' -> '" + ptrs[i]->label + "'");
+        }
+        if (tolDiag()) {
+            const double tolAfter = maxSubShapeTolerance(solid);
+            const double tolPrevAfter = prevBuilt.IsNull() ? 0.0 : maxSubShapeTolerance(prevBuilt);
+            std::fprintf(stderr,
+                "[tol-trace] piece %zu '%s' kind=%d prism=%d bentS=%d bentE=%d built=%.3e "
+                "afterCheck=%.3e | prev before=%.3e after=%.3e\n",
+                i, ptrs[i]->label.c_str(), (int)ptrs[i]->kind, (int)prismDone, (int)bentS,
+                (int)bentE, tolBuilt, tolAfter, tolPrevBefore, tolPrevAfter);
         }
         prevBuilt = solid;
         // Collect per PRIMITIVE instead of emitting straight into the compound: bridged
@@ -3896,6 +3949,16 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     if (diag) {
         std::cerr << "[mitre] prims=" << n << " boolean-cuts=" << nCut << " repaired=" << nRepaired
                   << " dropped-invalid=" << nInvalid << "\n";
+    }
+    if (tolDiag()) {
+        size_t k = 0;
+        for (TopExp_Explorer se(compound, TopAbs_SOLID); se.More(); se.Next(), ++k) {
+            const size_t owner = (primIndexPerSolid && k < primIndexPerSolid->size())
+                                     ? (*primIndexPerSolid)[k] : static_cast<size_t>(-1);
+            std::fprintf(stderr, "[tol-trace] OUT solid %zu owner=%zu '%s' tol=%.3e\n", k, owner,
+                         owner < n ? ptrs[owner]->label.c_str() : "?",
+                         maxSubShapeTolerance(se.Current()));
+        }
     }
     return compound;
 }

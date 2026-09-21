@@ -181,6 +181,13 @@ enum class CornerStyle {
 // weld is pure waste: overlapping pieces cut exactly the same volume, and that build was
 // costing as much as the product one (measured on 01_etd34 at --segments 4: two identical
 // conformal assemblies, 126 s total).
+// The ruled prism between two cap polygons (vertex i of `start` joined to vertex i of `end`),
+// the solid every faceted straight is. Lofted in the MILLIMETRE frame and returned in metres at
+// the model's own confusion -- see the definition for why a metre-frame loft is not (ABT #1266).
+// Returns a null shape, with the reason in *why, when OCC cannot build a valid solid.
+TopoDS_Shape loftRuledPrism(const std::vector<gp_Pnt>& start, const std::vector<gp_Pnt>& end,
+                            std::string* why = nullptr);
+
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& centreline, double wireRadius,
                           int polygonSegments, CornerStyle corners = CornerStyle::BisectionMitre,
                           std::vector<size_t>* primIndexPerSolid = nullptr,

@@ -41,6 +41,7 @@
 #include <BOPAlgo_CheckerSI.hxx>
 #include <BOPAlgo_ArgumentAnalyzer.hxx>
 #include <BRep_Tool.hxx>
+#include <Precision.hxx>
 #include <Geom_Surface.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopExp_Explorer.hxx>
@@ -1090,6 +1091,65 @@ TEST_CASE("Real winding: the lead corner closes onto the wrap straight (no half-
     INFO("half-thickness (" << wireThickness / 2.0 * 1e3 << " mm) straight edges: " << halfCount
                             << halves.str());
     REQUIRE(halfCount == 0);
+}
+
+// ABT #1266. A FACETED STRAIGHT MUST CARRY ONLY THE MODEL'S OWN CONFUSION.
+// Every faceted straight is a ruled prism between two cap polygons, and every side of it is an
+// exact planar trapezoid -- vertex i of the start cap joined to its own translate along the axis --
+// so the loft has nothing to approximate. Lofted in METRES it nevertheless came back with
+// 3.6-8.6 um edge and vertex tolerances (OCCT's approximation tolerances are absolute and
+// calibrated for millimetre models). On 02_flyback --segments 12 those were the seed of the four
+// ~11.85 um BOPAlgo self-intersections: grown by the booleans that met them, swallowed by the
+// one-body close's 20 um sliver repair, exposed by the STEP round trip that dropped them.
+//
+// THE FIXTURE IS THE REAL PIECE, not a stand-in. The two caps below are 'exit lead seg 0' of
+// 02_flyback_efd25_3c95's 'Primary parallel 0', read out of the one-body close's pristine operand
+// dump (MVB_ONE_BODY_DUMP) on origin/main 0a7fae1-lineage code: 12 vertices each, lateral edges
+// parallel to 1e-15 rad, start cap on the mitre plane of the wrap->lead corner, end cap flat at the
+// lead's end. That exact piece shipped at 8.302e-6 m; lofted in metres from these vertices it
+// reproduces 8.302e-6 to the last digit, lofted in millimetres it comes out at confusion.
+// A synthetic axis-aligned corner (tried first) does NOT reproduce the inflation and passes with
+// the fix reverted -- which is why the real vertices are used. Revert the millimetre-frame loft
+// in loftRuledPrism and this fails at ~8.3 um.
+TEST_CASE("Real winding: a faceted straight is lofted at the model's confusion (ABT #1266)",
+          "[realwinding][abt1266]") {
+    const std::vector<gp_Pnt> startCap{
+        {0.00019936538827139801, 0.0082500498605331506, -0.00489224680466955},
+        {0.00016469556061180299, 0.0083475996977821106, -0.0048492851906924697},
+        {8.5895690489285395e-05, 0.00841474542114495, -0.0047649829844652603},
+        {-1.59198605331505e-05, 0.0084334953882714003, -0.0046619288940666602},
+        {-0.000113469697782113, 0.0083988255606118004, -0.0045677361797957098},
+        {-0.000180615421144953, 0.0083200256904892803, -0.0045076437033741996},
+        {-0.00019936538827139801, 0.0082182101394668496, -0.0044977531953304499},
+        {-0.00016469556061180299, 0.0081206603022178896, -0.0045407148093075302},
+        {-8.5895690489283701e-05, 0.0080535145788550398, -0.0046250170155347397},
+        {1.59198605331505e-05, 0.0080347646117285999, -0.0047280711059333397},
+        {0.00011346969778211201, 0.0080694344393881998, -0.0048222638202042901},
+        {0.000180615421144953, 0.0081482343095107095, -0.0048823562966258003}};
+    std::vector<gp_Pnt> endCap;
+    for (const auto& p : startCap) endCap.emplace_back(p.X(), p.Y(), -0.0072019999999997503);
+
+    std::string why;
+    const TopoDS_Shape prism = mvb::loftRuledPrism(startCap, endCap, &why);
+    INFO("loftRuledPrism: " << (prism.IsNull() ? why : std::string("built")));
+    REQUIRE_FALSE(prism.IsNull());
+    REQUIRE(BRepCheck_Analyzer(prism).IsValid());
+    // It IS that piece: 12 sides + 2 caps, one solid.
+    int faces = 0, solids = 0;
+    for (TopExp_Explorer e(prism, TopAbs_FACE); e.More(); e.Next()) ++faces;
+    for (TopExp_Explorer e(prism, TopAbs_SOLID); e.More(); e.Next()) ++solids;
+    REQUIRE(faces == 14);
+    REQUIRE(solids == 1);
+
+    double worst = 0.0;
+    for (TopExp_Explorer e(prism, TopAbs_VERTEX); e.More(); e.Next())
+        worst = std::max(worst, BRep_Tool::Tolerance(TopoDS::Vertex(e.Current())));
+    for (TopExp_Explorer e(prism, TopAbs_EDGE); e.More(); e.Next())
+        worst = std::max(worst, BRep_Tool::Tolerance(TopoDS::Edge(e.Current())));
+    INFO("loosest sub-shape tolerance " << worst << " m; Precision::Confusion() = "
+                                        << Precision::Confusion() << " m (shipped: 8.302e-6 m)");
+    // Confusion is the model's own resolution; the factor only absorbs its last-bit rounding.
+    CHECK(worst <= Precision::Confusion() * (1.0 + 1e-9));
 }
 
 TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean",
