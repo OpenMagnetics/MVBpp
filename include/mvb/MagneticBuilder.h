@@ -212,7 +212,8 @@ public:
                                           bool includeInsulation = false,
                                           double coreCoatingThickness = 0.0,
                                           bool useRealWindingGeometry = false,
-                                          bool femReady = false) const;
+                                          bool femReady = false,
+                                          bool skipGeometryChecks = false) const;
     std::vector<NamedShape> buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
@@ -225,7 +226,15 @@ public:
                                           // shell solid ("<core> coating") of this thickness [m].
                                           double coreCoatingThickness = 0.0,
                                           bool useRealWindingGeometry = false,
-                                          bool femReady = false) const;
+                                          bool femReady = false,
+                                          // A VIEWER's geometry, not a part (the WASM/web build):
+                                          // skips the collision, containment and enamel-clearance
+                                          // proofs over the drawn copper. They are what makes a
+                                          // build trustworthy and most of what makes it slow; a
+                                          // picture on screen needs neither. Every consumer that
+                                          // exports a part leaves this false, and the builder says
+                                          // out loud when it is set.
+                                          bool skipGeometryChecks = false) const;
 
     // ---- Standalone builders for the unified bindings API -----------------
     //

@@ -347,13 +347,14 @@ std::vector<mvb::NamedShape> build_spacer(const std::string& json_str, int /*pol
     if (!gdOpt || gdOpt->empty()) {
         throw std::runtime_error("drawSpacer: core has no geometricalDescription");
     }
-    auto shapes = mvb::SpacerBuilder::buildSpacers(*gdOpt);
+    // ABT #1170: a spacer is a shape PLUS the insulation material MAS declares for it, and the
+    // whole assembly names them through mvb::appendSpacerSolids. This binding builds the spacers
+    // alone, so it takes the same shapes and the same "Spacer_<i>" names and role.
     std::vector<mvb::NamedShape> out;
-    out.reserve(shapes.size());
-    int i = 0;
-    for (auto& s : shapes) {
-        if (s.IsNull()) continue;
-        out.push_back(mvb::NamedShape{ std::move(s), "Spacer_" + std::to_string(i++) });
+    for (auto& spacer : mvb::SpacerBuilder::buildSpacers(*gdOpt)) {
+        if (spacer.shape.IsNull()) continue;
+        out.push_back(mvb::NamedShape{std::move(spacer.shape), "Spacer_" + std::to_string(out.size()),
+                                      mvb::Role::Spacer});
     }
     return out;
 }
@@ -477,8 +478,14 @@ std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygo
         // The conductor cross-section stays an exact circle regardless of segments, so the
         // wire segment count is moot (0); polygonSegments still facets the core built
         // internally for lead aiming.
+        // THE WEB DRAWS A PICTURE, NOT A PART (Alf, 2026-09-22: "as fast as possible, don't care
+        // about certification, checks or fusing"). The proofs over the drawn copper -- pairwise
+        // clearance at the coated envelope, window containment, the pin-rail gate -- are what a
+        // part needs and what most of the time goes to; the viewer needs none of them. Only this
+        // binding asks for it: every native consumer, the STEP/FEM exports included, keeps them.
         return b.buildRealWindingTurnsNamed(magnetic, /*wirePolygonSegments=*/0,
-                                            polygonSegments, paintCoating, femReady);
+                                            polygonSegments, paintCoating, femReady,
+                                            /*diagnosticSkipCollisionCheck=*/true);
     }
     if (j.is_array()) {
         // Standalone path: each Turn must carry its own dimensions and
@@ -574,7 +581,8 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
                                // which is every 3D viewer.
                                mvb::MagneticBuilder::declaredCoreCoatingThickness(magnetic.get_core()),
                                /*useRealWindingGeometry=*/true,
-                               femReady);
+                               femReady,
+                               /*skipGeometryChecks=*/true);   // a picture, not a part -- see drawTurns
     }
     auto magnetic = j.get<MAS::Magnetic>();
     std::size_t numTurns = 0;

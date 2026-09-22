@@ -955,7 +955,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                                                          bool includeInsulation,
                                                          double coreCoatingThickness,
                                                          bool useRealWindingGeometry,
-                                                         bool femReady) const {
+                                                         bool femReady,
+                                                         bool skipGeometryChecks) const {
     // MAS 1.x makes Magnetic.core / Magnetic.coil optional, but this builder
     // requires both present. The generated getters return the optional BY VALUE,
     // so bind COPIES (not references — a reference would dangle past the temporary).
@@ -1069,7 +1070,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
     OpenMagnetics::Magnetic enriched = magnetic_autocomplete_safe(magnetic, useRealWindingGeometry);
     return buildAllNamed(enriched, includeBobbin, symmetryPlanes,
                          wirePolygonSegments, corePolygonSegments, paintCoating, emitCoatingShells,
-                         includeInsulation, coreCoatingThickness, useRealWindingGeometry, femReady);
+                         includeInsulation, coreCoatingThickness, useRealWindingGeometry, femReady,
+                         skipGeometryChecks);
 }
 
 std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
@@ -1082,7 +1084,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                                          bool includeInsulation,
                                                          double coreCoatingThickness,
                                                          bool useRealWindingGeometry,
-                                                         bool femReady) const {
+                                                         bool femReady,
+                                                         bool skipGeometryChecks) const {
     auto all = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
 
     if (coreCoatingThickness > 0.0) {   // conformal core-coating shells (offset core - core)
@@ -1116,7 +1119,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     if (useRealWindingGeometry) {
         for (auto& ns : buildRealWindingConductorsNamed(magnetic, all, wirePolygonSegments,
                                                         paintCoating, emitCoatingShells, femReady,
-                                                        /*diagnosticSkipCollisionCheck=*/false,
+                                                        skipGeometryChecks,
                                                         /*cutterOnly=*/false,
                                                         &toroidTerminalPlane)) {
             turnShapes.push_back(ns.shape);

@@ -183,6 +183,12 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/ProjectionDrawing.cpp
     ${REPO_ROOT}/src/SpacerBuilder.cpp
     ${REPO_ROOT}/src/FR4Builder.cpp
+    # ABT #1169's accessory builders: the fourth, fifth and sixth sources to reach the native
+    # build without this list. The guard below caught them at CONFIGURE this time, which is why
+    # the web engine has been stuck at 2026-08-23 rather than linking against a stale half.
+    ${REPO_ROOT}/src/BaseBuilder.cpp
+    ${REPO_ROOT}/src/PinBuilder.cpp
+    ${REPO_ROOT}/src/ShuntBuilder.cpp
     ${REPO_ROOT}/src/StepExporter.cpp
     ${REPO_ROOT}/src/Symmetry.cpp
     ${REPO_ROOT}/src/Utils.cpp
