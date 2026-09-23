@@ -14368,32 +14368,40 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 pending.plannedBend = pinLead->route->plannedBendRadius;
                 pendingPinLeads[path.name].push_back(std::move(pending));
             }
+            // WHICH TERMINAL this lead is -- for BOTH branches below. The certified gate exempts
+            // two primitives of one conductor whose turn ordinals differ by at most one, UNLESS
+            // they belong to different terminals: a conductor's entrance and exit are not each
+            // other's continuation. Pin leads (roundedLeadChain) and toroid leads were tagged;
+            // the concentric fan's own leads were not, so `terminal` stayed -1, the cross-terminal
+            // test was false, and on a one-turn winding (every ordinal 0) the adjacent-ordinal
+            // exemption waved the entrance-vs-exit pair through unmeasured -- measured with the
+            // gate instrumented: 00_debug's leads reach it coincident (d = 0) with terminal -1 and
+            // ordinalExempt = 1. That is how a short was certified clean. The ROUND-wire branch is
+            // the one 00_debug takes; tagging only the rect branch changed nothing, which a
+            // revert-check and its control (identical: collision = 0 in both) showed.
+            // The two callers name the lead; any other caller must say which it is.
+            const int leadTerminal = what == "entrance lead" ? 0 : what == "exit lead" ? 1 : -2;
+            if (leadTerminal < 0)
+                throw std::logic_error("pushPlaneSegs: lead '" + what +
+                                       "' is neither the entrance nor the exit lead, so the "
+                                       "collision gate cannot tell which terminal it is");
             // The lead lies in its fan slot's axial plane and runs straight out radially, like
             // the dragback.
             if (!rectWire) {
+                // appendFilletedPolyline is shared with the dragback emitter, whose connections
+                // are no terminal, so it takes no tag: everything it appends HERE is this lead
+                // (its segments and its rounded corners) and is tagged afterwards.
+                const size_t before = path.prims.size();
                 appendFilletedPolyline(path.prims, leadPts, wireRadius, what, ordinal,
                                        /*isLead=*/true, /*isConnection=*/false,
                                        /*rounded=*/g_roundedLeadCorners ||
                                            path.isRectangular);
+                for (size_t k = before; k < path.prims.size(); ++k) path.prims[k].terminal = leadTerminal;
             }
             else {
                 if (std::getenv("MVB_DIAG"))
                     std::cerr << "[lead-wp]   " << what << " rect branch: leadPts="
                               << leadPts.size() << " prims before=" << path.prims.size() << "\n";
-                // WHICH TERMINAL this lead is. The certified gate exempts two primitives of one
-                // conductor whose turn ordinals differ by at most one, UNLESS they belong to
-                // different terminals -- a conductor's entrance and exit are not each other's
-                // continuation. Pin leads (roundedLeadChain) and toroid leads were tagged; these,
-                // the concentric fan's own leads, were not, so their `terminal` stayed -1, the
-                // cross-terminal test was false, and on a one-turn winding (every ordinal 0) the
-                // adjacent-ordinal exemption waved the entrance-vs-exit pair through unmeasured.
-                // That is how 00_debug's coincident leads -- a short -- were certified clean.
-                // The two callers name the lead; any other caller must say which it is.
-                const int leadTerminal = what == "entrance lead" ? 0 : what == "exit lead" ? 1 : -2;
-                if (leadTerminal < 0)
-                    throw std::logic_error("pushPlaneSegs: lead '" + what +
-                                           "' is neither the entrance nor the exit lead, so the "
-                                           "collision gate cannot tell which terminal it is");
                 for (size_t i = 0; i + 1 < leadPts.size(); ++i) {
                     if (leadPts[i].Distance(leadPts[i + 1]) < 1e-12) continue;
                     Primitive pr;
