@@ -9842,8 +9842,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // allowance first, and only falls back to the relaxed proof if nothing clears that way.
         bool filletStrict = false;
         const auto gridSlack = [&]() { return filletStrict ? 0.0 : cert::kCoordinateGridHalf; };
+        // cutHelixOut, when given, receives the lead's own wrap helix AS THE FILLET LEAVES IT:
+        // filletTerminalCorners shortens the stub it corners (cutSpiral, TerminalFillet.cpp),
+        // so the copper the emitter ships starts (ends) at the cut, not at the crossing slot.
         auto leadPrims3D = [&](const Vert& L, double c,
-                               double filletRoll = std::numeric_limits<double>::quiet_NaN())
+                               double filletRoll = std::numeric_limits<double>::quiet_NaN(),
+                               Primitive* cutHelixOut = nullptr)
             -> std::optional<std::vector<Primitive>> {
             const std::vector<PlanePt> wp = emittedRoute(L, c);
             const double zo = conductorZoff[L.ci];
@@ -9908,8 +9912,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 return std::nullopt;
             }
             std::vector<Primitive> out;
-            for (const auto& pr : chain)
+            for (const auto& pr : chain) {
                 if (pr.kind != Primitive::SPIRAL) out.push_back(pr);
+                else if (cutHelixOut != nullptr) *cutHelixOut = pr;
+            }
             return out;
         };
         leadPairDist3D = [&](const Vert& A, double cA, const Vert& B, double cB) {
@@ -9946,6 +9952,95 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 }
             return clr;
         };
+        // THE WRAP AS IT IS SHIPPED, NOT AS IT IS PLANNED (ABT #1362, complete_pushpull).
+        // A wrap that ends at a TERMINAL is filleted there, and filleting does not only ADD
+        // arcs: filletTerminalCorners CUTS the wrap back to the fillet's tangent point
+        // (cutSpiral, TerminalFillet.cpp) and the rounded corner replaces the vertex that stood
+        // at the crossing slot. wrapPiecesOf models the PLANNED span -- crossing slot to
+        // crossing slot -- so it keeps that vertex, and a neighbour proven against it is proven
+        // against copper the emitter never ships. Measured here: Secondary 1 parallel 1's
+        // entrance fillet was called 12.5 um inside its sibling's first wrap, and the witness
+        // sat EXACTLY on that wrap's az0 -- the corner point Secondary 1 parallel 0's own
+        // entrance fillet had already rounded away. Three implementations measured the emitted
+        // pair clean (the certified gate, omfem_stepcheck on the conducting and on the coated
+        // STEP).
+        // The cut is not estimated. It is read back from the SAME filletTerminalCorners call,
+        // on the same chain, that decides the corner: leadPrims3D hands back the helix the
+        // fillet left behind.
+        std::map<std::array<long long, 4>, std::optional<double>> wrapCutCache;
+        // The azimuth the wrap of conductor ciQ is cut to by the terminal fillet of the lead
+        // that attaches at `station` (entrance: station 0, the wrap's start; exit: the wrap's
+        // end). nullopt when there is no such lead, or no fillet fits at its slot -- in which
+        // case nothing is trimmed and the planned span stands.
+        auto terminalCutAz = [&](size_t ciQ, size_t station,
+                                 bool entrance) -> std::optional<double> {
+            for (size_t k = 0; k < verts.size(); ++k) {
+                const Vert& L = verts[k];
+                if (L.ci != ciQ || L.kind != 0 || L.rectWire) continue;
+                if (L.entrance != entrance) continue;
+                if (entrance ? station != 0 : L.attachStation != station) continue;
+                const double c = azCandSet[k] ? azCand[k]
+                                 : azAssigned[k] ? az[k]
+                                                 : (azPrevSet[k] ? azPrev[k] : 0.0);
+                const auto& m = entrance ? leadFilletIn : leadFilletOut;
+                const auto mit = m.find(ciQ);
+                const double roll = mit == m.end() ? std::numeric_limits<double>::quiet_NaN()
+                                                   : mit->second;
+                const std::array<long long, 4> key{
+                    static_cast<long long>(ciQ), entrance ? 1LL : 0LL,
+                    std::llround(c * 1e12),
+                    std::isfinite(roll) ? std::llround(roll * 1e12) : -1LL};
+                if (const auto cit = wrapCutCache.find(key); cit != wrapCutCache.end())
+                    return cit->second;
+                std::optional<double> cut;
+                Primitive cutHelix;
+                cutHelix.kind = Primitive::SEG;
+                if (leadPrims3D(L, c, roll, &cutHelix) && cutHelix.kind == Primitive::SPIRAL)
+                    cut = entrance ? cutHelix.spiral.az0 : cutHelix.spiral.az1;
+                if (std::getenv("MVB_LEAD_DIAG") && cut) {
+                    const double planned = kPlaneAz + c + (entrance ? 0.0 : kTwoPi);
+                    std::fprintf(stderr,
+                                 "[wrapcut] ci=%zu %s station=%zu slot=%.4f deg: the terminal "
+                                 "fillet cuts the wrap back to %.6f deg (%.6f deg of the "
+                                 "planned span, which ended at %.6f deg)\n",
+                                 ciQ, entrance ? "entrance" : "exit", station,
+                                 c * 180.0 / kPi, *cut * 180.0 / kPi,
+                                 std::abs(*cut - planned) * 180.0 / kPi, planned * 180.0 / kPi);
+                }
+                wrapCutCache[key] = cut;
+                return cut;
+            }
+            return std::nullopt;
+        };
+        // wrapPiecesOf, trimmed to the copper that survives this wrap's OWN terminal fillets.
+        auto emittedPiecesOf = [&](const WireRow& R) {
+            std::vector<Primitive> pieces = wrapPiecesOf(R);
+            const std::optional<double> loCut =
+                R.station == 0 ? terminalCutAz(R.ci, 0, /*entrance=*/true) : std::nullopt;
+            const std::optional<double> hiCut =
+                terminalCutAz(R.ci, R.station + 1, /*entrance=*/false);
+            if (!loCut && !hiCut) return pieces;
+            std::vector<Primitive> kept;
+            for (Primitive pr : pieces) {
+                if (pr.kind != Primitive::SPIRAL) { kept.push_back(pr); continue; }
+                const double a0 = pr.spiral.az0, a1 = pr.spiral.az1;
+                const double span = a1 - a0;
+                if (!(span > 1e-15)) { kept.push_back(pr); continue; }
+                double n0 = a0, n1 = a1;
+                if (loCut) n0 = std::max(n0, *loCut);
+                if (hiCut) n1 = std::min(n1, *hiCut);
+                if (!(n1 - n0 > 1e-12)) continue;   // wholly inside the rounded corner
+                const double f0 = (n0 - a0) / span, f1 = (n1 - a0) / span;
+                const double r0 = pr.spiral.r0, r1 = pr.spiral.r1;
+                const double y0 = pr.spiral.y0, y1 = pr.spiral.y1;
+                pr.spiral.az0 = n0; pr.spiral.r0 = r0 + (r1 - r0) * f0;
+                pr.spiral.y0 = y0 + (y1 - y0) * f0;
+                pr.spiral.az1 = n1; pr.spiral.r1 = r0 + (r1 - r0) * f1;
+                pr.spiral.y1 = y0 + (y1 - y0) * f1;
+                kept.push_back(pr);
+            }
+            return kept;
+        };
         // Lead L (its emitted segments at slot c) against the wrap leaving row R, PROVEN at
         // clearance clr by the certified engine -- the very object the gate measures.
         auto leadWrapClear = [&](const WireRow& R, const Vert& L, double c, double clr,
@@ -9954,7 +10049,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // Every EMITTED piece of the wrap, not one raised model of it (see wrapPiecesOf):
             // the +Z half sits on the wrap's own circle, `raise` further out than the raised
             // model says, and the risers between them are copper too.
-            for (const Primitive& helix : wrapPiecesOf(R)) {
+            for (const Primitive& helix : emittedPiecesOf(R)) {
             if (L.rectWire || R.rect) {
                 // RECTANGULAR WIRE (03_buck_inductor_pq3230_n95, 2026-09-02): the round capsule at
                 // the coated envelope is the wrong criterion -- a flat 3.1 x 0.6 wire's siblings
