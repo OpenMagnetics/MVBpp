@@ -459,6 +459,20 @@ std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int polyg
     return {b.buildBobbinNamedFromBobbin(bobbin, /*axisIsY=*/true, polygonSegments)};
 }
 
+// MEASURED, 2026-09-23 (Alf's custom_magnetic 41, 6 turns, node): the geometry proofs cost NOTHING
+// measurable -- 11.4 s with them on against 12.0 s with them off, i.e. inside the noise, while the
+// conductor build alone is ~10 s of it (MKF's re-wind 0.03-0.3 s, the core 0.3-0.7 s, the STL
+// ~0.7 s). So the browser runs the SAME proofs as every other consumer: an unproven picture that
+// is no faster is worth nothing. The switch stays because it is what priced them, and
+// mvbppSetSkipChecks(true) prices them again on any design; timing comes from mvbppLastTimingMs().
+bool g_skipGeometryChecks = false;
+bool g_reportTiming = false;
+double g_lastEnrichMs = 0.0, g_lastBuildMs = 0.0, g_lastCoreMs = 0.0;
+
+double now_ms() {
+    return emscripten_get_now();
+}
+
 std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygonSegments,
                                          bool paintCoating, bool useRealWindingGeometry = false,
                                          bool femReady = false) {
@@ -474,18 +488,26 @@ std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygo
                 "'coil' and 'core' (MKF must re-wind to route the real conductor); a bare "
                 "turnsDescription array cannot be used.");
         }
+        const double t0 = now_ms();
         auto magnetic = mvb::magnetic_autocomplete_safe(j, /*useRealWindingGeometry=*/true);
+        const double t1 = now_ms();
+        g_lastEnrichMs = t1 - t0;
         // The conductor cross-section stays an exact circle regardless of segments, so the
         // wire segment count is moot (0); polygonSegments still facets the core built
         // internally for lead aiming.
-        // THE WEB DRAWS A PICTURE, NOT A PART (Alf, 2026-09-22: "as fast as possible, don't care
-        // about certification, checks or fusing"). The proofs over the drawn copper -- pairwise
-        // clearance at the coated envelope, window containment, the pin-rail gate -- are what a
-        // part needs and what most of the time goes to; the viewer needs none of them. Only this
-        // binding asks for it: every native consumer, the STEP/FEM exports included, keeps them.
-        return b.buildRealWindingTurnsNamed(magnetic, /*wirePolygonSegments=*/0,
-                                            polygonSegments, paintCoating, femReady,
-                                            /*diagnosticSkipCollisionCheck=*/true);
+        if (g_reportTiming) {   // the core is built inside the call below (for lead aiming); price it
+            const double c0 = now_ms();
+            b.buildCoreNamed(magnetic.get_core(), polygonSegments);
+            g_lastCoreMs = now_ms() - c0;
+        }
+        auto out = b.buildRealWindingTurnsNamed(magnetic, /*wirePolygonSegments=*/0,
+                                                polygonSegments, paintCoating, femReady,
+                                                g_skipGeometryChecks);
+        g_lastBuildMs = now_ms() - t1;
+        if (g_reportTiming)
+            std::fprintf(stderr, "[mvbpp] real winding: MKF re-wind %.0f ms, geometry %.0f ms (core %.0f ms)\n",
+                         g_lastEnrichMs, g_lastBuildMs, g_lastCoreMs);
+        return out;
     }
     if (j.is_array()) {
         // Standalone path: each Turn must carry its own dimensions and
@@ -582,7 +604,7 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
                                mvb::MagneticBuilder::declaredCoreCoatingThickness(magnetic.get_core()),
                                /*useRealWindingGeometry=*/true,
                                femReady,
-                               /*skipGeometryChecks=*/true);   // a picture, not a part -- see drawTurns
+                               g_skipGeometryChecks);   // a picture, not a part -- see drawTurns
     }
     auto magnetic = j.get<MAS::Magnetic>();
     std::size_t numTurns = 0;
@@ -773,6 +795,16 @@ std::string _drawBobbinToPath(const std::string& json_str,
 }
 
 // drawTurns
+// Measurement/inspection handles for the viewer (see g_skipGeometryChecks above).
+void _setSkipChecks(bool on) { g_skipGeometryChecks = on; }
+void _setReportTiming(bool on) { g_reportTiming = on; }
+std::string _lastTimingMs() {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "{\"enrichMs\":%.1f,\"buildMs\":%.1f,\"coreMs\":%.1f}",
+                  g_lastEnrichMs, g_lastBuildMs, g_lastCoreMs);
+    return std::string(buf);
+}
+
 val _drawTurns(const std::string& json_str,
                const std::string& mode,
                const std::string& plane,
@@ -1050,6 +1082,9 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
     function("drawCorePieceToPath", &guard<&_drawCorePieceToPath>::call);
     function("drawBobbin",          &guard<&_drawBobbin>::call);
     function("drawBobbinToPath",    &guard<&_drawBobbinToPath>::call);
+    function("mvbppSetSkipChecks",  &_setSkipChecks);
+    function("mvbppSetReportTiming", &_setReportTiming);
+    function("mvbppLastTimingMs",   &_lastTimingMs);
     function("drawTurns",           &guard<&_drawTurns>::call);
     function("drawTurnsToPath",     &guard<&_drawTurnsToPath>::call);
     function("drawWinding",         &guard<&_drawWinding>::call);
