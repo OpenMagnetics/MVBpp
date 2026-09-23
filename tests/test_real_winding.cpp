@@ -1970,3 +1970,160 @@ TEST_CASE("Real winding: single-turn toroid primary drops both terminals without
         CHECK(r.tips >= 4);
     }
 }
+
+// =====================================================================================
+// PSPS E16 flyback, 2p / 4p (Alf's web export custom_magnetic (56), 2026-09-23).
+//
+// E16/8/5, P-S-S-P interleaved, Primary 10t x 2p, Secondary 4t x 4p, 0.5 mm round, U
+// sections. Every parallel crosses from its section 0 to its section 1 exactly once, on the
+// -Z face, through a radial step at its lane slot. The design MKF accepts is refused by the
+// gate (Primary p0's step and p1's band run 1.5 um apart) and, with the gate skipped, shows
+// three more defects Alf read off the STEP. The tests below pin each contract; all four were
+// written FAILING ([!shouldfail]) and flip when the fix lands, the cm37 way:
+//
+//   ABT #1359  lane order  -- the lanes must respect the parallel order along the travel
+//              direction, per winding. Today they are allocated over ALL conductors,
+//              centre-out alternating, which puts the Secondary's steps at 3, 1, 0, 2 along
+//              the face and the Primary's inverted in X.
+//   ABT #1360  pitch-true  -- the incoming face reaches the row AT the slot, the radial step
+//              is the return's only primitive, and the next turn slopes away FROM the slot.
+//              Today: wrap cut at the slot, stub up (0.121 mm), stub down, flat run to x = 0.
+//   ABT #1361  (MKF) both Primary parallels share ONE band row; side by side on a rect
+//              former that is unroutable in-plane. Only the certified build pins it.
+namespace {
+
+constexpr const char* kPspsFixture = "realwinding_psps_e16_flyback_2p4p.json";
+
+OpenMagnetics::Magnetic enrichPsps() {
+    auto magneticJson = loadFixture(kPspsFixture);
+    mvb::patch_dimension_nominals(magneticJson);   // the CLI's own preprocessing
+    return mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+}
+
+// The two lane probes need the centrelines of a design the gate refuses. The documented
+// diagnostic gate (ConductorBuilder::Options::diagnosticSkipCollisionCheck, reached from the
+// outside as MVB_SKIP_COLLISION_CHECK) exists for exactly this: "Tools and tests investigating
+// a specific refusal only". Scoped, so no other test inherits it.
+struct ScopedSkipCollisionCheck {
+    ScopedSkipCollisionCheck() { setenv("MVB_SKIP_COLLISION_CHECK", "1", 1); }
+    ~ScopedSkipCollisionCheck() { unsetenv("MVB_SKIP_COLLISION_CHECK"); }
+};
+
+using Poly = std::vector<std::array<double, 3>>;
+double dxOf(const Poly& p) { return p.back()[0] - p.front()[0]; }
+double dyOf(const Poly& p) { return p.back()[1] - p.front()[1]; }
+double dzOf(const Poly& p) { return p.back()[2] - p.front()[2]; }
+
+struct SectionCrossing {
+    size_t step;         // prims index of the radial step (dx = 0, |dz| >= a layer)
+    double slotX;        // the lane the step sits on
+    double travelSign;   // +1 / -1: sign of dx of the last face run before the step
+};
+
+// The inter-section returns of one conductor: a radial step is a non-lead primitive that
+// moves only in z (the layer direction on the -Z face) by at least a layer's depth. Nothing
+// else on this design does that -- the -X / +X faces move 6.35 mm in z but climb their pitch
+// in y, the corners are arcs, the stubs (seg 0 / seg 2) move only in y.
+std::vector<SectionCrossing> sectionCrossings(const mvb::ConductorBuilder::PathPolyline& path) {
+    std::vector<SectionCrossing> out;
+    for (size_t i = 0; i < path.prims.size(); ++i) {
+        if (path.primIsLead[i]) continue;
+        const auto& p = path.prims[i];
+        if (std::abs(dxOf(p)) > 1e-6 || std::abs(dyOf(p)) > 5e-5 || std::abs(dzOf(p)) < 3e-4)
+            continue;
+        SectionCrossing c{i, p.front()[0], 0.0};
+        for (size_t k = i; k-- > 0;) {
+            if (std::abs(dxOf(path.prims[k])) > 1e-3) {
+                c.travelSign = dxOf(path.prims[k]) > 0 ? 1.0 : -1.0;
+                break;
+            }
+        }
+        REQUIRE(c.travelSign != 0.0);
+        out.push_back(c);
+    }
+    return out;
+}
+
+int parallelOf(const std::string& pathName) {
+    const auto at = pathName.rfind("parallel ");
+    REQUIRE(at != std::string::npos);
+    return std::stoi(pathName.substr(at + 9));
+}
+std::string windingOf(const std::string& pathName) {
+    return pathName.substr(0, pathName.rfind(" parallel "));
+}
+
+}  // namespace
+
+TEST_CASE("Real winding: the PSPS E16 flyback (2p / 4p) builds CERTIFIED CLEAR (ABT #1359/#1360/#1361)",
+          "[realwinding][psps][!shouldfail]") {
+    auto enriched = enrichPsps();
+    mvb::MagneticBuilder builder;
+    // EXACTLY the CLI's path and config (mvbpp_step_generator --real): that is where Alf saw
+    // the refusal. The gate is the assertion.
+    mvb::DrawConfig cfg{"step", /*includeBobbin=*/true, /*scale=*/1.0, /*symmetryPlanes=*/0};
+    cfg.useRealWindingGeometry = true;
+    REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
+}
+
+TEST_CASE("Real winding: inter-section lanes follow the parallel order along the travel direction (ABT #1359)",
+          "[realwinding][psps][!shouldfail]") {
+    ScopedSkipCollisionCheck diagnostic;
+    auto enriched = enrichPsps();
+    mvb::MagneticBuilder builder;
+    const auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE(paths.size() == 6);   // Primary x 2, Secondary x 4
+
+    // winding -> (parallel, slot measured along the travel direction)
+    std::map<std::string, std::vector<std::pair<int, double>>> lanes;
+    for (const auto& path : paths) {
+        const auto crossings = sectionCrossings(path);
+        INFO(path.name);
+        REQUIRE(crossings.size() == 1);   // one section 0 -> section 1 return per conductor
+        lanes[windingOf(path.name)].push_back(
+            {parallelOf(path.name), crossings[0].slotX * crossings[0].travelSign});
+    }
+    REQUIRE(lanes.size() == 2);
+    for (auto& [winding, byParallel] : lanes) {
+        std::sort(byParallel.begin(), byParallel.end());
+        for (size_t i = 1; i < byParallel.size(); ++i) {
+            INFO(winding << ": parallel " << byParallel[i - 1].first << " at "
+                         << byParallel[i - 1].second * 1e3 << " mm, parallel "
+                         << byParallel[i].first << " at " << byParallel[i].second * 1e3
+                         << " mm along the travel direction");
+            // Alf: p0 steps first, the last parallel last -- never 3, 1, 0, 2.
+            CHECK(byParallel[i].second > byParallel[i - 1].second);
+        }
+    }
+}
+
+TEST_CASE("Real winding: an inter-section return is pitch-true at both ends -- the radial step alone (ABT #1360)",
+          "[realwinding][psps][!shouldfail]") {
+    ScopedSkipCollisionCheck diagnostic;
+    auto enriched = enrichPsps();
+    mvb::MagneticBuilder builder;
+    const auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE(paths.size() == 6);
+
+    for (const auto& path : paths) {
+        const auto crossings = sectionCrossings(path);
+        INFO(path.name);
+        REQUIRE(crossings.size() == 1);
+        const size_t s = crossings[0].step;
+        REQUIRE(s > 0);
+        REQUIRE(s + 1 < path.prims.size());
+        const auto& before = path.prims[s - 1];
+        const auto& after = path.prims[s + 1];
+        // The primitive feeding the step is the incoming FACE, climbing its pitch to the row --
+        // not a stub standing at the slot (dx = 0). Today Secondary p3 arrives 0.121 mm low
+        // and seg 0 stands the difference.
+        INFO("before the step: dx = " << dxOf(before) * 1e3 << " mm, dy = " << dyOf(before) * 1e3 << " mm");
+        CHECK(std::abs(dxOf(before)) > 1e-3);
+        CHECK(std::abs(dyOf(before)) > 1e-5);
+        // The primitive leaving the step is the next turn's FACE, sloping away from the slot --
+        // not a stub (seg 2, dx = 0) and not the flat walk back to the plane (seg 3, dy = 0).
+        INFO("after the step: dx = " << dxOf(after) * 1e3 << " mm, dy = " << dyOf(after) * 1e3 << " mm");
+        CHECK(std::abs(dxOf(after)) > 1e-3);
+        CHECK(std::abs(dyOf(after)) > 1e-5);
+    }
+}
