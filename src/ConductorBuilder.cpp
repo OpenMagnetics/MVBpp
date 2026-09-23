@@ -11947,13 +11947,21 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                       << (!aFits && !bFits ? "either lead" : (!aFits ? "the first lead" : "the second lead"));
                 } else if (pairIs3D &&
                            leadPairDist3D(A, az[j], B, az[k2]) + 1e-12 < A.rw + B.rw) {
+                    // Distances in NANOMETRES at picometre resolution. The first version printed
+                    // millimetres to four decimals, which is 100 nm per digit: a 45 nm requirement
+                    // and a zero separation both came out "0.0000", which is the unfalsifiable
+                    // report this witness exists to replace.
                     const double d3d = leadPairDist3D(A, az[j], B, az[k2]);
-                    m << "come within " << d3d * 1e3 << " mm in 3D, against their "
-                      << (A.rw + B.rw) * 1e3 << " mm summed coated envelope ("
-                      << (A.rw + B.rw - d3d) * 1e9 << " nm inside)";
+                    m << std::setprecision(3) << "come within " << d3d * 1e9
+                      << " nm in 3D, against their " << (A.rw + B.rw) * 1e9
+                      << " nm summed coated envelope (" << (A.rw + B.rw - d3d) * 1e9
+                      << " nm inside)";
                 } else {
-                    m << "are " << std::abs(xAt(A, az[j]) - xAt(B, az[k2])) * 1e3
-                      << " mm apart in x, need " << needDist(A, B, need(A, B)) * 1e3 << " mm";
+                    const double delivered = std::abs(xAt(A, az[j]) - xAt(B, az[k2]));
+                    const double nd = need(A, B);
+                    m << std::setprecision(3) << "are " << delivered * 1e9 << " nm apart in x, need "
+                      << needDist(A, B, nd) * 1e9 << " nm (angular requirement " << std::scientific
+                      << nd << " rad)" << std::fixed;
                 }
                 fanViolations.push_back(m.str());
             }
