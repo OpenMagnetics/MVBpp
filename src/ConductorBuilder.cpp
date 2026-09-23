@@ -9391,7 +9391,19 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     // costs ~0 and nothing scatters: 11_pushpull's 5.1 nm buys 3.1 um of x, i.e.
                     // 0.015 deg. It is a genuine MKF row deficit that buys a visible spread, and
                     // that stays the gate's to report.
-                    if (dRoute >= dSep) return 0.0;
+                    //
+                    // "Not coarser than the gate" also means not FINER than it. The gate proves a
+                    // pair at (envelope - kCoordinateGridHalf): a route within half a grid cell of
+                    // the envelope is touching, and touching is legal. An exact `>=` here asked
+                    // for more than the gate does, and the square root below amplifies whatever
+                    // it is given: on pushpull_transformer_complete (Primary 1 vs Primary 2, both
+                    // pinned to the plane) MKF packs the two rows exactly tangent, floating point
+                    // left dRoute about two ULPs (~5e-19 m) under dSep, and the fan demanded
+                    // 0.033 nm of x-separation (3.152e-09 rad) that the gate certifies as
+                    // unnecessary -- and the fan refusal then refused the design. #882's 5.1 nm
+                    // deficit is ten times the half-cell and still buys its 3.1 um exactly as
+                    // before; only a deficit the gate cannot see now costs nothing.
+                    if (dRoute + cert::kCoordinateGridHalf >= dSep) return 0.0;
                     const double dxNeed =
                         std::sqrt(std::max(0.0, dSep * dSep - dRoute * dRoute));
                     const double rrX = std::max(std::min(A.r, B.r), dSep);
