@@ -14909,8 +14909,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                             // band run — the non-terminal horizontal marker of this conductor
                             // whose radial span covers both stations. Its row height IS the
                             // corridor the blocking cleared; anything else re-invents the route.
-                            const double loX = std::min(s.x, nxt.x) - 1e-9;
-                            const double hiX = std::max(s.x, nxt.x) + 1e-9;
+                            // The 1 nm is a TOLERANCE on the coverage test, so it must LOOSEN
+                            // the span, not widen it: written as -/+ it demanded the run reach a
+                            // nanometre PAST each station, which rejected the exactly-covering
+                            // run MKF draws whenever the two layers sit one wire OD apart (the
+                            // centre-to-centre horizontal is then exactly the station span --
+                            // measured 1 nm short at both ends on a 4-parallel E16 flyback).
+                            const double loX = std::min(s.x, nxt.x) + 1e-9;
+                            const double hiX = std::max(s.x, nxt.x) - 1e-9;
                             double bestExtent = std::numeric_limits<double>::max();
                             for (const auto& sp : drawn) {
                                 if (sp.winding != ct.winding || sp.parallel != ct.parallel ||
@@ -14925,6 +14931,21 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                 if (sp.dimensions[0] < bestExtent) {
                                     bestExtent = sp.dimensions[0];
                                     bandY = sp.coordinates[1];
+                                }
+                            }
+                            if (std::isnan(bandY) && std::getenv("MVB_BAND_DIAG")) {
+                                std::fprintf(stderr, "[band] need span [%.12g, %.12g] mm for %s (w=%s p=%zu)\n",
+                                             loX*1e3, hiX*1e3, label.c_str(), ct.winding.c_str(), ct.parallel);
+                                for (const auto& sp : drawn) {
+                                    if (sp.winding != ct.winding || sp.parallel != ct.parallel ||
+                                        sp.isTerminal || !sp.layer.empty()) continue;
+                                    if (sp.dimensions.size() < 2 || sp.coordinates.size() < 2) continue;
+                                    const double x0 = sp.coordinates[0] - sp.dimensions[0] / 2.0;
+                                    const double x1 = sp.coordinates[0] + sp.dimensions[0] / 2.0;
+                                    std::fprintf(stderr,
+                                        "[band]  CAND run=%d x0=%.12g x1=%.12g  (x0-loX)=%.3g nm  (x1-hiX)=%.3g nm\n",
+                                        int(sp.dimensions[0] >= sp.dimensions[1]), x0*1e3, x1*1e3,
+                                        (x0-loX)*1e9, (x1-hiX)*1e9);
                                 }
                             }
                             if (std::isnan(bandY))
@@ -15762,9 +15783,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             stitchPinLead(p.prims, pl, p.wireRadius, drawnBend);
         }
     }
-    if (!pendingPinLeads.empty() && !opts.diagnosticSkipCollisionCheck)
+    // MVB_SKIP_COLLISION_CHECK reaches the same diagnostic gate from the outside, for callers
+    // (the CLI step generator) that have no parameter to thread it through. Diagnosis only:
+    // the result is interpenetrating copper, a picture and never a part.
+    const bool skipChecks =
+        opts.diagnosticSkipCollisionCheck || std::getenv("MVB_SKIP_COLLISION_CHECK") != nullptr;
+    if (!pendingPinLeads.empty() && !skipChecks)
         checkPinLeadClearance(paths, bobbinPd, opts.coreObstacles);
-    if (opts.diagnosticSkipCollisionCheck) {
+    if (skipChecks) {
         // Loud on purpose: a build that skipped this gate produces overlapping copper and
         // must not be mistaken for a valid part further downstream.
         std::cerr << "[ConductorBuilder] DIAGNOSTIC: collision check SKIPPED — the geometry "

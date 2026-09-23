@@ -30,6 +30,9 @@ static void printUsage(const char* prog) {
               << "  -d, --output-dir <dir> Output directory (batch mode)\n"
               << "  --no-mkf              Skip MKF enrichment\n"
               << "  --real                Real winding: continuous conductor per (winding, parallel)\n"
+              << "  --skip-collision-check  DIAGNOSTIC: build the conductors even when two of\n"
+                 "                        them overlap. Interpenetrating copper: a picture, never\n"
+                 "                        a part. Also via MVB_SKIP_COLLISION_CHECK.\n"
               << "  --fem                 FEM geometry: one-piece / conformal conductors (slow); "
                  "default is the fast drawing compound.\n"
                  "                        With --real, also writes <output>.leads.json: the\n"
@@ -305,6 +308,11 @@ int main(int argc, char* argv[]) {
             coatedFootprint = true;
         } else if (arg == "--fem") {
             femReady = true;
+        } else if (arg == "--skip-collision-check") {
+            // Diagnosis only: builds the conductors even when two of them overlap, so the
+            // overlap can be LOOKED AT instead of only read about in an exception. The STEP
+            // that comes out is interpenetrating copper -- a picture, never a part.
+            setenv("MVB_SKIP_COLLISION_CHECK", "1", 1);
         } else if (arg == "--core-segments") {
             if (i + 1 < argc) coreSegments = std::stoi(argv[++i]);
         } else if (arg == "--min-bend-radius") {
