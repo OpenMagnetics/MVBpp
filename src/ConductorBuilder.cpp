@@ -101,6 +101,7 @@
 #include <map>
 #include <numbers>
 #include <optional>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -938,7 +939,14 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                                                          : pb.turnOrdinal - pa.turnOrdinal) <= 1) {
                         continue;
                     }
-                    if (ci == cj && shareEndpoint(pa, pb)) continue;
+                    // The shared-endpoint exemption carries the SAME reservation as the ordinal
+                    // one above, and for the same reason: two primitives that join are one path's
+                    // continuation, but a conductor's entrance and its exit are not each other's
+                    // continuation. Without the crossTerminal guard, a one-turn winding whose two
+                    // terminals were planned at the identical point shares BOTH endpoints, so the
+                    // gate exempted the pair and never measured it -- a shorted turn certified
+                    // clean, two coincident port caps, and one surviving FEM port (00_debug).
+                    if (ci == cj && !crossTerminal && shareEndpoint(pa, pb)) continue;
                     double d = polyPolyDistance(polys[ci][i], polys[cj][j]);
                     if (std::getenv("MVB_PAIR_TRACE") &&
                         pa.label.find("turn 6_ending' -> 'Primary parallel 0 turn 7' (dragback) seg 1") != std::string::npos &&
@@ -11716,34 +11724,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 break;
             }
         }
-        // WHAT THE FAN COULD NOT RESOLVE, said out loud (pushpull, 2026-09-02). The dip loop above
-        // ends either at a fixpoint or at its pass cap; if its own exact model still finds a
-        // violation at the final slots, the emitted geometry WILL fail the certified gate, and the
-        // gate's witness alone does not say which planning constraint was unsatisfiable. Printed
-        // always: this is a defect report, not a diagnostic.
-        for (size_t j = 0; j < verts.size(); ++j) {
-            if (verts[j].kind == 2) continue;
-            std::string why;
-            if (!leadRowsClearAnyFillet(verts[j], az[j], &why))
-                std::fprintf(stderr,
-                             "[fan] UNRESOLVED at the final slots: %s %s (ci=%zu) at %.4f deg: "
-                             "%s\n",
-                             verts[j].wname.c_str(),
-                             verts[j].kind == 0 ? (verts[j].entrance ? "entrance lead" : "exit lead")
-                                                : "dragback",
-                             (size_t)verts[j].ci, az[j] * 180.0 / kPi, why.c_str());
-            for (size_t k2 = j + 1; k2 < verts.size(); ++k2) {
-                if (verts[k2].kind == 2) continue;
-                if (clears(verts[j], az[j], verts[k2], az[k2])) continue;
-                std::fprintf(stderr,
-                             "[fan] UNRESOLVED at the final slots: verticals ci=%zu (%s, %.4f deg) "
-                             "and ci=%zu (%s, %.4f deg) are %.4f mm apart in x, need %.4f mm\n",
-                             (size_t)verts[j].ci, verts[j].wname.c_str(), az[j] * 180.0 / kPi,
-                             (size_t)verts[k2].ci, verts[k2].wname.c_str(), az[k2] * 180.0 / kPi,
-                             std::abs(xAt(verts[j], az[j]) - xAt(verts[k2], az[k2])) * 1e3,
-                             needDist(verts[j], verts[k2], need(verts[j], verts[k2])) * 1e3);
-            }
-        }
         // ABT #839 mechanism C: stub sweep caps. An ENTRANCE stub sweeps forward from its
         // slot (increasing az); an EXIT stub sweeps backward from its slot (the arc occupies
         // [azE - sweep, azE]) -- measured: 14_dab's exit stubs reached the sibling one lane
@@ -11847,6 +11827,88 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 std::fprintf(stderr, "[fan-fillet] ci=%zu %s: corner rolled to %.3f deg\n",
                              (size_t)verts[k].ci, verts[k].entrance ? "entrance" : "exit",
                              v * 180.0 / kPi);
+        }
+        // WHAT THE FAN COULD NOT RESOLVE (pushpull, 2026-09-02) -- a REFUSAL, and it must be
+        // evaluated HERE, after the corner rolls above are assigned. It used to run before them,
+        // which meant it judged every lead on the DEFAULT (NaN-roll) corner while the emitter
+        // draws the rolled variant `bestFilletVariant` has just chosen: `leadRowsClearAnyFillet`
+        // short-circuits to the default whenever `filletRollsUnlocked` is false (non-pin designs),
+        // and `leadPairDist3D` reads `leadFilletIn/Out`, which were still EMPTY. So it reported a
+        // corner nobody would draw. Three pushpull designs carried 306 nm / 2845 nm "violations"
+        // that the certified gate then proved clean at 0 nm on cross-conductor pairs the same-wire
+        // exemption never covered -- the report was measuring the wrong geometry, not finding a
+        // defect. Refusing on that would have thrown away three sound designs.
+        //
+        // Alf, 2026-09-23: throw on every genuine violation. A layout that cannot satisfy its own
+        // clearance stops here, where the unsatisfiable constraint is still named -- but only once
+        // the geometry being judged is the geometry that ships.
+        //
+        // A refusal may only quote a number it actually MEASURED. `clears` decides a lead/lead
+        // pair with two independent criteria -- the exact 3D distance between the emitted
+        // polylines first, then the angular/x-separation model -- and the old report printed the
+        // x-model's numbers whichever one failed. When the 3D check failed and the x-model had no
+        // requirement that read "0.0000 mm apart in x, need 0.0000 mm": a real interpenetration
+        // reported as no violation at all. Each witness below names the criterion that rejected
+        // the pair and prints THAT criterion's delivered and required values.
+        auto assignedRollOf = [&](const Vert& V) {
+            const auto& m = V.entrance ? leadFilletIn : leadFilletOut;
+            auto it = m.find(V.ci);
+            return it == m.end() ? std::numeric_limits<double>::quiet_NaN() : it->second;
+        };
+        std::vector<std::string> fanViolations;
+        for (size_t j = 0; j < verts.size(); ++j) {
+            if (verts[j].kind == 2) continue;
+            std::string why;
+            if (!leadRowsClear(verts[j], az[j], &why, assignedRollOf(verts[j]))) {
+                std::ostringstream m;
+                m << verts[j].wname << " "
+                  << (verts[j].kind == 0 ? (verts[j].entrance ? "entrance lead" : "exit lead")
+                                         : "dragback")
+                  << " (ci=" << (size_t)verts[j].ci << ") at " << std::fixed << std::setprecision(4)
+                  << az[j] * 180.0 / kPi << " deg: " << why;
+                fanViolations.push_back(m.str());
+            }
+            for (size_t k2 = j + 1; k2 < verts.size(); ++k2) {
+                if (verts[k2].kind == 2) continue;
+                if (clears(verts[j], az[j], verts[k2], az[k2])) continue;
+                const Vert& A = verts[j];
+                const Vert& B = verts[k2];
+                std::ostringstream m;
+                m << "verticals ci=" << (size_t)A.ci << " (" << A.wname << ", " << std::fixed
+                  << std::setprecision(4) << az[j] * 180.0 / kPi << " deg) and ci=" << (size_t)B.ci
+                  << " (" << B.wname << ", " << az[k2] * 180.0 / kPi << " deg) ";
+                // Criterion 1, in the order `clears` applies it: the exact 3D distance between the
+                // two emitted lead polylines against their summed coated radii. leadPairDist3D
+                // returns a bare 0.0 when NO fillet fits the slot at all, which is indistinguishable
+                // from a measured zero -- so that case is detected here and named for what it is,
+                // rather than reported as a distance nobody measured.
+                const bool pairIs3D = A.kind == 0 && B.kind == 0 && !A.rectWire && !B.rectWire &&
+                                      leadPairDist3D;
+                const bool aFits = leadPrims3D(A, az[j], assignedRollOf(A)).has_value();
+                const bool bFits = leadPrims3D(B, az[k2], assignedRollOf(B)).has_value();
+                if (pairIs3D && !(aFits && bFits)) {
+                    m << "cannot be emitted at these slots: no terminal fillet fits "
+                      << (!aFits && !bFits ? "either lead" : (!aFits ? "the first lead" : "the second lead"));
+                } else if (pairIs3D &&
+                           leadPairDist3D(A, az[j], B, az[k2]) + 1e-12 < A.rw + B.rw) {
+                    const double d3d = leadPairDist3D(A, az[j], B, az[k2]);
+                    m << "come within " << d3d * 1e3 << " mm in 3D, against their "
+                      << (A.rw + B.rw) * 1e3 << " mm summed coated envelope ("
+                      << (A.rw + B.rw - d3d) * 1e9 << " nm inside)";
+                } else {
+                    m << "are " << std::abs(xAt(A, az[j]) - xAt(B, az[k2])) * 1e3
+                      << " mm apart in x, need " << needDist(A, B, need(A, B)) * 1e3 << " mm";
+                }
+                fanViolations.push_back(m.str());
+            }
+        }
+        if (!fanViolations.empty()) {
+            std::ostringstream m;
+            m << "ConductorBuilder: the lead fan could not satisfy its own clearances at the final "
+                 "slots -- REFUSED (" << fanViolations.size() << " violation(s)). The layout is "
+                 "infeasible, so no geometry is built from it:";
+            for (const auto& v : fanViolations) m << "\n  - " << v;
+            throw std::runtime_error(m.str());
         }
         // CONSECUTIVE dragback transitions of one conductor (a single-turn layer) chain end to
         // start: force them onto one azimuth so the chain stays connected.
