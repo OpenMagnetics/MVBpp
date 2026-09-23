@@ -5091,7 +5091,10 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
                      bool steepFinal = false, bool translateSiblingAtStart = false,
                      bool translateSiblingAtEnd = false,
                      double stubSweepCapStart = std::numeric_limits<double>::infinity(),
-                     double stubSweepCapEnd = std::numeric_limits<double>::infinity()) {
+                     double stubSweepCapEnd = std::numeric_limits<double>::infinity(),
+                     // ABT #1366: the azimuth at which the axial travel is COMPLETE -- see
+                     // heightAtAz. NaN spreads the climb over the whole sweep, as before.
+                     double climbEndAz = std::numeric_limits<double>::quiet_NaN()) {
     // U (SERPENTINE) LAYER LINK -- Alf, 2026-08-07, 14_dab; descent form Alf, 2026-08-08 (ABT
     // #608 final form). Layers wound in U (this one bottom to top, the next top to bottom)
     // connect DIFFERENTLY from a dragback, and differently from a cone: the wire leaves the
@@ -5246,8 +5249,23 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
     const double stubAzEnd = cappedStub(stubSweepCapEnd);
     const double azFrom = (stubAtStart && roomForStubs) ? azS + stubAzStart : azS;
     const double azTo = (stubAtEnd && roomForStubs) ? azE + kTwoPi - stubAzEnd : azE + kTwoPi;
+    // ABT #1366: WHERE THE AXIAL TRAVEL ENDS. The wrap climbs its layer's grid advance and
+    // ARRIVES at `yEnd`; `climbEndAz` is the azimuth where it gets there. Past that azimuth the
+    // wire has reached the station it was travelling to and travels LEVEL to its crossing --
+    // it does not keep climbing through the over-run. A crossing that sits PAST the plane (a
+    // fan slot, a dragback's or a terminal's) lengthens the sweep beyond one revolution, and
+    // continuing the helix over that extra azimuth put the last wrap of the topmost station
+    // above MKF's station by pitch * over-run: 13.3 um on 06_llc's Primary, which with MKF's
+    // by-construction ZERO flange margin (the corpus survey on ABT #1366: 51 of 57 windings
+    // tangent to the nanometre) is copper inside the bobbin flange. The station is MKF's and it
+    // is the END of the travel, not a point the helix passes through on its way further up.
+    // NaN keeps the whole sweep as the climb (the caller has nothing to say about it).
+    const double climbSpan = std::isnan(climbEndAz) ? sweepSpan : (climbEndAz - azS);
     auto heightAtAz = [&](double az) {
-        return s.y + (yEnd - s.y) * ((az - azS) / sweepSpan);
+        if (!(climbSpan > 0.0)) return yEnd;
+        // min(1) is the travel being COMPLETE, not a clamp on a height: the ratio is the share
+        // of the climb already spent, and a share cannot exceed the whole.
+        return s.y + (yEnd - s.y) * std::min(1.0, (az - azS) / climbSpan);
     };
     auto radiusAtAz = [&](double az) {
         return s.x + (n.x - s.x) * ((az - azS) / sweepSpan);
@@ -5377,9 +5395,26 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
                          label.c_str(), tallestBumpColumn(bumps).first, bumps.size());
         pushStub(azS, azFrom, tallestBumpColumn(bumps).first, /*terminalAtStart=*/true);
     }
-    appendBumpedSweep(path, radiusAtAz(azFrom), heightAtAz(azFrom), azFrom, radiusAtAz(azTo),
-                      heightAtAz(azTo), azTo, bumps, wireRadius, label, ordinal,
-                      /*isConnection=*/false);
+    // ABT #1366: the sweep is CUT where the axial travel ends. appendBumpedSweep spreads the
+    // height it is given linearly across the azimuth it is given, so a single sweep to azTo
+    // would re-spread the climb over the over-run -- arriving at the station, but on a helix
+    // shallower than the layer's own pitch, which is exactly what ABT #685 A5 measured as a
+    // sibling-clearance loss. Two pieces instead: the climb at MKF's pitch up to the station,
+    // then the level run out to the crossing. Same label and ordinal -- one turn, drawn in the
+    // two states the wire is actually in.
+    const double climbEnd = std::isnan(climbEndAz) ? azTo : climbEndAz;
+    if (climbEnd > azFrom && climbEnd < azTo) {
+        appendBumpedSweep(path, radiusAtAz(azFrom), heightAtAz(azFrom), azFrom,
+                          radiusAtAz(climbEnd), heightAtAz(climbEnd), climbEnd, bumps,
+                          wireRadius, label, ordinal, /*isConnection=*/false);
+        appendBumpedSweep(path, radiusAtAz(climbEnd), heightAtAz(climbEnd), climbEnd,
+                          radiusAtAz(azTo), heightAtAz(azTo), azTo, bumps, wireRadius, label,
+                          ordinal, /*isConnection=*/false);
+    } else {
+        appendBumpedSweep(path, radiusAtAz(azFrom), heightAtAz(azFrom), azFrom, radiusAtAz(azTo),
+                          heightAtAz(azTo), azTo, bumps, wireRadius, label, ordinal,
+                          /*isConnection=*/false);
+    }
     if (azTo < azE + kTwoPi) {
         if (std::getenv("MVB_RAISE_DIAG"))
             std::fprintf(stderr, "[raise] stub-end '%s' raise=%.9f (bumpsEnd=%zu)\n",
@@ -14893,9 +14928,28 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (std::abs(crossAz[i + 1] - crossAz[i]) <= 1e-9) return endY;
             if (std::abs(nw.x - sw.x) > wireRadius) return endY;
             if (i + 2 == nEmit || zDragbackAzimuth.count(i + 1)) {
-                endY = nw.y + (nw.y - sw.y) * (crossAz[i + 1] - crossAz[i]) / kTwoPi;
+                // ABT #1366: the stretch runs ONE WAY. A crossing that falls SHORT of a full
+                // revolution (negative) leaves the wrap short of its station, and the helix is
+                // genuinely that much lower there -- the ABT #685 reading, unchanged. A crossing
+                // PAST it does not lift the wrap above the station: MKF's station is where this
+                // travel ENDS, the azimuth beyond it is travelled level (see appendRoundWrap's
+                // heightAtAz), and lifting it there is what put 13.3 um of 06_llc's Primary
+                // inside the bobbin flange, which MKF packs with zero margin by construction.
+                endY = nw.y + (nw.y - sw.y) *
+                                  std::min(0.0, crossAz[i + 1] - crossAz[i]) / kTwoPi;
             }
             return endY;
+        };
+        // ABT #1366: the azimuth at which that travel is complete -- one grid advance per
+        // revolution, from wherever the wrap actually STARTS (its slot, a pitch-true landing),
+        // to the height it is travelling to. Equal to the sweep's end whenever the crossings
+        // agree, so a wrap that spans exactly one turn is drawn exactly as before.
+        auto wrapClimbEndAz = [&](size_t i, double startY, double endY) {
+            if (std::isnan(endY) || i + 1 >= nEmit)
+                return std::numeric_limits<double>::quiet_NaN();
+            const double advance = station(turns[i + 1]).y - station(turns[i]).y;
+            if (!(std::abs(advance) > 0.0)) return std::numeric_limits<double>::quiet_NaN();
+            return crossAz[i] + kTwoPi * (endY - startY) / advance;
         };
         // ABT #839: where transition `i`'s terminal stub -- the osculating arc -- actually ends.
         // The lead attaches THERE, not at the helix station the arc had to leave behind.
@@ -15215,8 +15269,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         const PlanePt before = station(turns[i - 1]);
                         if (std::abs(before.x - s.x) <= wireRadius &&
                             std::abs(crossAz[i] - kPlaneAz) > 1e-9) {
-                            const double rem =
-                                std::remainder(crossAz[i] - kPlaneAz, kTwoPi);
+                            // ABT #1366: one way, like the wrap that feeds it (see
+                            // wrapEndYOverride). A slot BEFORE the plane is reached before the
+                            // revolution is done and the wire is genuinely lower there; a slot
+                            // PAST it is reached after the wire has already arrived at this
+                            // station, and the dragback starts from the station. The two
+                            // formulas describe the SAME point -- the feeding wrap's end -- so
+                            // they are capped the same way or the chain opens a gap there.
+                            const double rem = std::min(
+                                0.0, std::remainder(crossAz[i] - kPlaneAz, kTwoPi));
                             sSrc.y = s.y + (s.y - before.y) * rem / kTwoPi;
                         }
                     }
@@ -15269,7 +15330,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                 stubCapIn.count(ci) ? stubCapIn.at(ci)
                                                     : std::numeric_limits<double>::infinity(),
                                 stubCapOut.count(ci) ? stubCapOut.at(ci)
-                                                     : std::numeric_limits<double>::infinity());
+                                                     : std::numeric_limits<double>::infinity(),
+                                // ABT #1366: where this wrap's climb ends -- from the height it
+                                // really starts at (sWrap), at MKF's own grid advance.
+                                wrapClimbEndAz(i, sWrap.y, endY));
             } else if (rectFamily) {
                 {
                     const RectStation rs0 = rectStation(s, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);
