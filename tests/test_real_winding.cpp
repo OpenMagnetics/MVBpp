@@ -1978,8 +1978,12 @@ TEST_CASE("Real winding: single-turn toroid primary drops both terminals without
 // sections. Every parallel crosses from its section 0 to its section 1 exactly once, on the
 // -Z face, through a radial step at its lane slot. The design MKF accepts is refused by the
 // gate (Primary p0's step and p1's band run 1.5 um apart) and, with the gate skipped, shows
-// three more defects Alf read off the STEP. The tests below pin each contract; all four were
-// written FAILING ([!shouldfail]) and flip when the fix lands, the cm37 way:
+// three more defects Alf read off the STEP. The tests below pin each contract; they were
+// written FAILING ([!shouldfail]) on 2026-09-23 and flipped the same day, the cm37 way, when
+// MKF gave each side-by-side sibling its own band row (#1361), a level inter-section return
+// became one step at the crossing with no lane (#1360), and lanes went per face in parallel
+// order (#1359) -- the design then built CERTIFIED CLEAR (0 nm, every pair proven). Any
+// regression in that chain shows here as the gate's own refusal.
 //
 //   ABT #1359  lane order  -- the lanes must respect the parallel order along the travel
 //              direction, per winding. Today they are allocated over ALL conductors,
@@ -2021,15 +2025,17 @@ struct SectionCrossing {
 };
 
 // The inter-section returns of one conductor: a radial step is a non-lead primitive that
-// moves only in z (the layer direction on the -Z face) by at least a layer's depth. Nothing
-// else on this design does that -- the -X / +X faces move 6.35 mm in z but climb their pitch
-// in y, the corners are arcs, the stubs (seg 0 / seg 2) move only in y.
+// crosses one layer's depth in z (the layer direction on the -Z face) without moving along
+// the face, carrying at most the entry turn's residual (half a wire) in y. Nothing else on
+// this design does that -- the -X / +X faces move 6.35 mm in z, the corners are arcs, the
+// stubs (seg 0 / seg 2) move only in y.
 std::vector<SectionCrossing> sectionCrossings(const mvb::ConductorBuilder::PathPolyline& path) {
     std::vector<SectionCrossing> out;
     for (size_t i = 0; i < path.prims.size(); ++i) {
         if (path.primIsLead[i]) continue;
         const auto& p = path.prims[i];
-        if (std::abs(dxOf(p)) > 1e-6 || std::abs(dyOf(p)) > 5e-5 || std::abs(dzOf(p)) < 3e-4)
+        if (std::abs(dxOf(p)) > 1e-6 || std::abs(dyOf(p)) > 3e-4 ||
+            std::abs(dzOf(p)) < 3e-4 || std::abs(dzOf(p)) > 2e-3)
             continue;
         SectionCrossing c{i, p.front()[0], 0.0};
         for (size_t k = i; k-- > 0;) {
@@ -2056,7 +2062,7 @@ std::string windingOf(const std::string& pathName) {
 }  // namespace
 
 TEST_CASE("Real winding: the PSPS E16 flyback (2p / 4p) builds CERTIFIED CLEAR (ABT #1359/#1360/#1361)",
-          "[realwinding][psps][!shouldfail]") {
+          "[realwinding][psps]") {
     auto enriched = enrichPsps();
     mvb::MagneticBuilder builder;
     // EXACTLY the CLI's path and config (mvbpp_step_generator --real): that is where Alf saw
@@ -2067,7 +2073,7 @@ TEST_CASE("Real winding: the PSPS E16 flyback (2p / 4p) builds CERTIFIED CLEAR (
 }
 
 TEST_CASE("Real winding: inter-section lanes follow the parallel order along the travel direction (ABT #1359)",
-          "[realwinding][psps][!shouldfail]") {
+          "[realwinding][psps]") {
     ScopedSkipCollisionCheck diagnostic;
     auto enriched = enrichPsps();
     mvb::MagneticBuilder builder;
@@ -2091,14 +2097,15 @@ TEST_CASE("Real winding: inter-section lanes follow the parallel order along the
                          << byParallel[i - 1].second * 1e3 << " mm, parallel "
                          << byParallel[i].first << " at " << byParallel[i].second * 1e3
                          << " mm along the travel direction");
-            // Alf: p0 steps first, the last parallel last -- never 3, 1, 0, 2.
-            CHECK(byParallel[i].second > byParallel[i - 1].second);
+            // Alf: p0 steps first, the last parallel last -- never 3, 1, 0, 2. Equal when the
+            // returns need no lane at all (a level return steps at the crossing itself).
+            CHECK(byParallel[i].second >= byParallel[i - 1].second);
         }
     }
 }
 
 TEST_CASE("Real winding: an inter-section return is pitch-true at both ends -- the radial step alone (ABT #1360)",
-          "[realwinding][psps][!shouldfail]") {
+          "[realwinding][psps]") {
     ScopedSkipCollisionCheck diagnostic;
     auto enriched = enrichPsps();
     mvb::MagneticBuilder builder;

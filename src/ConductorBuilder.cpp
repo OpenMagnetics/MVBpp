@@ -4056,6 +4056,27 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
         }
         return {{station.x, station.y}, {station.x, edgeY}, {borderX, edgeY}};
     }
+    // THE VERTICAL STANDS WHERE MKF DREW IT. On a rectangular/oblong column MKF draws the exit's
+    // stub one coated OD outward of the turn's column (the off-face vertical of ABT #849, now
+    // reserved by MKF so the layer it stands in is blocked over its height -- cm37, 2026-09-23):
+    // the route is then a radial step at the turn, the climb in that column, the edge run. A
+    // stub drawn in the turn's own column keeps the plain L-route.
+    // Read the offset off MKF's OWN rects: the run box starts half a wire inside the turn
+    // (lead.coordinates/dimensions), so its inner edge plus half its height is the turn's MKF
+    // radial, and the stub box's centre minus that is the off-face offset. Comparing the stub
+    // box with `station` instead mixed frames -- the station is this builder's plane radial,
+    // a former's worth away from MKF's (cm37: 5.0025 against 4.3805) -- and put the vertical
+    // one OD INWARD, through the sibling's layer.
+    const double turnMkfX = run->coordinates.at(0) - 0.5 * run->dimensions.at(0) +
+                            0.5 * run->dimensions.at(1);
+    for (const RSpace* s : group) {
+        if (!rectIsVertical(*s, foilRadial)) continue;
+        const double offFace = s->coordinates.at(0) - turnMkfX;
+        if (std::abs(offFace) > 1e-7) {
+            const double stubX = station.x + offFace;
+            return {{station.x, station.y}, {stubX, station.y}, {stubX, edgeY}, {borderX, edgeY}};
+        }
+    }
     return {{station.x, station.y}, {station.x, edgeY}, {borderX, edgeY}};
 }
 
@@ -5968,6 +5989,10 @@ double rectRisingLength(const RectStation& s0, double ride0, double rideBack0, d
            begX;
 }
 
+// MKF's rows and stations are placed to the nanometre and agree to within this where a row
+// claims a turn (ABT #844); a difference below it is rounding, never copper to draw.
+constexpr double kRowStationTol = 2e-5;
+
 void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStation& s1,
                     const std::string& label, size_t ordinal, double wireRadius,
                     double ride0, double rideBack0, bool isReturn, double chainRide,
@@ -5993,7 +6018,10 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                     // ABT #849: where the chain's tail ENDS -- the destination wrap's own
                     // pitch-true start height when that wrap begins at the slot (it starts
                     // begX-share above its station, see yAt), s1.y otherwise. NaN = s1.y.
-                    double chainEndY = std::numeric_limits<double>::quiet_NaN()) {
+                    double chainEndY = std::numeric_limits<double>::quiet_NaN(),
+                    // ABT #1360: a LEVEL inter-section return (see RectReturn::levelBand): one
+                    // radial step at the crossing, at the arrival height, and nothing else.
+                    bool levelBand = false) {
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
@@ -6184,6 +6212,24 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             ? (s0.cornerR - std::sqrt(std::max(0.0, s0.cornerR * s0.cornerR - xSlot * xSlot)))
             : 0.0;
         std::vector<gp_Pnt> pts;
+        if (levelBand) {
+            // LEVEL BAND ROUTE (ABT #1360): the exit turn sits on the band row and the entry
+            // turn within half a wire of it. One radial step at the crossing, from the arrival
+            // height at the source depth to the ENTRY STATION at the destination depth. MKF
+            // draws no vertical for an entry within half a wire of the run ("any residual height
+            // difference is the destination turn's own helix"); in 3D that residual is taken
+            // across the crossing itself, so the next wrap begins at its own station. Spending it
+            // along the next turn instead (measured 2026-09-23) put the siblings one SOURCE pitch
+            // apart (0.5357 mm) on the steep destination helix, whose envelope needs OD/cos:
+            // MKF stacks those stations 0.5446 apart, and the gate certified 6.4 um of enamel
+            // overlap on every sibling pair. No lane: nothing climbs or drops at any azimuth, so
+            // there is nothing for a sibling's turn to run through.
+            pts.insert(pts.end(), {gp_Pnt(0.0, yChain, -zN0), gp_Pnt(0.0, yEnd, -zDest)});
+            appendFilletedPolyline(path.prims, pts, wireRadius, label + " (dragback)", ordinal,
+                                   /*isLead=*/false, /*isConnection=*/true,
+                                   /*rounded=*/g_roundedLeadCorners || path.isRectangular);
+            return;
+        }
         if (!std::isnan(bandY)) {
             // BAND ROUTE (ABT #615 stage 3): MKF's stage-2 alternation puts the exit turn
             // adjacent to the band and the receiving section's first turn just under it, so
@@ -6197,9 +6243,15 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             // crosses every slot on its way to x=0; measured on cm37 with the whole-winding
             // parallel order: p0's drop hit p1's run at distance 0). zDesc is the chain's
             // own reservation, so the clearance is one OD by construction.
+            // A row-vs-station difference below kRowStationTol is MKF's own rounding (ABT
+            // #844 snaps rows to turns at the nm), not a stub to lay: the run sits at the wire's
+            // arrival height, inside the corridor either way. Laid as copper it is exactly the
+            // amount the sibling's OD spacing loses -- cm37's Secondary p0 climbed 66 nm onto
+            // its row and the certified gate found the sibling's face 64 nm inside the envelope.
+            const double bandRun = std::abs(bandY - yChain) <= kRowStationTol ? yChain : bandY;
             pts.insert(pts.end(), {gp_Pnt(xSlot, yChain, -(zN0 - slotSag)),
-                                    gp_Pnt(xSlot, bandY, -(zN0 - slotSag)),
-                                    gp_Pnt(xSlot, bandY, -zDesc),
+                                    gp_Pnt(xSlot, bandRun, -(zN0 - slotSag)),
+                                    gp_Pnt(xSlot, bandRun, -zDesc),
                                     gp_Pnt(xSlot, yEnd, -zDesc),
                                     gp_Pnt(xSlot, yEnd, -zDest)});
         }
@@ -7629,6 +7681,18 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             "by MKF before building real-winding conductors");
     }
 
+    // MVB_SPACES_DUMP: every reserved space MKF handed over (drawn routes AND per-layer
+    // squeezes), in mm, before they are split -- the 2D layout the 3D is built from.
+    if (std::getenv("MVB_SPACES_DUMP")) {
+        for (const auto& s : allSpaces) {
+            std::fprintf(stderr, "[space] w=%s p=%zu term=%d layer='%s' c=(%.4f,%.4f) d=(%.4f,%.4f) rot=%.1f\n",
+                         s.winding.c_str(), s.parallel, int(s.isTerminal), s.layer.c_str(),
+                         s.coordinates.size() > 0 ? s.coordinates[0] * 1e3 : 0.0,
+                         s.coordinates.size() > 1 ? s.coordinates[1] * 1e3 : 0.0,
+                         s.dimensions.size() > 0 ? s.dimensions[0] * 1e3 : 0.0,
+                         s.dimensions.size() > 1 ? s.dimensions[1] * 1e3 : 0.0, s.rotation);
+        }
+    }
     // Drawn connection routes only (layer == ""): the pink/blue boxes of the SVG.
     std::vector<RSpace> drawn;
     for (auto& s : allSpaces) {
@@ -8229,6 +8293,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                     // stage 3), not as the face-level adjacent chain
         bool levelLink = false;     // U turnaround: steps out at the SAME height, so it reserves
                                     // no space (see rectRideLevels)
+        // ABT #1359/#1360: an inter-section return whose exit turn already sits ON MKF's band row
+        // and whose entry turn is within half a wire of it has NO chain to lay -- no climb onto
+        // the band, no drop off it. It steps across at the crossing itself (x = 0), takes no
+        // lane, and the next turn starts sloping from where the step lands. Every lane offset
+        // was a defect here: the wrap was cut at the slot below its station and a stub stood the
+        // difference (Secondary p3, 0.121 mm), the next wrap began at the plane so a flat run
+        // walked back to it, and the slots -- allocated centre-out over all conductors -- put the
+        // siblings at 3, 1, 0, 2 along the face, the highest row's steep turn sweeping the others'
+        // steps (0.330 mm for a 0.534 envelope).
+        bool levelBand = false;
     };
     std::vector<RectReturn> rectReturns;
     // ABT #615/Alf 2026-08-09: a cross-layer transition whose SOURCE turn is ALONE in its
@@ -8269,6 +8343,40 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // between the sibling's turns -- one envelope from each, the flyback's own packing.
     std::map<size_t, double> leadSlotOf;
     std::map<size_t, double> exitSlotOf;   // ABT #849: exit lane per conductor (+X side)
+    // ABT #615 stage 3: an inter-section return follows MKF's DRAWN band run -- the non-terminal
+    // horizontal marker of this conductor whose radial span covers both stations. Its row height
+    // IS the corridor the blocking cleared; anything else re-invents the route. NaN when none.
+    // The 1 nm is a TOLERANCE on the coverage test, so it must LOOSEN the span, not widen it:
+    // written as -/+ it demanded the run reach a nanometre PAST each station, which rejected the
+    // exactly-covering run MKF draws whenever the two layers sit one wire OD apart (the
+    // centre-to-centre horizontal is then exactly the station span -- measured 1 nm short at
+    // both ends on a 4-parallel E16 flyback).
+    auto bandRowFor = [&](const ConductorTurns& ct, double sx, double nx) {
+        const double loX = std::min(sx, nx) + 1e-9;
+        const double hiX = std::max(sx, nx) - 1e-9;
+        double bestExtent = std::numeric_limits<double>::max();
+        double bandY = std::numeric_limits<double>::quiet_NaN();
+        for (const auto& sp : drawn) {
+            if (sp.winding != ct.winding || sp.parallel != ct.parallel || sp.isTerminal ||
+                !sp.layer.empty())
+                continue;
+            if (sp.dimensions.size() < 2 || sp.coordinates.size() < 2) continue;
+            if (sp.dimensions[0] < sp.dimensions[1]) continue;  // stub, not run
+            const double x0 = sp.coordinates[0] - sp.dimensions[0] / 2.0;
+            const double x1 = sp.coordinates[0] + sp.dimensions[0] / 2.0;
+            if (x0 > loX || x1 < hiX) continue;
+            if (sp.dimensions[0] < bestExtent) {
+                bestExtent = sp.dimensions[0];
+                bandY = sp.coordinates[1];
+            }
+        }
+        return bandY;
+    };
+    // A level return's exit turn is on the band row to within kRowStationTol (see the band
+    // route in appendRectWrap): MKF rounds rows and turns to 1 nm and the N-filar row IS the
+    // turn's row (measured 0.3-0.8 um apart), so anything beyond a few microns is a real stub
+    // that needs its own lane.
+    constexpr double kLevelBandTol = kRowStationTol;
     if (rectFamily) {
         std::map<size_t, double> slotOf;   // conductor -> x slot
         double maxDiam = 0.0;
@@ -8326,17 +8434,44 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         rectTangential.insert({cv, i});
                         continue;
                     }
-                    if (!slotOf.count(cv)) slotOf[cv] = 0.0;   // slot assigned below
+                    // A LEVEL step (see RectReturn::levelBand): an intra-section U turnaround
+                    // (levelLink) always; an inter-section return when its exit turn sits on
+                    // MKF's band row. Both are one radial step at the crossing, no lane. A laned
+                    // U turnaround of N-filar siblings puts the step column where the sibling's
+                    // helix is a lane's worth of pitch off its row (cm37, Primary layer 2:
+                    // 0.283 mm for a 0.311 envelope at the 0.367 mm lane).
+                    bool levelBand = levelLink && !interSection;
+                    if (interSection) {
+                        const PlanePt sa = station(ct.turns[i]);
+                        const PlanePt sb = station(ct.turns[i + 1]);
+                        const double bandY = bandRowFor(ct, sa.x, sb.x);
+                        levelBand = !std::isnan(bandY) && std::abs(sa.y - bandY) <= kLevelBandTol &&
+                                    std::abs(sb.y - sa.y) <= 0.5 * diam;
+                    }
+                    if (!levelBand && !slotOf.count(cv)) slotOf[cv] = 0.0;   // slot assigned below
                     rectReturns.push_back({cv, i, a.zPos, b.zPos, diam, 0.0,
-                                           windingFace.at(ct.winding), interSection, levelLink});
+                                           windingFace.at(ct.winding), interSection, levelLink,
+                                           levelBand});
                     maxDiam = std::max(maxDiam, diam);
                 }
             }
         }
-        // One x slot per conductor, centre-out around the crossing (x = 0), a coated OD
-        // apart (layout criterion: insulation touching).
-        int k = 0;
+        // One x slot per conductor that lays a chain, a coated OD apart (layout criterion:
+        // insulation touching). PER FACE, IN PARALLEL ORDER, DOWNSTREAM (ABT #1359, Alf: "the
+        // parallel order is not respected"): conductors on opposite faces never meet, so each
+        // face packs from its own crossing; conductor order is winding-major, parallel-minor,
+        // so within a winding p0 steps at the crossing and each later parallel one lane further
+        // along the travel direction (every wrap departs the crossing toward local -X). The
+        // previous centre-out alternation over ALL conductors let the Primary use up the first
+        // lanes and scattered the Secondary's four at 3, 1, 0, 2 along the face.
+        std::map<int, int> laneOfFace;
+        // A LEVEL return steps across at the crossing itself, so on its face the crossing is
+        // taken: the first laned conductor there starts one OD out (cm37 with the pre-#1361
+        // shared band: p0 level at x = 0, p1's chain also at lane 0 -- distance 0).
+        for (const auto& r : rectReturns)
+            if (r.levelBand) laneOfFace[r.side] = 1;
         for (auto& [cv, slot] : slotOf) {
+            const int k = laneOfFace[windingFace.at(conductors[cv].winding)]++;
             if (stadiumColumn) {
                 // Stadium lanes fan on ONE side of the cap apex (the rising turn's shortened
                 // final quarter ends there; a negative slot would overrun the apex into the
@@ -8344,13 +8479,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 slot = double(k) * maxDiam;
             }
             else {
-                const int step = (k + 1) / 2;
-                slot = (k % 2 == 1 ? +1.0 : -1.0) * step * maxDiam;
-                if (k == 0) slot = 0.0;
+                slot = -double(k) * maxDiam;
             }
-            ++k;
         }
-        for (auto& r : rectReturns) r.xSlot = slotOf.at(r.ci);
+        for (auto& r : rectReturns) r.xSlot = r.levelBand ? 0.0 : slotOf.at(r.ci);
         // Terminal-lead slots, allocated PER FACE: conductors on opposite isolation sides never
         // share a face, so each side packs from its own crossing outwards, one coated OD apart
         // (insulation touching -- the same layout criterion as the dragback lanes). One-sided,
@@ -8392,6 +8524,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             for (const auto& [cv, t] : slotOf)
                 if (std::abs(t) < 1e-12 && cv < conductors.size())
                     crossingTaken[windingFace.at(conductors[cv].winding)] = true;
+            // ABT #1360: a LEVEL inter-section return steps across AT the crossing, so it owns
+            // x = 0 on its face just as a lane there would (a sibling's lead dropped straight
+            // down the crossing would run into the step at its station).
+            for (const auto& r : rectReturns)
+                if (r.levelBand) crossingTaken[r.side] = true;
             std::map<int, int> kOfFace;
             for (const auto& [row, cv] : byRow) {
                 const int face = windingFace.at(conductors[cv].winding);
@@ -14905,47 +15042,19 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                 label);
                         }
                         if (ret->interSection) {
-                            // ABT #615 stage 3: an inter-section return follows MKF's DRAWN
-                            // band run — the non-terminal horizontal marker of this conductor
-                            // whose radial span covers both stations. Its row height IS the
-                            // corridor the blocking cleared; anything else re-invents the route.
-                            // The 1 nm is a TOLERANCE on the coverage test, so it must LOOSEN
-                            // the span, not widen it: written as -/+ it demanded the run reach a
-                            // nanometre PAST each station, which rejected the exactly-covering
-                            // run MKF draws whenever the two layers sit one wire OD apart (the
-                            // centre-to-centre horizontal is then exactly the station span --
-                            // measured 1 nm short at both ends on a 4-parallel E16 flyback).
-                            const double loX = std::min(s.x, nxt.x) + 1e-9;
-                            const double hiX = std::max(s.x, nxt.x) - 1e-9;
-                            double bestExtent = std::numeric_limits<double>::max();
-                            for (const auto& sp : drawn) {
-                                if (sp.winding != ct.winding || sp.parallel != ct.parallel ||
-                                    sp.isTerminal || !sp.layer.empty())
-                                    continue;
-                                if (sp.dimensions.size() < 2 || sp.coordinates.size() < 2)
-                                    continue;
-                                if (sp.dimensions[0] < sp.dimensions[1]) continue;  // stub, not run
-                                const double x0 = sp.coordinates[0] - sp.dimensions[0] / 2.0;
-                                const double x1 = sp.coordinates[0] + sp.dimensions[0] / 2.0;
-                                if (x0 > loX || x1 < hiX) continue;
-                                if (sp.dimensions[0] < bestExtent) {
-                                    bestExtent = sp.dimensions[0];
-                                    bandY = sp.coordinates[1];
-                                }
-                            }
+                            bandY = bandRowFor(ct, s.x, nxt.x);
                             if (std::isnan(bandY) && std::getenv("MVB_BAND_DIAG")) {
                                 std::fprintf(stderr, "[band] need span [%.12g, %.12g] mm for %s (w=%s p=%zu)\n",
-                                             loX*1e3, hiX*1e3, label.c_str(), ct.winding.c_str(), ct.parallel);
+                                             std::min(s.x, nxt.x)*1e3, std::max(s.x, nxt.x)*1e3,
+                                             label.c_str(), ct.winding.c_str(), ct.parallel);
                                 for (const auto& sp : drawn) {
                                     if (sp.winding != ct.winding || sp.parallel != ct.parallel ||
                                         sp.isTerminal || !sp.layer.empty()) continue;
                                     if (sp.dimensions.size() < 2 || sp.coordinates.size() < 2) continue;
-                                    const double x0 = sp.coordinates[0] - sp.dimensions[0] / 2.0;
-                                    const double x1 = sp.coordinates[0] + sp.dimensions[0] / 2.0;
-                                    std::fprintf(stderr,
-                                        "[band]  CAND run=%d x0=%.12g x1=%.12g  (x0-loX)=%.3g nm  (x1-hiX)=%.3g nm\n",
-                                        int(sp.dimensions[0] >= sp.dimensions[1]), x0*1e3, x1*1e3,
-                                        (x0-loX)*1e9, (x1-hiX)*1e9);
+                                    std::fprintf(stderr, "[band]  CAND run=%d x0=%.12g x1=%.12g mm\n",
+                                        int(sp.dimensions[0] >= sp.dimensions[1]),
+                                        (sp.coordinates[0] - sp.dimensions[0] / 2.0)*1e3,
+                                        (sp.coordinates[0] + sp.dimensions[0] / 2.0)*1e3);
                                 }
                             }
                             if (std::isnan(bandY))
@@ -15068,10 +15177,12 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                    rectRideFor(rs0.zPos, side),
                                    rectRideFor(rs0.zPos, 1 - side), ret != nullptr,
                                    chainRide, destRide, xSlot, stopX, startX, bandY,
-                                   ret ? nullptr : &riseEndY, chainStartY, chainEndY);
+                                   ret ? nullptr : &riseEndY, chainStartY, chainEndY,
+                                   ret ? ret->levelBand : false);
                     if (!ret && !std::isnan(riseEndY)) {
                         rectRiseEndY[i] = riseEndY;
                     }
+
                 }
             } else {
                 // Unreachable: effectivelyRound covers ROUND and degenerate oblong; rectFamily
@@ -15143,10 +15254,18 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                 formerCornerRadius, path.name);
                 const int side = windingFace.at(ct.winding);
                 const double kNaNr = std::numeric_limits<double>::quiet_NaN();
+                // ABT #849, the same rule as the ordinary destination wrap: a chain whose slot
+                // sits on the departure side (local -X) ENDS at that slot, so the ring it
+                // delivers begins there -- beginning at the crossing ran the ring's first
+                // straight back over the chain's step-out (cm37, Secondary p1's turn 22 once
+                // its lane moved to -X: 'seg 2 -> last-turn ring face -Z out' overlapped).
+                double ringStartX = kNaNr;
+                for (const auto& r : rectReturns)
+                    if (r.ci == ci && r.trans + 2 == nEmit && r.xSlot < -1e-12) ringStartX = -r.xSlot;
                 appendRectWrap(path, rsL, rsL, "'" + turns[nEmit - 1]->get_name() +
                                    "' (last-turn ring)", nEmit - 1, wireRadius,
                                rectRideFor(rsL.zPos, side), rectRideFor(rsL.zPos, 1 - side),
-                               false, 0.0, 0.0, 0.0, kNaNr, kNaNr, kNaNr);
+                               false, 0.0, 0.0, 0.0, kNaNr, ringStartX, kNaNr);
             }
         }
 
@@ -15280,13 +15399,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // step at the attach height, then the vertical) -- the wire rides over face
                 // copper by exactly the gate's envelope, the same rule the dragback chain
                 // uses for its descent. Two-point routes (attach on its own row) are untouched.
+                // The off-face step itself is MKF's now (2026-09-23): its drawn stub stands one
+                // OD outward on a rect/oblong column and terminalWaypoints replays it, so the
+                // layer it stands in was blocked for it. Nothing is added here any more.
                 const double exitLane = rectFamily && exitSlotOf.count(ci) ? exitSlotOf.at(ci) : 0.0;
-                if (rectFamily && !rectWire && !std::getenv("MVB_NO_EXIT_OFFFACE") && wp.size() >= 2 &&
-                    std::abs(wp[0].y - wp[1].y) > 1e-12 && std::abs(wp[0].x - wp[1].x) < 1e-12) {
-                    const double od = 2.0 * wireRadius;
-                    wp.insert(wp.begin() + 1, PlanePt{wp[0].x + od, wp[0].y});
-                    wp[2].x += od;
-                }
                 pushPlaneSegs(wp, "exit lead", nEmit - 1, /*stationAtFront=*/true, exitRaise,
                               azExit,
                               [&](double r) { return tallestBumpColumn(bumpsForTurn(r)).first; },
