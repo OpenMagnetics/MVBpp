@@ -939,14 +939,35 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                                                          : pb.turnOrdinal - pa.turnOrdinal) <= 1) {
                         continue;
                     }
-                    // The shared-endpoint exemption carries the SAME reservation as the ordinal
-                    // one above, and for the same reason: two primitives that join are one path's
-                    // continuation, but a conductor's entrance and its exit are not each other's
-                    // continuation. Without the crossTerminal guard, a one-turn winding whose two
-                    // terminals were planned at the identical point shares BOTH endpoints, so the
-                    // gate exempted the pair and never measured it -- a shorted turn certified
-                    // clean, two coincident port caps, and one surviving FEM port (00_debug).
-                    if (ci == cj && !crossTerminal && shareEndpoint(pa, pb)) continue;
+                    // The shared-endpoint exemption, and when an entrance may touch its own exit.
+                    // Two primitives that join are one path's continuation, so they are exempt.
+                    // An entrance and an exit are exempt from each other ONLY where one hands the
+                    // current straight on to the other: CONSECUTIVE primitives, the end of the
+                    // first being the start of the second, meeting at that one point.
+                    //
+                    // That is exactly a one-turn TOROID: a current transformer's primary is a
+                    // straight pass through the bore, its only copper is its two leads, and the
+                    // passage IS the turn -- the entrance comes up through the hole and the exit
+                    // carries on out of the far face from the same point, collinear. Measuring
+                    // that joint as a collision refused a wire for being continuous.
+                    //
+                    // It is NOT a one-turn winding whose two terminals were planned at the same
+                    // point: those leads share BOTH ends (the same segment, traversed both ways)
+                    // and have turn copper between them, so they are neither consecutive nor a
+                    // single-point hand-over. The old flat exemption let that pair through -- a
+                    // shorted turn certified clean, two coincident port caps and one surviving
+                    // FEM port (00_debug) -- and this still measures it.
+                    const bool pathJunction = [&] {
+                        if (ci != cj || j != i + 1) return false;
+                        const auto [a0, a1] = primEndpoints(pa);
+                        const auto [b0, b1] = primEndpoints(pb);
+                        constexpr double tol = 1e-9;   // the same identity as shareEndpoint
+                        const bool handsOver = a1.Distance(b0) < tol;
+                        const bool sharesBoth = (a0.Distance(b0) < tol && a1.Distance(b1) < tol) ||
+                                                (a0.Distance(b1) < tol && a1.Distance(b0) < tol);
+                        return handsOver && !sharesBoth;
+                    }();
+                    if (ci == cj && (crossTerminal ? pathJunction : shareEndpoint(pa, pb))) continue;
                     double d = polyPolyDistance(polys[ci][i], polys[cj][j]);
                     if (std::getenv("MVB_PAIR_TRACE") &&
                         pa.label.find("turn 6_ending' -> 'Primary parallel 0 turn 7' (dragback) seg 1") != std::string::npos &&
