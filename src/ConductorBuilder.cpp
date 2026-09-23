@@ -8148,6 +8148,88 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 mkfExitXOf[{c, entrance}] = q[0];
             }
         }
+        // ABT #1354: WHEN MKF DRAWS BOTH OF A CONDUCTOR'S TERMINALS AS ONE POLYLINE, ITS SLOTS
+        // ARE THE ONLY THING KEEPING THEM APART -- AND THEY ARE DRAWN THERE.
+        //
+        // MKF collapses a one-turn winding's entrance and exit onto ONE edge row on purpose
+        // ("its two terminals leave SIDE BY SIDE at the same height, so they share one row",
+        // Alf 2026-09-07). Both terminals then attach to the same, only turn at the same height,
+        // so the two ConnectionRoutes it draws are the SAME polyline walked in opposite
+        // directions -- measured on 00_debug, entrance (10.3385,0) -> (7.1185,0) and exit
+        // (7.1185,0) -> (10.3385,0). Every quantity this builder reads off a drawn route is
+        // therefore identical for the two ends, and the fan -- which packs entrance bundles and
+        // exit bundles separately and anchors each at the plane -- has nothing left to tell them
+        // apart. Both leads came out as the ONE segment [0,0,-17.4705] -> [0,0,-7.1185] mm and
+        // its reverse: a dead short. No geometric check catches it, because a short is not an
+        // overlap -- watertight, self-intersection and overlap all passed -- and OMFEM ended
+        // NO_PORTS. The fan's own diagnostic named it and shipped it anyway: "[fan] UNRESOLVED
+        // at the final slots: verticals ci=0 (Primary) and ci=0 (Primary) are 0.0000 mm apart in
+        // x, need 2.6770 mm".
+        //
+        // MKF DECIDES THE SEPARATION; this only consumes it. ConnectionRoute::exitSlot (MKF
+        // 97674548) is the x along the flange MKF placed that terminal's in-window run at, from
+        // Coil::terminal_exit_slots -- which sees a polyline distance of 0 between these two and
+        // pushes the exit one PITCH, the largest coated outer diameter among that side's
+        // terminal leads. On 00_debug: entrance x = 0.000 mm, exit x = 2.677 mm, the same
+        // 2.677 mm the fan said it needed, arrived at from the wires' own dimensions rather than
+        // chosen here. Nothing below derives, chooses or clamps a distance. The slots go into
+        // the same mkfExitXOf the pin leads already use, so the placement is the proven ABT
+        // #1237 path: draw the run at MKF's x, prove it against the rows and every placed
+        // vertical, nudge outward at most one wire radius, otherwise throw.
+        //
+        // SCOPE, deliberately the narrowest that fixes the defect: only a conductor whose two
+        // terminal routes are the SAME polyline (in either direction). That is the case -- and
+        // only that case -- where this builder demonstrably has no separation of its own, and it
+        // is read from the layout MKF emitted, not re-derived from turn coordinates or turn
+        // counts. MKF now hands a slot to EVERY terminal route, and it pushes an exit off the
+        // entrance's lane in ordinary designs too (02_flyback's Primary: 0.000 vs 0.430 mm),
+        // where the fan already separates the two leads by its own proven packing. Consuming the
+        // slots there as well would move the terminals of much of the corpus in one step; that
+        // wider consumption is a separate change, recorded as the follow-up on ABT #1354.
+        auto terminalRouteFor = [&](const std::string& winding, int64_t parallel,
+                                    bool entrance) -> const OpenMagnetics::ConnectionRoute* {
+            const auto wantKind = entrance ? OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE
+                                           : OpenMagnetics::ConnectionKind::TERMINAL_EXIT;
+            const OpenMagnetics::ConnectionRoute* found = nullptr;
+            for (const auto& r : connectionLayout.routes) {
+                if (r.kind != wantKind || r.winding != winding || r.parallel != parallel) continue;
+                if (found)
+                    throw std::runtime_error("ConductorBuilder: MKF's connection layout carries two " +
+                                             std::string(entrance ? "entrance" : "exit") + " routes for " +
+                                             winding + " parallel " + std::to_string(parallel));
+                found = &r;
+            }
+            return found;
+        };
+        for (size_t c = 0; c < conductors.size(); ++c) {
+            if (mkfExitXOf.count({c, true}) || mkfExitXOf.count({c, false})) continue;   // on pins
+            const std::string who = conductors[c].winding + " parallel " + std::to_string(conductors[c].parallel);
+            const auto* in = terminalRouteFor(conductors[c].winding, conductors[c].parallel, true);
+            const auto* out = terminalRouteFor(conductors[c].winding, conductors[c].parallel, false);
+            if (!in || !out) continue;
+            const auto reversed = std::vector<std::vector<double>>(out->waypoints.rbegin(), out->waypoints.rend());
+            if (in->waypoints != out->waypoints && in->waypoints != reversed) continue;
+            if (!in->exitSlot || !out->exitSlot)
+                throw std::runtime_error(
+                    "ConductorBuilder: MKF draws the entrance and the exit of " + who +
+                    " as one polyline, so only their exit slots keep the two terminals apart, but the " +
+                    std::string(in->exitSlot ? "exit" : "entrance") + " route carries none "
+                    "(Coil::terminal_exit_slots, ABT #1354). Drawing them would emit both leads at one "
+                    "point, which is a short.");
+            if (*in->exitSlot == *out->exitSlot)
+                throw std::runtime_error(
+                    "ConductorBuilder: MKF draws the entrance and the exit of " + who +
+                    " as one polyline AND puts both on the same exit slot (" +
+                    std::to_string(*in->exitSlot * 1e3) + " mm), so the two terminals coincide -- a "
+                    "short. The side-by-side rule is not satisfied by the layout MKF emitted "
+                    "(Coil::terminal_exit_slots, ABT #1354).");
+            mkfExitXOf[{c, true}] = *in->exitSlot;
+            mkfExitXOf[{c, false}] = *out->exitSlot;
+            if (std::getenv("MVB_LEAD_DIAG"))
+                std::fprintf(stderr, "[mkf-slot] %s: MKF draws one polyline for both terminals and "
+                             "separates them by slot -- entrance at x %.9f mm, exit at x %.9f mm\n",
+                             who.c_str(), *in->exitSlot * 1e3, *out->exitSlot * 1e3);
+        }
     }
     paths.reserve(conductors.size());
     // Solder bodies (foil terminals, ABT #970): raw solids emitted beside the conductors.
@@ -10971,8 +11053,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (pinnedMembers > 0 && pinnedMembers != group.size())
                     throw std::runtime_error(
                         "ConductorBuilder: the " + std::string(verts[group[0]].entrance ? "entrance" : "exit") +
-                        " leads of '" + verts[group[0]].wname + "' are partly on pins; a bundle is drawn "
-                        "either at MKF's pin slots or by the fan, not both");
+                        " leads of '" + verts[group[0]].wname + "' hold MKF's exit slots only in part; a bundle "
+                        "is drawn either at MKF's slots or by the fan, not both");
                 if (pinnedMembers > 0) {
                     std::vector<double> fixedAz(group.size(), 0.0);
                     std::string why;
@@ -11074,9 +11156,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         }
                         throw std::runtime_error(
                             "ConductorBuilder: the " + std::string(verts[group[0]].entrance ? "entrance" : "exit") +
-                            " leads of '" + verts[group[0]].wname + "' end on bobbin pins, and MKF's exit slot "
+                            " leads of '" + verts[group[0]].wname + "' are drawn at MKF's exit slots, and one "
                             "cannot be drawn clear -- " + why + ". MKF's lane plan is off by more than a "
-                            "wire radius: Coil::terminal_exit_slots, ABT #1237.");
+                            "wire radius: Coil::terminal_exit_slots, ABT #1237/#1354.");
                     }
                     for (size_t g = 0; g < group.size(); ++g) {
                         az[group[g]] = fixedAz[g];
@@ -11387,7 +11469,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             for (auto& [wnameOfBundle, members] : bundle) {
                 if (members.size() < 2) continue;
-                // ABT #1237: a bundle on pins holds MKF's slots, lead by lead.
+                // ABT #1237/#1354: a bundle drawn at MKF's slots holds them, lead by lead.
                 bool onPins = false;
                 for (size_t k : members)
                     for (size_t m : verts[k].cis)
