@@ -14380,6 +14380,20 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (std::getenv("MVB_DIAG"))
                     std::cerr << "[lead-wp]   " << what << " rect branch: leadPts="
                               << leadPts.size() << " prims before=" << path.prims.size() << "\n";
+                // WHICH TERMINAL this lead is. The certified gate exempts two primitives of one
+                // conductor whose turn ordinals differ by at most one, UNLESS they belong to
+                // different terminals -- a conductor's entrance and exit are not each other's
+                // continuation. Pin leads (roundedLeadChain) and toroid leads were tagged; these,
+                // the concentric fan's own leads, were not, so their `terminal` stayed -1, the
+                // cross-terminal test was false, and on a one-turn winding (every ordinal 0) the
+                // adjacent-ordinal exemption waved the entrance-vs-exit pair through unmeasured.
+                // That is how 00_debug's coincident leads -- a short -- were certified clean.
+                // The two callers name the lead; any other caller must say which it is.
+                const int leadTerminal = what == "entrance lead" ? 0 : what == "exit lead" ? 1 : -2;
+                if (leadTerminal < 0)
+                    throw std::logic_error("pushPlaneSegs: lead '" + what +
+                                           "' is neither the entrance nor the exit lead, so the "
+                                           "collision gate cannot tell which terminal it is");
                 for (size_t i = 0; i + 1 < leadPts.size(); ++i) {
                     if (leadPts[i].Distance(leadPts[i + 1]) < 1e-12) continue;
                     Primitive pr;
@@ -14388,6 +14402,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     pr.label = what + " seg " + std::to_string(i);
                     pr.turnOrdinal = ordinal;
                     pr.isLead = true;
+                    pr.terminal = leadTerminal;
                     path.prims.push_back(std::move(pr));
                 }
             }
