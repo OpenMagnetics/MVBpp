@@ -3955,7 +3955,11 @@ bool rectIsVertical(const RSpace& s, double foilRadial = 0.0) {
 // stub + run = L-route along the window edge). `station` = the connecting turn.
 std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
                                        const PlanePt& station, const std::string& who,
-                                       double foilRadial = 0.0) {
+                                       double foilRadial,
+                                       // The connecting turn's radial in MKF's OWN frame (its
+                                       // coordinates[0]): the reference the drawn stub's x is
+                                       // measured against. NaN = no off-face reading (foils).
+                                       double turnMkfRadial) {
     if (group.empty()) {
         throw std::runtime_error("ConductorBuilder: no drawn terminal lead for " + who +
                                  " in MKF's connection reserved spaces");
@@ -4061,17 +4065,15 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
     // reserved by MKF so the layer it stands in is blocked over its height -- cm37, 2026-09-23):
     // the route is then a radial step at the turn, the climb in that column, the edge run. A
     // stub drawn in the turn's own column keeps the plain L-route.
-    // Read the offset off MKF's OWN rects: the run box starts half a wire inside the turn
-    // (lead.coordinates/dimensions), so its inner edge plus half its height is the turn's MKF
-    // radial, and the stub box's centre minus that is the off-face offset. Comparing the stub
-    // box with `station` instead mixed frames -- the station is this builder's plane radial,
-    // a former's worth away from MKF's (cm37: 5.0025 against 4.3805) -- and put the vertical
-    // one OD INWARD, through the sibling's layer.
-    const double turnMkfX = run->coordinates.at(0) - 0.5 * run->dimensions.at(0) +
-                            0.5 * run->dimensions.at(1);
+    // The offset is the stub box's centre against the TURN'S OWN MKF radial -- both in MKF's
+    // frame. Not against `station` (this builder's plane radial, a former's worth away from
+    // MKF's: cm37 5.0025 vs 4.3805), and not inferred from the run box either: its height is
+    // the SLEEVE's on a sleeved lead (22_margin_tape_forward: 0.7435 mm run for a 0.3435 mm
+    // wire), and reading the wire width off it put every lead vertical 0.2 mm INSIDE the
+    // column -- the one-body fuse then kept 1 % of the Primary's copper (ABT #1377).
     for (const RSpace* s : group) {
-        if (!rectIsVertical(*s, foilRadial)) continue;
-        const double offFace = s->coordinates.at(0) - turnMkfX;
+        if (!rectIsVertical(*s, foilRadial) || std::isnan(turnMkfRadial)) continue;
+        const double offFace = s->coordinates.at(0) - turnMkfRadial;
         if (std::abs(offFace) > 1e-7) {
             const double stubX = station.x + offFace;
             return {{station.x, station.y}, {stubX, station.y}, {stubX, edgeY}, {borderX, edgeY}};
@@ -8554,8 +8556,30 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (ct.turns.empty()) continue;
                 byLastRow.push_back({station(ct.turns.back()).y, cv});
             }
-            std::sort(byLastRow.begin(), byLastRow.end(),
-                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            // ABT #1377: "highest row -> smallest x" is right only when the arriving straights
+            // DESCEND toward the crossing. A winding that climbs to its exit arrives LOWER at an
+            // upstream lane than at its station, so a lower sibling's lead placed upstream meets
+            // that straight where it has not finished climbing: 22_margin_tape_forward's
+            // Secondary (0.5 mm, 2p, rows 0.5466 apart) put p0's exit step at +0.534 under
+            // p1's last straight, 13.4 um below p1's row -- 198.7 nm inside the enamel. The
+            // ordering follows the direction the last turns actually move: descending exits
+            // keep the highest row at the crossing; ascending exits put the LOWEST row there,
+            // so every sibling straight that still runs past a lane is on the side it moves
+            // away from. Per face, from the conductors' own last wraps.
+            std::map<int, double> exitClimbOfFace;
+            for (size_t cv = 0; cv < conductors.size(); ++cv) {
+                const auto& ct = conductors[cv];
+                if (ct.turns.size() < 2) continue;
+                exitClimbOfFace[windingFace.at(ct.winding)] +=
+                    station(ct.turns.back()).y - station(ct.turns[ct.turns.size() - 2]).y;
+            }
+            std::sort(byLastRow.begin(), byLastRow.end(), [&](const auto& a, const auto& b) {
+                const int fa = windingFace.at(conductors[a.second].winding);
+                const int fb = windingFace.at(conductors[b.second].winding);
+                if (fa != fb) return fa < fb;
+                const bool ascending = exitClimbOfFace.count(fa) && exitClimbOfFace.at(fa) > 0.0;
+                return ascending ? a.first < b.first : a.first > b.first;
+            });
             // MVB_NO_EXIT_LANES bisects the whole exit-lane mechanism: with no lanes allocated,
             // stopX falls back to NaN and the lead's xShift to 0, i.e. exactly the old behaviour.
             const bool noExitLanes = std::getenv("MVB_NO_EXIT_LANES") != nullptr;
@@ -9033,9 +9057,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         std::fprintf(stderr, " (%.4f,%.4f)", pw.x * 1e3, pw.y * 1e3);
                     std::fprintf(stderr, "\n");
                 };
-                dump("IN", egrp, terminalWaypoints(egrp, pf, whoV + " entrance", foilRadialV));
+                dump("IN", egrp, terminalWaypoints(egrp, pf, whoV + " entrance", foilRadialV,
+                                                   ct.turns.front()->get_coordinates()[0]));
                 if (!xgrp.empty())
-                    dump("OUT", xgrp, terminalWaypoints(xgrp, pl, whoV + " exit", foilRadialV));
+                    dump("OUT", xgrp, terminalWaypoints(xgrp, pl, whoV + " exit", foilRadialV,
+                                                        ct.turns[nEmitP - 1]->get_coordinates()[0]));
             }
             // The attach advances mirror the emission's gates: helical first/last wrap only
             // (a radius-step transition — link or steep landing — attaches AT its station).
@@ -9054,10 +9080,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // 25.9 mm tall "lead" packed one coated OD per lane is what put six of eight exits
             // a sheet-height outside the window (ABT #1000).
             if (foilRadialV <= 0.0) {
-            routeVert(terminalWaypoints(egrp, pf, whoV + " entrance", foilRadialV), true, pf, advIn, 0);
+            routeVert(terminalWaypoints(egrp, pf, whoV + " entrance", foilRadialV,
+                                        ct.turns.front()->get_coordinates()[0]),
+                      true, pf, advIn, 0);
             if (!xgrp.empty())
-                routeVert(terminalWaypoints(xgrp, pl, whoV + " exit", foilRadialV), false, pl, advOut,
-                          nEmitP - 1);
+                routeVert(terminalWaypoints(xgrp, pl, whoV + " exit", foilRadialV,
+                                            ct.turns[nEmitP - 1]->get_coordinates()[0]),
+                          false, pl, advOut, nEmitP - 1);
             else   // one drawn lead: synthesized straight-out exit (see splitTerminalGroups)
                 routeVert({{pl.x, pl.y}, {pl.x + 1.0, pl.y}}, false, pl, advOut, nEmitP - 1);
             }
@@ -14780,7 +14809,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // The tangent corner replaces the straight radial attach; it is only
                 // defined for MKF routes WITHOUT a vertical connection. If MKF draws an
                 // L here, the corner-through-a-stub geometry is unspecified -- refuse.
-                if (terminalWaypoints(entranceGroup, first, path.name + " entrance", foilRadial).size() != 2)
+                if (terminalWaypoints(entranceGroup, first, path.name + " entrance", foilRadial,
+                                      turns.front()->get_coordinates()[0]).size() != 2)
                     throw std::runtime_error(
                         "ConductorBuilder: MKF drew a vertical connection on " + path.name +
                         "'s rect-wire entrance lead -- the tangent lead corner through an "
@@ -14854,7 +14884,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     fLead.x = term->x;
                     fLead.y = term->y;
                 }
-                wp = terminalWaypoints(entranceGroup, fLead, path.name + " entrance", foilRadial);
+                wp = terminalWaypoints(entranceGroup, fLead, path.name + " entrance", foilRadial,
+                                       turns.front()->get_coordinates()[0]);
             }
             if (!wp.empty()) {
                 extendBorder(wp);
@@ -15276,7 +15307,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             std::vector<PlanePt> wp;
             if (effectivelyRound && rectWire) {
                 if (!exitGroup.empty() &&
-                    terminalWaypoints(exitGroup, last, path.name + " exit", foilRadial).size() != 2)
+                    terminalWaypoints(exitGroup, last, path.name + " exit", foilRadial,
+                                      turns.back()->get_coordinates()[0]).size() != 2)
                     throw std::runtime_error(
                         "ConductorBuilder: MKF drew a vertical connection on " + path.name +
                         "'s rect-wire exit lead -- the tangent lead corner through an "
@@ -15335,7 +15367,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         lLead.x += rsL.cornerR;
                     }
                 }
-                wp = terminalWaypoints(exitGroup, lLead, path.name + " exit", foilRadial);
+                wp = terminalWaypoints(exitGroup, lLead, path.name + " exit", foilRadial,
+                                       turns.back()->get_coordinates()[0]);
             } else {
                 // MKF drew only one lead (see splitTerminalGroups): synthesized minimal
                 // straight-out exit at the last turn's own row.
