@@ -1,5 +1,4 @@
 {
-    "masVersion": "1.0.0",
     "inputs": {
         "designRequirements": {
             "name": "Boost Inductor 12V to 48V",
@@ -87,5 +86,6 @@
             ]
         }
     },
-    "outputs": []
+    "outputs": [],
+    "schemaVersion": "2.0.0"
 }
