@@ -39,6 +39,8 @@
 #include <gp_Circ.hxx>
 #include <gp_Torus.hxx>
 #include "mvb/WireAssembler.h"
+#include "mvb/PortPlane.h"
+#include "mvb/NamedShape.h"
 #include <gp_Dir.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
@@ -2234,4 +2236,116 @@ TEST_CASE("Assembler: the manifold gate throws on a non-manifold solid (ABT #140
     bb.Add(doubled, shellOf(box));
     CHECK_THROWS_WITH(mvb::requireManifoldCopper(doubled, "doubled shell"),
                       Catch::Matchers::ContainsSubstring("NON-MANIFOLD"));
+}
+
+// ---- ABT #1400: every port clears the copper it does not cut -----------------------------------
+// OMFEM's port rule (include/mvb/PortPlane.h), applied to the FEM product exactly as the mesher
+// meets it: for every "<conductor> terminal <k>" cap, h = the half-diagonal of the cap's bounding
+// box; the port face lies kPortPlaneInsetCaps h inside the cap (into the lead); every conductor
+// solid that does not cross that face must lie at least kPortPlaneGuardCaps h inside it. On the
+// two-switch forward (the corpus draw: --real --fem --segments 12, MVB_FAN_TERMINALS_ON_PLANE=1,
+// MVB_WELD_ALL=1) the Primary entrance Litz tip ended 0.6995 mm past the outermost Secondary
+// foil's copper, against the 0.7545 mm its 0.539 mm cap needs, and OMFEM refused the mesh. Bounding
+// boxes are AddOptimal (the true extent, not the pole hull): this measures the geometry.
+// Foil sheet ends and a foil lead's soldered end are joints, not ports: a cap touching another
+// conductor or solder body is skipped, as OMFEM now does, and so is a foil sheet's end cap (below).
+TEST_CASE("Real winding: every port plane clears the copper it does not cut -- two-switch forward (ABT #1400)",
+          "[realwinding][port]") {
+    ScopedEnv1403 plane("MVB_FAN_TERMINALS_ON_PLANE", "1");
+    ScopedEnv1403 weld("MVB_WELD_ALL", "1");
+    auto magneticJson = loadFixture("realwinding_two_switch_forward_litz_foil.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto built = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                             /*wirePolygonSegments=*/12, /*corePolygonSegments=*/12,
+                                             /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                             /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                             /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    REQUIRE_FALSE(built.empty());
+    auto boxOf = [](const TopoDS_Shape& s) {
+        Bnd_Box b;
+        BRepBndLib::AddOptimal(s, b, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+        std::array<double, 6> r{};
+        b.Get(r[0], r[1], r[2], r[3], r[4], r[5]);
+        return r;
+    };
+    struct Body { std::string name; TopoDS_Shape solid; std::array<double, 6> box; };
+    std::vector<Body> conductors, joints;   // conductor solids; conductor + solder bodies for contact
+    for (const auto& ns : built) {
+        if (ns.shape.IsNull() || ns.name.find(" terminal ") != std::string::npos) continue;
+        const bool solder = ns.role == mvb::Role::Solder;
+        const bool copper = ns.role == mvb::Role::Turn;
+        if (!solder && !copper) continue;
+        for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next()) {
+            if (copper) conductors.push_back({ns.name, e.Current(), boxOf(e.Current())});
+            joints.push_back({ns.name, e.Current(), boxOf(e.Current())});
+        }
+    }
+    REQUIRE(conductors.size() > 2);
+    size_t capsChecked = 0, jointsSkipped = 0, sheetEndsSkipped = 0;
+    double worstMargin = std::numeric_limits<double>::max();
+    for (const auto& ns : built) {
+        const auto at = ns.name.find(" terminal ");
+        if (at == std::string::npos || ns.shape.IsNull()) continue;
+        const std::string owner = ns.name.substr(0, at);
+        const auto cb = boxOf(ns.shape);
+        const double h = mvb::portCapHalfDiagonal(cb[0], cb[1], cb[2], cb[3], cb[4], cb[5]);
+        // A JOINT touches another body (OMFEM: exact contact within 1e-3 of the cap's own size).
+        bool joint = false;
+        for (const auto& b : joints) {
+            if (b.name == owner) continue;
+            BRepExtrema_DistShapeShape d(ns.shape, b.solid);
+            REQUIRE(d.IsDone());
+            if (d.Value() <= 1e-3 * h) { joint = true; break; }
+        }
+        if (joint) { ++jointsSkipped; continue; }
+        // A FOIL SHEET's two ends are joints too -- the current reaches the sheet through its
+        // soldered lead wires, which are conductors of their own ("<sheet> entrance lead" /
+        // "<sheet> exit lead") and carry the ports. Its end caps (a 12 mm half-diagonal on this
+        // design) are not ports; OMFEM classifies them on its side (a separate issue from this
+        // one), so they are skipped here BY NAME and counted.
+        bool sheet = false;
+        for (const auto& b : conductors)
+            if (b.name == owner + " entrance lead" || b.name == owner + " exit lead") { sheet = true; break; }
+        if (sheet) { ++sheetEndsSkipped; continue; }
+        // The cap's plane normal and the side it faces: the axis is the normal's dominant
+        // component; outward is away from its own conductor's bulk.
+        TopExp_Explorer fx(ns.shape, TopAbs_FACE);
+        REQUIRE(fx.More());
+        BRepAdaptor_Surface sf(TopoDS::Face(fx.Current()));
+        REQUIRE(sf.GetType() == GeomAbs_Plane);
+        const gp_Dir n = sf.Plane().Axis().Direction();
+        const double an[3] = {std::abs(n.X()), std::abs(n.Y()), std::abs(n.Z())};
+        const int axis = (an[0] >= an[1] && an[0] >= an[2]) ? 0 : (an[1] >= an[2] ? 1 : 2);
+        INFO("cap '" << ns.name << "' normal (" << n.X() << ", " << n.Y() << ", " << n.Z() << ")");
+        REQUIRE(an[axis] > 0.99);   // the 0.5 inset is the axis-aligned cap's
+        const double capC = 0.5 * (cb[axis] + cb[axis + 3]);
+        double ownLo = std::numeric_limits<double>::max(), ownHi = std::numeric_limits<double>::lowest();
+        for (const auto& b : conductors)
+            if (b.name == owner) { ownLo = std::min(ownLo, b.box[axis]); ownHi = std::max(ownHi, b.box[axis + 3]); }
+        REQUIRE(ownLo < ownHi);
+        const double s = (capC - ownLo) < (ownHi - capC) ? -1.0 : 1.0;   // outward sign on the axis
+        const double tip = s * capC;
+        const double portPlane = tip - mvb::kPortPlaneInsetCaps * h;
+        ++capsChecked;
+        for (const auto& b : conductors) {
+            double lo = s * b.box[axis], hi = s * b.box[axis + 3];
+            if (lo > hi) std::swap(lo, hi);
+            if (lo <= portPlane && hi >= portPlane) continue;   // crosses: the port face slices it
+            const double margin = (tip - hi) - mvb::portPlaneClearance(h);
+            if (margin < worstMargin)
+                std::fprintf(stderr, "[port-test] '%s' vs '%s': tip to copper %.6f mm, needs %.6f mm (h %.6f mm)\n",
+                             ns.name.c_str(), b.name.c_str(), (tip - hi) * 1e3,
+                             mvb::portPlaneClearance(h) * 1e3, h * 1e3);
+            worstMargin = std::min(worstMargin, margin);
+            INFO("'" << b.name << "' copper at " << hi * 1e3 << " mm, tip at " << tip * 1e3
+                     << " mm: tip to copper " << (tip - hi) * 1e3 << " mm against "
+                     << mvb::portPlaneClearance(h) * 1e3 << " mm (cap half-diagonal " << h * 1e3 << " mm)");
+            CHECK(margin >= 0.0);
+        }
+    }
+    std::fprintf(stderr, "[port-test] caps checked %zu, joints skipped %zu, foil sheet ends skipped %zu, "
+                         "worst margin %.6f mm\n", capsChecked, jointsSkipped, sheetEndsSkipped,
+                 worstMargin * 1e3);
+    REQUIRE(capsChecked > 0);
 }

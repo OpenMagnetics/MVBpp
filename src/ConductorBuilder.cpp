@@ -1,5 +1,6 @@
 #include "mvb/ConductorBuilder.h"
 #include "mvb/WireAssembler.h"   // ABT #685: the centreline vocabulary + THE assembler
+#include "mvb/PortPlane.h"      // ABT #1400: the port-plane rule shared with OMFEM
 #include <mvb/TerminalFillet.h>
 #include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
@@ -7696,6 +7697,231 @@ static void dropToroidLeadTipsToPlane(std::vector<ConductorPath>& paths, const g
                       << copperDeepest * 1e3 << " mm, core " << coreDepth * 1e3
                       << " mm, clearance max(2 OD_thin, 1 OD_thick) = "
                       << clearance * 1e3 << " mm, " << drops.size() << " terminal(s) on the plane)\n";
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// THE PORT PLANE (ABT #1400). A terminal's lead tip is where OMFEM puts its port: it pulls the
+// air-box face kPortPlaneInsetCaps cap half-diagonals INTO the lead and refuses any conductor
+// that does not cross that face yet sits within kPortPlaneGuardCaps of it (include/mvb/PortPlane.h
+// has the rule and its derivation). Toroids drop their tips to a copper-relative plane
+// (dropToroidLeadTipsToPlane); concentric leads used to end on a plane set by the round wire's
+// outermost turn plus four of its ODs, which knows nothing of the copper actually drawn there --
+// on the two-switch forward the outermost Secondary foil, ridden 1.64 mm out over a dragback,
+// came within 0.6995 mm of the Primary entrance tip against the 0.7545 mm the rule demands.
+namespace {
+
+struct PortTip {
+    ConductorPath* path;
+    size_t prim;        // the straight lead SEG ending on the port
+    bool atA;           // the tip is seg.a (entrance) / seg.b (exit)
+    gp_XYZ u;           // outward unit direction of the lead at the tip
+    double capHalfDiag; // portCapHalfDiagonal of the cap's bounding box
+};
+
+// How far a conductor's copper reaches from its centreline along the unit direction u. A round
+// section reaches its radius in every direction. A rectangular section on a concentric column
+// (width radial, height along the column axis Y -- TurnBuilder::build_rect_profile), a foil sheet
+// included, reaches 0.5 W |n.u| + 0.5 H |u_y| with n the horizontal radial direction; bounded
+// here by the horizontal part of u, so it never under-reads. A toroid's rectangular section is
+// oriented by the ring, not by Y: its half-diagonal (wireRadius) bounds it.
+double copperReachAlong(const ConductorPath& p, const gp_XYZ& u) {
+    if (p.isRectangular && !p.toroidal) {
+        const double uy = std::min(1.0, std::abs(u.Y()));
+        return 0.5 * p.wireWidth * std::sqrt(1.0 - uy * uy) + 0.5 * p.wireHeight * uy;
+    }
+    return p.wireRadius;
+}
+
+// The copper extent of one centreline piece along u: sampled centreline depths, widened by the
+// section's reach and, for a curved piece, by the sampling sag (the true curve lies within it of
+// the polyline), so the interval always CONTAINS the copper.
+std::pair<double, double> primCopperExtentAlong(const ConductorPath& p, const Primitive& pr,
+                                                const gp_XYZ& u) {
+    double lo = std::numeric_limits<double>::max(), hi = std::numeric_limits<double>::lowest();
+    for (const gp_Pnt& q : samplePrim(pr, p.wireRadius)) {
+        const double d = q.XYZ().Dot(u);
+        lo = std::min(lo, d);
+        hi = std::max(hi, d);
+    }
+    const double pad = copperReachAlong(p, u) +
+                       (pr.kind == Primitive::SEG ? 0.0 : samplingSag(p.wireRadius));
+    return {lo - pad, hi + pad};
+}
+
+// Every port of the finished paths: the free ends that are terminal lead tips. A foil sheet's two
+// ends and a foil lead wire's soldered end are JOINTS, not ports (they sit in the solder film);
+// a pin-routed end ends on its pin, not on a port plane (`pinEnds`: name -> {entrance, exit}).
+std::vector<PortTip> collectPortTips(std::vector<ConductorPath>& paths,
+                                     const std::set<std::pair<std::string, bool>>& pinEnds) {
+    std::vector<PortTip> tips;
+    for (auto& p : paths) {
+        if (p.prims.empty()) continue;
+        if (p.isFoil && p.leadOnlyTerminal < 0) continue;   // the sheet: both ends soldered
+        for (int end = 0; end < 2; ++end) {
+            if (p.leadOnlyTerminal >= 0 && end != p.leadOnlyTerminal) continue;   // the soldered end
+            if (pinEnds.count({p.name, end == 1})) continue;
+            const size_t i = end == 0 ? 0 : p.prims.size() - 1;
+            const Primitive& pr = p.prims[i];
+            if (pr.kind != Primitive::SEG || !pr.isLead)
+                throw std::runtime_error("ConductorBuilder: the " +
+                                         std::string(end == 0 ? "entrance" : "exit") + " of '" +
+                                         p.name + "' ends in '" + pr.label +
+                                         "', not in a straight terminal lead; its port cannot be placed");
+            const gp_Pnt& tip = end == 0 ? pr.seg.a : pr.seg.b;
+            const gp_Pnt& root = end == 0 ? pr.seg.b : pr.seg.a;
+            gp_XYZ u = tip.XYZ() - root.XYZ();
+            const double len = u.Modulus();
+            if (!(len > 1e-12))
+                throw std::runtime_error("ConductorBuilder: terminal lead '" + pr.label + "' of '" +
+                                         p.name + "' has no length");
+            u /= len;
+            // The cap is the lead's cross-section at the tip: a disc of the path's radius (for a
+            // rectangular wire that radius is the half-diagonal, whose disc circumscribes the
+            // rectangle) in the plane normal to u. Its bounding box has half-extent
+            // R sqrt(1 - u_i^2) on axis i -- exact for the disc, and never smaller than the faceted
+            // or rectangular cap drawn inside it.
+            const double R = p.wireRadius;
+            const gp_XYZ e(R * std::sqrt(std::max(0.0, 1.0 - u.X() * u.X())),
+                           R * std::sqrt(std::max(0.0, 1.0 - u.Y() * u.Y())),
+                           R * std::sqrt(std::max(0.0, 1.0 - u.Z() * u.Z())));
+            const gp_XYZ lo = tip.XYZ() - e, hi = tip.XYZ() + e;
+            tips.push_back({&p, i, end == 0, u,
+                            portCapHalfDiagonal(lo.X(), lo.Y(), lo.Z(), hi.X(), hi.Y(), hi.Z())});
+        }
+    }
+    return tips;
+}
+
+double tipDepth(const PortTip& t) {
+    const Primitive& pr = t.path->prims[t.prim];
+    return (t.atA ? pr.seg.a : pr.seg.b).XYZ().Dot(t.u);
+}
+
+// OMFEM applies the 0.5-cap inset only to a cap whose normal is along an axis (|n_axis| > 0.99);
+// an oblique cap gets 1.5, which PortPlane.h's rule does not cover. Concentric leads run along Z
+// and toroid drops along the mounting's down (-Y once exported), so an oblique port is a lead this
+// rule was never derived for: refuse it rather than certify it under the wrong inset.
+void requireAxisAlignedPort(const PortTip& t) {
+    if (t.path->toroidal) return;   // the build frame is not the exported one; drops map to -Y
+    const double m = std::max({std::abs(t.u.X()), std::abs(t.u.Y()), std::abs(t.u.Z())});
+    if (!(m > 0.99)) {
+        std::ostringstream s;
+        s.precision(6);
+        s << "ConductorBuilder: the port of '" << t.path->name << "' at '"
+          << t.path->prims[t.prim].label << "' faces (" << t.u.X() << ", " << t.u.Y() << ", "
+          << t.u.Z() << "), not along an axis; the port-plane rule (PortPlane.h) covers only "
+             "axis-aligned caps";
+        throw std::runtime_error(s.str());
+    }
+}
+
+}  // namespace
+
+// THE CONCENTRIC TIP DROP (ABT #1400), the analogue of dropToroidLeadTipsToPlane. Ports facing the
+// same way share a face; on each face, the deepest copper along that direction -- every piece of
+// every conductor, rides and foil step-outs included, EXCEPT the straight tip segments of that
+// face's own ports (they are what crosses the port plane) and of pin-routed ends (stitchPinLead
+// cuts those back to the window exit) -- sets how far the tips must reach:
+//     tip depth >= deepest + portPlaneClearance(cap half-diagonal)   for every port on the face.
+// A face whose tips already satisfy it is left exactly as drawn. Otherwise EVERY tip on that face
+// is extended, along its own straight segment, to one common depth (the largest any of them
+// needs, never less than the deepest tip already drawn), so the terminals stay flush -- the air
+// box has one face there, and a tip short of it would not reach the boundary.
+static void dropConcentricLeadTipsToPortPlane(std::vector<ConductorPath>& paths,
+                                              const std::set<std::pair<std::string, bool>>& pinEnds) {
+    std::vector<PortTip> tips = collectPortTips(paths, pinEnds);
+    std::vector<PortTip> concentric;
+    for (const auto& t : tips)
+        if (!t.path->toroidal) concentric.push_back(t);
+    if (concentric.empty()) return;
+    // The tip SEGs that do not count as copper to clear: every port's own, and every pin end's.
+    std::set<std::pair<const ConductorPath*, size_t>> excluded;
+    for (const auto& t : tips) excluded.insert({t.path, t.prim});
+    for (const auto& p : paths) {
+        if (p.prims.empty()) continue;
+        if (pinEnds.count({p.name, false})) excluded.insert({&p, 0});
+        if (pinEnds.count({p.name, true})) excluded.insert({&p, p.prims.size() - 1});
+    }
+    std::vector<bool> grouped(concentric.size(), false);
+    for (size_t g = 0; g < concentric.size(); ++g) {
+        if (grouped[g]) continue;
+        std::vector<size_t> face;
+        for (size_t k = g; k < concentric.size(); ++k)
+            if (!grouped[k] && (concentric[k].u - concentric[g].u).Modulus() < 1e-9) {
+                grouped[k] = true;
+                face.push_back(k);
+            }
+        const gp_XYZ u = concentric[g].u;
+        double deepest = std::numeric_limits<double>::lowest();
+        std::string deepestOwner;
+        for (const auto& p : paths)
+            for (size_t i = 0; i < p.prims.size(); ++i) {
+                if (excluded.count({&p, i})) continue;
+                const double hi = primCopperExtentAlong(p, p.prims[i], u).second;
+                if (hi > deepest) { deepest = hi; deepestOwner = p.name + " '" + p.prims[i].label + "'"; }
+            }
+        double need = std::numeric_limits<double>::lowest(), drawn = need;
+        bool short_ = false;
+        for (size_t k : face) {
+            requireAxisAlignedPort(concentric[k]);
+            const double req = deepest + portPlaneClearance(concentric[k].capHalfDiag);
+            need = std::max(need, req);
+            drawn = std::max(drawn, tipDepth(concentric[k]));
+            if (tipDepth(concentric[k]) < req) short_ = true;
+        }
+        if (!short_) continue;
+        const double target = std::max(need, drawn);
+        for (size_t k : face) {
+            PortTip& t = concentric[k];
+            Primitive& pr = t.path->prims[t.prim];
+            gp_Pnt& tip = t.atA ? pr.seg.a : pr.seg.b;
+            const double before = tip.XYZ().Dot(u);
+            tip = gp_Pnt(tip.XYZ() + u * (target - before));
+            if (std::getenv("MVB_DIAG") || std::getenv("MVB_PORT_DIAG"))
+                std::fprintf(stderr,
+                             "[port-drop] %s '%s' tip depth %.6f -> %.6f mm (deepest copper %.6f mm: "
+                             "%s; cap half-diagonal %.6f mm, clearance %.6f mm, %zu port(s) on the face)\n",
+                             t.path->name.c_str(), pr.label.c_str(), before * 1e3, target * 1e3,
+                             deepest * 1e3, deepestOwner.c_str(), t.capHalfDiag * 1e3,
+                             portPlaneClearance(t.capHalfDiag) * 1e3, face.size());
+        }
+    }
+}
+
+// THE PORT-PLANE GATE (ABT #1400): the rule OMFEM will apply, applied here first, and THROWN. For
+// every port: its plane lies kPortPlaneInsetCaps cap half-diagonals inside the tip; every centreline
+// piece of every conductor that does not cross that plane must lie at least kPortPlaneGuardCaps cap
+// half-diagonals inside it. Piece by piece, not conductor by conductor: an unwelded assembly reaches
+// OMFEM as one solid per piece, and a piece that does not cross the plane is checked on its own
+// there too (a welded conductor that crosses is skipped by OMFEM, so this is the stricter reading).
+static void checkPortPlanes(std::vector<ConductorPath>& paths,
+                            const std::set<std::pair<std::string, bool>>& pinEnds) {
+    for (const auto& t : collectPortTips(paths, pinEnds)) {
+        requireAxisAlignedPort(t);
+        const double plane = tipDepth(t) - kPortPlaneInsetCaps * t.capHalfDiag;
+        const double guard = kPortPlaneGuardCaps * t.capHalfDiag;
+        for (const auto& p : paths)
+            for (const auto& pr : p.prims) {
+                const auto [lo, hi] = primCopperExtentAlong(p, pr, t.u);
+                if (lo <= plane && hi >= plane) continue;   // crosses: a lead the port face slices
+                const double gap = plane - hi;              // negative: beyond the port face
+                // kCertEpsilon (1 pm) is the arithmetic's own slack, not a tolerance: the drop
+                // places a tip EXACTLY at the clearance, and recomputing that sum in another order
+                // differs in the last bits (measured: 0.522481201 against 0.522481201 mm).
+                if (gap >= guard - kCertEpsilon) continue;
+                std::ostringstream m;
+                m.precision(9);
+                m << "ConductorBuilder: the port of '" << t.path->name << "' at '"
+                  << t.path->prims[t.prim].label << "' (tip depth " << tipDepth(t) * 1e3
+                  << " mm along (" << t.u.X() << ", " << t.u.Y() << ", " << t.u.Z()
+                  << "), cap half-diagonal " << t.capHalfDiag * 1e3 << " mm) has '" << p.name
+                  << "' piece '" << pr.label << "' " << gap * 1e3
+                  << " mm inside its port plane, against the " << guard * 1e3
+                  << " mm the port needs (tip to copper " << (tipDepth(t) - hi) * 1e3 << " mm of "
+                  << portPlaneClearance(t.capHalfDiag) * 1e3 << " mm; PortPlane.h, ABT #1400)";
+                throw std::runtime_error(m.str());
+            }
     }
 }
 
@@ -16365,6 +16591,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         }
         *opts.toroidTerminalPlaneOut = plane;
     }
+    // ABT #1400: the ports. Pin-routed ends are not ports (they end on their pins).
+    std::set<std::pair<std::string, bool>> pinEnds;
+    for (const auto& [name, leads] : pendingPinLeads)
+        for (const auto& pl : leads) pinEnds.insert({name, pl.exit});
+    dropConcentricLeadTipsToPortPlane(paths, pinEnds);
     // ABT #1172 (WP3): continue the pin-assigned terminal leads to their pins, now that nothing
     // else reads the lead copper to place the winding (see the concentric emitter).
     for (auto& p : paths) {
@@ -16422,6 +16653,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     }
     else {
         const EnamelGateVerdict verdict = checkCollisions(paths);
+        // The port-plane gate (ABT #1400) throws, so a refused port leaves the verdict at NotRun.
+        checkPortPlanes(paths, pinEnds);
         checkWindowContainment(paths, windowBoundsPerPath);
         // Published only once containment has also passed (it throws otherwise).
         if (opts.enamelGateVerdictOut) *opts.enamelGateVerdictOut = verdict;
