@@ -587,14 +587,17 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
     mvb::MagneticBuilder b;
     // useRealWindingGeometry: replace the per-turn closed loops with ONE continuous copper body per
     // (winding, parallel). MKF must (re)wind, so re-enrich through the real-winding autocomplete.
-    // The conductor cross-section stays an exact circle regardless of segments, so wireSeg is moot
-    // (0); polygonSegments still facets the core/bobbin.
+    // Drawing (femReady false): the conductor cross-section stays an exact circle; polygonSegments
+    // facets the core/bobbin only. FEM (femReady true): wire and core facet in LOCKSTEP at
+    // polygonSegments, the tools/mvbpp_step_generator --fem --segments N contract ("core faceting
+    // follows wire faceting, always"): a faceted wire against an exact core wall touches it at every
+    // polygon vertex, which gmsh's fragment then corrupts.
     // femReady: false [default] -> fast per-run compound (drawing); true -> slow one-piece/conformal
     // FEM geometry (single body where a sweep closes, conformal mitre for dense toroids).
     if (useRealWindingGeometry) {
         auto magnetic = mvb::magnetic_autocomplete_safe(j, /*useRealWindingGeometry=*/true);
         return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
-                               /*wireSeg=*/0, polygonSegments, paintCoating,
+                               /*wireSeg=*/femReady ? polygonSegments : 0, polygonSegments, paintCoating,
                                /*emitCoatingShells=*/false, /*includeInsulation=*/false,
                                // The declared core coating, drawn as its own solid. This binding
                                // reaches buildAllNamed directly, so it has to make the same call
