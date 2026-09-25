@@ -172,10 +172,13 @@ inline gp_Pnt evalPrim(const Primitive& pr, double t) {
             // (WireAssembler: f = (1 - cos(pi t))/2), not linearly. The certifier must evaluate
             // the curve the emitter draws; a linear read of a blend is off by up to 0.18 of the
             // ramp (0.29 mm on a foil's 1.6 mm corner ramp, ABT #970, 2026-09-04).
+            // An eased climb (ABT #1403) reads its quadratic height the same way: every profile
+            // comes from the one definition in WireAssembler.h.
             const double az = pr.spiral.az0 + (pr.spiral.az1 - pr.spiral.az0) * t;
-            const double f = pr.spiral.blend ? 0.5 * (1.0 - std::cos(kPi * t)) : t;
-            const double r = pr.spiral.r0 + (pr.spiral.r1 - pr.spiral.r0) * f;
-            const double y = pr.spiral.y0 + (pr.spiral.y1 - pr.spiral.y0) * f;
+            const double r =
+                pr.spiral.r0 + (pr.spiral.r1 - pr.spiral.r0) * spiralRadiusFrac(pr.spiral, t);
+            const double y =
+                pr.spiral.y0 + (pr.spiral.y1 - pr.spiral.y0) * spiralHeightFrac(pr.spiral, t);
             return gp_Pnt(pr.spiral.cx + r * std::cos(az), y, pr.spiral.cz - r * std::sin(az));
         }
         default:
@@ -285,6 +288,15 @@ inline double maxSecondDerivative(const Primitive& pr) {
                 const double radial = std::abs(dr) * (0.5 * kPi * kPi + kPi * S);
                 return std::sqrt(radial * radial + rMax * rMax * S * S * S * S) +
                        dy * 0.5 * kPi * kPi;
+            }
+            if (pr.spiral.levelOut) {
+                // ABT #1403: constant radius (enforced where the piece is made), y'' = -2 dy:
+                // the radial part r S^2 and the axial part 2|dy| are orthogonal.
+                if (dr != 0.0)
+                    throw std::runtime_error("cert::maxSecondDerivative: '" + pr.label +
+                                             "' is an eased climb on a varying radius");
+                const double dy = std::abs(pr.spiral.y1 - pr.spiral.y0);
+                return std::hypot(rMax * S * S, 2.0 * dy);
             }
             return std::sqrt(4.0 * dr * dr * S * S + rMax * rMax * S * S * S * S);
         }
@@ -1277,7 +1289,7 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
     // one-sided fillet is still G1); only if BOTH sides are untrimmable do we give up.
     auto trimmable = [](const Primitive& p) {
         return p.kind == Primitive::SEG || p.kind == Primitive::ARC3 ||
-               (p.kind == Primitive::SPIRAL && !p.spiral.blend);
+               (p.kind == Primitive::SPIRAL && !p.spiral.blend && !p.spiral.levelOut);
     };
     for (size_t i = 0; i + 1 < count; ++i) {
         if (exitDir(*prims[i]).Angle(entryDir(*prims[i + 1])) < 0.05) continue;
@@ -1960,7 +1972,7 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
             return BRepPrimAPI_MakeRevol(face, gp_Ax1(pr.arc.c, revDir), std::abs(pr.arc.sweep))
                 .Shape();
         }
-        if (!round && pr.kind == Primitive::SPIRAL && !pr.spiral.blend) {
+        if (!round && pr.kind == Primitive::SPIRAL && !pr.spiral.blend && !pr.spiral.levelOut) {
             // RISING RECT CORNER (Alf, 18_stacked): the pipe-shell swept the section from a
             // SAMPLED chord tangent, so the solid began its rotation before the straight's
             // real end and its lateral surfaces matched neither neighbour. Loft EXACT
@@ -3399,7 +3411,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
         // NO prune: the conformal assembler runs no booleans, so it cannot make slivers --
         // every solid is a swept primitive, and it throws rather than dropping any.
         return assembleWire(cptrs, path.wireRadius, wirePolygonSegments,
-                            CornerStyle::BisectionMitre, primIndexPerSolid, cutterOnly);
+                            CornerStyle::BisectionMitre, primIndexPerSolid, cutterOnly, path.name);
     }
     // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
     // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
@@ -3802,7 +3814,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
     // cannot build a valid solid for the tight-bore poloidal corner at exact surfaces.
     if (path.toroidal && path.femReady) {
         return assembleWire(ptrs, path.wireRadius, wirePolygonSegments,
-                        CornerStyle::BisectionMitre, primIndexPerSolid, cutterOnly);
+                        CornerStyle::BisectionMitre, primIndexPerSolid, cutterOnly, path.name);
     }
 
     BRep_Builder builder;
@@ -4763,7 +4775,15 @@ std::pair<double, double> tallestBumpColumn(const std::vector<WrapBump>& bumps,
 void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart, double r1,
                        double y1, double azEnd, const std::vector<WrapBump>& bumps,
                        double wireRadius, const std::string& label, size_t ordinal,
-                       bool isConnection) {
+                       bool isConnection, bool levelOut = false) {
+    // ABT #1403: an EASED climb (Spiral::levelOut) is a short piece at the end of a wrap's travel.
+    // It must be emitted as ONE spiral -- the head/level/tail split below would cut its quadratic
+    // profile into pieces that no longer start at the climb's slope -- and it only exists where
+    // the height changes on a constant radius.
+    if (levelOut && (azEnd - azStart > kPi + 1e-9 || std::abs(r1 - r0) >= 1e-12 ||
+                     std::abs(y1 - y0) < 1e-12))
+        throw std::runtime_error("ConductorBuilder: the climb easing of '" + label +
+                                 "' is not a short constant-radius rise; it has no construction");
     auto radiusAt = [&](double az) {
         const double t = (az - azStart) / (azEnd - azStart);
         return r0 + (r1 - r0) * t;
@@ -4791,6 +4811,7 @@ void appendBumpedSweep(ConductorPath& path, double r0, double y0, double azStart
             pr.kind = Primitive::SPIRAL;
             pr.spiral = {0, cz, ra, ya, a0, rb, yb, a1};
             pr.spiral.blend = blend;
+            pr.spiral.levelOut = levelOut;
         }
         pr.label = label + suffix;
         pr.turnOrdinal = ordinal;
@@ -5114,7 +5135,11 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
                      double stubSweepCapEnd = std::numeric_limits<double>::infinity(),
                      // ABT #1366: the azimuth at which the axial travel is COMPLETE -- see
                      // heightAtAz. NaN spreads the climb over the whole sweep, as before.
-                     double climbEndAz = std::numeric_limits<double>::quiet_NaN()) {
+                     double climbEndAz = std::numeric_limits<double>::quiet_NaN(),
+                     // ABT #1403: the bend radius MKF planned for THIS wire (its terminal routes'
+                     // plannedBendRadius, Coil::lead_bend_radius), which the climb-to-level easing
+                     // bends at. NaN: none known -- an easing that is needed then throws.
+                     double wireBendRadius = std::numeric_limits<double>::quiet_NaN()) {
     // U (SERPENTINE) LAYER LINK -- Alf, 2026-08-07, 14_dab; descent form Alf, 2026-08-08 (ABT
     // #608 final form). Layers wound in U (this one bottom to top, the next top to bottom)
     // connect DIFFERENTLY from a dragback, and differently from a cone: the wire leaves the
@@ -5423,7 +5448,61 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
     // then the level run out to the crossing. Same label and ordinal -- one turn, drawn in the
     // two states the wire is actually in.
     const double climbEnd = std::isnan(climbEndAz) ? azTo : climbEndAz;
-    if (climbEnd > azFrom && climbEnd < azTo) {
+    // ABT #1403: THE CLIMB EASES INTO THE LEVEL RUN. Cut at climbEnd, the helix arriving at MKF's
+    // pitch met the level run at a C0 kink of the pitch angle (2.23 deg on the isolated
+    // buck-boost's Primary top wraps). The assembler bridged it (its wedge r tan(theta/2) sat
+    // under the sampling sag), the bridge grew the helix r tan(theta) into the level run, and the
+    // weld of two caps crossing at 2.2 deg left a sliver face and an edge shared by three faces:
+    // a non-manifold, self-intersecting conductor that BRepCheck calls valid.
+    // The wire itself bends from the pitch to level, so the centreline does too: a piece whose
+    // height slope falls LINEARLY from the climb's k to zero (Spiral::levelOut) over
+    // [climbEnd - a, climbEnd + a]. Its height gain is k a -- exactly what the helix climbs over
+    // [climbEnd - a, climbEnd], so it leaves the helix at climbEnd - a and arrives at the station
+    // height at climbEnd + a: both ends ON the #1366 curves, tangent to each, and the climb is at
+    // MKF's pitch everywhere outside the easing. Nowhere does it rise above the station (the flange
+    // margin #1366 protects), and it lies at most k a / 4 below the helix, at climbEnd.
+    // THE BEND IS MKF'S: in the unrolled cylinder the slope falls from k/r to 0 over an arc
+    // 2 a r, a bend of radius 2 a r^2 / k at the level end, where it is tightest. Setting that to
+    // the bend radius MKF planned for this very wire -- its terminal routes' plannedBendRadius,
+    // Coil::lead_bend_radius: the declared buildability AND the wire's own IEC 60317 flexibility
+    // minimum -- gives a = R k / (2 r^2). One wire, one bend radius: the easing never picks a
+    // value of its own. (The buildability floor alone, 1.05 r, left the inner fibre of the bend
+    // about a micrometre long -- a near-horn sweep.)
+    const double climbSlope = (climbEnd > azS) ? (heightAtAz(climbEnd) - s.y) / (climbEnd - azS) : 0.0;
+    const bool easeClimb = climbEnd > azFrom && climbEnd < azTo && std::abs(climbSlope) > 1e-12;
+    if (easeClimb) {
+        if (std::abs(n.x - s.x) >= 1e-12)
+            throw std::runtime_error(
+                "ConductorBuilder: '" + label + "' ends its climb on a varying radius (" +
+                std::to_string(s.x * 1e3) + " -> " + std::to_string(n.x * 1e3) +
+                " mm); the climb-to-level easing has no conical construction");
+        const double rCe = radiusAtAz(climbEnd);
+        if (!(wireBendRadius > 0.0))
+            throw std::runtime_error("ConductorBuilder: '" + label + "' must ease its climb into "
+                                     "level, and MKF planned no bend radius for this wire (its "
+                                     "terminal routes carry no plannedBendRadius)");
+        const double bendR = wireBendRadius;
+        const double a = bendR * std::abs(climbSlope) / (2.0 * rCe * rCe);
+        if (!(climbEnd - a > azFrom) || !(climbEnd + a < azTo)) {
+            std::ostringstream m;
+            m.precision(9);
+            m << "ConductorBuilder: '" << label << "' has no room to ease its climb into level: "
+              << "the easing needs " << a * 180.0 / kPi << " deg either side of the station at "
+              << climbEnd * 180.0 / kPi << " deg, the wrap spans [" << azFrom * 180.0 / kPi << ", "
+              << azTo * 180.0 / kPi << "] deg (bend radius " << bendR * 1e3 << " mm)";
+            throw std::runtime_error(m.str());
+        }
+        const double yE = heightAtAz(climbEnd);
+        appendBumpedSweep(path, radiusAtAz(azFrom), heightAtAz(azFrom), azFrom,
+                          radiusAtAz(climbEnd - a), heightAtAz(climbEnd - a), climbEnd - a, bumps,
+                          wireRadius, label, ordinal, /*isConnection=*/false);
+        appendBumpedSweep(path, radiusAtAz(climbEnd - a), heightAtAz(climbEnd - a), climbEnd - a,
+                          radiusAtAz(climbEnd + a), yE, climbEnd + a, bumps, wireRadius, label,
+                          ordinal, /*isConnection=*/false, /*levelOut=*/true);
+        appendBumpedSweep(path, radiusAtAz(climbEnd + a), yE, climbEnd + a, radiusAtAz(azTo),
+                          heightAtAz(azTo), azTo, bumps, wireRadius, label, ordinal,
+                          /*isConnection=*/false);
+    } else if (climbEnd > azFrom && climbEnd < azTo) {
         appendBumpedSweep(path, radiusAtAz(azFrom), heightAtAz(azFrom), azFrom,
                           radiusAtAz(climbEnd), heightAtAz(climbEnd), climbEnd, bumps,
                           wireRadius, label, ordinal, /*isConnection=*/false);
@@ -7712,6 +7791,27 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // Keyed by the two turn names the transition joins. A transition MKF drew no route for (the
     // toroidal emitter publishes none yet) falls back to the old heuristic, which is why it is
     // still here.
+    // ABT #1403: the ONE bend radius MKF planned for a conductor's wire -- what its terminal routes
+    // carry as plannedBendRadius (Coil::lead_bend_radius). Both ends must agree: a disagreement (a
+    // sleeve rated differently at one end) leaves no single radius for the bare wire, and throws.
+    // NaN when the layout carries no terminal route for the conductor.
+    auto plannedWireBendRadius = [&](const std::string& winding, int64_t parallel) {
+        double radius = std::numeric_limits<double>::quiet_NaN();
+        for (const auto& r : connectionLayout.routes) {
+            if (r.winding != winding || r.parallel != parallel) continue;
+            if (r.kind != OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE &&
+                r.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT)
+                continue;
+            if (!(r.plannedBendRadius > 0.0)) continue;
+            if (!std::isnan(radius) && std::abs(r.plannedBendRadius - radius) > 1e-15)
+                throw std::runtime_error(
+                    "ConductorBuilder: MKF planned two bend radii for " + winding + " parallel " +
+                    std::to_string(parallel) + " (" + std::to_string(radius * 1e3) + " and " +
+                    std::to_string(r.plannedBendRadius * 1e3) + " mm); the wire has no single one");
+            radius = r.plannedBendRadius;
+        }
+        return radius;
+    };
     std::map<std::pair<std::string, std::string>, OpenMagnetics::ConnectionKind> connectionKindOf;
     for (const auto& route : connectionLayout.routes) {
         if (route.fromTurn.empty() || route.toTurn.empty()) continue;   // a terminal
@@ -10183,6 +10283,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             std::vector<Primitive> kept;
             for (Primitive pr : pieces) {
                 if (pr.kind != Primitive::SPIRAL) { kept.push_back(pr); continue; }
+                if (pr.spiral.levelOut)
+                    throw std::runtime_error("ConductorBuilder: cannot trim the eased climb '" +
+                                             pr.label + "' at a terminal corner (linear cut)");
                 const double a0 = pr.spiral.az0, a1 = pr.spiral.az1;
                 const double span = a1 - a0;
                 if (!(span > 1e-15)) { kept.push_back(pr); continue; }
@@ -15399,7 +15502,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                                      : std::numeric_limits<double>::infinity(),
                                 // ABT #1366: where this wrap's climb ends -- from the height it
                                 // really starts at (sWrap), at MKF's own grid advance.
-                                wrapClimbEndAz(i, sWrap.y, endY));
+                                wrapClimbEndAz(i, sWrap.y, endY),
+                                // ABT #1403: the bend MKF planned for this wire.
+                                plannedWireBendRadius(ct.winding, ct.parallel));
             } else if (rectFamily) {
                 {
                     const RectStation rs0 = rectStation(s, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);
@@ -16338,6 +16443,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             pl.isRectangular = p.isRectangular;
             pl.wireWidth = p.wireWidth;
             pl.wireHeight = p.wireHeight;
+            // ABT #1403: every junction as the assembler will judge it.
+            for (size_t j = 1; j < p.prims.size(); ++j) {
+                ConductorBuilder::PathPolyline::Junction jn;
+                jn.fromLabel = p.prims[j - 1].label;
+                jn.toLabel = p.prims[j].label;
+                jn.fromKind = p.prims[j - 1].kind;
+                jn.toKind = p.prims[j].kind;
+                jn.angle = junctionAngle(p.prims[j - 1], p.prims[j], p.wireRadius);
+                jn.verdict = junctionVerdict(jn.angle, jn.fromKind, jn.toKind, p.wireRadius);
+                pl.junctions.push_back(std::move(jn));
+            }
             for (const auto& pr : p.prims) {
                 auto pts = samplePrim(pr, p.wireRadius);
                 if (pts.size() < 2) continue;

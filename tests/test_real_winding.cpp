@@ -16,6 +16,10 @@
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <BRep_Builder.hxx>
+#include <TopoDS_Solid.hxx>
+#include <TopoDS_Shell.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <TopoDS_Vertex.hxx>
@@ -2133,4 +2137,101 @@ TEST_CASE("Real winding: an inter-section return is pitch-true at both ends -- t
         CHECK(std::abs(dxOf(after)) > 1e-3);
         CHECK(std::abs(dyOf(after)) > 1e-5);
     }
+}
+
+// ---- ABT #1403: no kinked bridge, and nothing unsound leaves the assembler ------------------
+namespace {
+struct ScopedEnv1403 {
+    std::string name;
+    ScopedEnv1403(const char* n, const char* v) : name(n) { setenv(n, v, 1); }
+    ~ScopedEnv1403() { unsetenv(name.c_str()); }
+};
+}   // namespace
+
+// The isolated buck-boost's Primary top wraps ended their climb at a 2.23 deg C0 kink (a helix
+// meeting the level run past its station). The assembler judged it "bridged" -- its wedge under
+// the sampling sag -- grew the helix into the level run and welded two caps crossing at 2.2 deg
+// into a non-manifold sliver. Read straight off the centreline, as the assembler will judge it:
+// no junction may be BRIDGED at a nonzero angle. (A bridged junction is only sound when it is
+// tangent; a kink under the sag is still a kink.)
+TEST_CASE("Real winding: no junction is bridged at a nonzero angle -- isolated buck-boost (ABT #1403)",
+          "[realwinding][abt1403]") {
+    ScopedEnv1403 plane("MVB_FAN_TERMINALS_ON_PLANE", "1");
+    auto magneticJson = loadFixture("realwinding_isolated_buckboost_litz_2p.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE_FALSE(paths.empty());
+    size_t junctions = 0, spiralArc = 0, kinkedBridges = 0;
+    for (const auto& path : paths) {
+        for (const auto& j : path.junctions) {
+            ++junctions;
+            const bool sa = (j.fromKind == mvb::Primitive::SPIRAL && j.toKind == mvb::Primitive::ARC3) ||
+                            (j.fromKind == mvb::Primitive::ARC3 && j.toKind == mvb::Primitive::SPIRAL);
+            if (sa) ++spiralArc;
+            if (j.verdict == mvb::JunctionVerdict::Bridge && j.angle > mvb::kTangentJunctionAngle) {
+                ++kinkedBridges;
+                UNSCOPED_INFO(path.name << ": '" << j.fromLabel << "' -> '" << j.toLabel << "' bridged at "
+                                        << j.angle * 180.0 / std::numbers::pi << " deg");
+            }
+        }
+    }
+    // The filter matched: the paths carry junctions, and SPIRAL<->ARC3 ones among them (the
+    // level runs past the stations are arcs).
+    REQUIRE(junctions > 0);
+    REQUIRE(spiralArc > 0);
+    CHECK(kinkedBridges == 0);
+}
+
+// The refusal itself, on the minimal chain that produced the defect: a helix at the measured
+// slope (dy/ds 0.038858) running into a LEVEL arc at the same radius -- a 2.23 deg SPIRAL->ARC3
+// kink whose wedge (8.85 um) sits under the sag (9.11 um) of the 0.455 mm Litz. assembleWire must
+// throw naming the pieces, not bridge and weld it.
+TEST_CASE("Assembler: a kinked SPIRAL->ARC3 bridge is refused, not welded (ABT #1403)",
+          "[realwinding][abt1403]") {
+    ScopedEnv1403 weld("MVB_WELD_ALL", "1");
+    const double rw = 0.455368e-3, r = 8.3866e-3, slope = 0.038858;
+    const double azSpan = std::numbers::pi / 2.0;
+    mvb::Primitive helix;
+    helix.kind = mvb::Primitive::SPIRAL;
+    helix.spiral = {0.0, 0.0, r, 0.0, 0.0, r, slope * r * azSpan, azSpan};
+    helix.label = "test helix";
+    mvb::Primitive level;
+    level.kind = mvb::Primitive::ARC3;
+    const double y1 = helix.spiral.y1;
+    level.arc.c = gp_Pnt(0.0, y1, 0.0);
+    level.arc.axis = gp_XYZ(0.0, 1.0, 0.0);
+    level.arc.v0 = mvb::azPointC(0.0, 0.0, r, y1, azSpan).XYZ() - level.arc.c.XYZ();
+    level.arc.sweep = 0.3;
+    level.label = "test level run";
+    const double ang = mvb::junctionAngle(helix, level, rw);
+    INFO("junction angle " << ang * 180.0 / std::numbers::pi << " deg");
+    REQUIRE(ang > mvb::kTangentJunctionAngle);
+    REQUIRE(mvb::junctionVerdict(ang, helix.kind, level.kind, rw) == mvb::JunctionVerdict::Bridge);
+    const std::vector<const mvb::Primitive*> chain{&helix, &level};
+    REQUIRE_THROWS_WITH(mvb::assembleWire(chain, rw, 12, mvb::CornerStyle::BisectionMitre, nullptr,
+                                          false, "test conductor"),
+                        Catch::Matchers::ContainsSubstring("refusing to bridge and weld"));
+}
+
+// The manifold gate, on shapes whose defect is certain by construction: a solid holding the same
+// closed shell twice uses every edge four times (non-manifold). A single box passes.
+// (Self-intersection is not a draw-time check any more -- see the [stepvalidity] tests.)
+TEST_CASE("Assembler: the manifold gate throws on a non-manifold solid (ABT #1403)",
+          "[realwinding][abt1403]") {
+    auto shellOf = [](const TopoDS_Shape& s) {
+        TopExp_Explorer x(s, TopAbs_SHELL);
+        REQUIRE(x.More());
+        return TopoDS::Shell(x.Current());
+    };
+    const TopoDS_Shape box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 1.0, 1.0, 1.0).Shape();
+    CHECK(mvb::requireManifoldCopper(box, "clean box") == 1);
+
+    BRep_Builder bb;
+    TopoDS_Solid doubled;
+    bb.MakeSolid(doubled);
+    bb.Add(doubled, shellOf(box));
+    bb.Add(doubled, shellOf(box));
+    CHECK_THROWS_WITH(mvb::requireManifoldCopper(doubled, "doubled shell"),
+                      Catch::Matchers::ContainsSubstring("NON-MANIFOLD"));
 }

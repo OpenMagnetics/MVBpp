@@ -4,6 +4,7 @@
 #include "mvb/NamedShape.h"
 #include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
+#include "mvb/WireAssembler.h"
 #include <TopoDS_Shape.hxx>
 #include <gp_Trsf.hxx>
 #include <array>
@@ -249,6 +250,16 @@ public:
         std::vector<bool> primIsLead;
         std::array<double, 3> end0{}, end1{};   // free ends (terminal port centres)
         std::array<double, 3> dir0{}, dir1{};   // OUTWARD end tangents (port normals)
+        // ABT #1403: every junction between consecutive centreline pieces (all of them, including
+        // any a sample-less piece bounds), with the direction change and the verdict assembleWire
+        // applies to it (mvb::junctionVerdict). Kinds are Primitive::Kind values.
+        struct Junction {
+            std::string fromLabel, toLabel;
+            int fromKind = 0, toKind = 0;
+            double angle = 0.0;   // radians
+            JunctionVerdict verdict = JunctionVerdict::Tangent;
+        };
+        std::vector<Junction> junctions;
     };
     // TERMINAL-LEAD COPPER LENGTH (ABT #1215). What MVB++ actually draws beyond the turns, per
     // winding, measured on the SAME finished centreline the conductor solids are swept from (the

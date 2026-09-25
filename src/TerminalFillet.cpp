@@ -314,7 +314,8 @@ std::optional<Biarc> biarc(const gp_Pnt& P1, const gp_Vec& t1, const gp_Pnt& P2,
 // Two SPIRAL pieces that are one and the same helix: same axis, same radial and axial pitch per
 // radian, and `a` ends exactly where `b` starts. Then a fillet may run through their boundary.
 bool sameHelix(const Primitive& a, const Primitive& b) {
-    if (a.kind != Primitive::SPIRAL || b.kind != Primitive::SPIRAL || a.spiral.blend || b.spiral.blend)
+    if (a.kind != Primitive::SPIRAL || b.kind != Primitive::SPIRAL || a.spiral.blend || b.spiral.blend ||
+        a.spiral.levelOut || b.spiral.levelOut)
         return false;
     const Spiral& x = a.spiral;
     const Spiral& y = b.spiral;
@@ -333,7 +334,7 @@ bool sameHelix(const Primitive& a, const Primitive& b) {
 size_t segIdx0(size_t i, bool exitCorner) { return exitCorner ? i + 1 : i; }
 
 bool isStub(const Primitive& p) {
-    return p.kind == Primitive::SPIRAL && !p.spiral.blend &&
+    return p.kind == Primitive::SPIRAL && !p.spiral.blend && !p.spiral.levelOut &&
            p.label.find("(terminal stub)") != std::string::npos;
 }
 
@@ -342,7 +343,8 @@ bool isLayerLink(const Primitive& p) {
 }
 
 bool isWrapSpiral(const Primitive& p) {
-    return p.kind == Primitive::SPIRAL && !p.spiral.blend && !p.isConnection;
+    return p.kind == Primitive::SPIRAL && !p.spiral.blend && !p.spiral.levelOut &&
+           !p.isConnection;
 }
 
 bool isLeadSeg(const Primitive& p) {

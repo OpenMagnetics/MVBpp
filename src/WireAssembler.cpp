@@ -59,6 +59,10 @@
 #include <TColgp_HArray1OfPnt2d.hxx>
 #include <gp_Vec2d.hxx>
 #include <Geom2d_TrimmedCurve.hxx>
+#include <Geom2d_BezierCurve.hxx>
+#include <Geom2dConvert.hxx>
+#include <Geom2dConvert_CompCurveToBSplineCurve.hxx>
+#include <TColgp_Array1OfPnt2d.hxx>
 #include <GeomAPI_PointsToBSpline.hxx>
 #include <GeomAPI_Interpolate.hxx>
 #include <Geom_BSplineCurve.hxx>
@@ -157,16 +161,21 @@ int spiralSampleCount(const Spiral& sp, double wireRadius) {
     double stepAz = std::numeric_limits<double>::max();
     for (int i = 0; i < kStations; ++i) {
         const double t = static_cast<double>(i) / (kStations - 1);
-        const double f = sp.blend ? 0.5 * (1.0 - std::cos(kPi * t)) : t;
-        const double fp = sp.blend ? 0.5 * kPi * std::sin(kPi * t) : 1.0;
-        const double r = sp.r0 + (sp.r1 - sp.r0) * f;
-        const double k = (sp.r1 - sp.r0) * fp / dAz;
-        const double m = (sp.y1 - sp.y0) * fp / dAz;
+        const double r = sp.r0 + (sp.r1 - sp.r0) * spiralRadiusFrac(sp, t);
+        const double k = (sp.r1 - sp.r0) * spiralRadiusFracRate(sp, t) / dAz;
+        const double m = (sp.y1 - sp.y0) * spiralHeightFracRate(sp, t) / dAz;
         const double speed2 = k * k + r * r + m * m;
         if (speed2 < 1e-24) continue;
         const double quad = 2.0 * k * k + r * r;
-        const double kappa =
+        double kappa =
             std::sqrt(m * m * (4.0 * k * k + r * r) + quad * quad) / (speed2 * std::sqrt(speed2));
+        if (sp.levelOut) {
+            // ABT #1403: the eased climb bends its height too (y'' != 0). On its constant radius
+            // (k = 0), |P' x P''|^2 = r^2 (m^2 + y''^2) + r^4 exactly.
+            const double y2 = (sp.y1 - sp.y0) * spiralHeightFracCurvature(sp, t) / (dAz * dAz);
+            kappa = std::sqrt(r * r * (m * m + y2 * y2) + r * r * r * r) /
+                    (speed2 * std::sqrt(speed2));
+        }
         if (kappa < 1e-12) continue;   // locally straight: no sag to bound
         stepAz = std::min(stepAz, std::sqrt(8.0 * maxSag / kappa) / std::sqrt(speed2));
     }
@@ -218,9 +227,9 @@ std::vector<gp_Pnt> samplePrim(const Primitive& p, double wireRadius) {
     pts.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
         double t = static_cast<double>(i) / (n - 1);
-        double f = sp.blend ? 0.5 * (1.0 - std::cos(kPi * t)) : t;
-        pts.push_back(azPointC(sp.cx, sp.cz, sp.r0 + (sp.r1 - sp.r0) * f,
-                               sp.y0 + (sp.y1 - sp.y0) * f, sp.az0 + (sp.az1 - sp.az0) * t));
+        pts.push_back(azPointC(sp.cx, sp.cz, sp.r0 + (sp.r1 - sp.r0) * spiralRadiusFrac(sp, t),
+                               sp.y0 + (sp.y1 - sp.y0) * spiralHeightFrac(sp, t),
+                               sp.az0 + (sp.az1 - sp.az0) * t));
     }
     return pts;
 }
@@ -261,6 +270,18 @@ double primLength(const Primitive& p) {
             // r(t) = r0 + dr t, y(t) = y0 + dy t, az(t) = az0 + daz t, t in [0, 1]:
             // |P'(t)|^2 = dr^2 + dy^2 + (daz r(t))^2.
             const double dr = sp.r1 - sp.r0, dy = sp.y1 - sp.y0, daz = std::abs(sp.az1 - sp.az0);
+            if (sp.levelOut) {
+                // ABT #1403: y' = 2 dy (1 - t), r constant. With u = 1 - t,
+                // |P'| = sqrt(B^2 u^2 + C^2), B = 2|dy|, C = daz r0, and
+                // integral_0^1 = [u/2 sqrt(B^2 u^2 + C^2) + C^2/(2B) asinh(B u / C)]_0^1.
+                if (dr != 0.0)
+                    throw std::runtime_error("primLength: '" + p.label + "' is an eased climb on a "
+                                             "varying radius, which has no construction");
+                const double B = 2.0 * std::abs(dy), C = daz * sp.r0;
+                if (B == 0.0) return C;
+                if (C == 0.0) return 0.5 * B;
+                return 0.5 * std::sqrt(B * B + C * C) + C * C / (2.0 * B) * std::asinh(B / C);
+            }
             const double a = dr * dr + dy * dy;
             if (daz == 0.0) return std::sqrt(a);
             if (dr == 0.0) return std::sqrt(a + daz * daz * sp.r0 * sp.r0);
@@ -547,14 +568,50 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
                 const double dAz = sp.az1 - sp.az0;
                 const double sgn = (dAz >= 0.0) ? 1.0 : -1.0;
                 const double dvdu = (std::abs(dAz) > 1e-12) ? v1 / dAz : 0.0;
-                const double dsduA = std::sqrt(sp.r0 * sp.r0 + dvdu * dvdu);
-                const double dsduB = std::sqrt(sp.r1 * sp.r1 + dvdu * dvdu);
+                // An eased climb leaves at twice the mean slope and arrives level (ABT #1403).
+                const double dvduA = sp.levelOut ? 2.0 * dvdu : dvdu;
+                const double dvduB = sp.levelOut ? 0.0 : dvdu;
+                const double dsduA = std::sqrt(sp.r0 * sp.r0 + dvduA * dvduA);
+                const double dsduB = std::sqrt(sp.r1 * sp.r1 + dvduB * dvduB);
                 const double az0e =
                     sp.az0 - (overA > 0.0 && dsduA > 1e-12 ? sgn * overA / dsduA : 0.0);
                 const double az1e =
                     sp.az1 + (overB > 0.0 && dsduB > 1e-12 ? sgn * overB / dsduB : 0.0);
                 TopoDS_Edge e;
-                if (!sp.blend) {
+                if (sp.levelOut) {
+                    // ABT #1403: the eased climb is a PARABOLA in (U, V) -- U linear, V
+                    // quadratic -- which a degree-2 Bezier represents EXACTLY: poles at the two
+                    // ends and, between them, the intersection of the end tangents (slope
+                    // 2 dy / dAz from the start, level into the end). Mitre/bridge growth continues
+                    // each end along its OWN tangent: the helix it leaves at the start, the level
+                    // run it joins at the end -- the exact neighbouring curves, not an estimate.
+                    if (!constantRadius)
+                        throw std::runtime_error(
+                            "primEdge: '" + pr.label + "' is an eased climb on a varying radius, "
+                            "which has no construction");
+                    const gp_Pnt2d q0(sp.az0, v0), q1(sp.az0 + 0.5 * dAz, v0 + dy),
+                        q2(sp.az1, v0 + dy);
+                    TColgp_Array1OfPnt2d poles(1, 3);
+                    poles.SetValue(1, q0);
+                    poles.SetValue(2, q1);
+                    poles.SetValue(3, q2);
+                    Handle(Geom2d_BezierCurve) bez = new Geom2d_BezierCurve(poles);
+                    Handle(Geom2d_BoundedCurve) pc = bez;
+                    if (az0e != sp.az0 || az1e != sp.az1) {
+                        Geom2dConvert_CompCurveToBSplineCurve cc(
+                            Geom2dConvert::CurveToBSplineCurve(bez));
+                        const double slope0 = std::abs(dAz) > 1e-12 ? 2.0 * dy / dAz : 0.0;
+                        if (az0e != sp.az0 &&
+                            !cc.Add(GCE2d_MakeSegment(gp_Pnt2d(az0e, v0 + (az0e - sp.az0) * slope0),
+                                                      q0).Value(), 1e-12))
+                            return TopoDS_Edge();
+                        if (az1e != sp.az1 &&
+                            !cc.Add(GCE2d_MakeSegment(q2, gp_Pnt2d(az1e, v0 + dy)).Value(), 1e-12))
+                            return TopoDS_Edge();
+                        pc = cc.BSplineCurve();
+                    }
+                    e = BRepBuilderAPI_MakeEdge(pc, surf).Edge();
+                } else if (!sp.blend) {
                     auto vAt = [&](double az) { return v0 + (az - sp.az0) * dvdu; };
                     Handle(Geom2d_TrimmedCurve) seg2d =
                         GCE2d_MakeSegment(gp_Pnt2d(az0e, vAt(az0e)),
@@ -794,10 +851,13 @@ static gp_Dir spiralTangent(const Spiral& sp, bool atStart) {
     const double az = atStart ? sp.az0 : sp.az1;
     double rp = 0.0, yp = 0.0;
     const double r = atStart ? sp.r0 : sp.r1;
-    if (std::fabs(daz) > 1e-12 && !sp.blend) {
-        rp = (sp.r1 - sp.r0) / daz;
-        yp = (sp.y1 - sp.y0) / daz;
-    }   // cosine-blend spirals have purely azimuthal end tangents (r' = y' = 0)
+    if (std::fabs(daz) > 1e-12) {
+        // The profile's own rates at this end (ABT #1403): 1 for a linear spiral, 0 at both
+        // ends of a cosine blend (purely azimuthal end tangents), 2 -> 0 for an eased climb.
+        const double t = atStart ? 0.0 : 1.0;
+        rp = (sp.r1 - sp.r0) * spiralRadiusFracRate(sp, t) / daz;
+        yp = (sp.y1 - sp.y0) * spiralHeightFracRate(sp, t) / daz;
+    }
     // P(az) = (cx + r cos az, y, cz - r sin az)  [azPointC convention]
     gp_XYZ t(rp * std::cos(az) - r * std::sin(az), yp,
              -rp * std::sin(az) - r * std::cos(az));
@@ -2266,9 +2326,67 @@ static bool capDiscAt(const TopoDS_Shape& s, const gp_Pnt& j, const gp_Dir& n, d
     return gp_Pnt(moment / area).Distance(j) <= 1e-6 * r;    // and centred on the junction
 }
 
+double junctionAngle(const Primitive& before, const Primitive& after, double wireRadius) {
+    return primFwdEnd(before, wireRadius).Angle(primFwdStart(after, wireRadius));
+}
+
+JunctionVerdict junctionVerdict(double ang, int ka, int kb, double wireRadius) {
+    // The rule is documented where assembleWire applies it (worthMitring); this is that rule,
+    // verbatim, so the path-level test and the assembler cannot disagree.
+    if (ang <= kTangentJunctionAngle) return JunctionVerdict::Tangent;
+    const bool mitrePipes = std::getenv("MVB_MITRE_PIPES") != nullptr;
+    auto cuttableKind = [mitrePipes](int k) {
+        return mitrePipes || k == Primitive::SEG || k == Primitive::ARC3;
+    };
+    if (cuttableKind(ka) && cuttableKind(kb)) return JunctionVerdict::Mitre;
+    return wireRadius * std::tan(0.5 * ang) > samplingSag(wireRadius) ? JunctionVerdict::Mitre
+                                                                      : JunctionVerdict::Bridge;
+}
+
+size_t requireManifoldCopper(const TopoDS_Shape& shape, const std::string& conductor,
+                             const std::vector<std::string>& pieceLabelPerSolid) {
+    // ABT #1403. BRepCheck_Analyzer passes solids that are not manifold: the isolated buck-boost's
+    // Primary parallels each carried an edge shared by more than two faces (and a 0.000856 mm^2
+    // sliver face) from a weld of two caps crossing at 2.2 deg, and BRepCheck called both solids
+    // valid. MANIFOLD is checked here directly: every non-degenerate edge is used by exactly two
+    // faces. A seam edge of a periodic face is used twice by that one face, which is two uses and
+    // correct, so the count is of face USES (TopExp::MapShapesAndAncestors lists a face once per
+    // occurrence), not of distinct faces. A degenerate edge (a pole) bounds one face by
+    // construction. It is a topology walk -- milliseconds -- run once per finished conductor.
+    // SELF-INTERSECTION (BOPAlgo_ArgumentAnalyzer) is NOT checked here: at draw time it cost more
+    // than the draw itself (8903 s of the two-switch forward's 9071 s), and on the rect-column
+    // corner tubes at 1.02 wire radii it flags surfaces that lie within 35 nm of the exact,
+    // fold-free tube. It is asserted by the [stepvalidity] tests instead.
+    size_t k = 0, checked = 0;
+    for (TopExp_Explorer sx(shape, TopAbs_SOLID); sx.More(); sx.Next(), ++k) {
+        const TopoDS_Shape& solid = sx.Current();
+        TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+        TopExp::MapShapesAndAncestors(solid, TopAbs_EDGE, TopAbs_FACE, edgeFaces);
+        for (int i = 1; i <= edgeFaces.Extent(); ++i) {
+            const TopoDS_Edge& e = TopoDS::Edge(edgeFaces.FindKey(i));
+            if (BRep_Tool::Degenerated(e)) continue;
+            const int uses = edgeFaces(i).Extent();
+            if (uses == 2) continue;
+            BRepAdaptor_Curve c(e);
+            const gp_Pnt mid = c.Value(0.5 * (c.FirstParameter() + c.LastParameter()));
+            std::ostringstream m;
+            m.precision(6);
+            m << "assembleWire: conductor '" << conductor << "' solid " << k
+              << (k < pieceLabelPerSolid.size() ? " (built from piece '" + pieceLabelPerSolid[k] + "')"
+                                                : std::string())
+              << " is NON-MANIFOLD: an edge at (" << mid.X() * 1e3 << ", " << mid.Y() * 1e3 << ", "
+              << mid.Z() * 1e3 << ") mm is used by " << uses << " faces, not 2";
+            throw std::runtime_error(m.str());
+        }
+        ++checked;
+    }
+    return checked;
+}
+
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wireRadius,
                           int segments, CornerStyle corners,
-                          std::vector<size_t>* primIndexPerSolid, bool skipWeld) {
+                          std::vector<size_t>* primIndexPerSolid, bool skipWeld,
+                          const std::string& conductorName) {
     // WHEN IS A JUNCTION A CORNER? ABT #685 (Alf, 2026-08-18). Not "below 3 degrees", which was
     // another chosen number. A junction that is NOT mitred is BRIDGED: the earlier piece grows
     // flush past the joint until it fills the wedge the direction change opens on the outer side
@@ -2283,7 +2401,6 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     // ANY slice thickness -- 143 um or 3.3 um both came back INVALID, with the volume collapsing
     // from 0.411 mm3 to 0.0008 mm3 and a face LOST. The trim was refused, the piece stood proud,
     // and that was the reported "mitre overshoot".
-    const double sag = samplingSag(wireRadius);
     // Growth that fills the wedge at a bridged (un-mitred) joint. Clamped well inside the range
     // where bridging is ever chosen, so tan() cannot run away.
     auto bridgeGrow = [&](double ang) { return wireRadius * std::tan(std::min(ang, 0.5)); };
@@ -2303,28 +2420,25 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     // polygon-profile rebuild, the ShapeFix pass and the flush-tube repair fallback existed, so
     // it is worth re-measuring rather than assuming. Any slice that still fails is caught by the
     // existing validity check and rebuilt as a flush tube -- loudly, never silently.
-    const bool mitrePipes = std::getenv("MVB_MITRE_PIPES") != nullptr;
-    auto cuttableKind = [mitrePipes](int k) {
-        return mitrePipes || k == Primitive::SEG || k == Primitive::ARC3;
-    };
+    // (MVB_MITRE_PIPES=1 is read by junctionVerdict.)
+    // PIPE END (ABT #961) -- the history of the bridged-vs-mitred rule junctionVerdict applies:
+    // The sag rule measured the WRONG quantity. It compared the bridged
+    // stub's lateral poke-out, r*tan(ang)*sin(ang) -- quadratic in the angle -- against the
+    // model's chordal sag, and so called a 3.47 deg riser/wrap joint "beneath resolution"
+    // (0.37 um on 10_emi) and bridged it. But a bridge grows the earlier piece r*tan(ang)
+    // = 6 um straight into its neighbour: a full-section overlap of 0.00019 mm3, forty times
+    // per design, which the weld then has to hide and cannot when the fused body
+    // self-intersects. What a flush, un-mitred joint actually leaves is a WEDGE: each
+    // piece's perpendicular cap misses the shared bisector by r*tan(ang/2) at its rim,
+    // LINEAR in the angle -- 3.0 um at 3.47 deg, above the 2.2 um sag, so the wedge is real
+    // and the joint must be mitred (measured: NO OVERLAPS, watertight, same copper to
+    // 0.004 mm3). At 2.8e-5 deg (00_debug's closing wrap) the same quantity is 2.5e-8 mm,
+    // nothing the model can represent, and mitring THERE is what let a half-space knife
+    // bite a closed revolution's other end (REMOVED 89.2 mm3 against a 27.2 mm3 bound) --
+    // so those joints stay bridged, with a growth of a fraction of a nanometre.
+    // The rule itself lives in junctionVerdict (one definition, readable off a path by tests).
     auto worthMitring = [&](double ang, int ka, int kb) {
-        if (ang <= 1e-9) return false;                       // truly tangent: caps already coincide
-        if (cuttableKind(ka) && cuttableKind(kb)) return true;
-        // PIPE END (ABT #961). The sag rule measured the WRONG quantity. It compared the bridged
-        // stub's lateral poke-out, r*tan(ang)*sin(ang) -- quadratic in the angle -- against the
-        // model's chordal sag, and so called a 3.47 deg riser/wrap joint "beneath resolution"
-        // (0.37 um on 10_emi) and bridged it. But a bridge grows the earlier piece r*tan(ang)
-        // = 6 um straight into its neighbour: a full-section overlap of 0.00019 mm3, forty times
-        // per design, which the weld then has to hide and cannot when the fused body
-        // self-intersects. What a flush, un-mitred joint actually leaves is a WEDGE: each
-        // piece's perpendicular cap misses the shared bisector by r*tan(ang/2) at its rim,
-        // LINEAR in the angle -- 3.0 um at 3.47 deg, above the 2.2 um sag, so the wedge is real
-        // and the joint must be mitred (measured: NO OVERLAPS, watertight, same copper to
-        // 0.004 mm3). At 2.8e-5 deg (00_debug's closing wrap) the same quantity is 2.5e-8 mm,
-        // nothing the model can represent, and mitring THERE is what let a half-space knife
-        // bite a closed revolution's other end (REMOVED 89.2 mm3 against a 27.2 mm3 bound) --
-        // so those joints stay bridged, with a growth of a fraction of a nanometre.
-        return wireRadius * std::tan(0.5 * ang) > sag;
+        return junctionVerdict(ang, ka, kb, wireRadius) == JunctionVerdict::Mitre;
     };
     // |unit + unit| = 2 cos(angle/2): 0.2 admits joints up to ~168 degrees and rejects the folds
     // beyond, whose bisector carries no usable direction (ABT #685).
@@ -2386,6 +2500,30 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     for (size_t i = 0; i < n; ++i) {
         fs[i] = primFwdStart(*ptrs[i], wireRadius);
         fe[i] = primFwdEnd(*ptrs[i], wireRadius);
+    }
+    // ABT #1403: A BRIDGE BETWEEN A SPIRAL AND AN ARC3 AT A NONZERO ANGLE IS REFUSED. Bridging
+    // grows the earlier piece r*tan(theta) past the joint and the weld then has to fuse two
+    // flat caps crossing at theta. On the isolated buck-boost (2.23 deg, wedge 8.85 um under the
+    // 9.11 um sag) that fuse left a sliver face and an edge shared by three faces -- a
+    // non-manifold conductor BRepCheck calls valid. Such a junction is a kink the path must not
+    // have (the round wrap eases its climb into level for exactly this reason), so it is an
+    // error in the centreline, reported here rather than welded.
+    for (size_t i = 1; i < n; ++i) {
+        const int ka = ptrs[i - 1]->kind, kb = ptrs[i]->kind;
+        const bool spiralArc = (ka == Primitive::SPIRAL && kb == Primitive::ARC3) ||
+                               (ka == Primitive::ARC3 && kb == Primitive::SPIRAL);
+        if (!spiralArc) continue;
+        const double ang = fe[i - 1].Angle(fs[i]);
+        if (junctionVerdict(ang, ka, kb, wireRadius) != JunctionVerdict::Bridge) continue;
+        std::ostringstream m;
+        m.precision(9);
+        m << "assembleWire: conductor '" << conductorName << "' has a "
+          << (ka == Primitive::SPIRAL ? "SPIRAL->ARC3" : "ARC3->SPIRAL") << " junction kinked by "
+          << ang * 180.0 / kPi << " deg between '" << ptrs[i - 1]->label << "' and '"
+          << ptrs[i]->label << "' (wedge " << wireRadius * std::tan(0.5 * ang) * 1e6
+          << " um, under the " << samplingSag(wireRadius) * 1e6
+          << " um sag): refusing to bridge and weld it (ABT #1403)";
+        throw std::runtime_error(m.str());
     }
     int nCut = 0, nRepaired = 0, nInvalid = 0;
     std::vector<TopoDS_Shape> built;
@@ -2592,7 +2730,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         auto revolutionHalves = [&](const Primitive& pr) {
             std::vector<Primitive> out;
             const Spiral& sp = pr.spiral;
-            const bool closed = pr.kind == Primitive::SPIRAL && !sp.blend &&
+            const bool closed = pr.kind == Primitive::SPIRAL && !sp.blend && !sp.levelOut &&
                                 std::abs(sp.r1 - sp.r0) < 1e-12 &&
                                 std::abs(sp.az1 - sp.az0) > 0.97 * kTwoPi;
             if (!closed) {
@@ -3405,69 +3543,11 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         std::vector<TopoDS_Shape> accPieces;
         auto flush = [&]() {
             if (acc.IsNull()) return;
-            // SELF-INTERSECTION GATE, ONCE PER ACCUMULATION (2026-08-31).
-            // A fuse can be BRepCheck-VALID yet BOPAlgo-SELF-INTERSECTING -- a check BRepCheck
-            // simply does not perform. Such a solid is marginal: it survives in memory and
-            // tips to invalid when the STEP round-trip reconstructs it, which is exactly how
-            // 06_llc shipped 'Primary parallel 0 [solid 25]' as CAD DEFECTIVE (measured:
-            // valid pre-scale, valid post-scale, invalid on read-back; no writer setting
-            // changes it; ShapeFix and UnifySameDomain only "repair" it by deleting copper,
-            // 3.652 -> 3.633/3.536 mm3, which the volume guards correctly reject).
-            // Checking every fuse is correct but prohibitively slow (the analyzer re-runs on a
-            // growing accumulator: ~6 turns in 25 min). Checking ONCE per flush costs one
-            // analysis per conductor run instead of hundreds, and the remedy needs no repair:
-            // fall back to the pieces we already hold, unwelded -- exactly the shape every
-            // green design's weld-refusal path produces.
-            // ABT #1265 (Alf, 2026-09-19: "I would replace it with a real test, and make sure it
-            // doesn't run with each STEP"). The gate below is a PROXY for the defect that
-            // actually matters: a solid that is BRepCheck-valid in memory and INVALID once the
-            // STEP round-trip reconstructs it (06_llc's 'Primary parallel 0 [solid 25]'). Paying
-            // BOPAlgo_ArgumentAnalyzer on every build to approximate that is the single most
-            // expensive step in the assembler -- 1094 s of 02_flyback's 1632 s at --segments 12,
-            // 590 s of it on one conductor. The real condition is now asserted where it belongs,
-            // once, by tests/test_step_roundtrip.cpp ([stepvalidity]): build, export, RE-READ,
-            // and require every solid valid. Set MVB_WELD_SELFINT_GATE=1 to run the in-build
-            // proxy again (it still refuses a bad weld by emitting the pieces unwelded).
-            static const bool selfIntGate = std::getenv("MVB_WELD_SELFINT_GATE") != nullptr;
-            if (selfIntGate && accPieces.size() > 1) {
-                bool selfInt = false;
-                const auto tSi0 = std::chrono::steady_clock::now();
-                try {
-                    BOPAlgo_ArgumentAnalyzer an;
-                    an.SetShape1(acc);
-                    an.ArgumentTypeMode() = Standard_True;
-                    an.SelfInterMode() = Standard_True;
-                    // ABT #1265: the analyzer is a BOPAlgo_Options, so it takes the same
-                    // parallel flag the booleans use. Measured on 01_etd34 at --segments 4:
-                    // this gate alone was 79 s of a 232 s build (the glued fuse was 22 s).
-                    an.SetRunParallel(Standard_True);
-                    an.Perform();
-                    selfInt = an.HasFaulty();
-                } catch (const Standard_Failure&) {
-                }
-                if (std::getenv("MVB_WELD_DEBUG"))
-                    std::cerr << "[weld-time] self-intersection gate: "
-                              << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now() - tSi0).count() << " ms\n";
-                if (selfInt) {
-                    std::cerr << "[weld-selfint] '"
-                              << (accOwner < (int)ptrs.size() ? ptrs[accOwner]->label
-                                                              : std::string("?"))
-                              << "' welded body self-intersects (BOPAlgo); emitting its "
-                              << accPieces.size() << " pieces unwelded" << std::endl;
-                    for (const auto& pc : accPieces) {
-                        for (TopExp_Explorer px(pc, TopAbs_SOLID); px.More(); px.Next()) {
-                            builder.Add(compound, px.Current());
-                            if (primIndexPerSolid != nullptr)
-                                primIndexPerSolid->push_back(accOwner);
-                        }
-                    }
-                    acc.Nullify();
-                    accVol = 0.0;
-                    accPieces.clear();
-                    return;
-                }
-            }
+            // ABT #1403: the self-intersection check that used to sit here (MVB_WELD_SELFINT_GATE,
+            // opt-in, and on a hit it quietly emitted the pieces unwelded) is gone. Manifoldness
+            // is asserted ONCE per finished conductor at the end of assembleWire
+            // (requireManifoldCopper) and a failure THROWS; self-intersection is asserted by the
+            // [stepvalidity] tests (ABT #1265: BOPAlgo must not run in the draw).
             // FINAL GATE: nothing invalid leaves the assembler. Every producer upstream
             // validates its own result, yet 06_llc still shipped one BRepCheck-invalid solid
             // ('Primary parallel 0 [solid 25]', 3.65 mm3, 80 faces) that was valid when swept
@@ -3500,12 +3580,17 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                         }
                     } catch (const Standard_Failure&) {
                     }
-                    if (!repaired)
-                        std::cerr << "[assembler-invalid] '"
-                                  << (accOwner < (int)ptrs.size() ? ptrs[accOwner]->label
-                                                                  : std::string("?"))
-                                  << "' emits an INVALID solid (" << g0.Mass() * 1e9
-                                  << " mm^3) that ShapeFix could not repair" << std::endl;
+                    if (!repaired) {
+                        // ABT #1403: an invalid solid is not shipped with a line on stderr.
+                        std::ostringstream m;
+                        m.precision(9);
+                        m << "assembleWire: conductor '" << conductorName << "' piece '"
+                          << (accOwner < (int)ptrs.size() ? ptrs[accOwner]->label
+                                                          : std::string("?"))
+                          << "' produced a BRepCheck-INVALID solid (" << g0.Mass() * 1e9
+                          << " mm^3) that ShapeFix could not repair";
+                        throw std::runtime_error(m.str());
+                    }
                 }
                 builder.Add(compound, out);
                 if (primIndexPerSolid != nullptr) primIndexPerSolid->push_back(accOwner);
@@ -3949,6 +4034,17 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     if (diag) {
         std::cerr << "[mitre] prims=" << n << " boolean-cuts=" << nCut << " repaired=" << nRepaired
                   << " dropped-invalid=" << nInvalid << "\n";
+    }
+    // ABT #1403: THE MANIFOLD GATE, once per finished conductor. A cutting tool (skipWeld) is
+    // never shipped copper -- its pieces overlap by design -- and is not checked.
+    if (!skipWeld) {
+        std::vector<std::string> pieceLabels;
+        size_t nSolids = 0;
+        for (TopExp_Explorer se(compound, TopAbs_SOLID); se.More(); se.Next()) ++nSolids;
+        if (primIndexPerSolid != nullptr && primIndexPerSolid->size() == nSolids)
+            for (size_t owner : *primIndexPerSolid)
+                pieceLabels.push_back(owner < n ? ptrs[owner]->label : std::string("?"));
+        requireManifoldCopper(compound, conductorName, pieceLabels);
     }
     if (tolDiag()) {
         size_t k = 0;

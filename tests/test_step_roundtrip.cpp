@@ -9,9 +9,11 @@
 //
 // Paying the proxy on every build cost more than everything else in the assembler put together:
 // 1094 s of 02_flyback's 1632 s at --segments 12, 590 s of it on a single conductor. So the
-// proxy is now opt-in (MVB_WELD_SELFINT_GATE=1) and the real condition is asserted HERE, once,
-// where a regression is supposed to be caught: build the geometry, write the STEP, READ IT
-// BACK, and require every solid to be valid and the copper to survive.
+// per-accumulation proxy was dropped and the real condition is asserted HERE, once, where a
+// regression is supposed to be caught: build the geometry, write the STEP, READ IT BACK, and
+// require every solid to be valid and the copper to survive. (ABT #1403 replaced the opt-in
+// MVB_WELD_SELFINT_GATE with a gate that runs ONCE per finished conductor and throws --
+// requireSoundCopper in WireAssembler.)
 //
 // Reading back is the whole point: importSTEP goes through the same STEPCAFControl reader a
 // consumer uses, so a solid that only "works" while it is still in the builder's memory fails
@@ -28,6 +30,13 @@
 #include "constructive_models/Magnetic.h"
 
 #include <BRep_Tool.hxx>
+#include <sstream>
+#include <BRepAdaptor_Curve.hxx>
+#include <BOPAlgo_ArgumentAnalyzer.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+#include <TopoDS_Edge.hxx>
+#include <cstdlib>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
@@ -54,6 +63,7 @@ json loadDesign(const std::string& name) {
     std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/" + name);
     if (!f.good()) f = std::ifstream(std::string(MAS_COMPLETE_DIR) + "/" + name);
     if (!f.good()) f = std::ifstream("tests/mas_complete_fixtures/" + name);
+    if (!f.good()) f = std::ifstream("tests/realwinding_fixtures/" + name);
     REQUIRE(f.good());
     json j = json::parse(f);
     return j.contains("magnetic") ? j.at("magnetic") : j;
@@ -95,25 +105,88 @@ double brepNoise(const std::vector<mvb::NamedShape>& shapes) {
     return faceTol * area;
 }
 
-// Build the FEM product for one design, write it, read it back, and hold the round trip to the
-// two things that must survive it: every solid valid, and the copper still there.
-void requireStepRoundTripValid(const std::string& design, int segments) {
+std::vector<mvb::NamedShape> buildFemProduct(const std::string& design, int segments) {
     const json magneticJson = loadDesign(design);
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
 
     mvb::MagneticBuilder builder;
-    const auto built = builder.buildAllNamed(enriched,
-                                             /*includeBobbin=*/true,
-                                             /*symmetryPlanes=*/0,
-                                             /*wirePolygonSegments=*/segments,
-                                             /*corePolygonSegments=*/segments,
-                                             /*paintCoating=*/false,          // CD, ABT #1261
-                                             /*emitCoatingShells=*/false,
-                                             /*includeInsulation=*/false,
-                                             /*coreCoatingThickness=*/0.0,
-                                             /*useRealWindingGeometry=*/true,
-                                             /*femReady=*/true);
+    return builder.buildAllNamed(enriched,
+                                 /*includeBobbin=*/true,
+                                 /*symmetryPlanes=*/0,
+                                 /*wirePolygonSegments=*/segments,
+                                 /*corePolygonSegments=*/segments,
+                                 /*paintCoating=*/false,          // CD, ABT #1261
+                                 /*emitCoatingShells=*/false,
+                                 /*includeInsulation=*/false,
+                                 /*coreCoatingThickness=*/0.0,
+                                 /*useRealWindingGeometry=*/true,
+                                 /*femReady=*/true);
+}
+
+// ABT #1403: THE TWO PROPERTIES A MESHABLE SOLID NEEDS AND BRepCheck DOES NOT TEST, asserted on
+// every solid of the product: each non-degenerate edge used by exactly two faces (the draw checks
+// this too, and throws), and no self-intersection by BOPAlgo_ArgumentAnalyzer (too expensive for
+// the draw: 8903 s of the two-switch forward's 9071 s, so it lives here). Returns the number of
+// solids checked, and how many of them are conductor copper.
+// copperOnly: check the conductors' solids only (the fixture sweep below -- its question is the
+// copper; the other parts are covered by the round trip).
+std::pair<size_t, size_t> requireSoundSolids(const std::vector<mvb::NamedShape>& built,
+                                             bool copperOnly = false) {
+    size_t solids = 0, copperSolids = 0;
+    for (const auto& ns : built) {
+        if (ns.shape.IsNull()) continue;
+        if (copperOnly && ns.role != mvb::Role::Turn) continue;
+        size_t k = 0;
+        for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next(), ++k) {
+            const TopoDS_Shape& solid = e.Current();
+            ++solids;
+            if (ns.role == mvb::Role::Turn) ++copperSolids;
+            TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+            TopExp::MapShapesAndAncestors(solid, TopAbs_EDGE, TopAbs_FACE, edgeFaces);
+            int nonManifold = 0;
+            std::ostringstream where;
+            for (int i = 1; i <= edgeFaces.Extent(); ++i) {
+                const TopoDS_Edge& edge = TopoDS::Edge(edgeFaces.FindKey(i));
+                if (BRep_Tool::Degenerated(edge)) continue;
+                if (edgeFaces(i).Extent() == 2) continue;
+                ++nonManifold;
+                BRepAdaptor_Curve c(edge);
+                const gp_Pnt m = c.Value(0.5 * (c.FirstParameter() + c.LastParameter()));
+                where << " edge used by " << edgeFaces(i).Extent() << " faces at (" << m.X() * 1e3
+                      << ", " << m.Y() * 1e3 << ", " << m.Z() * 1e3 << ") mm;";
+            }
+            BOPAlgo_ArgumentAnalyzer an;
+            an.SetShape1(solid);
+            an.ArgumentTypeMode() = Standard_True;
+            an.SelfInterMode() = Standard_True;
+            an.SmallEdgeMode() = Standard_False;
+            an.SetRunParallel(Standard_True);
+            an.Perform();
+            INFO("solid " << k << " of '" << ns.name << "'" << where.str());
+            CHECK(nonManifold == 0);
+            CHECK_FALSE(an.HasFaulty());
+        }
+    }
+    return {solids, copperSolids};
+}
+
+void requireStepRoundTripValid(const std::string& design,
+                               const std::vector<mvb::NamedShape>& built);
+
+// Build the FEM product for one design, write it, read it back, and hold the round trip to the
+// two things that must survive it: every solid valid, and the copper still there.
+void requireStepRoundTripValid(const std::string& design, int segments) {
+    requireStepRoundTripValid(design, buildFemProduct(design, segments));
+}
+
+void requireStepRoundTripValid(const std::string& design,
+                               const std::vector<mvb::NamedShape>& built) {
     REQUIRE_FALSE(built.empty());
+    // The conductors manifold and self-intersection-free (ABT #1403). Copper only: this is new
+    // coverage for the copper, and every part -- bobbin included -- is still held to BRepCheck
+    // validity on both sides of the round trip below. (The bobbins' own open flange edges at the
+    // lead slots are a separate finding.)
+    REQUIRE(requireSoundSolids(built, /*copperOnly=*/true).second > 0);
 
     // In-memory validity FIRST, so a failure says which side of the round trip broke.
     int inMemorySolids = 0;
@@ -198,4 +271,54 @@ TEST_CASE("STEP round trip keeps every solid valid: 06_llc (the regression case)
 // polygonal faces, which is where BOPAlgo's sporadic self-intersections were seen (ABT #1111).
 TEST_CASE("STEP round trip keeps every solid valid: CMC faceted", "[stepvalidity][slow]") {
     requireStepRoundTripValid("common_mode_choke_complete.json", 12);
+}
+
+// ABT #1403: THE ISOLATED BUCK-BOOST, FACETED, AS THE CORPUS DRAWS IT (--real --fem --segments 12,
+// MVB_FAN_TERMINALS_ON_PLANE=1, MVB_WELD_ALL=1). Both Primary parallels ended their top wrap with a
+// helix meeting the level run past its station at a 2.23 deg C0 kink; the assembler bridged it and
+// the weld left, on each, a 0.000856 mm^2 sliver face and an edge shared by THREE faces -- a solid
+// BRepCheck calls valid, OMFEM's stepcheck calls CAD DEFECTIVE, and gmsh cannot mesh. This asserts
+// the two properties directly, on EVERY solid of the product (copper, core, bobbin): each
+// non-degenerate edge used by exactly two faces, and BOPAlgo finds no self-intersection. Then the
+// STEP round trip, like every [stepvalidity] case.
+namespace {
+struct ScopedEnv {
+    std::string name;
+    ScopedEnv(const char* n, const char* v) : name(n) { setenv(n, v, 1); }
+    ~ScopedEnv() { unsetenv(name.c_str()); }
+};
+}   // namespace
+
+TEST_CASE("STEP round trip keeps every solid valid: isolated buck-boost (faceted)",
+          "[stepvalidity][abt1403]") {
+    ScopedEnv plane("MVB_FAN_TERMINALS_ON_PLANE", "1");
+    ScopedEnv weld("MVB_WELD_ALL", "1");
+    const std::string design = "realwinding_isolated_buckboost_litz_2p.json";
+    const auto built = buildFemProduct(design, 12);
+    REQUIRE_FALSE(built.empty());
+    const auto [solids, copperSolids] = requireSoundSolids(built);
+    // The filter matched: the product has its copper (two Primary and three Secondary parallels)
+    // and the other parts.
+    REQUIRE(copperSolids >= 4);
+    REQUIRE(solids > copperSolids);
+    requireStepRoundTripValid(design, built);
+}
+
+// ABT #1403: THE REAL-WINDING FIXTURES whose conductors the rect-column corner question concerns,
+// plus the two-switch forward, built as the FEM product (exact geometry), their COPPER held to
+// requireSoundSolids -- self-intersection is not checked in the draw, so it is checked here.
+// (The bobbins of these five designs are non-manifold/self-intersecting on their own, a separate
+// finding outside this test's question.)
+TEST_CASE("Real-winding fixtures: every solid manifold and self-intersection free",
+          "[stepvalidity][slow][abt1403]") {
+    for (const char* design : {"realwinding_rect_U.json", "realwinding_u_order_margin_e16.json",
+                               "realwinding_interleaved_full_section_e16.json",
+                               "realwinding_e16_litz_2layer_leadcollision.json",
+                               "realwinding_two_switch_forward_litz_foil.json"}) {
+        INFO("design " << design);
+        const auto built = buildFemProduct(design, 0);
+        const auto [solids, copperSolids] = requireSoundSolids(built, /*copperOnly=*/true);
+        CHECK(copperSolids > 0);
+        CHECK(solids == copperSolids);
+    }
 }

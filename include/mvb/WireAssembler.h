@@ -113,7 +113,40 @@ struct Spiral {
     double r0 = 0, y0 = 0, az0 = 0;
     double r1 = 0, y1 = 0, az1 = 0;
     bool blend = false;      // cosine-blend r/y (end tangents purely azimuthal)
+    // ABT #1403: a CLIMB EASING INTO LEVEL. The height's slope falls LINEARLY from the climb's own
+    // slope at the start to zero at the end: y = y0 + (y1 - y0) (2t - t^2), so dy/daz is
+    // 2 (y1 - y0) / (az1 - az0) at t = 0 and 0 at t = 1. The radius stays linear and must be
+    // CONSTANT (the piece lives on the wrap's own cylinder; a conical ease has no construction
+    // here and is refused where it would be made). This is what joins a helix to the level run
+    // past its station tangentially, where a plain junction left a C0 kink of the pitch angle.
+    bool levelOut = false;
 };
+
+// THE SPIRAL'S PROFILE, ONE DEFINITION (ABT #1403). Every consumer that evaluates a SPIRAL reads
+// its radius and height fractions (and their parameter derivatives) from here, so a new profile
+// cannot be drawn one way and certified or sampled another. t is the primitive parameter in
+// [0, 1]; azimuth is always linear in t.
+inline double spiralRadiusFrac(const Spiral& sp, double t) {
+    return sp.blend ? 0.5 * (1.0 - std::cos(std::numbers::pi * t)) : t;
+}
+inline double spiralRadiusFracRate(const Spiral& sp, double t) {
+    return sp.blend ? 0.5 * std::numbers::pi * std::sin(std::numbers::pi * t) : 1.0;
+}
+inline double spiralHeightFrac(const Spiral& sp, double t) {
+    if (sp.blend) return 0.5 * (1.0 - std::cos(std::numbers::pi * t));
+    if (sp.levelOut) return t * (2.0 - t);
+    return t;
+}
+inline double spiralHeightFracRate(const Spiral& sp, double t) {
+    if (sp.blend) return 0.5 * std::numbers::pi * std::sin(std::numbers::pi * t);
+    if (sp.levelOut) return 2.0 * (1.0 - t);
+    return 1.0;
+}
+inline double spiralHeightFracCurvature(const Spiral& sp, double t) {
+    if (sp.blend) return 0.5 * std::numbers::pi * std::numbers::pi * std::cos(std::numbers::pi * t);
+    if (sp.levelOut) return -2.0;
+    return 0.0;
+}
 struct Blend {
     gp_Pnt a, b;
     gp_XYZ u{1, 0, 0};       // unit tangent direction at both ends
@@ -188,10 +221,36 @@ enum class CornerStyle {
 TopoDS_Shape loftRuledPrism(const std::vector<gp_Pnt>& start, const std::vector<gp_Pnt>& end,
                             std::string* why = nullptr);
 
+// `conductorName` names the conductor in the manifold gate's error (ABT #1403): every finished
+// (welded) conductor is checked ONCE, at the end, for every non-degenerate edge being used by
+// exactly two faces, and a failure THROWS naming the conductor and the centreline piece the
+// offending solid was built from. skipWeld (a cutting tool, never shipped copper) is not checked.
+// Self-intersection (BOPAlgo) is not checked in the draw -- the [stepvalidity] tests assert it.
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& centreline, double wireRadius,
                           int polygonSegments, CornerStyle corners = CornerStyle::BisectionMitre,
                           std::vector<size_t>* primIndexPerSolid = nullptr,
-                          bool skipWeld = false);
+                          bool skipWeld = false, const std::string& conductorName = {});
+
+// THE JUNCTION VERDICT (ABT #685 / #1403), the one rule assembleWire applies at every junction
+// between consecutive centreline pieces, exposed so a test can read it off a path without
+// building copper.
+//   Tangent: the pieces meet at an angle <= kTangentJunctionAngle -- their caps coincide;
+//   Mitre:   a real corner, grown and sliced on the angle-bisector plane;
+//   Bridge:  a near-tangent joint left un-mitred and welded (the wedge sits below the model's
+//            resolution on a pipe end). ABT #1403: a Bridge between a SPIRAL and an ARC3 at a
+//            nonzero angle is REFUSED by assembleWire (it throws) -- welding two caps crossing at
+//            that angle is what left the isolated buck-boost a non-manifold sliver.
+enum class JunctionVerdict { Tangent, Mitre, Bridge };
+constexpr double kTangentJunctionAngle = 1e-9;   // radians
+JunctionVerdict junctionVerdict(double angle, int kindBefore, int kindAfter, double wireRadius);
+// The direction change between the end of `before` and the start of `after`, radians.
+double junctionAngle(const Primitive& before, const Primitive& after, double wireRadius);
+
+// The manifold gate on its own (see assembleWire): throws std::runtime_error naming `conductor`
+// (and, where known, the piece label per solid) when any solid of `shape` has a non-degenerate
+// edge not used by exactly two faces. Returns the number of solids checked.
+size_t requireManifoldCopper(const TopoDS_Shape& shape, const std::string& conductor,
+                             const std::vector<std::string>& pieceLabelPerSolid = {});
 
 // Sampling / geometry queries on a centreline piece, shared by the chunk builders and the
 // collision gate. Pure measurement — they build no copper.
