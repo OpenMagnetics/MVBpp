@@ -16626,6 +16626,43 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     };
     std::vector<std::vector<Primitive>> preFilletPrims(paths.size());
     for (size_t pi = 0; pi < paths.size(); ++pi) preFilletPrims[pi] = paths[pi].prims;
+    // Every candidate terminal fillet is PROVEN against the other conductors before it is taken
+    // (TerminalFillet.h, FilletClears): the certified pair prover at the coated envelope, exactly
+    // the gate's rule, so a fillet the gate would refuse is never chosen in the first place.
+    auto provePiecesClear = [&](size_t pi, const std::vector<Primitive>& pieces, std::string* why) {
+        for (const auto& pr : pieces) {
+            const auto a = primEndpoints(pr);
+            for (size_t qi = 0; qi < paths.size(); ++qi) {
+                if (qi == pi) continue;
+                const double envelope = paths[pi].wireRadius + paths[qi].wireRadius;
+                for (const auto& other : paths[qi].prims) {
+                    const auto b = primEndpoints(other);
+                    const double reach = 4.0 * envelope + a.first.Distance(a.second);
+                    if (a.first.Distance(b.first) > reach && a.first.Distance(b.second) > reach &&
+                        a.second.Distance(b.first) > reach && a.second.Distance(b.second) > reach)
+                        continue;
+                    const auto proof = cert::provePairClears(pr, other, envelope - cert::kCoordinateGridHalf);
+                    if (!proof.clears) {
+                        if (why) {
+                            std::ostringstream m;
+                            m.precision(9);
+                            m << paths[pi].name << " '" << pr.label << "' vs " << paths[qi].name << " '"
+                              << other.label << "' (envelope " << envelope << " m)";
+                            *why = m.str();
+                        }
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+    auto filletClearsFor = [&](size_t pi) -> FilletClears {
+        return [&, pi](const std::vector<Primitive>& arcs, std::string* why) {
+            return provePiecesClear(pi, arcs, why);
+        };
+    };
+    std::map<size_t, std::string> unclearedFillet;   // path -> witness of a corner none of whose fillets cleared
     for (size_t pi = 0; pi < paths.size(); ++pi) {
         auto& p = paths[pi];
         if (p.isRectangular || (p.toroidal && !p.femReady)) continue;
@@ -16638,6 +16675,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // certified gate below has the last word (no silent acceptance).
         smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
                          linkVetoFor(pi));
+        // The fan's corner first, for every path: a candidate can only be proven against the
+        // neighbours' FINAL copper, and a neighbour's own fillet trims its stub and wrap end (06_llc:
+        // proven against Secondary p2's still-unfilleted exit wrap, every candidate of p1's exit
+        // corner read as a collision). The repair pass below proves and replaces.
         const size_t filleted = filletTerminalCorners(
             p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
             leadFilletIn.count(pi) ? leadFilletIn.at(pi) : std::numeric_limits<double>::quiet_NaN(),
@@ -16666,62 +16707,43 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             out.erase(std::unique(out.begin(), out.end()), out.end());
             return out;
         };
+        std::string arcsWhy;
         auto arcsClear = [&](size_t pi) {
-            for (size_t idx : touchedByFillet(pi)) {
-                const auto& pr = paths[pi].prims[idx];
-                for (size_t qi = 0; qi < paths.size(); ++qi) {
-                    if (qi == pi) continue;
-                    const double envelope = paths[pi].wireRadius + paths[qi].wireRadius;
-                    for (const auto& other : paths[qi].prims) {
-                        const auto a = primEndpoints(pr);
-                        const auto b = primEndpoints(other);
-                        const double reach = 4.0 * envelope + a.first.Distance(a.second);
-                        if (a.first.Distance(b.first) > reach && a.first.Distance(b.second) > reach &&
-                            a.second.Distance(b.first) > reach && a.second.Distance(b.second) > reach)
-                            continue;
-                        if (!cert::provePairClears(pr, other, envelope - cert::kCoordinateGridHalf)
-                                 .clears)
-                            return false;
-                    }
-                }
-            }
-            return true;
+            std::vector<Primitive> touched;
+            for (size_t idx : touchedByFillet(pi)) touched.push_back(paths[pi].prims[idx]);
+            return provePiecesClear(pi, touched, &arcsWhy);
         };
         for (size_t pi = 0; pi < paths.size(); ++pi) {
             auto& p = paths[pi];
             if (std::getenv("MVB_NO_CORNER_REPAIR")) break;   // bisect switch
             if (p.isRectangular || (p.toroidal && !p.femReady)) continue;
+            // Every drawn corner is proven here, against the other conductors as they finally are;
+            // one that does not clear is re-searched with each candidate proven before it is taken.
             if (arcsClear(pi)) continue;
-            const double had = leadFilletIn.count(pi) ? leadFilletIn.at(pi)
-                                                      : std::numeric_limits<double>::quiet_NaN();
-            bool fixed = false;
-            // The DEFAULT corner is a candidate too -- it is the one the corpus was verified on,
-            // and on complete_pushpull it is the only one that clears (the fan asked for a roll
-            // its own model preferred, and the drawn geometry disagrees).
-            for (int k = -1; k < 24 && !fixed; ++k) {
-                const double roll = k < 0 ? std::numeric_limits<double>::quiet_NaN()
-                                          : kTwoPi * k / 24.0;
-                p.prims = preFilletPrims[pi];
-                smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
-                                 linkVetoFor(pi));
-                filletTerminalCorners(p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius,
-                                      p.name, roll, roll);
-                if (arcsClear(pi)) {
-                    fixed = true;
-                    if (std::getenv("MVB_DIAG"))
-                        std::cerr << "[buildAll] '" << p.name << "' terminal corners re-rolled to "
-                                  << roll * 180.0 / kPi << " deg (the fan's hint did not clear)\n";
-                }
-            }
+            // Re-searched with every candidate proven: each corner keeps the fan's roll when a fit
+            // along it clears, and otherwise walks the default snap and 24 even rolls
+            // (filletTerminalCorners with `clears`), taking the first proven fit.
+            p.prims = preFilletPrims[pi];
+            smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name, linkVetoFor(pi));
+            size_t uncleared = 0;
+            std::string unclearedWhy;
+            filletTerminalCorners(
+                p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius, p.name,
+                leadFilletIn.count(pi) ? leadFilletIn.at(pi) : std::numeric_limits<double>::quiet_NaN(),
+                leadFilletOut.count(pi) ? leadFilletOut.at(pi) : std::numeric_limits<double>::quiet_NaN(),
+                filletClearsFor(pi), &uncleared, &unclearedWhy);
+            if (uncleared > 0) unclearedFillet[pi] = unclearedWhy;
+            // The pieces the fillets trimmed are proven too (the corner is not only its arcs).
+            const bool fixed = uncleared == 0 && arcsClear(pi);
+            if (fixed && std::getenv("MVB_DIAG"))
+                std::cerr << "[buildAll] '" << p.name << "' terminal corners re-searched with proven fillets\n";
             if (!fixed) {
-                // Put back what the fan asked for and let the gate name the pair.
-                p.prims = preFilletPrims[pi];
-                smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
-                                 linkVetoFor(pi));
-                filletTerminalCorners(
-                    p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius, p.name, had,
-                    leadFilletOut.count(pi) ? leadFilletOut.at(pi)
-                                            : std::numeric_limits<double>::quiet_NaN());
+                // No roll and no fillet along the corner clears every other conductor: the corner
+                // cannot be drawn, and a fillet picked blind would only move the refusal to the gate.
+                throw std::runtime_error(
+                    "ConductorBuilder: no terminal fillet of " + p.name + " clears the other conductors "
+                    "at any roll or along its corner. " + (unclearedFillet.count(pi) ? unclearedFillet.at(pi)
+                                                                : "Witness: " + arcsWhy));
             }
         }
     }

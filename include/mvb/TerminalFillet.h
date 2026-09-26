@@ -31,10 +31,21 @@ namespace mvb {
 // computes is not a search: at exact touch a wire may not bend TOWARDS a neighbour at all, so the
 // admissible rolls are a half-circle (those pointing away from it) and the answer is the one
 // nearest the direction the lead actually needs. One construction, every design.
+// FILLETS ARE PROVEN, NOT PICKED BLIND (06_llc, stepvalidity). The first biarc that fits the bend
+// radius is not necessarily one the neighbours leave room for: on 06_llc Secondary p1's entrance
+// the first fit (L = 0.588 mm, 2.79 deg of helix) reached under the layer-1 wrap passing one coated
+// diameter overhead, 3.34 um inside its envelope. With `clears` given, every fitting candidate is
+// proven against the other conductors before it is taken, and the search walks on to the next one
+// when it does not clear. When NO candidate of a corner clears: with `uncleared` given the corner is
+// left as it was and `*uncleared` counts it (the caller re-rolls and, failing that, throws with
+// `*witness`); without it, it throws with the witness here.
+using FilletClears = std::function<bool(const std::vector<Primitive>& arcs, std::string* witness)>;
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
                              const std::string& who,
                              double entranceRoll = std::numeric_limits<double>::quiet_NaN(),
-                             double exitRoll = std::numeric_limits<double>::quiet_NaN());
+                             double exitRoll = std::numeric_limits<double>::quiet_NaN(),
+                             const FilletClears& clears = {}, size_t* uncleared = nullptr,
+                             std::string* witness = nullptr);
 
 // Replaces each straight radial LAYER LINK by a biarc tangent to the two wraps it joins, taking
 // the azimuth it needs from each (ABT #969, Alf's option 2). `clears` decides between the

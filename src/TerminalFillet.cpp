@@ -478,7 +478,8 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
 }
 
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
-                             const std::string& who, double entranceRoll, double exitRoll) {
+                             const std::string& who, double entranceRoll, double exitRoll,
+                             const FilletClears& clears, size_t* uncleared, std::string* witness) {
     size_t done = 0;
     for (size_t i = 0; i + 1 < prims.size(); ++i) {
         const bool exitCorner = filletable(prims[i], prims[i + 1]);
@@ -571,9 +572,24 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                          consumeLeg ? " [short leg consumed, previous leg used]" : "");
         }
         std::optional<Fillet> best, gentle;
+        size_t rejected = 0;
+        std::string lastWitness;
         gp_Pnt P1, P2, gentleP1, gentleP2;
         bool intoNeighbour = false, gentleNb = false;
         double azCut = azJoint, gentleCut = azJoint;
+        // The ROLL of the corner: the caller's, and -- when the fillet must be proven (clears) and
+        // none at that roll clears -- every other: the default snap, then 24 even rolls. Each is
+        // searched along the corner exactly as before; the first proven fit is taken.
+        std::vector<double> rollsToTry{exitCorner ? exitRoll : entranceRoll};
+        if (clears) {
+            if (std::isfinite(rollsToTry.front())) rollsToTry.push_back(std::numeric_limits<double>::quiet_NaN());
+            for (int k = 0; k < 24; ++k) rollsToTry.push_back(2.0 * kPi * k / 24.0);
+        }
+        const double Lstart = L;
+        for (size_t rollIndex = 0; rollIndex < rollsToTry.size() && !best; ++rollIndex) {
+        const double rollNow = rollsToTry[rollIndex];
+        L = Lstart;
+        gentle.reset();
         for (int it = 0; it < 24; ++it, L *= 1.2) {
             const double dAz = L / std::max(atJoint.dsdaz, 1e-18);
             if (L > 0.9 * usable) break;
@@ -612,7 +628,7 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                 // THE ROLL: which way, about the helix's own tangent, the corner escapes. The
                 // caller gives it when it can see the neighbours; NaN keeps the historical snap
                 // to the natural plane nearest the lead.
-                const double roll = exitCorner ? exitRoll : entranceRoll;
+                const double roll = rollNow;
                 {
                     // Snap the bend direction to one of the helix's two natural planes: the
                     // osculating plane (T, N) when the lead lies radially, the rectifying plane
@@ -725,6 +741,23 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                              sp.label.c_str(), it, L * 1e3, dAz * 180.0 / kPi, best ? "biarc" : "NO-BIARC",
                              useNb ? " [into neighbour]" : "", best ? best->minRadius * 1e3 : -1.0, minBend * 1e3);
             }
+            if (best && best->minRadius >= minBend * (1.0 - 1e-9) && clears) {
+                // Proven before it is taken: a fit that does not clear the other conductors is
+                // not a candidate, whatever its radius.
+                std::vector<Primitive> candidate;
+                for (const auto& ao : best->arcs) candidate.push_back(ao.pr);
+                std::string why;
+                if (!clears(candidate, &why)) {
+                    ++rejected;
+                    lastWitness = "candidate it=" + std::to_string(it) + " (L " + std::to_string(L * 1e3) +
+                                  " mm, " + std::to_string(dAz * 180.0 / kPi) + " deg of helix): " + why;
+                    if (std::getenv("MVB_FILLET_DIAG"))
+                        std::fprintf(stderr, "[fillet] '%s' it=%d REJECTED, does not clear: %s\n",
+                                     sp.label.c_str(), it, why.c_str());
+                    best.reset();
+                    continue;
+                }
+            }
             if (best && best->minRadius >= minBend * (1.0 - 1e-9)) {
                 intoNeighbour = useNb;
                 // MVB_FILLET_GENTLE=1: keep growing, and take the LAST fit rather than the
@@ -747,6 +780,19 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
             P1 = gentleP1;
             P2 = gentleP2;
             intoNeighbour = gentleNb;
+        }
+        }
+        if (!best && rejected > 0) {
+            std::ostringstream m;
+            m << "TerminalFillet: every fitting fillet of the terminal corner of " << who << " at '"
+              << sp.label << "' (" << rejected << " candidate(s)) comes closer to another conductor than "
+              << "their coated envelopes allow; last: " << lastWitness;
+            if (uncleared) {
+                ++*uncleared;
+                if (witness) *witness = m.str();
+                continue;   // left as it was: the caller re-rolls or throws with this witness
+            }
+            throw std::runtime_error(m.str());
         }
         if (!best) {
             std::ostringstream m;
