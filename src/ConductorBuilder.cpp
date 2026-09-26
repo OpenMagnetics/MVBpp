@@ -6173,7 +6173,16 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                     double chainEndY = std::numeric_limits<double>::quiet_NaN(),
                     // ABT #1360: a LEVEL inter-section return (see RectReturn::levelBand): one
                     // radial step at the crossing, at the arrival height, and nothing else.
-                    bool levelBand = false) {
+                    bool levelBand = false,
+                    // ABT #1423: MKF's TANGENT DEPARTURE (ConnectionRoute::tangentDeparture). The
+                    // entrance lead arrives straight along the -X face, so the first revolution
+                    // BEGINS at the start of that face's straight: its connection-face half
+                    // straight and its -X-Z corner are not drawn (tangentStart). The exit lead
+                    // leaves straight off the end of the +X face straight, so the last revolution
+                    // ENDS there: its +X-Z corner and connection-face half straight are not drawn
+                    // (tangentEnd). The climb stays pitch-true over the FULL path, exactly as for
+                    // a slot-shortened wrap (startAtX / stopAtX).
+                    bool tangentStart = false, bool tangentEnd = false) {
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
@@ -6259,7 +6268,20 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                 "ConductorBuilder: entrance corner offset " + std::to_string(begX) +
                 " m lies outside the -Z face straight of " + label);
         const double endCut = stadium ? s0.cornerR * stadiumTheta : endX;
-        const double L = rectRisingLength(s0, ride0, rideBack0, endCut, begX);
+        if (tangentStart || tangentEnd) {
+            if (stadium || isReturn)
+                throw std::runtime_error("ConductorBuilder: a tangent departure on " + label +
+                                         " is only defined for a rising wrap on a rectangular column");
+            if ((tangentStart && !std::isnan(startAtX)) || (tangentEnd && !std::isnan(stopAtX)))
+                throw std::runtime_error("ConductorBuilder: " + label + " has both a tangent departure "
+                                         "and a slot on the connection face at the same end");
+            if (ride0 != 0.0)
+                throw std::runtime_error("ConductorBuilder: " + label + " leaves tangentially off a lateral "
+                                         "face that a dragback lane extends; MKF refuses that layout");
+        }
+        const double tangentBeg = tangentStart ? s0.segX + q : 0.0;
+        const double tangentEnd_ = tangentEnd ? q + s0.segX : 0.0;
+        const double L = rectRisingLength(s0, ride0, rideBack0, endCut, begX) - tangentBeg - tangentEnd_;
         if (L < 1e-12) {
             throw std::runtime_error(
                 "ConductorBuilder: rect turn of " + label +
@@ -6284,9 +6306,9 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         // starts begX-share above its station (where the full-path helix truly is at the slot --
         // the lead attaches there, exactly like the round side's entranceAttachY) and ends
         // endCut-share short of s1.y (the descent chain starts there and covers the rest).
-        const double Lplain = L + begX + endCut;
+        const double Lplain = L + begX + endCut + tangentBeg + tangentEnd_;
         const double slopeBand = dy / Lplain;
-        auto yAt = [&](double at) { return s0.y + slopeBand * (begX + at); };
+        auto yAt = [&](double at) { return s0.y + slopeBand * (begX + tangentBeg + at); };
         if (riseEndYOut) {
             *riseEndYOut = yAt(L);
         }
@@ -6305,8 +6327,10 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             path.prims.push_back(std::move(pr));
             arc += q;
         };
-        riseSeg(-begX, -zN0, -s0.segX, -zN0, s0.segX - begX, "face -Z out");
-        riseCorner(-s0.segX, -cZ0, kPi / 2.0, "corner -X-Z");
+        if (!tangentStart) {
+            riseSeg(-begX, -zN0, -s0.segX, -zN0, s0.segX - begX, "face -Z out");
+            riseCorner(-s0.segX, -cZ0, kPi / 2.0, "corner -X-Z");
+        }
         riseSeg(-s0.xPos, -cZ0, -s0.xPos, +cP0, 2.0 * s0.segZ + ride0 + rideBack0,
                 "face -X");
         riseCorner(-s0.segX, +cP0, kPi, "corner -X+Z");
@@ -6327,8 +6351,10 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             arc += s0.cornerR * sweep;
             return;
         }
-        riseCorner(+s0.segX, -cZ0, 0.0, "corner +X-Z");
-        riseSeg(+s0.segX, -zN0, endX, -zN0, s0.segX - endX, "face -Z in");
+        if (!tangentEnd) {
+            riseCorner(+s0.segX, -cZ0, 0.0, "corner +X-Z");
+            riseSeg(+s0.segX, -zN0, endX, -zN0, s0.segX - endX, "face -Z in");
+        }
         return;
     }
     // CROSS-LAYER DRAGBACK (Alf, 2026-08-06): the CHAIN ONLY, no revolution -- exactly like
@@ -15506,6 +15532,66 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 cnr.isLead = true;
                 path.prims.push_back(std::move(cnr));
             };
+        // ABT #1423: MKF's tangent departures for this conductor (ConnectionRoute::tangentDeparture).
+        // A terminal lead whose bend does not fit on the connection face's straight leaves straight
+        // off a lateral face instead; MKF decides it, and says where and along what line.
+        const OpenMagnetics::TangentDeparture* tangentIn = nullptr;
+        const OpenMagnetics::TangentDeparture* tangentOut = nullptr;
+        for (const auto& r : connectionLayout.routes) {
+            if (r.winding != ct.winding || r.parallel != ct.parallel || !r.tangentDeparture) continue;
+            if (r.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE) tangentIn = &*r.tangentDeparture;
+            else if (r.kind == OpenMagnetics::ConnectionKind::TERMINAL_EXIT) tangentOut = &*r.tangentDeparture;
+            else
+                throw std::runtime_error("ConductorBuilder: MKF put a tangent departure on a non-terminal "
+                                         "route of " + path.name);
+        }
+        if ((tangentIn || tangentOut) && (!rectFamily || stadiumColumn || turns.size() < 2))
+            throw std::runtime_error("ConductorBuilder: MKF lays a tangent terminal departure on " + path.name +
+                                     ", which is only drawn for a rectangular column with at least one "
+                                     "revolution");
+        // The straight lead of a tangent departure, from MKF's departure point along MKF's direction
+        // to this conductor's common tip plane (z = -(leadTipRadius + zoff), where every terminal of
+        // the conductor finishes). MKF's charged lead ends at the window border's plane; the tip plane
+        // is at or beyond it, or the drawing would be shorter than the copper MKF charged.
+        auto tangentLeadSeg = [&](const OpenMagnetics::TangentDeparture& d, bool isExit) {
+            if (d.point.size() != 3 || d.direction.size() != 3 || d.end.size() != 3)
+                throw std::runtime_error("ConductorBuilder: MKF's tangent departure of " + path.name +
+                                         " lacks its point, direction or end");
+            if (!(d.direction[2] < 0.0))
+                throw std::runtime_error("ConductorBuilder: MKF's tangent departure of " + path.name +
+                                         " does not leave towards the front (-Z)");
+            const double tipZ = -(leadTipRadius + zoff);
+            const double t = (tipZ - d.point[2]) / d.direction[2];
+            if (t < d.length - 1e-12) {
+                std::ostringstream m;
+                m.precision(9);
+                m << "ConductorBuilder: the tip plane of " << path.name << " (z = " << tipZ
+                  << " m) is nearer than the end of the tangent lead MKF charged (" << d.length << " m)";
+                throw std::runtime_error(m.str());
+            }
+            const gp_Pnt dep(d.point[0], d.point[1], d.point[2]);
+            const gp_Pnt tip(d.point[0] + t * d.direction[0], d.point[1] + t * d.direction[1], tipZ);
+            Primitive run;
+            run.kind = Primitive::SEG;
+            run.seg = isExit ? Seg{dep, tip} : Seg{tip, dep};
+            run.label = path.name + (isExit ? " exit lead seg 0" : " entrance lead seg 0");
+            run.turnOrdinal = isExit ? turns.size() - 1 : 0;
+            run.isLead = true;
+            return run;
+        };
+        // The wrap must begin (end) exactly at MKF's departure point.
+        auto requireAtDeparture = [&](const gp_Pnt& p, const OpenMagnetics::TangentDeparture& d,
+                                      const char* what) {
+            const double off = p.Distance(gp_Pnt(d.point[0], d.point[1], d.point[2]));
+            if (off > 1e-9) {
+                std::ostringstream m;
+                m.precision(9);
+                m << "ConductorBuilder: the " << what << " revolution of " << path.name << " meets its lateral "
+                  << "face's end at (" << p.X() << ", " << p.Y() << ", " << p.Z() << "), " << off
+                  << " m from MKF's tangent departure point";
+                throw std::runtime_error(m.str());
+            }
+        };
         {
             std::vector<PlanePt> wp;
             std::optional<RectStation> entranceCorner;
@@ -15517,7 +15603,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // advance over the shortened remainder -- a steeper helix than its siblings', 145 nm
             // inside the coated envelope at the face crossing on isolated_buck.
             double rectEntranceAttachY = std::numeric_limits<double>::quiet_NaN();
-            if (rectFamily && turns.size() > 1) {
+            if (rectFamily && turns.size() > 1 && !tangentIn) {
                 bool ret0e = false;
                 const RectReturn* nextRet0 = nullptr;
                 for (const auto& r : rectReturns) {
@@ -15549,7 +15635,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     }
                 }
             }
-            if (effectivelyRound && rectWire) {
+            if (tangentIn) {
+                // ABT #1423: the entrance arrives straight along the -X face; no route on the
+                // connection face, no corner. The first wrap begins at MKF's departure point.
+                path.prims.push_back(tangentLeadSeg(*tangentIn, /*isExit=*/false));
+            } else if (effectivelyRound && rectWire) {
                 // The tangent corner replaces the straight radial attach; it is only
                 // defined for MKF routes WITHOUT a vertical connection. If MKF draws an
                 // L here, the corner-through-a-stub geometry is unspecified -- refuse.
@@ -15880,8 +15970,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     // end and collided the U layer link on realwinding_round_2p, measured).
                     const bool hasExitSlot = exitSlotOf.count(ci) && exitSlotOf.at(ci) > 1e-12;
                     const double exitSlot = hasExitSlot ? exitSlotOf.at(ci) : 0.0;
+                    // ABT #1423: a tangent exit ends the last wrap at its +X face's end instead.
+                    const bool tangentEndHere = i + 2 == nEmit && tangentOut != nullptr;
+                    const bool tangentStartHere = i == 0 && tangentIn != nullptr;
+                    if ((tangentEndHere || tangentStartHere) && (ret || (tangentEndHere && nextRet)))
+                        throw std::runtime_error("ConductorBuilder: MKF lays a tangent terminal departure on " +
+                                                 label + ", which is a return, not a revolution");
                     const double stopX = nextRet ? nextRet->xSlot
-                                       : (i + 2 == nEmit && !ret && (rw || hasExitSlot)
+                                       : (i + 2 == nEmit && !ret && !tangentEndHere && (rw || hasExitSlot)
                                               ? (rw ? rs1.cornerR : 0.0) + exitSlot
                                               : kNaN);
                     // ABT #849: a wrap fed by a RETURN whose slot sits on the departure side
@@ -15896,8 +15992,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     if (rectFamily && !std::getenv("MVB_NO_CHAIN_END_SLOT"))
                         for (const auto& r : rectReturns)
                             if (r.ci == ci && i > 0 && r.trans == i - 1) prevRetForStart = &r;
-                    const double startX = (i == 0 && !ret)
+                    const double startX = (i == 0 && !ret && !tangentStartHere)
                                               ? (rw ? rs0.cornerR : 0.0) + leadSlot
+                                              : (i == 0 && tangentStartHere) ? kNaN
                                               : (prevRetForStart && !ret && prevRetForStart->xSlot < -1e-12
                                                      ? -prevRetForStart->xSlot
                                                      : kNaN);
@@ -15960,12 +16057,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         chainEndY = rs1.y + dyN * begXN / (LN + begXN + endCutN);
                     }
                     double riseEndY = std::numeric_limits<double>::quiet_NaN();
+                    const size_t primsBeforeWrap = path.prims.size();
                     appendRectWrap(path, rs0, rs1, label, i, wireRadius,
                                    rectRideFor(rs0.zPos, side),
                                    rectRideFor(rs0.zPos, 1 - side), ret != nullptr,
                                    chainRide, destRide, xSlot, stopX, startX, bandY,
                                    ret ? nullptr : &riseEndY, chainStartY, chainEndY,
-                                   ret ? ret->levelBand : false);
+                                   ret ? ret->levelBand : false, tangentStartHere, tangentEndHere);
+                    if (tangentStartHere)
+                        requireAtDeparture(path.prims.at(primsBeforeWrap).seg.a, *tangentIn, "first");
+                    if (tangentEndHere)
+                        requireAtDeparture(path.prims.back().seg.b, *tangentOut, "last");
                     if (!ret && !std::isnan(riseEndY)) {
                         rectRiseEndY[i] = riseEndY;
                     }
@@ -16035,6 +16137,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             bool lastDelivered = rectTangential.count({ci, nEmit - 2}) > 0;
             for (const auto& r : rectReturns)
                 if (r.ci == ci && r.trans + 2 == nEmit) lastDelivered = true;
+            if (lastDelivered && tangentOut)
+                throw std::runtime_error("ConductorBuilder: MKF lays a tangent exit on " + path.name +
+                                         ", whose last turn is delivered by a return, not a revolution");
             if (lastDelivered) {
                 const RectStation rsL =
                     rectStation(station(turns[nEmit - 1]), rectHalfW, rectHalfD, minBend,
@@ -16061,7 +16166,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // minimal one: from the last station straight out radially at its own level.
         {
             std::vector<PlanePt> wp;
-            if (effectivelyRound && rectWire) {
+            if (tangentOut) {
+                // ABT #1423: the exit leaves straight off the end of the +X face straight, where the
+                // last wrap ended (checked against MKF's departure point in the wrap loop).
+                path.prims.push_back(tangentLeadSeg(*tangentOut, /*isExit=*/true));
+            } else if (effectivelyRound && rectWire) {
                 if (!exitGroup.empty() &&
                     terminalWaypoints(exitGroup, last, path.name + " exit", foilRadial,
                                       turns.back()->get_coordinates()[0]).size() != 2)
