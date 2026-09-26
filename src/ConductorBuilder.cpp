@@ -6089,9 +6089,16 @@ RectStation rectStation(const PlanePt& p, double halfW, double halfD, double min
     // round. The faces do not move (xPos/zPos below are untouched); the arc CENTRES move inward
     // by the corner radius, which is what `inset` has always meant here. formerCornerRadius = 0
     // reproduces the old sharp-column behaviour exactly.
-    double cornerR = clearance + formerCornerRadius;
-    if (cornerR < minBend) {
-        cornerR = minBend;
+    // ABT #1295: MKF's corner (clearance off the face + the former's corner), never raised to a
+    // floor of MVB++'s own; `minBend` is only the sweep guard -- at or below it the tube folds.
+    const double cornerR = clearance + formerCornerRadius;
+    if (!(cornerR > minBend)) {
+        std::ostringstream m;
+        m.precision(9);
+        m << "ConductorBuilder: the corner MKF charged " << who << " (" << cornerR * 1e3
+          << " mm) does not exceed the wire's radial half-extent (" << minBend * 1e3
+          << " mm): the swept corner would fold onto itself";
+        throw std::runtime_error(m.str());
     }
     double inset = cornerR - clearance;
     if (inset > std::min(halfW, halfD)) {
@@ -8173,23 +8180,31 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
     // Column geometry (concentric) / toroidal window data.
     MAS::ColumnShape columnShape = bobbinPd.get_column_shape();
-    // THE FORMER'S CORNER RADIUS (ABT #959), from MKF so there is one definition of it: the MAS
-    // datum when the bobbin carries one, the shape's own radius for round/oblong, and the
-    // injection-moulding rule for a synthesised rectangular bobbin. A moulded former has no sharp
-    // corner, and the wire wound on it bends around that radius -- which is what BobbinBuilder
-    // already assumed when it rounded the bobbin SOLID's outer corners, while this path went on
-    // routing the copper around a mathematically sharp one.
-    // MVB_FORMER_CORNER: OPT-IN until ABT #959's sibling-parallel question is settled. Routing
-    // the copper around the former's real corner removes 02_flyback's 42 self-intersections, but
-    // it also SHORTENS the wrap path (42.28 -> 41.41 mm on 02), which steepens the pitch-true
-    // slope by ~2%. On a design whose sibling parallels were laid EXACTLY tangent that is enough
-    // to push them inside their coated envelopes: 04_forward refuses with 114 pairs, worst 53 nm.
-    // Measured both ways on 04: corner ON -> refused, corner OFF -> builds clean. Default OFF, so
-    // this tree behaves exactly as it did before, and the corner is one env var away for testing.
+    // THE CORNERS ARE MKF'S (ABT #1295; supersedes the MVB_FORMER_CORNER opt-in of ABT #959).
+    // MKF charges every rect-column turn for a corner of radius frame.cornerRadius + standoff
+    // (Coil::get_turn_bend_radius_in_frame -- the radius get_turn_length_in_frame charges and
+    // WireBend judges) and records it per turn (Coil::get_turn_bend_radius). MVB++ used to draw
+    // its own: the former as a sharp corner and the wire at a 1.02 x wire-radius floor, i.e. a
+    // different turn length than the one MKF charged R_dc for. Now the drawn corner radius is
+    // the station's clearance off the column face plus MKF's former corner for that section --
+    // literally MKF's expression -- and every turn is checked against the radius MKF recorded
+    // for it (see mkfCornerCheck below); a turn MKF charged no radius for throws.
+    // A FORMER CORNER MKF FALLS BACK ON: when the bobbin carries no column corner radius, MKF's
+    // Bobbin::get_column_corner_radius substitutes the moulding rule (inside = 0.15 x wall,
+    // outside = inside + wall). That is MKF's decision and is drawn as such.
+    auto mkfFrameOfSection = [&](const std::string& section) -> OpenMagnetics::WoundColumnFrame {
+        if constexpr (std::is_same_v<CoilT, OpenMagnetics::Coil>) {
+            OpenMagnetics::Coil c = coil;
+            return c.get_wound_column_frame_for_section(section);
+        }
+        else {
+            throw std::runtime_error("ConductorBuilder: a rect-column corner needs MKF's wound column "
+                                     "frame, which only an MKF-wound OpenMagnetics::Coil carries");
+        }
+    };
     double formerCornerRadius = 0.0;
-    if (!isToroidal && std::getenv("MVB_FORMER_CORNER") &&
-        (columnShape == MAS::ColumnShape::RECTANGULAR ||
-         columnShape == MAS::ColumnShape::IRREGULAR)) {
+    if (!isToroidal && (columnShape == MAS::ColumnShape::RECTANGULAR ||
+                        columnShape == MAS::ColumnShape::IRREGULAR)) {
         OpenMagnetics::Bobbin bobbinForCorner;
         bobbinForCorner.set_processed_description(bobbinPd);
         formerCornerRadius = bobbinForCorner.get_column_corner_radius();
@@ -8867,7 +8882,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             const bool rectW = w.get_type() == MAS::WireType::RECTANGULAR ||
                                w.get_type() == MAS::WireType::PLANAR;
             const double rw = rectW ? 0.5 * std::hypot(ew, eh) : 0.5 * std::min(ew, eh);
-            const double mb = rw * 1.02;
+            // ABT #1295: rectStation's sweep guard (the corner itself is MKF's).
+            const double mb = (w.get_type() == MAS::WireType::FOIL || rectW) ? 0.5 * ew : rw;
             if (std::getenv("MVB_DIAG")) {
                 for (size_t i = 0; i < ct.turns.size(); ++i) {
                     const RectStation st =
@@ -12592,7 +12608,47 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         auto [copW, copH] = TurnBuilder::wireDimensions(wire, *ct.turns.front(), /*paintCoating=*/false);
         // Same minimum-bend rule as build_concentric_rect_column_turn: a swept corner
         // self-intersects when the arc radius is below the profile's radial half-extent.
-        double minBend = opts.effectiveBend(wireRadius * 1.02);
+        // ABT #1295: the wrap corners are MKF's (see mkfFrameOfSection above). What remains here is
+        // a GUARD, not a radius: a corner whose centreline radius does not exceed the section's
+        // radial half-extent sweeps a self-intersecting tube, and rectStation refuses it.
+        const double minBend = (foilWire || rectWire) ? 0.5 * wireW : wireRadius;
+        // The terminal lead corners (rectLeadCorner) are LEADS, not turns, and keep their own
+        // bend rule for now: 1.02 x the envelope radius, unchanged by ABT #1295 (a lead's MKF
+        // radius, plannedBendRadius, takes the larger of a rectangular wire's flatwise and
+        // edgewise IEC radii because a lead turns in 3-D -- 12.5 mm on the rectangular-wire
+        // fixture, which no lead corner on its face can hold).
+        const double leadCornerBend = opts.effectiveBend(wireRadius * 1.02);
+        // This conductor's own former corner, from MKF's frame for its section (a lateral leg has
+        // its own), shadowing the main column's for everything below.
+        const bool rectColumnHere = !isToroidal && !ct.turns.empty() &&
+                                    (columnShape == MAS::ColumnShape::RECTANGULAR ||
+                                     columnShape == MAS::ColumnShape::IRREGULAR);
+        const double formerCornerRadius = [&]() {
+            if (!rectColumnHere) return 0.0;
+            return mkfFrameOfSection(sectionOfTurn(ct.turns.front())).cornerRadius;
+        }();
+        // Every turn's drawn corner must be the one MKF charged it for, to the bit.
+        if (rectColumnHere) {
+            if constexpr (std::is_same_v<CoilT, OpenMagnetics::Coil>) {
+                for (const MAS::Turn* t : ct.turns) {
+                    const auto charged = coil.get_turn_bend_radius(t->get_name());
+                    if (!charged)
+                        throw std::runtime_error("ConductorBuilder: MKF charged no corner radius for '" +
+                                                 t->get_name() + "' on a rectangular column; it has "
+                                                 "none to be drawn at (ABT #1295)");
+                    const double drawn = rectStation(station(t), rectHalfW, rectHalfD, minBend,
+                                                     formerCornerRadius, ct.winding + " parallel " + std::to_string(ct.parallel)).cornerR;
+                    if (std::abs(drawn - charged.value()) > 1e-12) {
+                        std::ostringstream m;
+                        m.precision(12);
+                        m << "ConductorBuilder: '" << t->get_name() << "' would be drawn with a corner of "
+                          << drawn * 1e3 << " mm, but MKF charged it " << charged.value() * 1e3
+                          << " mm (ABT #1295: the drawn corner is MKF's)";
+                        throw std::runtime_error(m.str());
+                    }
+                }
+            }
+        }
 
         ConductorPath path;
         path.name = ct.winding + " parallel " + std::to_string(ct.parallel);
@@ -15386,7 +15442,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                   const std::string& what) {
             const gp_XYZ Rhat(std::cos(azL), 0.0, -std::sin(azL));
             const gp_XYZ That(-std::sin(azL), 0.0, -std::cos(azL));
-            const double Rc = std::max(minBend, 1.02 * 0.5 * path.wireWidth);
+            const double Rc = std::max(leadCornerBend, 1.02 * 0.5 * path.wireWidth);
             const double q = 0.5 * kPi * Rc;
             const gp_XYZ C2 = azPointC(0, 0, st.x, st.y, azL).XYZ() + Rhat * Rc;
             const double runLen = leadTipRadius - st.x;
