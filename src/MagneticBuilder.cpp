@@ -956,7 +956,9 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                                                          double coreCoatingThickness,
                                                          bool useRealWindingGeometry,
                                                          bool femReady,
-                                                         bool skipGeometryChecks) const {
+                                                         bool skipGeometryChecks,
+                                                         EnamelGateVerdict* enamelGateVerdictOut) const {
+    if (enamelGateVerdictOut) *enamelGateVerdictOut = EnamelGateVerdict::NotRun;
     // MAS 1.x makes Magnetic.core / Magnetic.coil optional, but this builder
     // requires both present. The generated getters return the optional BY VALUE,
     // so bind COPIES (not references — a reference would dangle past the temporary).
@@ -1071,7 +1073,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
     return buildAllNamed(enriched, includeBobbin, symmetryPlanes,
                          wirePolygonSegments, corePolygonSegments, paintCoating, emitCoatingShells,
                          includeInsulation, coreCoatingThickness, useRealWindingGeometry, femReady,
-                         skipGeometryChecks);
+                         skipGeometryChecks, enamelGateVerdictOut);
 }
 
 std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
@@ -1085,7 +1087,9 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                                          double coreCoatingThickness,
                                                          bool useRealWindingGeometry,
                                                          bool femReady,
-                                                         bool skipGeometryChecks) const {
+                                                         bool skipGeometryChecks,
+                                                         EnamelGateVerdict* enamelGateVerdictOut) const {
+    if (enamelGateVerdictOut) *enamelGateVerdictOut = EnamelGateVerdict::NotRun;
     auto all = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
 
     if (coreCoatingThickness > 0.0) {   // conformal core-coating shells (offset core - core)
@@ -1110,6 +1114,9 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     // re-deriving the role from the name at the append below turned all of them into Turn.
     std::vector<Role> turnRoles;
     double toroidTerminalPlane = std::numeric_limits<double>::quiet_NaN();   // ABT #1173
+    // Published to enamelGateVerdictOut only on the successful return below: a later stage that
+    // throws (shunt/base collisions, the bobbin cut, symmetry) leaves the caller's NotRun.
+    EnamelGateVerdict gateVerdict = EnamelGateVerdict::NotRun;
     // ABT #1173: a base this assembly cannot draw is refused before any copper is built.
     if (includeBobbin) {
         if (const auto base = BaseBuilder::baseOf<OpenMagnetics::Bobbin>(magnetic.get_coil().get_bobbin()))
@@ -1121,7 +1128,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                                         paintCoating, emitCoatingShells, femReady,
                                                         skipGeometryChecks,
                                                         /*cutterOnly=*/false,
-                                                        &toroidTerminalPlane)) {
+                                                        &toroidTerminalPlane,
+                                                        &gateVerdict)) {
             turnShapes.push_back(ns.shape);
             turnNames.push_back(ns.name);
             turnPartNames.push_back(std::move(ns.partNames));
@@ -1248,7 +1256,9 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     // geometry: BOPAlgo then reported sporadic self-intersections on faceted revolves (ABT #1111
     // -- 11 of 38 designs at --segments 12; the same solids are clean rescaled to metres).
 
-    return apply_symmetry(std::move(all), symmetryPlanes);
+    auto result = apply_symmetry(std::move(all), symmetryPlanes);
+    if (enamelGateVerdictOut) *enamelGateVerdictOut = gateVerdict;
+    return result;
 }
 
 // ---- ABT #1169 (WP0): accessory-solid hook --------------------------------
@@ -1516,7 +1526,8 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
     bool femReady,
     bool diagnosticSkipCollisionCheck,
     bool cutterOnly,
-    double* toroidTerminalPlaneOut) const {
+    double* toroidTerminalPlaneOut,
+    EnamelGateVerdict* enamelGateVerdictOut) const {
     MAS::CoreBobbinProcessedDescription bobbinPd;
     bool toroidalCore = false;
     ConductorBuilder::Options copts = realWindingConductorOptions(
@@ -1524,14 +1535,25 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
     copts.diagnosticSkipCollisionCheck = diagnosticSkipCollisionCheck;
     copts.cutterOnly = cutterOnly;
     if (toroidTerminalPlaneOut) *toroidTerminalPlaneOut = std::numeric_limits<double>::quiet_NaN();
+    if (enamelGateVerdictOut) *enamelGateVerdictOut = EnamelGateVerdict::NotRun;
+    // Accumulated locally and published only after EVERY build returned, so a later build that
+    // throws cannot leave an earlier build's Certified behind.
+    EnamelGateVerdict combined = EnamelGateVerdict::NotRun;
+    bool firstBuild = true;
 
     std::vector<NamedShape> out;
     auto emitConductors = [&](bool coat, const std::string& suffix) {
         copts.paintCoating = coat;
         double plane = std::numeric_limits<double>::quiet_NaN();
         copts.toroidTerminalPlaneOut = &plane;
+        EnamelGateVerdict verdict = EnamelGateVerdict::NotRun;
+        copts.enamelGateVerdictOut = &verdict;
         auto built = ConductorBuilder::buildAll(magnetic.get_coil(), bobbinPd, toroidalCore, copts);
         copts.toroidTerminalPlaneOut = nullptr;
+        copts.enamelGateVerdictOut = nullptr;
+        // Certified survives only if every build was certified; the first weaker outcome wins.
+        if (firstBuild || combined == EnamelGateVerdict::Certified) combined = verdict;
+        firstBuild = false;
         if (toroidTerminalPlaneOut && !std::isnan(plane) &&
             (std::isnan(*toroidTerminalPlaneOut) || plane < *toroidTerminalPlaneOut))
             *toroidTerminalPlaneOut = plane;
@@ -1556,6 +1578,7 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
     } else {
         emitConductors(paintCoating, "");
     }
+    if (enamelGateVerdictOut) *enamelGateVerdictOut = combined;
     return out;
 }
 

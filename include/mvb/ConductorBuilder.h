@@ -18,6 +18,23 @@ namespace OpenMagnetics { class Coil; }
 
 namespace mvb {
 
+// What the enamel gate (ConductorBuilder's collision check over the finished paths) proved
+// about one build. Only Certified is a proof: every pair of primitives of DISTINCT conductors
+// was shown at or beyond its coated envelope, so no two conductors share volume. A consumer
+// that relies on that proof (OMFEM skips welding a winding's parallels, which cannot overlap
+// when this holds) must treat every other value as "not proven". NotRun is the value a build
+// starts at, so a verdict nobody set -- a throw, an early return, a path that never reached
+// the gate -- is visible as such and never reads as a pass. Open to extension: a new gate
+// outcome gets its own value, never a reuse of Certified.
+enum class EnamelGateVerdict {
+    NotRun,           // the gate did not complete in this build
+    Certified,        // every distinct-conductor pair proven at/beyond its coated envelope
+    SampledOnly,      // clear except BLEND-involved pairs, which are sampled, not proven
+    ReportedAllowed,  // certified intrusions found and let through by MVB_ALLOW_ENAMEL
+    Skipped,          // checks disabled (diagnosticSkipCollisionCheck, MVB_SKIP_COLLISION_CHECK,
+                      // MVB_LEAD_NO_VALIDATE)
+};
+
 // Real-winding geometry: ONE continuous copper body per (winding, parallel), replacing
 // TurnBuilder's independent closed loops when DrawConfig::useRealWindingGeometry is on.
 //
@@ -182,6 +199,10 @@ public:
         // solver. Nothing in the library sets this — only the tools and tests that exist to
         // investigate a specific refusal (see the [realwinding][diagnostic] tests).
         bool diagnosticSkipCollisionCheck = false;
+        // When non-null, buildAll writes the enamel gate's verdict for THIS build here. It is
+        // set to NotRun on entry and only overwritten by the gate's own outcome, so a build
+        // that throws leaves NotRun behind (see EnamelGateVerdict).
+        EnamelGateVerdict* enamelGateVerdictOut = nullptr;
         // ABT #871 — MULTI-COLUMN PLACEMENT. Section name -> the core column that section's
         // turns wrap, for the sections that do NOT wrap the main column. Resolved by the
         // caller (MagneticBuilder::WoundColumnResolver reads the MAS placement chain

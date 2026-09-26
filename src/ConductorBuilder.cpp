@@ -818,7 +818,7 @@ void checkWindowContainment(const std::vector<ConductorPath>& paths,
     }
 }
 
-void checkCollisions(const std::vector<ConductorPath>& paths) {
+EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
     if (std::getenv("MVB_PATH_DUMP")) {
         for (size_t ci = 0; ci < paths.size(); ++ci) {
             for (const auto& pr : paths[ci].prims) {
@@ -864,7 +864,7 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
     if (std::getenv("MVB_LEAD_NO_VALIDATE")) {
         std::cerr << "[ConductorBuilder] MVB_LEAD_NO_VALIDATE set: collision gate SKIPPED -- "
                      "diagnostic geometry, not for FEM\n";
-        return;
+        return EnamelGateVerdict::Skipped;
     }
     // Pre-sample every primitive once (rect/toroidal wraps are 9-10 primitives per turn;
     // re-sampling per pair would dominate the gate).
@@ -1198,10 +1198,9 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
         if (std::getenv("MVB_ALLOW_ENAMEL")) {
             std::cerr << "[gate] " << m.str() << "  (MVB_ALLOW_ENAMEL set: reported, not refused)"
                       << std::endl;
+            return EnamelGateVerdict::ReportedAllowed;
         }
-        else {
-            throw std::runtime_error(m.str());
-        }
+        throw std::runtime_error(m.str());
     }
     else if (coatedUncertifiable > 0) {
         // BLEND-involved pairs have no rigorous sag bound yet, so they can be neither proven nor
@@ -1212,12 +1211,12 @@ void checkCollisions(const std::vector<ConductorPath>& paths) {
                           ? 0.0
                           : worstUncertifiable * 1e3)
                   << " mm)." << std::endl;
+        return EnamelGateVerdict::SampledOnly;
     }
-    else {
-        std::cerr << "[gate] enamel rule: CERTIFIED -- every pair proven at or beyond its coated "
-                     "envelope (0 nm interpenetration)."
-                  << std::endl;
-    }
+    std::cerr << "[gate] enamel rule: CERTIFIED -- every pair proven at or beyond its coated "
+                 "envelope (0 nm interpenetration)."
+              << std::endl;
+    return EnamelGateVerdict::Certified;
 }
 
 
@@ -7701,6 +7700,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                      std::vector<ConductorBuilder::PathPolyline>* polyOut = nullptr,
                                      // ABT #1215: finished centrelines, no solids (see polyOut).
                                      std::vector<ConductorPath>* centrelineOut = nullptr) {
+    // Every build starts unproven: only the gate's own outcome below may overwrite this, so a
+    // throw anywhere in the build leaves NotRun, never a previous build's Certified.
+    if (opts.enamelGateVerdictOut) *opts.enamelGateVerdictOut = EnamelGateVerdict::NotRun;
     // ABT #685 (Alf, 2026-08-17): WHAT a connection IS comes from MKF, not from a threshold here.
     // isZReturn() used to answer it from turn coordinates -- a median pitch, a filar-count bound,
     // a sign-of-advance rule -- and every one of those had a comment naming the design it had been
@@ -16311,10 +16313,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // must not be mistaken for a valid part further downstream.
         std::cerr << "[ConductorBuilder] DIAGNOSTIC: collision check SKIPPED — the geometry "
                      "below may contain overlapping conductors and is not a valid part.\n";
+        if (opts.enamelGateVerdictOut) *opts.enamelGateVerdictOut = EnamelGateVerdict::Skipped;
     }
     else {
-        checkCollisions(paths);
+        const EnamelGateVerdict verdict = checkCollisions(paths);
         checkWindowContainment(paths, windowBoundsPerPath);
+        // Published only once containment has also passed (it throws otherwise).
+        if (opts.enamelGateVerdictOut) *opts.enamelGateVerdictOut = verdict;
     }
 
     // Centreline capture mode (ABT #1215): the same finished paths, handed back whole.

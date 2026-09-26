@@ -213,7 +213,12 @@ public:
                                           double coreCoatingThickness = 0.0,
                                           bool useRealWindingGeometry = false,
                                           bool femReady = false,
-                                          bool skipGeometryChecks = false) const;
+                                          bool skipGeometryChecks = false,
+                                          // Non-null: receives the enamel gate's verdict over the
+                                          // real-winding conductors of THIS call (see
+                                          // EnamelGateVerdict). NotRun when no gate ran (no real
+                                          // winding, or the build threw).
+                                          EnamelGateVerdict* enamelGateVerdictOut = nullptr) const;
     std::vector<NamedShape> buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
@@ -234,7 +239,9 @@ public:
                                           // picture on screen needs neither. Every consumer that
                                           // exports a part leaves this false, and the builder says
                                           // out loud when it is set.
-                                          bool skipGeometryChecks = false) const;
+                                          bool skipGeometryChecks = false,
+                                          // See the MAS overload.
+                                          EnamelGateVerdict* enamelGateVerdictOut = nullptr) const;
 
     // ---- Standalone builders for the unified bindings API -----------------
     //
@@ -350,7 +357,11 @@ public:
         bool cutterOnly = false,
         // ABT #1173: receives the LOWEST toroid terminal plane over the conductor builds emitted
         // (bare and coating shells lay their leads at their own radii); NaN when none.
-        double* toroidTerminalPlaneOut = nullptr) const;
+        double* toroidTerminalPlaneOut = nullptr,
+        // Receives the verdict over every conductor build this call emitted: Certified only
+        // when EACH of them (bare and coating shells) was certified, otherwise the first
+        // non-certified outcome. NotRun on entry.
+        EnamelGateVerdict* enamelGateVerdictOut = nullptr) const;
 };
 
 } // namespace mvb
