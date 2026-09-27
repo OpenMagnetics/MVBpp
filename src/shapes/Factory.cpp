@@ -14,6 +14,7 @@
 #include "mvb/shapes/ShapePm.h"
 #include "mvb/shapes/ShapePQ.h"
 #include "mvb/shapes/ShapeRM.h"
+#include "mvb/shapes/ShapeSlab.h"
 #include "mvb/shapes/ShapeT.h"
 #include "mvb/shapes/ShapeU.h"
 #include "mvb/shapes/ShapeUr.h"
@@ -87,6 +88,12 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
             builder = std::make_unique<ShapePQ>(); break;
         case MAS::CoreShapeFamily::RM:
             builder = std::make_unique<ShapeRM>(); break;
+        // Slab cores (MKF CorePieceSlab, ABT #263): pot cores with two flats. RS is NOT here:
+        // its set pairs a slab half with a plain pot round, and the geometricalDescription
+        // MKF emits carries two identical RS halfSets, so nothing says which half is round.
+        case MAS::CoreShapeFamily::DS:
+        case MAS::CoreShapeFamily::HS:
+            builder = std::make_unique<ShapeSlab>(); break;
         default:
             return nullptr;
     }

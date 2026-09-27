@@ -348,11 +348,22 @@ std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
         const MAS::CoreShape* shapeData = std::get_if<MAS::CoreShape>(&*shapeOpt);
         if (!shapeData) continue;
 
+        // A family with no builder used to be skipped here. When every piece was skipped the
+        // core came back as an EMPTY shape list, and the WASM binding reported it as
+        // "side='' filtered out all geometry" -- a DS 14/08 chosen by the adviser (MKF added the
+        // slab families in f31bca46) drew no core and named the wrong cause. Say what is missing.
+        // The family's MAS spelling (core_shape_family_to_string does not know every family).
+        const std::string familyName = nlohmann::json(shapeData->get_family()).get<std::string>();
         auto builder = shapes::createShapeBuilder(shapeData->get_family(), "", corePolygonSegments);
-        if (!builder) continue;
+        if (!builder)
+            throw std::runtime_error("buildCoreShapes: no 3D geometry builder for core family '" +
+                                     familyName + "' (shape '" +
+                                     shapeData->get_name().value_or(std::string("?")) + "')");
 
         TopoDS_Shape shape = builder->buildPiece(*shapeData);
-        if (shape.IsNull()) continue;
+        if (shape.IsNull())
+            throw std::runtime_error("buildCoreShapes: the '" + familyName + "' builder returned no solid for shape '" +
+                                     shapeData->get_name().value_or(std::string("?")) + "'");
 
         auto dimsOpt = shapeData->get_dimensions();
         auto dims = dimsOpt ? flatten_dimensions(*dimsOpt) : std::map<std::string, double>{};

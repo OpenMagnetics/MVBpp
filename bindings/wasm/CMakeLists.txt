@@ -216,6 +216,7 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/shapes/ShapeU.cpp
     ${REPO_ROOT}/src/shapes/ShapeUr.cpp
     ${REPO_ROOT}/src/shapes/ShapeUt.cpp
+    ${REPO_ROOT}/src/shapes/ShapeSlab.cpp
     ${REPO_ROOT}/src/shapes/Factory.cpp
 )
 

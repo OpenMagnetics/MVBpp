@@ -128,6 +128,10 @@ py::object deliver(std::vector<mvb::NamedShape> named,
                     double scale,
                     const std::string& symmetry,
                     const std::string& side) {
+    // Checked before the pipeline, so an empty build is not reported as the side filter's doing.
+    if (named.empty()) {
+        throw std::runtime_error("mvbpp: the builder produced no geometry to deliver");
+    }
     std::string m = upper(mode);
     if (m != "2D" && m != "3D") {
         throw std::runtime_error("mvbpp: mode must be '3D' or '2D' (got '" + mode + "')");

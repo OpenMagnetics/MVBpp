@@ -253,6 +253,7 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/shapes/ShapeU.cpp
     src/shapes/ShapeUr.cpp
     src/shapes/ShapeUt.cpp
+    src/shapes/ShapeSlab.cpp
     src/shapes/Factory.cpp
 )
 set_target_properties(mvb++ PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -306,6 +307,7 @@ add_executable(mvb_tests
     tests/test_toroid_base.cpp
     tests/test_step_roundtrip.cpp
     tests/test_sleeves.cpp
+    tests/test_slab_cores.cpp
 )
 
 target_compile_definitions(mvb_tests PRIVATE
