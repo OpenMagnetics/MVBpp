@@ -3557,8 +3557,15 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // solids rather than inferred from the handoff that does not exist there (see capDiscAt,
         // ABT #1186). Only a tangent, endpoint-exact, ungrown junction qualifies: a mitred joint's
         // caps are cut, not shared, and a lens there is a real defect.
+        // ...and at segments > 0 the same holds across a ROUND TRANSITION (ABT #1528): an exact
+        // round arc meets a neighbour that turns round at that end, so both caps are the nominal
+        // disc again. Without the exemption the gate ran a Common on two coincident circular
+        // caps, which OCC crawls through (07_cmc: ~19 s per joint in PerformEF against the
+        // transition loft, > 1 h per design). The disc is still MEASURED on both solids: a
+        // polygon cap (no transition built) fails capDiscAt and keeps the boolean.
         bool roundCapsShared = false;
-        if (segments <= 0 && i > 0 && !bentS && angS <= 1e-12 && dpS <= 1e-9 &&
+        if ((segments <= 0 || roundStartHere || hereRound) && i > 0 && !bentS && angS <= 1e-12 &&
+            dpS <= 1e-9 &&
             !sphereAtPrevJunction && !prevBuilt.IsNull() && !solid.IsNull()) {
             const gp_Pnt jPt = primEndpoints(*ptrs[i]).first;
             double aPrev = 0.0, aCur = 0.0, offPrev = 0.0, offCur = 0.0;
@@ -3955,13 +3962,13 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                 }
                 if (e0 > s0 && allTangent) {
                     std::vector<TopoDS_Shape> gs;
-                    double sum = 0.0, mx = 0.0;
+                    double sum = 0.0, mn = std::numeric_limits<double>::max();
                     for (size_t k = s0; k <= e0; ++k) {
                         gs.push_back(groupAt(k));
                         GProp_GProps gp;
                         BRepGProp::VolumeProperties(gs.back(), gp);
                         sum += gp.Mass();
-                        mx = std::max(mx, gp.Mass());
+                        mn = std::min(mn, gp.Mass());
                     }
                     const auto tGlue0 = std::chrono::steady_clock::now();
                     try {
@@ -3971,7 +3978,19 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                         for (size_t i2 = 1; i2 < gs.size(); ++i2) ftools.Append(gs[i2]);
                         fu.SetArguments(fargs);
                         fu.SetTools(ftools);
-                        fu.SetGlue(BOPAlgo_GlueShift);
+                        // FULL glue, not Shift (ABT #1528). Every junction of a tangent run
+                        // is a shared cap -- a phase-continued polygon, or since the round
+                        // transitions an exact disc against a loft whose round end lies on the
+                        // same circle -- so its sub-shapes coincide FULLY, the input GlueFull is
+                        // specified for. GlueShift still intersects every edge with every face,
+                        // and a circle lying on a ruled B-spline boundary is where that costs:
+                        // PerformEF/IntCurveSurface ran > 25 min on one 267-piece 07_cmc run
+                        // (~20 s per round junction) and 283 s on one 20_iso run. Measured
+                        // GlueFull on the same runs: 7.5 s and 1.7 s, and the 20_iso result
+                        // census-identical to GlueShift (faces, thin faces, every conductor's
+                        // volume to 14 digits). The conservation test below is what makes the
+                        // stronger promise safe: a glue that drops or invents copper is refused.
+                        fu.SetGlue(BOPAlgo_GlueFull);
                         fu.SetRunParallel(true);
                         fu.Build();
                         if (fu.IsDone() && !fu.Shape().IsNull() &&
@@ -3982,12 +4001,8 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                                 ++ns;
                             GProp_GProps gf;
                             BRepGProp::VolumeProperties(fu.Shape(), gf);
-                            // Same two bounds the pairwise path uses: a union can be neither
-                            // smaller than its largest input (OCC dropped an operand) nor
-                            // larger than their sum (invented copper). One solid, or the weld
-                            // did not happen and there is nothing to gain.
-                            // ACCEPTANCE: ONE valid solid, conserving volume within the same
-                            // two bounds the pairwise path uses. The one-solid requirement is
+                            // ACCEPTANCE: ONE valid solid that neither invents copper (above
+                            // the sum) nor loses any piece (below). The one-solid requirement is
                             // not fastidiousness -- it was RELAXED on 2026-09-19 to "strictly
                             // fewer solids than pieces", on the reasoning that a run whose
                             // chain is interrupted cannot become one body by any means, and
@@ -3998,20 +4013,36 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                             // than one glued fuse does -- worse geometry AND slower. So: take
                             // the glued fuse when it delivers the whole run as one body, and
                             // otherwise let the ladder do its work.
-                            if (ns == 1 && gf.Mass() <= sum * (1.0 + 1e-3) &&
-                                gf.Mass() >= mx * (1.0 - 1e-3)) {
+                            // A tangent run's pieces ABUT (shared caps, no bridging growth),
+                            // so the union must carry every piece: judged against the SMALLEST
+                            // one, because the failure mode loses a whole piece and a round
+                            // transition is one facet chord (the half-revolution fuse's rule).
+                            // Measured deficits: <= 3.4e-7 mm3 against smallest pieces of
+                            // >= 1.6e-3 mm3 (20_iso, 07_cmc, 10_emi).
+                            if (std::getenv("MVB_WELD_DEBUG"))
+                                std::cerr << "[glue-cons] run " << s0 << ".." << e0 << " sum="
+                                          << sum * 1e9 << " fused=" << gf.Mass() * 1e9
+                                          << " mm3, deficit=" << (sum - gf.Mass()) * 1e9
+                                          << " mm3, smallest=" << mn * 1e9 << " mm3\n";
+                            const bool conserves = sum - gf.Mass() <= 0.01 * mn;
+                            if (ns == 1 && conserves && gf.Mass() <= sum * (1.0 + 1e-3)) {
                                 runFused[s0] = {e0, fu.Shape()};
-                                if (ns > 1 && std::getenv("MVB_WELD_DEBUG"))
-                                    std::cerr << "[glue-fuse] run " << s0 << ".." << e0
-                                              << " welded " << gs.size() << " pieces into " << ns
-                                              << " solids (chain interrupted)\n";
-                            } else if (std::getenv("MVB_WELD_DEBUG")) {
-                                std::cerr << "[glue-fuse] run " << s0 << ".." << e0
-                                          << " refused: solids=" << ns << " vol=" << gf.Mass()
-                                          << " sum=" << sum << " max=" << mx << "\n";
+                            } else {
+                                std::cerr << "[glue-fuse] run " << s0 << ".." << e0 << " ("
+                                          << gs.size() << " pieces) refused: solids=" << ns
+                                          << " fused=" << gf.Mass() * 1e9 << " sum=" << sum * 1e9
+                                          << " smallest=" << mn * 1e9
+                                          << " mm3; welding it pairwise instead\n";
                             }
+                        } else {
+                            std::cerr << "[glue-fuse] run " << s0 << ".." << e0 << " ("
+                                      << gs.size() << " pieces) gave no valid shape; welding it "
+                                         "pairwise instead\n";
                         }
-                    } catch (const Standard_Failure&) {
+                    } catch (const Standard_Failure& f) {
+                        std::cerr << "[glue-fuse] run " << s0 << ".." << e0 << " threw ("
+                                  << (f.GetMessageString() ? f.GetMessageString() : "(null)")
+                                  << "); welding it pairwise instead\n";
                     }
                     if (std::getenv("MVB_WELD_DEBUG"))
                         std::cerr << "[weld-time] glued fuse of " << gs.size() << " pieces: "
