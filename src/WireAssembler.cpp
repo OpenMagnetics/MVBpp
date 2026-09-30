@@ -371,6 +371,54 @@ static TopoDS_Wire wireProfileWirePhased(const gp_Pnt& center, const gp_Dir& nor
     return poly.Wire();
 }
 
+// A ROUND section drawn THROUGH a polygon's vertices: the exact circle of radius r about
+// (center, normal), cut into one arc per polygon edge at the polygon's own vertices (ABT #1528).
+// Where an exactly round piece (a tight arc, see kFacetTightArcExactRatio) meets a faceted
+// neighbour, the two sections used to be a circle and an inscribed polygon in one plane, and
+// the 12 circular segments between them -- r(1 - cos(pi/n)) deep, 6.05 um on a 0.1775 mm wire --
+// were exposed as micron-wide faces (20_iso: two rings per terminal lead). The faceted piece's
+// round end is this circle split at ITS OWN polygon's vertices, so each transition face is
+// ruled between one arc and its own chord; the round piece keeps its two-edge circle, and the
+// glue imprints the extra break-points on that same circular edge. Throws when the vertices
+// are not on that circle: a round section through them would not be the wire.
+static TopoDS_Wire roundSectionThrough(const std::vector<gp_Pnt>& verts, const gp_Pnt& center,
+                                       const gp_Dir& normal, double r) {
+    const size_t n = verts.size();
+    if (n < 3) throw std::runtime_error("roundSectionThrough: fewer than 3 vertices");
+    for (const auto& v : verts) {
+        const gp_XYZ d = v.XYZ() - center.XYZ();
+        const double off = d.Dot(normal.XYZ());
+        const double rad = (d - normal.XYZ() * off).Modulus();
+        if (std::abs(off) > 1e-3 * r || std::abs(rad - r) > 1e-3 * r)
+            throw std::runtime_error(
+                "roundSectionThrough: a section vertex is " + std::to_string(off * 1e6) +
+                " um off the section plane and " + std::to_string((rad - r) * 1e6) +
+                " um off the wire radius; no round section of this wire passes through it");
+    }
+    // Arcs run in the circle's positive sense, so the circle's axis must turn the way the
+    // vertices do -- otherwise each "arc" would be the long way round.
+    const gp_XYZ c0 = verts[0].XYZ() - center.XYZ(), c1 = verts[1].XYZ() - center.XYZ();
+    const gp_Dir ax = c0.Crossed(c1).Dot(normal.XYZ()) > 0 ? normal : normal.Reversed();
+    const gp_XYZ x0 = c0 - ax.XYZ() * c0.Dot(ax.XYZ());
+    const gp_Circ circ(gp_Ax2(center, ax, gp_Dir(x0)), r);
+    BRepBuilderAPI_MakeWire mw;
+    for (size_t i = 0; i < n; ++i) {
+        BRepBuilderAPI_MakeEdge me(circ, verts[i], verts[(i + 1) % n]);
+        if (!me.IsDone()) throw std::runtime_error("roundSectionThrough: arc edge failed");
+        mw.Add(me.Edge());
+    }
+    if (!mw.IsDone()) throw std::runtime_error("roundSectionThrough: arc wire did not close");
+    return mw.Wire();
+}
+
+// The polygon vertices of a wire, in wire order.
+static std::vector<gp_Pnt> wireVertices(const TopoDS_Wire& w) {
+    std::vector<gp_Pnt> pts;
+    for (BRepTools_WireExplorer we(w); we.More(); we.Next())
+        pts.push_back(BRep_Tool::Pnt(we.CurrentVertex()));
+    return pts;
+}
+
 // The neighbour section's phase in this piece's own deterministic frame at (center, normal):
 // the angle of its first vertex, minus the polygon's base offset. Returns false when the wire
 // is unusable (wrong vertex count, vertex on the axis).
@@ -1028,7 +1076,27 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
                                   int segments,
                                   const TopoDS_Wire* startProfileOverride = nullptr,
                                   TopoDS_Wire* endCapOut = nullptr,
-                                  bool* startPhasedOut = nullptr) {
+                                  bool* startPhasedOut = nullptr,
+                                  bool roundStart = false, bool roundEnd = false) {
+    // A round transition (ABT #1528) is built by the faceted SEG prism and by the pipe sweep
+    // below; any other construction asked for one is a caller fault, not something to skip.
+    if ((roundStart || roundEnd) && (segments <= 0 || pr.kind == Primitive::SEG ||
+                                     pr.kind == Primitive::ARC3))
+        throw std::runtime_error("'" + pr.label + "': a round transition was requested from a "
+                                 "construction that has none (kind " + std::to_string(pr.kind) +
+                                 ", segments " + std::to_string(segments) + ")");
+    // GROWTH BELOW THE MODEL'S LENGTH RESOLUTION IS NO GROWTH. An endpoint distance of a
+    // few 1e-19 m (fp noise between two primitives that meet exactly) used to arrive here as a
+    // "growth", sending a spiral down the analytic-growth edge construction, which OCC refuses
+    // outright on a radius-varying face spiral ("BRepAdaptor_Curve::No geometry"; measured on
+    // every toroid top/bottom chord of the [realwinding] toroid fixtures: overE = 6.5e-19 m).
+    // The flush, uncut retry then silently rebuilt each one. Precision::Confusion() is the
+    // B-Rep's own resolution, so this moves no copper the model could represent.
+    if (overA < Precision::Confusion()) overA = 0.0;
+    if (overB < Precision::Confusion()) overB = 0.0;
+    if ((roundStart && overA > 0.0) || (roundEnd && overB > 0.0))
+        throw std::runtime_error("'" + pr.label + "': a round transition at a GROWN end -- the "
+                                 "round neighbour's section is not where this piece ends");
     if (pr.kind == Primitive::SEG) {
         gp_Vec d(pr.seg.a, pr.seg.b);
         double len = d.Magnitude();
@@ -1124,6 +1192,12 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         }
         // Tight arcs are revolved exactly even in faceted mode -- see kFacetTightArcExactRatio.
         // The exact piece carries no polygon phase, so a neighbour cannot adopt one from it.
+        // The exact profile stays the two-edge split circle. Splitting it at the polygon's
+        // vertices (tried for ABT #1528) cuts the TORUS into one strip per profile arc, and on a
+        // short remainder arc the strips beside the bend axis are ~1.2 um wide -- the very
+        // micro-geometry #1111 exists to avoid (measured on 20_iso's 5-degree third fillet
+        // arc). The faceted neighbour's round transition lies on the same circle, so the glue
+        // only imprints its break-points on this cap's edge; no face is split.
         if (!profWire.IsNull() && radius < kFacetTightArcExactRatio * r) {
             if (std::getenv("MVB_MITRE_DIAG"))
                 std::cerr << "[tight-arc] '" << pr.label << "' bend " << radius * 1e6 << " um < "
@@ -1302,7 +1376,24 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
             else if (m == "approxc1")    ps.SetForceApproxC1(Standard_True);
             else if (m == "tight")       ps.SetTolerance(1e-7, 1e-7, 1e-4);
         }
-        ps.Add(profMm);
+        // ROUND END(S) (ABT #1528): this piece is the one-facet-chord transition beside an
+        // exactly round neighbour, so it is swept between the ROUND section (the circle split at
+        // the polygon's vertices) and the polygon. The polygon at the far end keeps this piece's
+        // own phase value; the next piece continues whatever section this sweep actually ends on.
+        if (roundStart || roundEnd) {
+            if (roundStart && roundEnd)
+                throw std::runtime_error("'" + pr.label + "': a transition piece cannot be "
+                                         "round at both ends");
+            const TopoDS_Wire polyEnd =
+                wireProfileWirePhased(ends.second, tB, r, segments, phase0);
+            TopoDS_Wire a = prof, b = polyEnd;
+            if (roundStart) a = roundSectionThrough(wireVertices(prof), spineStart, spineDir, r);
+            if (roundEnd) b = roundSectionThrough(wireVertices(polyEnd), ends.second, tB, r);
+            ps.Add(TopoDS::Wire(BRepBuilderAPI_Transform(a, up, Standard_True).Shape()));
+            ps.Add(TopoDS::Wire(BRepBuilderAPI_Transform(b, up, Standard_True).Shape()));
+        } else {
+            ps.Add(profMm);
+        }
         ps.Build();
         // MakeSolid() is not idempotent -- a second call returns false -- so it runs exactly
         // once, here, and every later test reads the result.
@@ -1565,6 +1656,86 @@ TopoDS_Shape loftRuledPrism(const std::vector<gp_Pnt>& start, const std::vector<
     return out;
 }
 
+// The faceted prism with a ROUND end where it meets an exactly round piece (ABT #1528). The
+// section goes from the round one (the circle split at the polygon's vertices, see
+// roundSectionThrough) to the polygon over ONE FACET CHORD, 2 r sin(pi/n) -- the length on which
+// the transition's ruled faces are as long as they are wide -- and is the ordinary prism beyond.
+// Every ruling joins a point of the circle to a point of its chord, both inside the round wire,
+// so the transition never leaves the wire's envelope; it adds back, over that chord length, the
+// circular segments the polygon leaves out. Only for a PERPENDICULAR (tangent-junction) cap:
+// the round section must be a true section of the wire. Throws rather than refusing -- the
+// caller's refusal path is a different construction, and a round neighbour must not silently
+// fall back to the ring this exists to remove.
+static TopoDS_Shape loftRuledPrismRoundEnds(const std::vector<gp_Pnt>& start,
+                                           const std::vector<gp_Pnt>& end, const gp_Dir& dir,
+                                           double r, bool roundStart, bool roundEnd) {
+    const size_t n = start.size();
+    if (n < 3 || end.size() != n)
+        throw std::runtime_error("round-ended prism: cap polygons differ in size");
+    auto centreOf = [&](const std::vector<gp_Pnt>& p) {
+        gp_XYZ c(0, 0, 0);
+        for (const auto& q : p) c += q.XYZ();
+        return gp_Pnt(c / double(n));
+    };
+    auto shifted = [&](const std::vector<gp_Pnt>& p, double t) {
+        std::vector<gp_Pnt> o(p);
+        for (auto& q : o) q.Translate(gp_Vec(dir) * t);
+        return o;
+    };
+    auto requirePerpendicular = [&](const std::vector<gp_Pnt>& p, const char* which) {
+        const gp_Pnt c = centreOf(p);
+        for (const auto& q : p)
+            if (std::abs(gp_Vec(c, q).Dot(gp_Vec(dir))) > 1e-3 * r)
+                throw std::runtime_error(std::string("round-ended prism: the ") + which +
+                                         " cap is not perpendicular to the axis (a mitred "
+                                         "junction); a round transition needs a true section");
+    };
+    const double chord = 2.0 * r * std::sin(kPi / double(n));
+    const double span = gp_Vec(start.front(), end.front()).Dot(gp_Vec(dir));
+    const double need = chord * ((roundStart ? 1.0 : 0.0) + (roundEnd ? 1.0 : 0.0));
+    if (!(span > need))
+        throw std::runtime_error("round-ended prism: " + std::to_string(span * 1e6) +
+                                 " um straight is shorter than its round transition(s), " +
+                                 std::to_string(need * 1e6) + " um");
+    std::vector<TopoDS_Wire> sections;
+    auto up = [](const TopoDS_Wire& w) {
+        return TopoDS::Wire(BRepBuilderAPI_Transform(w, mitreUpTrsf(), Standard_True).Shape());
+    };
+    auto polyUp = [&](const std::vector<gp_Pnt>& p) {
+        BRepBuilderAPI_MakePolygon mp;
+        for (const auto& q : p) mp.Add(q.Transformed(mitreUpTrsf()));
+        mp.Close();
+        if (!mp.IsDone()) throw std::runtime_error("round-ended prism: polygon wire failed");
+        return mp.Wire();
+    };
+    if (roundStart) {
+        requirePerpendicular(start, "start");
+        sections.push_back(up(roundSectionThrough(start, centreOf(start), dir, r)));
+        sections.push_back(polyUp(shifted(start, chord)));
+    } else {
+        sections.push_back(polyUp(start));
+    }
+    if (roundEnd) {
+        requirePerpendicular(end, "end");
+        sections.push_back(polyUp(shifted(end, -chord)));
+        sections.push_back(up(roundSectionThrough(end, centreOf(end), dir, r)));
+    } else {
+        sections.push_back(polyUp(end));
+    }
+    BRepOffsetAPI_ThruSections loft(Standard_True /*solid*/, Standard_True /*ruled*/);
+    for (const auto& w : sections) loft.AddWire(w);
+    loft.CheckCompatibility(Standard_False);   // vertex i joins vertex i, by construction
+    loft.Build();
+    if (!loft.IsDone() || loft.Shape().IsNull())
+        throw std::runtime_error("round-ended prism: loft failed");
+    if (!BRepCheck_Analyzer(loft.Shape()).IsValid())
+        throw std::runtime_error("round-ended prism: loft invalid (BRepCheck)");
+    const TopoDS_Shape out = fromMitreFrame(loft.Shape());
+    if (out.IsNull() || !BRepCheck_Analyzer(out).IsValid())
+        throw std::runtime_error("round-ended prism: loft invalid after the return to metres");
+    return out;
+}
+
 static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double r, int segments,
                                      const gp_Pnt& Ps, const gp_XYZ& ns,
                                      const gp_Pnt& Pe, const gp_XYZ& ne,
@@ -1573,7 +1744,8 @@ static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double 
                                      bool sharedTrusted = false,
                                      bool* startAdoptedOut = nullptr,
                                      bool staggerAdopt = false,
-                                     std::string* why = nullptr) {
+                                     std::string* why = nullptr,
+                                     bool roundStart = false, bool roundEnd = false) {
     auto refuse = [&](const std::string& r) { if (why) *why = r; return TopoDS_Shape(); };
     if (segments <= 0) return refuse("segments <= 0");
     const double dS = dir.XYZ().Dot(ns), dE = dir.XYZ().Dot(ne);
@@ -1760,7 +1932,11 @@ static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double 
     // to confusion without inflating anything.
     try {
         std::string loftWhy;
-        const TopoDS_Shape out = loftRuledPrism(vs, ve, &loftWhy);
+        // A round neighbour (ABT #1528) gets its round transition; that loft throws itself
+        // when it cannot be built, since refusing here would drop to the knife path.
+        const TopoDS_Shape out = (roundStart || roundEnd)
+                                     ? loftRuledPrismRoundEnds(vs, ve, dir, r, roundStart, roundEnd)
+                                     : loftRuledPrism(vs, ve, &loftWhy);
         if (out.IsNull()) return refuse(loftWhy);
         // SUB-RESOLUTION SLIVER GUARD. "> 0" let through prisms whose two end planes almost
         // coincide: positive volume below what the B-Rep can represent (measured on the
@@ -1896,12 +2072,7 @@ static TopoDS_Shape mitredRoundPrism(const gp_Pnt& a, const gp_Dir& dir, double 
 
 // Ordered polygon vertices of a closed wire (edge order), and back. The section-wire handoff
 // moves junction sections between the prism path (points) and the pipe/revolve path (wires).
-static std::vector<gp_Pnt> wireToPoints(const TopoDS_Wire& w) {
-    std::vector<gp_Pnt> pts;
-    for (BRepTools_WireExplorer we(w); we.More(); we.Next())
-        pts.push_back(BRep_Tool::Pnt(we.CurrentVertex()));
-    return pts;
-}
+static std::vector<gp_Pnt> wireToPoints(const TopoDS_Wire& w) { return wireVertices(w); }
 static TopoDS_Wire pointsToWire(const std::vector<gp_Pnt>& pts) {
     if (pts.size() < 3) return {};
     BRepBuilderAPI_MakePolygon poly;
@@ -2697,6 +2868,44 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // flush forward (no cut) -- one side only, so the bridge is never doubled.
         const double angS = (i > 0) ? fe[i - 1].Angle(fs[i]) : 0.0;
         const double angE = (i + 1 < n) ? fe[i].Angle(fs[i + 1]) : 0.0;
+        // ROUND TRANSITIONS (ABT #1528). A tight arc is revolved exactly round even in faceted
+        // mode (kFacetTightArcExactRatio); where it meets a faceted neighbour the circle and the
+        // inscribed polygon leave n circular-segment faces, r(1 - cos(pi/n)) deep (20_iso: two
+        // 4.02 um rings per terminal lead). The faceted neighbour therefore turns round over its
+        // last/first facet chord. Built only where that is EXACT -- a tangent, endpoint-shared,
+        // ungrown junction, into a faceted SEG or a plain (linear-height) SPIRAL; anywhere else
+        // the old step stays, and says so on stderr every time.
+        auto exactRound = [&](const Primitive& p) {
+            return segments > 0 && p.kind == Primitive::ARC3 &&
+                   p.arc.v0.Modulus() < kFacetTightArcExactRatio * wireRadius;
+        };
+        // The transition shares the arc's section through the phase handoff, so it exists only
+        // while that handoff does (the MVB_NO_SECTION_HANDOFF / MVB_NO_PHASE_CONTINUATION A/B
+        // switches turn both off together).
+        auto transitionable = [&](const Primitive& p) {
+            if (handoffDisabled() || !phaseContinuationEnabled()) return false;
+            // A SPIRAL only when it is a true HELIX (constant radius, linear height): the split
+            // below measures its arc length as a helix's and sweeps it between two profiles,
+            // which a radius-varying face spiral (a toroid's top chord) does not survive.
+            return p.kind == Primitive::SEG ||
+                   (p.kind == Primitive::SPIRAL && !p.spiral.blend && !p.spiral.levelOut &&
+                    std::abs(p.spiral.r1 - p.spiral.r0) < 1e-12);
+        };
+        const bool hereRound = exactRound(*ptrs[i]);
+        const bool roundNbrS = i > 0 && !hereRound && exactRound(*ptrs[i - 1]);
+        const bool roundNbrE = i + 1 < n && !hereRound && exactRound(*ptrs[i + 1]);
+        // Tangent means UNGROWN: a bridged junction grows the earlier piece's end by the wedge
+        // as soon as its angle exceeds 1e-12 rad (overE below), so that is the bound here too --
+        // on either side, since the round arc's own grown end would overshoot the transition.
+        const bool roundStartHere = roundNbrS && transitionable(*ptrs[i]) && !bentS &&
+                                    dpS <= 1e-9 && angS <= 1e-12;
+        const bool roundEndHere = roundNbrE && transitionable(*ptrs[i]) && !bentE &&
+                                  dpE <= 1e-9 && angE <= 1e-12;
+        if ((roundNbrS && !roundStartHere) || (roundNbrE && !roundEndHere))
+            std::cerr << "[round-junction] '" << ptrs[i]->label << "' meets an exactly round arc "
+                      << "at its " << (roundNbrS && !roundStartHere ? "start" : "end")
+                      << " where no exact round transition exists (mitred, mismatched, grown, or "
+                         "an unsupported kind): the circle/polygon step remains there\n";
         const double growS0 = mitreGrow(angS) + dpS;
         const double overS = bentS ? growS0 + curveGrow(*ptrs[i], growS0, true) : 0.0;
         // A bridged end grows by the WEDGE the bend opens (r*tan(theta)) as well as any endpoint
@@ -2761,6 +2970,43 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         bool startCapAdopted = false;
         bool staggerHereForAudit = false;
         std::vector<Primitive> pieces = revolutionHalves(*ptrs[i]);
+        // A SPIRAL with a round neighbour sheds one facet chord at that end as its own
+        // transition piece (swept round -> polygon). Radius and height are linear in azimuth on
+        // a plain helix (transitionable() above), so the split is exact, and the arc length per
+        // radian is exactly sqrt(R^2 + (dy/daz)^2).
+        bool pieceRoundStart = false, pieceRoundEnd = false;
+        if (ptrs[i]->kind == Primitive::SPIRAL && (roundStartHere || roundEndHere)) {
+            const double chord = 2.0 * wireRadius * std::sin(kPi / double(segments));
+            auto splitAt = [&](const Primitive& pr, bool fromStart) {
+                const Spiral& sp = pr.spiral;
+                const double sweep = sp.az1 - sp.az0;
+                const double R = fromStart ? sp.r0 : sp.r1;
+                const double dyDaz = (sp.y1 - sp.y0) / sweep;
+                const double dAz = chord / std::sqrt(R * R + dyDaz * dyDaz);
+                if (!(dAz < std::abs(sweep)))
+                    throw std::runtime_error("'" + pr.label + "': spiral shorter than its round "
+                                             "transition (" + std::to_string(chord * 1e6) +
+                                             " um)");
+                const double t = fromStart ? dAz / std::abs(sweep) : 1.0 - dAz / std::abs(sweep);
+                Primitive a = pr, b = pr;
+                a.spiral.az1 = b.spiral.az0 = sp.az0 + t * sweep;
+                a.spiral.y1 = b.spiral.y0 = sp.y0 + t * (sp.y1 - sp.y0);
+                a.spiral.r1 = b.spiral.r0 = sp.r0 + t * (sp.r1 - sp.r0);
+                return std::pair<Primitive, Primitive>(a, b);
+            };
+            if (roundStartHere) {
+                auto [a, b] = splitAt(pieces.front(), true);
+                pieces.front() = b;
+                pieces.insert(pieces.begin(), a);
+                pieceRoundStart = true;
+            }
+            if (roundEndHere) {
+                auto [a, b] = splitAt(pieces.back(), false);
+                pieces.back() = a;
+                pieces.push_back(b);
+                pieceRoundEnd = true;
+            }
+        }
         // The section-wire handoff (see rawGrownSolid): the previous piece's ACTUAL end
         // section enters this piece as its start profile when the junction is tangent and
         // exact, and this piece's own end section is captured for the next.
@@ -2819,8 +3065,11 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // is the 0.9 mm riser -- under the 2*pi*r length boundary those stay verbatim).
         TopoDS_Wire startCapWire;
         if (junctionEndpointExact && prevEndCapValid) {
+            // Never into an exactly round receiver (ABT #1528): a round piece has no facets to
+            // osculate, and a staggered cap would put its round section's break-points half a
+            // facet off the ones its faceted neighbour ends on.
             const bool staggerPipeOffer =
-                i > 0 && !bentS && dpS <= 1e-9 && ptrs[i]->kind != Primitive::SEG &&
+                i > 0 && !bentS && dpS <= 1e-9 && ptrs[i]->kind != Primitive::SEG && !hereRound &&
                 ptrs[i - 1]->kind == Primitive::SEG &&
                 ptrs[i - 1]->seg.a.Distance(ptrs[i - 1]->seg.b) > kTwoPi * wireRadius;
             if (staggerPipeOffer) {
@@ -2842,16 +3091,47 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         TopoDS_Wire pieceEndCapWire;
         auto sweepPieces = [&](double a0, double b0) {
             std::vector<TopoDS_Shape> got;
+            // THE SEAM BETWEEN TWO HALF-REVOLUTIONS IS A TANGENT JUNCTION LIKE ANY OTHER, so
+            // the second half starts from the first half's ACTUAL end section. ABT #1528: each
+            // half used to start on its own canonical section, while the first half's pipe
+            // arrives at the seam with its polygon rotated by the helix's torsion. The two
+            // coplanar 12-gons then overlapped only partially, and the glue fuse left 24
+            // micron-wide triangles in the seam plane (1.05-4.0 um wide on 20_iso, one ring
+            // per closed turn: 907 of 2,086 faces), which cost OMFEM its last skin-layer
+            // slivers.
+            // No silent fallback: a faceted seam that cannot continue the first half's section
+            // would rebuild exactly those rings, so it throws naming the primitive. Only the
+            // explicit A/B kill-switches (MVB_NO_SECTION_HANDOFF / MVB_NO_PHASE_CONTINUATION)
+            // opt out, and an exact-round profile (segments <= 0) has no phase to mismatch.
+            const bool seamMustContinue =
+                segments > 0 && !handoffDisabled() && phaseContinuationEnabled();
+            TopoDS_Wire seamW;
             for (size_t q = 0; q < pieces.size(); ++q) {
                 TopoDS_Wire endW;
+                bool seamAdopted = false;
+                if (q > 0 && seamMustContinue && seamW.IsNull())
+                    throw std::runtime_error(
+                        "'" + pieces[q].label + "': piece " + std::to_string(q - 1) + "'s sweep "
+                        "returned no end section, so piece " + std::to_string(q) + " cannot "
+                        "start on it (the seam would carry a phase-mismatch ring, ABT #1528)");
+                const TopoDS_Wire* startW =
+                    q == 0 ? ((a0 <= 0.0 && !startCapWire.IsNull()) ? &startCapWire : nullptr)
+                           : &seamW;
+                const bool roundA = q == 0 && pieceRoundStart;
+                const bool roundB = q + 1 == pieces.size() && pieceRoundEnd;
                 TopoDS_Shape sp = rawGrownSolid(
                     pieces[q], wireRadius, q == 0 ? a0 : 0.0,
-                    q + 1 == pieces.size() ? b0 : 0.0, segments,
-                    (q == 0 && a0 <= 0.0 && !startCapWire.IsNull()) ? &startCapWire : nullptr,
-                    q + 1 == pieces.size() ? &endW : nullptr,
-                    q == 0 ? &startCapAdopted : nullptr);
+                    q + 1 == pieces.size() ? b0 : 0.0, segments, startW, &endW,
+                    q == 0 ? &startCapAdopted : &seamAdopted, roundA, roundB);
                 if (sp.IsNull()) return std::vector<TopoDS_Shape>{};
+                if (q > 0 && seamMustContinue && !seamAdopted)
+                    throw std::runtime_error(
+                        "'" + pieces[q].label + "': piece " + std::to_string(q) + " could not "
+                        "adopt piece " + std::to_string(q - 1) + "'s end-section phase at the "
+                        "seam (ABT #1528)");
+
                 got.push_back(sp);
+                seamW = endW;
                 if (q + 1 == pieces.size()) pieceEndCapWire = endW;
             }
             return got;
@@ -2956,15 +3236,22 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                 // verbatim at 5/418, green staggered at 418/418), while a short receiver has
                 // nothing to osculate along and NEEDS the exact face (10_emi's 0.9 mm risers,
                 // 3.6 r: green verbatim, 5/50 staggered). Boundary: one section circumference.
+                // ...and never onto a round transition (ABT #1528): its round section must keep
+                // the round neighbour's break-points, not a half-facet rotation of them.
                 const bool staggerHere =
-                    tangentIn && dv.Magnitude() > kTwoPi * wireRadius;
+                    tangentIn && dv.Magnitude() > kTwoPi * wireRadius && !roundStartHere;
                 staggerHereForAudit = staggerHere;   // a staggered adoption is a half-facet rotation: NOT the same face
                 std::string facetWhy;
                 TopoDS_Shape prism = mitredFacetPrism(
                     A, dir, wireRadius, segments, Ps, nsx, Pe, nex,
                     (junctionEndpointExact && prevEndCapValid) ? &prevEndCap : nullptr, &endCap,
                     /*sharedTrusted=*/prevEndCapTrusted, &startCapAdopted,
-                    /*staggerAdopt=*/staggerHere, &facetWhy);
+                    /*staggerAdopt=*/staggerHere, &facetWhy, roundStartHere, roundEndHere);
+                if ((roundStartHere || roundEndHere) && prism.IsNull())
+                    throw std::runtime_error("'" + ptrs[i]->label + "': the faceted prism with a "
+                                             "round transition was refused (" + facetWhy +
+                                             "); the knife path has no round transition");
+
                 if (prism.IsNull() && std::getenv("MVB_MITRE_DIAG")) {
                     std::cerr << "[facet-prism] '" << ptrs[i]->label << "' len " << dv.Magnitude() * 1e6
                               << " um r " << wireRadius * 1e6 << " um bentS=" << bentS << " bentE=" << bentE
@@ -2986,10 +3273,20 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         if (!prismDone) prevEndCapValid = false;
         std::vector<TopoDS_Shape> parts;
         if (!prismDone) parts = sweepPieces(overS, overE);
-        if (!prismDone && parts.empty()) {  // ARC clamp (near-full revolve): flush, uncut tube
-            parts = sweepPieces(0.0, 0.0);
-            bentS = bentE = false;
-        }
+        // No flush, uncut retry. That retry used to rebuild a piece whose grown sweep failed
+        // (a near-full ARC revolve, or a sweep that came back invalid) without its growth and
+        // without its mitres, and clearing bentS/bentE shipped corners nobody cut, silently. A
+        // piece that cannot be built as drawn is a fault in the layout or the sweep: name it.
+        if (!prismDone && parts.empty())
+            throw std::runtime_error(
+                "'" + ptrs[i]->label + "': the " +
+                (ptrs[i]->kind == Primitive::ARC3     ? std::string("ARC3")
+                 : ptrs[i]->kind == Primitive::SPIRAL ? std::string("SPIRAL")
+                 : ptrs[i]->kind == Primitive::BLEND  ? std::string("BLEND")
+                                                      : std::string("SEG")) +
+                " piece could not be swept with its junction growth (start " +
+                std::to_string(overS * 1e6) + " um, end " + std::to_string(overE * 1e6) +
+                " um); refusing to rebuild it flush and uncut");
         if (!prismDone) solid = parts.empty() ? TopoDS_Shape() : parts.front();
         if (!prismDone && !pieceEndCapWire.IsNull()) {
             // A pipe/revolve delivered its true end section: hand it on (trusted) so a
@@ -3093,14 +3390,18 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                 // general boolean treats them as an intersection problem and loses a half.
                 BRepAlgoAPI_Fuse fu;
                 TopTools_ListOfShape args, tools;
+                // Every piece: two half-revolutions, plus any round transition (ABT #1528).
                 args.Append(BRepBuilderAPI_Transform(parts[0], up, Standard_True).Shape());
-                tools.Append(BRepBuilderAPI_Transform(parts[1], up, Standard_True).Shape());
+                for (size_t q = 1; q < parts.size(); ++q)
+                    tools.Append(BRepBuilderAPI_Transform(parts[q], up, Standard_True).Shape());
                 fu.SetArguments(args);
                 fu.SetTools(tools);
                 fu.SetGlue(BOPAlgo_GlueShift);
                 fu.Build();
                 if (!fu.IsDone() || fu.Shape().IsNull())
-                    throw std::runtime_error("fuse of the two half-revolutions did not complete");
+                    throw std::runtime_error("fuse of the " + std::to_string(parts.size()) +
+                                             " pieces of '" + ptrs[i]->label +
+                                             "' did not complete");
                 solid = BRepBuilderAPI_Transform(fu.Shape(), down, Standard_True).Shape();
                 // THE FUSE MUST ACCOUNT FOR EVERY CUBIC MICRON. ABT #685 (Alf, 2026-08-19,
                 // "why is turn 2 -> turn 2_ending not connecting with the layer link?"): on the
@@ -3115,34 +3416,41 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                 // flush-overlapping solids (the weld-lens pattern the rect path already uses;
                 // the consumer's fragment welds them) and say so.
                 {
-                    GProp_GProps gA, gB, gF;
-                    BRepGProp::VolumeProperties(parts[0], gA);
-                    BRepGProp::VolumeProperties(parts[1], gB);
+                    std::vector<double> pv;
+                    for (const auto& pt : parts) {
+                        GProp_GProps g;
+                        BRepGProp::VolumeProperties(pt, g);
+                        pv.push_back(g.Mass());
+                    }
+                    GProp_GProps gF;
                     BRepGProp::VolumeProperties(solid, gF);
+                    const double gAm = pv[0], gBm = pv.size() > 1 ? pv[1] : 0.0;
                     // Flush abutment: no shared volume, the union must carry every cubic
-                    // micron of both halves. The failure mode loses an entire half (~50%); one
-                    // percent is pure measurement headroom, not a configuration in between.
-                    const double expected = gA.Mass() + gB.Mass();
-                    if (gF.Mass() < expected * 0.99) {
+                    // micron of every piece. The failure mode loses a WHOLE piece, so the loss
+                    // is judged against the SMALLEST piece -- a round transition is one facet
+                    // chord, ~0.3% of a turn, and a whole-sum percentage could not see it go.
+                    // One percent of that piece is measurement headroom.
+                    double expected = 0.0, smallest = std::numeric_limits<double>::max();
+                    for (double v : pv) { expected += v; smallest = std::min(smallest, v); }
+                    if (expected - gF.Mass() > 0.01 * smallest) {
                         std::cerr << "[ConductorBuilder] fuse of '" << ptrs[i]->label
-                                  << "' lost copper (A=" << gA.Mass() * 1e9
-                                  << " B=" << gB.Mass() * 1e9 << " fused=" << gF.Mass() * 1e9
-                                  << " mm3, expected >= " << expected * 0.99 * 1e9
-                                  << "); keeping both halves as flush-abutting solids for the "
+                                  << "' lost copper (" << parts.size() << " pieces, sum="
+                                  << expected * 1e9 << " fused=" << gF.Mass() * 1e9
+                                  << " mm3, smallest piece " << smallest * 1e9
+                                  << " mm3); keeping the pieces as flush-abutting solids for the "
                                      "consumer's weld."
                                   << std::endl;
                         TopoDS_Compound both;
                         BRep_Builder bb2;
                         bb2.MakeCompound(both);
-                        bb2.Add(both, parts[0]);
-                        bb2.Add(both, parts[1]);
+                        for (const auto& pt : parts) bb2.Add(both, pt);
                         solid = both;
                     }
                     if (std::getenv("MVB_FUSE_DIAG")) {
                         int ns = 0;
                         for (TopExp_Explorer e(solid, TopAbs_SOLID); e.More(); e.Next()) ++ns;
-                        std::cerr << "[fuse] '" << ptrs[i]->label << "' A=" << gA.Mass() * 1e9
-                                  << " B=" << gB.Mass() * 1e9 << " fused=" << gF.Mass() * 1e9
+                        std::cerr << "[fuse] '" << ptrs[i]->label << "' A=" << gAm * 1e9
+                                  << " B=" << gBm * 1e9 << " fused=" << gF.Mass() * 1e9
                                   << " mm3, solids=" << ns << std::endl;
                         int si = 0;
                         for (TopExp_Explorer e(solid, TopAbs_SOLID); e.More(); e.Next(), ++si) {
