@@ -145,6 +145,9 @@ FetchContent_Declare(
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/MkfCheckout.cmake)
+# Take configure's own edits back out so the update step sees a clean checkout (see there).
+mvbpp_mkf_unplant("${_MKF_SRC}")
 FetchContent_GetProperties(MKF)
 if(NOT mkf_POPULATED)
     FetchContent_Populate(MKF)
@@ -230,7 +233,12 @@ add_library(mvb++ STATIC
 # only src/shapes/*.cpp -- and TerminalFillet.cpp lives in src/. A guard narrower than the list
 # it protects gives false confidence: the configure passed, so the omission looked impossible.
 # So the glob is now RECURSIVE over every source the native build compiles.
+# MAS -> FEM mesh in the browser (ABT #1588): gmsh + MMG, same fork and options as native. Its
+# sources (src/mesh/) belong to mvbpp_mesh, so the guard below counts that target's list too.
+include(${CMAKE_CURRENT_SOURCE_DIR}/MvbMeshWasm.cmake)
 get_target_property(_mvb_wasm_srcs mvb++ SOURCES)
+get_target_property(_mvb_mesh_wasm_srcs mvbpp_mesh SOURCES)
+list(APPEND _mvb_wasm_srcs ${_mvb_mesh_wasm_srcs})
 file(GLOB_RECURSE _mvb_all_srcs "${REPO_ROOT}/src/*.cpp")
 foreach(_s ${_mvb_all_srcs})
     if(NOT "${_s}" IN_LIST _mvb_wasm_srcs)
@@ -253,13 +261,14 @@ target_include_directories(mvb++ PUBLIC
 )
 target_link_libraries(mvb++ PUBLIC occt MKF nlohmann_json::nlohmann_json)
 
+
 # ── WASM module ───────────────────────────────────────────────────────────────
 add_executable(mvbpp_wasm mvbpp_wasm.cpp)
 
 # cmrc embeds resources via static constructors in libdata.a.  When linking
 # static libraries the linker drops unreferenced object files, so the resource
 # initializers never run.  Force the entire archive so all cmrc files are kept.
-target_link_libraries(mvbpp_wasm PRIVATE mvb++)
+target_link_libraries(mvbpp_wasm PRIVATE mvb++ mvbpp_mesh)
 target_link_options(mvbpp_wasm PRIVATE
     "LINKER:--whole-archive"
     "$<TARGET_FILE:data>"

@@ -445,6 +445,20 @@ async function main() {
         assert(threw, 'Expected exception for invalid side');
     });
 
+    // ── mesher ────────────────────────────────────────────────────────────────
+
+    console.log('\nmvbpp WASM — mesher');
+    console.log('─'.repeat(50));
+
+    test('meshBuildRevision reports the linked gmsh fork and MMG', () => {
+        const rev = JSON.parse(mvbpp.meshBuildRevision());
+        // gmsh answers this itself at run time: the fork's om-4.15.2 build, not a checkout.
+        assert(/^4\.15\.2-git-[0-9a-f]{7}$/.test(rev.gmsh), `gmsh version: ${rev.gmsh}`);
+        assert(rev.mmg === '5.8.0', `mmg version: ${rev.mmg}`);
+        for (const k of ['mvbpp', 'mkf', 'mas'])
+            assert(/^[0-9a-f]{40}(-dirty)?$/.test(rev[k]), `${k} revision: ${rev[k]}`);
+    });
+
     // ── error handling ────────────────────────────────────────────────────────
 
     console.log('\nmvbpp WASM — error handling');

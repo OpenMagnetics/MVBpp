@@ -15,6 +15,7 @@
 #include "mvb/BobbinBuilder.h"
 #include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
+#include "mvb/mesh/Mesher.h"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/Coil.h"
 #include <nlohmann/json.hpp>
@@ -1050,6 +1051,10 @@ std::string _enrichMagnetic(const std::string& json_str) {
     return out.dump();
 }
 
+// What the mesher in this module was built from (ABT #1588/#1592). It initialises the linked
+// gmsh to ask its version, so it is also the proof that gmsh and MMG are in the module and run.
+std::string _meshBuildRevision() { return mvb::mesh::buildRevision().dump(); }
+
 // Re-exposed for the WebFrontend worker (both still exist in C++, just unbound after the
 // draw* API refactor): the symmetry-plane query the 3D viewer uses to offer half/quarter
 // cut options, and the core-gapping technical drawing (SVG) the technical-drawing exporter
@@ -1111,6 +1116,7 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
 
     // Metadata
     function("getSupportedFamilies", &guard<&mvb::get_supported_families>::call);
+    function("meshBuildRevision",   &guard<&_meshBuildRevision>::call);
 
     // Re-exposed for the WebFrontend worker (unbound after the draw* refactor)
     function("getSymmetryPlanes",   &guard<&_getSymmetryPlanes>::call);
