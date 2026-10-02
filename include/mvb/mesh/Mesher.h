@@ -74,6 +74,12 @@ MeshResult meshMagnetic(const nlohmann::json& magnetic, const nlohmann::json& re
 // The recipe schema: every knob with section, key, unit, default and one documentation line.
 nlohmann::json recipeTemplate();
 
+// What THIS library was built from, for a mesh's provenance (ABT #1592): the MVB++, MKF and MAS
+// commits compiled in (a "-dirty" suffix when the checkout had uncommitted changes), and the
+// gmsh and MMG versions linked. The gmsh version is asked of the linked gmsh at run time, never
+// read from a checkout. Before/after builds of a move step must report identical values.
+nlohmann::json buildRevision();
+
 // ---- Export ----------------------------------------------------------------------------------
 // format: "msh2" (gmsh 2.2, what OMFEM writes today: the identity-gate reference), "msh4", "bdf" (Nastran bulk data: large-field
 // GRID* only, PSOLID/MAT1 or PSHELL per region with the region name, throws on an element with no

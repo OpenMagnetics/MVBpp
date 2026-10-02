@@ -87,15 +87,25 @@ endif()
 find_package(OpenMP REQUIRED)
 find_library(MVBPP_GMP_LIBRARY gmp REQUIRED)
 
+# What this library is compiled from, refreshed on every build (cmake/BuildRev.cmake), so a
+# mesh's provenance names the code that was LINKED rather than whatever a checkout holds now.
+set(_mvbpp_gen "${CMAKE_BINARY_DIR}/generated")
+add_custom_target(mvbpp_buildrev
+    COMMAND ${CMAKE_COMMAND} -DOUT=${_mvbpp_gen}/mvb/mesh/BuildRev.h
+            -DMVBPP_DIR=${CMAKE_CURRENT_SOURCE_DIR} -DMKF_DIR=${_MKF_SRC} -DMAS_DIR=${_MAS_SRC}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildRev.cmake
+    BYPRODUCTS ${_mvbpp_gen}/mvb/mesh/BuildRev.h
+    COMMENT "Recording the MVB++/MKF/MAS revisions mvbpp_mesh is built from")
+
 add_library(mvbpp_mesh ${_mvbpp_lib_kind}
     src/mesh/Mesher.cpp
     src/mesh/SizeField.cpp
     src/mesh/MeshRecipe.cpp
 )
-add_dependencies(mvbpp_mesh gmsh_external)
+add_dependencies(mvbpp_mesh gmsh_external mvbpp_buildrev)
 target_include_directories(mvbpp_mesh
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE ${MVBPP_GMSH_PREFIX}/include ${MVBPP_MMG_PREFIX}/include)
+    PRIVATE ${MVBPP_GMSH_PREFIX}/include ${MVBPP_MMG_PREFIX}/include ${_mvbpp_gen})
 target_link_libraries(mvbpp_mesh
     PUBLIC  mvb++ nlohmann_json::nlohmann_json
     PRIVATE ${MVBPP_GMSH_PREFIX}/lib/libgmsh.a ${MVBPP_MMG_PREFIX}/lib/libmmg.a

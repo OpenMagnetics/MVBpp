@@ -173,6 +173,9 @@ FetchContent_Declare(
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/MkfCheckout.cmake)
+# Take configure's own edits back out so the update step sees a clean checkout (see there).
+mvbpp_mkf_unplant("${_MKF_SRC}")
 FetchContent_GetProperties(MKF)
 if(NOT mkf_POPULATED)
     FetchContent_Populate(MKF)

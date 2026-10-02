@@ -89,10 +89,13 @@ MAS::Magnetic make_bare_toroid_magnetic() {
     turn.set_winding("Primary");
     turn.set_length(0.05);
     turn.set_parallel(0);
-    turn.set_coordinates({0.0, 0.0});
+    // The inner XY-plane crossing: the wire centre against the hole wall (B/2 - wire radius =
+    // 7.0 mm). A turn at the origin sits on the hole axis and has no azimuth to mount the
+    // toroid by, which MVB++ rejects.
+    turn.set_coordinates({0.0070, 0.0});
     // The outer XY-plane crossing. MKF emits it for every toroidal turn and MVB++ refuses to
-    // invent one, so a hand-built turn has to carry it: the wire threads the bore at the
-    // origin and comes back round outside the 12.5 mm outer radius.
+    // invent one, so a hand-built turn has to carry it: the wire threads the bore at 7.0 mm
+    // and comes back round outside the 12.5 mm outer radius.
     turn.set_additional_coordinates(
         std::optional<std::vector<std::vector<double>>>(
             std::vector<std::vector<double>>{{0.0130, 0.0}}));
@@ -149,7 +152,9 @@ TEST_CASE("A declared core coating is drawn as its own solid", "[core-coating]")
     auto magnetic = make_bare_toroid_magnetic();
     MAS::CoreCoating coating;
     coating.set_type(std::optional<MAS::CoatingType>(MAS::CoatingType::EPOXY));
-    coating.set_thickness(0.0005);
+    MAS::DimensionWithTolerance thickness;
+    thickness.set_nominal(0.0005);
+    coating.set_thickness(thickness);
     auto core = magnetic.get_core().value();
     auto functional = core.get_functional_description();
     functional.set_coating(std::optional<MAS::CoreCoatingDataOrNameUnion>(coating));
@@ -166,7 +171,9 @@ TEST_CASE("A magnetic-epoxy shield cap is not drawn as a core coating", "[core-c
     auto magnetic = make_bare_toroid_magnetic();
     MAS::CoreCoating coating;
     coating.set_type(std::optional<MAS::CoatingType>(MAS::CoatingType::MAGNETIC_EPOXY));
-    coating.set_thickness(0.0005);
+    MAS::DimensionWithTolerance thickness;
+    thickness.set_nominal(0.0005);
+    coating.set_thickness(thickness);
     auto core = magnetic.get_core().value();
     auto functional = core.get_functional_description();
     functional.set_coating(std::optional<MAS::CoreCoatingDataOrNameUnion>(coating));
