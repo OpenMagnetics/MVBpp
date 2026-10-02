@@ -3,6 +3,7 @@
 #include "mvb/Utils.h"
 #include <array>
 #include <functional>
+#include <deque>
 #include <set>
 #include "constructive_models/Coil.h"
 #include "constructive_models/Wire.h"
@@ -21,9 +22,11 @@
 #include <Geom_BezierCurve.hxx>
 #include <TColgp_Array1OfPnt.hxx>
 #include <BRepAdaptor_Curve.hxx>
+#include <GCPnts_AbscissaPoint.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepTools_WireExplorer.hxx>
+#include <BRepTools.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <cstdio>
 #include <BRepAlgoAPI_Cut.hxx>
@@ -56,6 +59,8 @@
 #include <Geom_Surface.hxx>
 #include <Geom2dAPI_Interpolate.hxx>
 #include <Geom2d_BSplineCurve.hxx>
+#include <TColStd_Array1OfInteger.hxx>
+#include <TColStd_Array1OfReal.hxx>
 #include <TColgp_HArray1OfPnt2d.hxx>
 #include <gp_Vec2d.hxx>
 #include <Geom2d_TrimmedCurve.hxx>
@@ -169,7 +174,7 @@ int spiralSampleCount(const Spiral& sp, double wireRadius) {
         const double quad = 2.0 * k * k + r * r;
         double kappa =
             std::sqrt(m * m * (4.0 * k * k + r * r) + quad * quad) / (speed2 * std::sqrt(speed2));
-        if (sp.levelOut) {
+        if (sp.levelOut || sp.easeIn > 0.0) {
             // ABT #1403: the eased climb bends its height too (y'' != 0). On its constant radius
             // (k = 0), |P' x P''|^2 = r^2 (m^2 + y''^2) + r^4 exactly.
             const double y2 = (sp.y1 - sp.y0) * spiralHeightFracCurvature(sp, t) / (dAz * dAz);
@@ -270,6 +275,16 @@ double primLength(const Primitive& p) {
             // r(t) = r0 + dr t, y(t) = y0 + dy t, az(t) = az0 + daz t, t in [0, 1]:
             // |P'(t)|^2 = dr^2 + dy^2 + (daz r(t))^2.
             const double dr = sp.r1 - sp.r0, dy = sp.y1 - sp.y0, daz = std::abs(sp.az1 - sp.az0);
+            if (sp.easeIn > 0.0) {
+                // ABT #1528: the easing (the levelOut integral over e daz) plus the level run.
+                if (dr != 0.0)
+                    throw std::runtime_error("primLength: '" + p.label + "' is an eased climb on a "
+                                             "varying radius, which has no construction");
+                const double B = 2.0 * std::abs(dy), C = sp.easeIn * daz * sp.r0;
+                const double ease = B == 0.0 ? C : C == 0.0 ? 0.5 * B
+                                  : 0.5 * std::sqrt(B * B + C * C) + C * C / (2.0 * B) * std::asinh(B / C);
+                return ease + (1.0 - sp.easeIn) * daz * sp.r0;
+            }
             if (sp.levelOut) {
                 // ABT #1403: y' = 2 dy (1 - t), r constant. With u = 1 - t,
                 // |P'| = sqrt(B^2 u^2 + C^2), B = 2|dy|, C = daz r0, and
@@ -417,6 +432,104 @@ static std::vector<gp_Pnt> wireVertices(const TopoDS_Wire& w) {
     for (BRepTools_WireExplorer we(w); we.More(); we.Next())
         pts.push_back(BRep_Tool::Pnt(we.CurrentVertex()));
     return pts;
+}
+
+// THE FACE A MITRE KNIFE LEFT (ABT #1528): the one planar face of `s` lying in the bisector
+// plane (P, n) with its centroid within a wire radius of P -- the corner's exact cut section.
+// Null when there is none, or more than one (the caller says so).
+static TopoDS_Wire mitreCutWire(const TopoDS_Shape& s, const gp_Pnt& P, const gp_Dir& n,
+                                double r) {
+    TopoDS_Wire found;
+    int hits = 0;
+    for (TopExp_Explorer fx(s, TopAbs_FACE); fx.More(); fx.Next()) {
+        const TopoDS_Face f = TopoDS::Face(fx.Current());
+        BRepAdaptor_Surface sf(f);
+        if (sf.GetType() != GeomAbs_Plane) continue;
+        const gp_Pln pl = sf.Plane();
+        const gp_Dir pn = pl.Axis().Direction();
+        if (std::min(pn.Angle(n), pn.Angle(n.Reversed())) > 1e-9) continue;
+        if (pl.Distance(P) > 1e-9) continue;
+        GProp_GProps g;
+        BRepGProp::SurfaceProperties(f, g);
+        if (g.CentreOfMass().Distance(P) > r) continue;
+        found = BRepTools::OuterWire(f);
+        ++hits;
+    }
+    return hits == 1 ? found : TopoDS_Wire();
+}
+
+// THE CUT-FACE HANDOFF'S PRECONDITION (ABT #1528), decided before anything is built: the cut
+// face a mitre knife left must have one vertex per facet, every vertex in the mitre plane and on
+// this wire's section, and -- when the prism already exists -- each cut vertex k must be nearer
+// the prism's own vertex k than either of its neighbours (after the wire is restarted to pair
+// them), the same pairing mitredFacetPrism itself demands. A cut
+// half a facet out of phase (06_llc, flyback, 24_margin: 48-228 um) can only be met by twisting
+// the prism, which OMFEM's layered mesh punishes; such a corner keeps the knife construction.
+// Returns the reason it does not qualify, empty when it does.
+static TopoDS_Wire wireStartingAt(const TopoDS_Wire& w, const gp_Pnt& first, const gp_Pnt& second);
+static std::string cutHandoffRefusal(const TopoDS_Wire& cut, int segments, double r,
+                                     const gp_Pnt& P, const gp_Dir& n, const gp_Pnt& axisPt,
+                                     const gp_Dir& axis, const std::vector<gp_Pnt>* pairWith) {
+    const std::vector<gp_Pnt> vc = wireVertices(cut);
+    if ((int)vc.size() != segments)
+        return std::to_string(vc.size()) + " cut vertices, want " + std::to_string(segments);
+    for (const auto& q : vc) {
+        if (std::abs(gp_Vec(P, q).Dot(gp_Vec(n))) > 1e-8) return "a cut vertex off the mitre plane";
+        const gp_XYZ foot = axisPt.XYZ() + axis.XYZ() * gp_Vec(axisPt, q).Dot(gp_Vec(axis));
+        const double rad = (q.XYZ() - foot).Modulus();
+        if (rad < 0.8 * r || rad > 1.6 * r)
+            return "a cut vertex " + std::to_string(rad / r) + " r from the prism axis";
+    }
+    if (pairWith) {
+        // The prism pairs the cut's vertex k with its own vertex k after restarting the cut at the
+        // vertex nearest its own vertex 0 (wireStartingAt); every pair must be nearer than either
+        // neighbour, or the loft's rulings would cross. The SAME test the prism applies, so the
+        // decision made here is the one the build will honour.
+        const std::vector<gp_Pnt>& pv = *pairWith;
+        if ((int)pv.size() != segments) return "the prism has no end polygon to pair with";
+        const std::vector<gp_Pnt> vo = wireVertices(wireStartingAt(cut, pv[0], pv[1]));
+        if ((int)vo.size() != segments) return "the reordered cut lost vertices";
+        for (int k = 0; k < segments; ++k) {
+            const double dk = vo[k].Distance(pv[k]);
+            const double dn = std::min(vo[k].Distance(pv[(k + 1) % segments]),
+                                       vo[k].Distance(pv[(k + segments - 1) % segments]));
+            if (!(dk < dn))
+                return "cut vertex " + std::to_string(k) + " is " + std::to_string(dk * 1e6) +
+                       " um from its pair and " + std::to_string(dn * 1e6) + " um from the next: "
+                       "out of phase, no unambiguous pairing";
+        }
+    }
+    return {};
+}
+
+// `w` restarted at its vertex nearest `first` and running towards `second`, so a ruled loft
+// pairs its vertex k with the other section's vertex k. Throws if the result does not start there.
+static TopoDS_Wire wireStartingAt(const TopoDS_Wire& w, const gp_Pnt& first, const gp_Pnt& second) {
+    std::vector<TopoDS_Edge> edges;
+    std::vector<gp_Pnt> verts;
+    for (BRepTools_WireExplorer we(w); we.More(); we.Next()) {
+        edges.push_back(we.Current());
+        verts.push_back(BRep_Tool::Pnt(we.CurrentVertex()));
+    }
+    const size_t n = edges.size();
+    if (n < 3) throw std::runtime_error("wireStartingAt: fewer than 3 edges");
+    size_t k0 = 0;
+    for (size_t k = 1; k < n; ++k)
+        if (verts[k].Distance(first) < verts[k0].Distance(first)) k0 = k;
+    const bool forward =
+        verts[(k0 + 1) % n].Distance(second) <= verts[(k0 + n - 1) % n].Distance(second);
+    BRepBuilderAPI_MakeWire mw;
+    for (size_t j = 0; j < n; ++j) {
+        if (forward) mw.Add(edges[(k0 + j) % n]);
+        else mw.Add(TopoDS::Edge(edges[(k0 + 2 * n - 1 - j) % n].Reversed()));
+    }
+    if (!mw.IsDone()) throw std::runtime_error("wireStartingAt: the reordered wire did not close");
+    const TopoDS_Wire out = mw.Wire();
+    const auto ov = wireVertices(out);
+    if (ov.size() != n || ov.front().Distance(verts[k0]) > 1e-12)
+        throw std::runtime_error("wireStartingAt: the reordered wire does not start at the "
+                                 "requested vertex");
+    return out;
 }
 
 // The neighbour section's phase in this piece's own deterministic frame at (center, normal):
@@ -617,8 +730,9 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
                 const double sgn = (dAz >= 0.0) ? 1.0 : -1.0;
                 const double dvdu = (std::abs(dAz) > 1e-12) ? v1 / dAz : 0.0;
                 // An eased climb leaves at twice the mean slope and arrives level (ABT #1403).
-                const double dvduA = sp.levelOut ? 2.0 * dvdu : dvdu;
-                const double dvduB = sp.levelOut ? 0.0 : dvdu;
+                const double dvduA = sp.levelOut ? 2.0 * dvdu
+                                   : sp.easeIn > 0.0 ? 2.0 * dvdu / sp.easeIn : dvdu;
+                const double dvduB = (sp.levelOut || sp.easeIn > 0.0) ? 0.0 : dvdu;
                 const double dsduA = std::sqrt(sp.r0 * sp.r0 + dvduA * dvduA);
                 const double dsduB = std::sqrt(sp.r1 * sp.r1 + dvduB * dvduB);
                 const double az0e =
@@ -626,7 +740,41 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
                 const double az1e =
                     sp.az1 + (overB > 0.0 && dsduB > 1e-12 ? sgn * overB / dsduB : 0.0);
                 TopoDS_Edge e;
-                if (sp.levelOut) {
+                if (sp.easeIn > 0.0) {
+                    // ABT #1528: the folded easing and its level run as ONE exact pcurve -- the
+                    // easing's parabola (a degree-2 Bezier, as below) then the level line,
+                    // joined C1 at t = easeIn (knot multiplicity 2). One edge, so the pipe has no
+                    // face boundary at the easing's end and no micron strips.
+                    if (!constantRadius)
+                        throw std::runtime_error(
+                            "primEdge: '" + pr.label + "' is an eased climb on a varying radius, "
+                            "which has no construction");
+                    const double e0 = sp.easeIn;
+                    const gp_Pnt2d q0(sp.az0, v0), q1(sp.az0 + 0.5 * e0 * dAz, v0 + dy),
+                        q2(sp.az0 + e0 * dAz, v0 + dy), q4(sp.az1, v0 + dy);
+                    const gp_Pnt2d q3(0.5 * (q2.X() + q4.X()), v0 + dy);
+                    TColgp_Array1OfPnt2d poles(1, 5);
+                    poles.SetValue(1, q0); poles.SetValue(2, q1); poles.SetValue(3, q2);
+                    poles.SetValue(4, q3); poles.SetValue(5, q4);
+                    TColStd_Array1OfReal knots(1, 3);
+                    knots.SetValue(1, 0.0); knots.SetValue(2, e0); knots.SetValue(3, 1.0);
+                    TColStd_Array1OfInteger mults(1, 3);
+                    mults.SetValue(1, 3); mults.SetValue(2, 2); mults.SetValue(3, 3);
+                    Handle(Geom2d_BSplineCurve) bs = new Geom2d_BSplineCurve(poles, knots, mults, 2);
+                    Handle(Geom2d_BoundedCurve) pc = bs;
+                    if (az0e != sp.az0 || az1e != sp.az1) {
+                        Geom2dConvert_CompCurveToBSplineCurve cc(bs);
+                        if (az0e != sp.az0 &&
+                            !cc.Add(GCE2d_MakeSegment(gp_Pnt2d(az0e, v0 + (az0e - sp.az0) * dvduA),
+                                                      q0).Value(), 1e-12))
+                            return TopoDS_Edge();
+                        if (az1e != sp.az1 &&
+                            !cc.Add(GCE2d_MakeSegment(q4, gp_Pnt2d(az1e, v0 + dy)).Value(), 1e-12))
+                            return TopoDS_Edge();
+                        pc = cc.BSplineCurve();
+                    }
+                    e = BRepBuilderAPI_MakeEdge(pc, surf).Edge();
+                } else if (sp.levelOut) {
                     // ABT #1403: the eased climb is a PARABOLA in (U, V) -- U linear, V
                     // quadratic -- which a degree-2 Bezier represents EXACTLY: poles at the two
                     // ends and, between them, the intersection of the end tangents (slope
@@ -1198,7 +1346,7 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         // micro-geometry #1111 exists to avoid (measured on 20_iso's 5-degree third fillet
         // arc). The faceted neighbour's round transition lies on the same circle, so the glue
         // only imprints its break-points on this cap's edge; no face is split.
-        if (!profWire.IsNull() && radius < kFacetTightArcExactRatio * r) {
+        if (!profWire.IsNull() && (radius < kFacetTightArcExactRatio * r || pr.arc.exactRound)) {
             if (std::getenv("MVB_MITRE_DIAG"))
                 std::cerr << "[tight-arc] '" << pr.label << "' bend " << radius * 1e6 << " um < "
                           << kFacetTightArcExactRatio << " x r (" << r * 1e6
@@ -1206,10 +1354,77 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
             profWire.Nullify();
             if (startPhasedOut) *startPhasedOut = false;
         }
-        TopoDS_Face prof =
-            !profWire.IsNull()
-                ? BRepBuilderAPI_MakeFace(profWire).Face()
-                : BRepBuilderAPI_MakeFace(wireProfileWireSplit(start, gp_Dir(tangent), r, 2)).Face();
+        // AN EXACT ROUND ARC STARTS ITS SPLIT CIRCLE ON THE SECTION IT RECEIVES (ABT #1528).
+        // The split circle's two break-points used to sit on deterministicSectionFrame at every
+        // arc start. A revolve carries its start frame to its end ROTATED, and the rotated
+        // frame is the deterministic frame of the end tangent only when the bend axis is the
+        // world reference: 08_pq's lead fillet leans 0.8 deg off it, so the next arc's
+        // break-points landed 0.98 um from the previous arc's, and a faceted neighbour's
+        // polygon vertex 2.3-4.2 um from an arc's -- circumferential micro-edges on the shared
+        // section that OMFEM meshed into 22 slivers. At an ungrown tangent start the circle
+        // now breaks at a vertex of the received section and its antipode; the arc hands on
+        // its true end section below; the assembler passes it on to a faceted neighbour only
+        // where that neighbour's own vertex would otherwise miss a break-point by less than the
+        // polygon's sagitta, and always to a following round arc.
+        // WHICH antipodal pair: the one most nearly square to the bend radius. A tight arc's
+        // torus runs its inner side R - r from the bend axis (5.5 um on 10_emi's exit fillet),
+        // so a break-point there makes a longitudinal seam (R - r) x sweep long -- 0.67 um --
+        // while a pair square to the radius gives two seams ~R x sweep. The neighbour's other
+        // vertices only imprint break-points 2 pi / n away, never a micro-edge. With nothing
+        // received, the break-points go on the bend axis direction for the same reason.
+        const bool roundInFacetMode = segments > 0 && profWire.IsNull();
+        gp_Dir splitX = roundInFacetMode
+                            ? gp_Dir(pr.arc.axis)
+                            : deterministicSectionFrame(start, gp_Dir(tangent)).XDirection();
+        if (roundInFacetMode && startProfileOverride && !startProfileOverride->IsNull() &&
+            overA <= 0.0) {
+            const std::vector<gp_Pnt> rv = wireVertices(*startProfileOverride);
+            std::string bad;
+            if ((int)rv.size() != segments || segments % 2 != 0)
+                bad = std::to_string(rv.size()) + " vertices, want an even " +
+                      std::to_string(segments);
+            for (size_t k = 0; bad.empty() && k < rv.size(); ++k) {
+                const gp_XYZ d = rv[k].XYZ() - start.XYZ();
+                const double off = d.Dot(gp_Dir(tangent).XYZ());
+                const double rad = (d - gp_Dir(tangent).XYZ() * off).Modulus();
+                // The model's own length resolution: a received section 0.65 nm off the
+                // plane (08_pq's stub -> fillet) is the same section.
+                if (std::abs(off) > Precision::Confusion() ||
+                    std::abs(rad - r) > Precision::Confusion())
+                    bad = "vertex " + std::to_string(k) + " is " + std::to_string(off * 1e9) +
+                          " nm off the start plane and " + std::to_string((rad - r) * 1e9) +
+                          " nm off the wire radius";
+            }
+            if (bad.empty() &&
+                (rv[0].XYZ() + rv[segments / 2].XYZ() - 2.0 * start.XYZ()).Modulus() >
+                    2.0 * Precision::Confusion())
+                bad = "vertices 0 and n/2 are not antipodal";
+            if (bad.empty()) {
+                const gp_XYZ radial = v0e.Normalized();
+                double bestCos = 2.0;
+                for (int k = 0; k < segments / 2; ++k) {
+                    gp_XYZ d = rv[k].XYZ() - start.XYZ();
+                    d -= gp_Dir(tangent).XYZ() * d.Dot(gp_Dir(tangent).XYZ());
+                    const double c = std::abs(d.Normalized().Dot(radial));
+                    if (c < bestCos) { bestCos = c; splitX = gp_Dir(d); }
+                }
+                if (startPhasedOut) *startPhasedOut = true;
+            } else {
+                std::cerr << "[round-phase] '" << pr.label << "' keeps its own split frame: the "
+                          << "received section is not this arc's start circle (" << bad
+                          << "); its break-points can miss the neighbour's by microns\n";
+            }
+        }
+        TopoDS_Wire roundProf;
+        if (profWire.IsNull()) {
+            const gp_Circ circ(gp_Ax2(start, gp_Dir(tangent), splitX), r);
+            BRepBuilderAPI_MakeWire mw;
+            mw.Add(BRepBuilderAPI_MakeEdge(circ, 0.0, kPi).Edge());
+            mw.Add(BRepBuilderAPI_MakeEdge(circ, kPi, kTwoPi).Edge());
+            roundProf = mw.Wire();
+        }
+        TopoDS_Face prof = !profWire.IsNull() ? BRepBuilderAPI_MakeFace(profWire).Face()
+                                              : BRepBuilderAPI_MakeFace(roundProf).Face();
         BRepPrimAPI_MakeRevol rev(prof, gp_Ax1(pr.arc.c, gp_Dir(pr.arc.axis)), total);
         if (rev.IsDone() && std::getenv("MVB_CAP_DEBUG")) {
             // Where the revolve's PLANAR caps land against the arc's analytic ends (the same
@@ -1240,6 +1455,25 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
             rot.SetRotation(gp_Ax1(pr.arc.c, gp_Dir(pr.arc.axis)), total);
             *endCapOut = TopoDS::Wire(
                 BRepBuilderAPI_Transform(profWire, rot, Standard_True).Shape());
+        }
+        if (rev.IsDone() && endCapOut && roundInFacetMode && overB <= 0.0) {
+            // The round arc's true end section, as the polygon a faceted neighbour adopts:
+            // n points on the end circle, vertex 0 and n/2 on this arc's own break-points.
+            gp_Trsf rot;
+            rot.SetRotation(gp_Ax1(pr.arc.c, gp_Dir(pr.arc.axis)), total);
+            const gp_Ax2 fr(start, gp_Dir(tangent), splitX);
+            BRepBuilderAPI_MakePolygon mp;
+            for (int k = 0; k < segments; ++k) {
+                const double t = kTwoPi * k / segments;
+                mp.Add(gp_Pnt(start.XYZ() + fr.XDirection().XYZ() * (r * std::cos(t)) +
+                              fr.YDirection().XYZ() * (r * std::sin(t)))
+                           .Transformed(rot));
+            }
+            mp.Close();
+            if (!mp.IsDone())
+                throw std::runtime_error("'" + pr.label + "': the round arc's end section "
+                                         "polygon could not be built");
+            *endCapOut = mp.Wire();
         }
         return rev.IsDone() ? rev.Shape() : TopoDS_Shape();
     }
@@ -1398,6 +1632,27 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         // MakeSolid() is not idempotent -- a second call returns false -- so it runs exactly
         // once, here, and every later test reads the result.
         const bool pipeMade = ps.IsDone() && ps.MakeSolid();
+        if (pipeMade && std::getenv("MVB_CAP_DEBUG") && (roundStart || roundEnd)) {
+            // Where the transition's swept end SECTIONS put their break-points, against the
+            // vertices they were built through (MakePipeShell may re-frame a section).
+            auto worst = [&](const TopoDS_Shape& got, const std::vector<gp_Pnt>& want) {
+                double w = 0.0;
+                for (TopExp_Explorer vx(got, TopAbs_VERTEX); vx.More(); vx.Next()) {
+                    const gp_Pnt g = BRep_Tool::Pnt(TopoDS::Vertex(vx.Current())).Transformed(down);
+                    double best = 1e9;
+                    for (const auto& q : want) best = std::min(best, g.Distance(q));
+                    w = std::max(w, best);
+                }
+                return w;
+            };
+            std::cerr << "[round-sweep] '" << pr.label << "' first section vertices off the "
+                      << "built ones by <= " << worst(ps.FirstShape(), wireVertices(prof)) * 1e9
+                      << " nm, last section by <= "
+                      << worst(ps.LastShape(),
+                               wireVertices(wireProfileWirePhased(ends.second, tB, r, segments,
+                                                                  phase0))) * 1e9
+                      << " nm\n";
+        }
         if (pipeMade && std::getenv("MVB_CAP_DEBUG")) {
             // Where the sweep's PLANAR caps actually are, against the analytic ends: a pipe whose
             // cap is tilted or displaced from its nominal section is what leaves wedges at
@@ -1668,10 +1923,16 @@ TopoDS_Shape loftRuledPrism(const std::vector<gp_Pnt>& start, const std::vector<
 // fall back to the ring this exists to remove.
 static TopoDS_Shape loftRuledPrismRoundEnds(const std::vector<gp_Pnt>& start,
                                            const std::vector<gp_Pnt>& end, const gp_Dir& dir,
-                                           double r, bool roundStart, bool roundEnd) {
+                                           double r, bool roundStart, bool roundEnd,
+                                           const TopoDS_Wire* startWire = nullptr,
+                                           const TopoDS_Wire* endWire = nullptr,
+                                           bool endWireOverChord = false) {
     const size_t n = start.size();
     if (n < 3 || end.size() != n)
         throw std::runtime_error("round-ended prism: cap polygons differ in size");
+    if ((startWire && roundStart) || (endWire && roundEnd))
+        throw std::runtime_error("round-ended prism: an end cannot take a neighbour's cut face "
+                                 "and also be round");
     auto centreOf = [&](const std::vector<gp_Pnt>& p) {
         gp_XYZ c(0, 0, 0);
         for (const auto& q : p) c += q.XYZ();
@@ -1692,7 +1953,8 @@ static TopoDS_Shape loftRuledPrismRoundEnds(const std::vector<gp_Pnt>& start,
     };
     const double chord = 2.0 * r * std::sin(kPi / double(n));
     const double span = gp_Vec(start.front(), end.front()).Dot(gp_Vec(dir));
-    const double need = chord * ((roundStart ? 1.0 : 0.0) + (roundEnd ? 1.0 : 0.0));
+    const double need = chord * ((roundStart || startWire ? 1.0 : 0.0) +
+                                 (roundEnd || (endWire && endWireOverChord) ? 1.0 : 0.0));
     if (!(span > need))
         throw std::runtime_error("round-ended prism: " + std::to_string(span * 1e6) +
                                  " um straight is shorter than its round transition(s), " +
@@ -1712,6 +1974,11 @@ static TopoDS_Shape loftRuledPrismRoundEnds(const std::vector<gp_Pnt>& start,
         requirePerpendicular(start, "start");
         sections.push_back(up(roundSectionThrough(start, centreOf(start), dir, r)));
         sections.push_back(polyUp(shifted(start, chord)));
+    } else if (startWire) {
+        // The cut face's curves turn into this prism's own regular polygon (laid on the start
+        // plane, see mitredFacetPrism) over ONE facet chord; beyond it the prism is exact.
+        sections.push_back(up(*startWire));
+        sections.push_back(polyUp(shifted(start, chord)));
     } else {
         sections.push_back(polyUp(start));
     }
@@ -1719,6 +1986,12 @@ static TopoDS_Shape loftRuledPrismRoundEnds(const std::vector<gp_Pnt>& start,
         requirePerpendicular(end, "end");
         sections.push_back(polyUp(shifted(end, -chord)));
         sections.push_back(up(roundSectionThrough(end, centreOf(end), dir, r)));
+    } else if (endWire) {
+        // Over the last chord when this prism's own polygon was turned to the cut's phase (a free
+        // start, see mitredFacetPrism); over the whole prism when its start is pinned by the
+        // previous piece, so the turn to the cut's phase is spread and never a twist.
+        if (endWireOverChord) sections.push_back(polyUp(shifted(end, -chord)));
+        sections.push_back(up(*endWire));
     } else {
         sections.push_back(polyUp(end));
     }
@@ -1745,7 +2018,9 @@ static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double 
                                      bool* startAdoptedOut = nullptr,
                                      bool staggerAdopt = false,
                                      std::string* why = nullptr,
-                                     bool roundStart = false, bool roundEnd = false) {
+                                     bool roundStart = false, bool roundEnd = false,
+                                     const TopoDS_Wire* startCut = nullptr,
+                                     const TopoDS_Wire* endCut = nullptr) {
     auto refuse = [&](const std::string& r) { if (why) *why = r; return TopoDS_Shape(); };
     if (segments <= 0) return refuse("segments <= 0");
     const double dS = dir.XYZ().Dot(ns), dE = dir.XYZ().Dot(ne);
@@ -1892,6 +2167,80 @@ static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double 
         std::cerr << "[cap-debug] shared start cap SIZE mismatch (" << startCapShared->size()
                   << " vs " << segments << ")\n";
     }
+    // THE NEIGHBOUR'S CUT FACE (ABT #1528). A curved piece knifed at this mitre ends on the
+    // curves its facets cut in the bisector plane, not on a polygon, so no polygon this prism
+    // could pick coincides with it -- the two faces overlapped in 2n micron triangles (10_emi's
+    // dragback corners, 1.3-3 um). The prism starts ON that face instead: its vertices are the
+    // cut's, and the loft rules each cut curve to this prism's chord at the far end.
+    TopoDS_Wire startCutUse;
+    if (startCut && !startCut->IsNull()) {
+        const std::vector<gp_Pnt> vc = wireVertices(*startCut);
+        std::string bad;
+        if ((int)vc.size() != segments) bad = std::to_string(vc.size()) + " cut vertices";
+        if (!bad.empty() && std::getenv("MVB_CUT_DIAG")) {
+            int ke = 0;
+            for (BRepTools_WireExplorer we(*startCut); we.More(); we.Next(), ++ke) {
+                const gp_Pnt p = BRep_Tool::Pnt(we.CurrentVertex());
+                const gp_XYZ foot = a.XYZ() + dir.XYZ() * gp_Vec(a, p).Dot(gp_Vec(dir));
+                const gp_XYZ d = p.XYZ() - foot;
+                BRepAdaptor_Curve ec(we.Current());
+                std::fprintf(stderr, "[cut-diag] v%d az=%.4f deg rad/r=%.6f edge=%d len=%.3f um\n", ke,
+                             std::atan2(d.Dot(dy.XYZ()), d.Dot(dx.XYZ())) * 180.0 / kPi,
+                             d.Modulus() / r, (int)ec.GetType(),
+                             GCPnts_AbscissaPoint::Length(ec) * 1e6);
+            }
+        }
+        for (const auto& p : vc) {
+            if (!bad.empty()) break;
+            if (std::abs(gp_Vec(Ps, p).Dot(gp_Vec(gp_Dir(ns)))) > 1e-8) bad = "a cut vertex off the start plane";
+            const gp_XYZ foot = a.XYZ() + dir.XYZ() * gp_Vec(a, p).Dot(gp_Vec(dir));
+            const double rad = (p.XYZ() - foot).Modulus();
+            if (rad < 0.8 * r || rad > 1.6 * r) bad = "a cut vertex at " + std::to_string(rad / r) + " r from the axis";
+        }
+        if (!bad.empty()) return refuse("neighbour's cut face does not fit this prism (" + bad + ")");
+        // The prism keeps its OWN exact section -- the regular polygon of radius r, turned to the
+        // cut's phase and laid on the start plane -- and the loft turns the cut face into it over
+        // one facet chord. Taking the cut's vertices as the polygon instead carried the cut's
+        // shape down the whole straight: after 00_debug's 67.9-degree corner they sit outside the
+        // radius, and the 13 mm lead came out 2.4 % fat in section.
+        const gp_XYZ d0 = vc.front().XYZ() -
+                          (a.XYZ() + dir.XYZ() * gp_Vec(a, vc.front()).Dot(gp_Vec(dir)));
+        const double ang0 = std::atan2(d0.Dot(dy.XYZ()), d0.Dot(dx.XYZ()));
+        for (int i = 0; i < segments; ++i) {
+            const double ang = ang0 + kTwoPi * i / segments;
+            const gp_XYZ v = a.XYZ() + dx.XYZ() * (r * std::cos(ang)) + dy.XYZ() * (r * std::sin(ang));
+            vs[i] = gp_Pnt(v + dir.XYZ() * ((Ps.XYZ() - v).Dot(ns) / dS));
+        }
+        startCutUse = wireStartingAt(*startCut, vs[0], vs[1]);
+        const std::vector<gp_Pnt> vo = wireVertices(startCutUse);
+        for (int k = 0; k < segments; ++k) {
+            const double dk = vo[k].Distance(vs[k]);
+            if (dk >= vo[k].Distance(vs[(k + 1) % segments]) ||
+                dk >= vo[k].Distance(vs[(k + segments - 1) % segments]))
+                return refuse("cut vertex " + std::to_string(k) + " does not pair with this "
+                              "prism's own vertex (" + std::to_string(dk * 1e6) + " um)");
+        }
+        if (startAdoptedOut) *startAdoptedOut = true;   // the start face IS the neighbour's cut
+    }
+    // A FREE START (no neighbour cap, no cut, not round -- a terminal lead's open end) takes its
+    // phase from the cut face it ends on, so the prism stays its own exact polygon and only its
+    // last chord turns into the cut. Lofting the whole prism onto the cut instead tapered
+    // 00_debug's entrance lead 1.4 % fat in section toward its corner, into its exit lead.
+    const bool endFromCut = endCut && !endCut->IsNull() && !roundStart && !roundEnd &&
+                            !startCapShared && !(startCut && !startCut->IsNull());
+    if (endFromCut) {
+        const std::vector<gp_Pnt> ec = wireVertices(*endCut);
+        if ((int)ec.size() != segments)
+            return refuse("neighbour's cut face has " + std::to_string(ec.size()) + " vertices");
+        const gp_XYZ d0 = ec.front().XYZ() -
+                          (a.XYZ() + dir.XYZ() * gp_Vec(a, ec.front()).Dot(gp_Vec(dir)));
+        const double ang0 = std::atan2(d0.Dot(dy.XYZ()), d0.Dot(dx.XYZ()));
+        for (int i = 0; i < segments; ++i) {
+            const double ang = ang0 + kTwoPi * i / segments;
+            const gp_XYZ v = a.XYZ() + dx.XYZ() * (r * std::cos(ang)) + dy.XYZ() * (r * std::sin(ang));
+            vs[i] = gp_Pnt(v + dir.XYZ() * ((Ps.XYZ() - v).Dot(ns) / dS));
+        }
+    }
     // The end cap is the FINAL start polygon projected to the end plane -- computed from vs
     // so an adopted (phase-shifted) start cap yields a straight, untwisted prism.
     std::vector<gp_Pnt> ve(segments);
@@ -1906,6 +2255,27 @@ static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double 
         // that corner -- exactly the configuration the handoff-off control meshes green.
         if (!(te > Precision::Confusion())) return {};
         ve[i] = gp_Pnt(vs[i].XYZ() + dir.XYZ() * te);
+    }
+    TopoDS_Wire endCutUse;
+    if (endCut && !endCut->IsNull()) {
+        if (roundEnd) return refuse("an end cannot take a cut face and be round");
+        endCutUse = wireStartingAt(*endCut, ve[0], ve[1]);
+        const std::vector<gp_Pnt> vc = wireVertices(endCutUse);
+        if ((int)vc.size() != segments)
+            return refuse("neighbour's cut face has " + std::to_string(vc.size()) + " vertices");
+        const double facet = 2.0 * r * std::sin(kPi / segments);
+        for (int k = 0; k < segments; ++k) {
+            if (std::abs(gp_Vec(Pe, vc[k]).Dot(gp_Vec(gp_Dir(ne)))) > 1e-8)
+                return refuse("a neighbour cut vertex off the end plane");
+            // Vertex k of the cut must pair with this prism's vertex k unambiguously -- nearer
+            // to it than to either of its neighbours -- or the rulings would cross.
+            const double dk = vc[k].Distance(ve[k]);
+            if (dk >= vc[k].Distance(ve[(k + 1) % segments]) ||
+                dk >= vc[k].Distance(ve[(k + segments - 1) % segments]))
+                return refuse("neighbour cut vertex " + std::to_string(k) + " (" +
+                              std::to_string(dk * 1e6) + " um from its pair) is as near another "
+                              "vertex of this prism");
+        }
     }
     // ThruSections between the two cap polygons, RULED: OCC's own constructor for exactly this
     // ruled prism, with face orientations it manages itself. The first implementation hand-sewed
@@ -1934,9 +2304,14 @@ static TopoDS_Shape mitredFacetPrism(const gp_Pnt& a, const gp_Dir& dir, double 
         std::string loftWhy;
         // A round neighbour (ABT #1528) gets its round transition; that loft throws itself
         // when it cannot be built, since refusing here would drop to the knife path.
-        const TopoDS_Shape out = (roundStart || roundEnd)
-                                     ? loftRuledPrismRoundEnds(vs, ve, dir, r, roundStart, roundEnd)
-                                     : loftRuledPrism(vs, ve, &loftWhy);
+        const bool special =
+            roundStart || roundEnd || !startCutUse.IsNull() || !endCutUse.IsNull();
+        const TopoDS_Shape out =
+            special ? loftRuledPrismRoundEnds(vs, ve, dir, r, roundStart, roundEnd,
+                                              startCutUse.IsNull() ? nullptr : &startCutUse,
+                                              endCutUse.IsNull() ? nullptr : &endCutUse,
+                                              endFromCut)
+                    : loftRuledPrism(vs, ve, &loftWhy);
         if (out.IsNull()) return refuse(loftWhy);
         // SUB-RESOLUTION SLIVER GUARD. "> 0" let through prisms whose two end planes almost
         // coincide: positive volume below what the B-Rep can represent (measured on the
@@ -2554,10 +2929,141 @@ size_t requireManifoldCopper(const TopoDS_Shape& shape, const std::string& condu
     return checked;
 }
 
+static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
+                                     double wireRadius, int segments, CornerStyle corners,
+                                     std::vector<size_t>* primIndexPerSolid, bool skipWeld,
+                                     const std::string& conductorName);
+
+// FOLD A SUB-FACET CLIMB EASING INTO ITS LEVEL RUN (ABT #1528). The easing ConductorBuilder
+// puts between a helix and its level run (ABT #1403) is as long as MKF's bend radius makes it:
+// on a shallow pitch that is 2.2 um (10_emi), and a faceted piece that short has n side faces
+// that short -- micron strips. Its centreline is within nanometres of the level run it joins,
+// but it is its own piece, so nothing can merge its faces with the neighbour's. Here, and only
+// where the easing is shorter than one facet chord, it becomes the first part of the level run:
+// ONE spiral (Spiral::easeIn) with the same exact centreline -- the easing's parabola, then
+// level -- swept as one piece. Nothing moves: the fold is checked to reproduce both originals'
+// end points and total length, and anything short that cannot be folded is reported.
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wireRadius,
                           int segments, CornerStyle corners,
                           std::vector<size_t>* primIndexPerSolid, bool skipWeld,
                           const std::string& conductorName) {
+    if (segments <= 0)
+        return assembleWireImpl(ptrs, wireRadius, segments, corners, primIndexPerSolid,
+                                skipWeld, conductorName);
+    const double chord = 2.0 * wireRadius * std::sin(kPi / segments);
+    std::deque<Primitive> folded;
+    std::vector<const Primitive*> use;
+    std::vector<size_t> orig;
+    for (size_t k = 0; k < ptrs.size(); ++k) {
+        const Primitive& L = *ptrs[k];
+        const bool shortEase = L.kind == Primitive::SPIRAL && L.spiral.levelOut &&
+                               !L.spiral.blend && primLength(L) < chord;
+        if (!shortEase) {
+            use.push_back(ptrs[k]);
+            orig.push_back(k);
+            continue;
+        }
+        std::string why;
+        Primitive M;
+        if (k + 1 >= ptrs.size()) why = "it ends the conductor";
+        else {
+            const Primitive& A = *ptrs[k + 1];
+            const Spiral& sp = L.spiral;
+            const auto le = primEndpoints(L);
+            if (A.kind != Primitive::ARC3) why = "the piece after it is not a level arc";
+            else if (std::abs(std::abs(A.arc.axis.Y()) - 1.0) > 1e-12)
+                why = "the arc after it is not about the vertical axis";
+            else if (A.arc.c.Distance(gp_Pnt(sp.cx, sp.y1, sp.cz)) > 1e-12 ||
+                     std::abs(A.arc.v0.Modulus() - sp.r1) > 1e-12 * sp.r1)
+                why = "the arc after it is not on the easing's own cylinder at its height";
+            else if (primEndpoints(A).first.Distance(le.second) > 1e-12)
+                why = "the arc after it does not start where the easing ends";
+            else {
+                M = A;
+                M.kind = Primitive::SPIRAL;
+                M.spiral = sp;
+                M.spiral.levelOut = false;
+                M.spiral.az1 = sp.az1 + A.arc.sweep * (A.arc.axis.Y() > 0.0 ? 1.0 : -1.0);
+                M.spiral.easeIn = (sp.az1 - sp.az0) / (M.spiral.az1 - sp.az0);
+                const double lenIn = primLength(L) + primLength(A);
+                if (!(M.spiral.easeIn > 0.0 && M.spiral.easeIn < 1.0))
+                    why = "the arc runs backwards over the easing";
+                else if (primEndpoints(M).second.Distance(primEndpoints(A).second) > 1e-9)
+                    why = "the folded piece would not end where the arc does";
+                else if (std::abs(primLength(M) - lenIn) > 1e-12 + 1e-9 * lenIn)
+                    why = "the folded piece's length is not the two pieces' sum";
+            }
+        }
+        if (!why.empty()) {
+            std::cerr << "[ease-fold] '" << L.label << "' is a " << primLength(L) * 1e6
+                      << " um climb easing, shorter than a " << chord * 1e6
+                      << " um facet chord, and is NOT folded (" << why
+                      << "): its facets stay that short\n";
+            use.push_back(ptrs[k]);
+            orig.push_back(k);
+            continue;
+        }
+        folded.push_back(M);
+        use.push_back(&folded.back());
+        orig.push_back(k + 1);   // the solid is the level run's, now eased in
+        ++k;
+    }
+    // ROUND FILLET CHAINS (ABT #1528). A tight arc is revolved exactly round; a faceted ARC3
+    // tangent to it has no round transition (only a straight or a helix can turn round over a
+    // chord), so the two met as a 12-gon against a circle in one plane -- 11_pushpull's terminal
+    // fillets, whose lens would not weld and whose conductor then shipped as 2-3 solids. Every
+    // arc tangent-chained to a tight arc is made round too: the chain's straight and helical
+    // neighbours turn round over a chord as they already do beside a tight arc.
+    {
+        const size_t m = use.size();
+        std::vector<bool> rnd(m, false);
+        for (size_t k = 0; k < m; ++k)
+            rnd[k] = use[k]->kind == Primitive::ARC3 &&
+                     (use[k]->arc.exactRound ||
+                      use[k]->arc.v0.Modulus() < kFacetTightArcExactRatio * wireRadius);
+        auto tangentJoin = [&](size_t a, size_t b) {
+            return use[a]->kind == Primitive::ARC3 && use[b]->kind == Primitive::ARC3 &&
+                   junctionAngle(*use[a], *use[b], wireRadius) <= 1e-12 &&
+                   primEndpoints(*use[a]).second.Distance(primEndpoints(*use[b]).first) <= 1e-9;
+        };
+        std::vector<size_t> made;
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t k = 0; k < m; ++k) {
+                if (rnd[k] || use[k]->kind != Primitive::ARC3) continue;
+                if ((k > 0 && rnd[k - 1] && tangentJoin(k - 1, k)) ||
+                    (k + 1 < m && rnd[k + 1] && tangentJoin(k, k + 1))) {
+                    rnd[k] = true;
+                    made.push_back(k);
+                    changed = true;
+                }
+            }
+        }
+        for (size_t k : made) {
+            folded.push_back(*use[k]);
+            folded.back().arc.exactRound = true;
+            std::cerr << "[round-chain] '" << use[k]->label << "' (bend "
+                      << use[k]->arc.v0.Modulus() * 1e6 << " um, " << kFacetTightArcExactRatio
+                      << " x r = " << kFacetTightArcExactRatio * wireRadius * 1e6
+                      << " um) is revolved exactly round: it is tangent-chained to a tight arc\n";
+            use[k] = &folded.back();
+        }
+    }
+    const size_t base = primIndexPerSolid ? primIndexPerSolid->size() : 0;
+    TopoDS_Shape out = assembleWireImpl(use, wireRadius, segments, corners, primIndexPerSolid,
+                                        skipWeld, conductorName);
+    if (primIndexPerSolid)
+        for (size_t j = base; j < primIndexPerSolid->size(); ++j) {
+            size_t& v = (*primIndexPerSolid)[j];
+            if (v < orig.size()) v = orig[v];
+        }
+    return out;
+}
+
+static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
+                                     double wireRadius, int segments, CornerStyle corners,
+                                     std::vector<size_t>* primIndexPerSolid, bool skipWeld,
+                                     const std::string& conductorName) {
     // WHEN IS A JUNCTION A CORNER? ABT #685 (Alf, 2026-08-18). Not "below 3 degrees", which was
     // another chosen number. A junction that is NOT mitred is BRIDGED: the earlier piece grows
     // flush past the joint until it fills the wedge the direction change opens on the outer side
@@ -2660,6 +3166,78 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             R = atStart ? pr.spiral.r0 : pr.spiral.r1;
         if (!(R > 1e-12)) return 0.0;   // straight, or grown along a straight spine extension
         return R * (1.0 - std::cos(std::min(g / R, kPi)));
+    };
+    // THE GROWTH THE KNIFE ACTUALLY NEEDS, MEASURED (ABT #1528). curveGrow corrects the tip, but
+    // a piece grown along its own curve also TURNS its end section, and the rim on one side can
+    // still fall short of the bisector plane: on 10_emi's dragback corner the plane then met the
+    // arc's own end cap (a 23 um straight edge in the cut face, a sliver of end cap left exposed,
+    // and no single cut face for the neighbour to share). So solve it: continue the piece exactly
+    // as its grown solid is continued (the circle for an arc, the helix/cone for an analytic
+    // spiral, the tangent otherwise) and take the least growth that puts EVERY rim point of the
+    // end section past the plane. Growth past the plane is never copper -- the knife removes it.
+    auto requiredGrowth = [&](const Primitive& pr, bool atStart, const gp_Pnt& J,
+                              const gp_Dir& nPlane, double g0) {
+        auto pose = [&](double g) -> std::pair<gp_Pnt, gp_Vec> {
+            const auto ends = primEndpoints(pr);
+            if (pr.kind == Primitive::ARC3) {
+                const double R = pr.arc.v0.Modulus();
+                const double sg = pr.arc.sweep >= 0.0 ? 1.0 : -1.0;
+                const double t = atStart ? -sg * g / R : pr.arc.sweep + sg * g / R;
+                const gp_XYZ rad = rotateXYZ(pr.arc.v0, pr.arc.axis, t);
+                return {gp_Pnt(pr.arc.c.XYZ() + rad), gp_Vec(pr.arc.axis.Crossed(rad) * sg)};
+            }
+            if (pr.kind == Primitive::SPIRAL && primEdgeGrowsAnalytically(pr)) {
+                const Spiral& sp = pr.spiral;
+                const double dAz = sp.az1 - sp.az0;
+                const double sg = dAz >= 0.0 ? 1.0 : -1.0;
+                const double tt = atStart ? 0.0 : 1.0;
+                const double rr = atStart ? sp.r0 : sp.r1, yy = atStart ? sp.y0 : sp.y1;
+                const double drdaz = (sp.r1 - sp.r0) * spiralRadiusFracRate(sp, tt) / dAz;
+                const double dydaz = (sp.y1 - sp.y0) * spiralHeightFracRate(sp, tt) / dAz;
+                const double dsdaz = std::sqrt(rr * rr + drdaz * drdaz + dydaz * dydaz);
+                const double daz = (atStart ? -sg : sg) * g / dsdaz;
+                const double az = (atStart ? sp.az0 : sp.az1) + daz;
+                const double r_ = rr + drdaz * daz, y_ = yy + dydaz * daz;
+                const gp_Pnt P = azPointC(sp.cx, sp.cz, r_, y_, az);
+                const gp_Vec T(drdaz * std::cos(az) - r_ * std::sin(az), dydaz,
+                               -drdaz * std::sin(az) - r_ * std::cos(az));
+                return {P, T * sg};
+            }
+            const gp_Dir T = atStart ? primFwdStart(pr, wireRadius) : primFwdEnd(pr, wireRadius);
+            const gp_Pnt E = atStart ? ends.first : ends.second;
+            return {E.Translated(gp_Vec(T) * (atStart ? -g : g)), gp_Vec(T)};
+        };
+        auto clearance = [&](double g) {
+            const auto [C, T] = pose(g);
+            const gp_Ax2 ax(C, gp_Dir(T));
+            double worst = std::numeric_limits<double>::max();
+            for (int k = 0; k < 72; ++k) {
+                const double a = kTwoPi * k / 72.0;
+                const gp_XYZ P = C.XYZ() + (ax.XDirection().XYZ() * std::cos(a) +
+                                            ax.YDirection().XYZ() * std::sin(a)) * wireRadius;
+                const double d = (P - J.XYZ()).Dot(nPlane.XYZ()) * (atStart ? -1.0 : 1.0);
+                worst = std::min(worst, d);
+            }
+            return worst;
+        };
+        const double margin = Precision::Confusion();
+        if (clearance(g0) > margin) return g0;
+        double lo = g0, hi = g0;
+        const double step = 0.25 * wireRadius, cap = g0 + 20.0 * wireRadius;
+        while (!(clearance(hi) > margin)) {
+            lo = hi;
+            hi += step;
+            if (hi > cap)
+                throw std::runtime_error("'" + pr.label + "': no growth up to " +
+                                         std::to_string(cap * 1e6) + " um carries its " +
+                                         (atStart ? "start" : "end") + " section past the mitre "
+                                         "plane");
+        }
+        for (int it = 0; it < 40; ++it) {
+            const double mid = 0.5 * (lo + hi);
+            (clearance(mid) > margin ? hi : lo) = mid;
+        }
+        return hi;
     };
     const bool diag = std::getenv("MVB_MITRE_DIAG") != nullptr;
     BRep_Builder builder;
@@ -2815,7 +3393,21 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     // 5/50). The boundary is one section circumference, 2*pi*r: a coplanar band longer than
     // the full perimeter cannot cross transversally anywhere.
     double prevSourceLen = 0.0;
+    // THE MITRE KNIFE'S CUT FACE, HANDED ACROSS (ABT #1528). prevEndCutWire: the face the knife
+    // left at the END of the previous (curved) piece, for a prism to start on.
+    // rebuildPrevPrismEnd: how to rebuild the previous prism onto the face the knife leaves at
+    // the START of this (curved) piece -- the prism was built first, so it is rebuilt.
+    TopoDS_Wire prevEndCutWire;
+    std::function<TopoDS_Shape(const TopoDS_Wire&, std::string&)> rebuildPrevPrismEnd;
+    // The previous prism's own end polygon and planes, for the rebuild's precondition.
+    struct PrismEndPlane { gp_Pnt P; gp_Dir n; gp_Pnt axisPt; gp_Dir axis; bool startFree = false; };
+    std::vector<gp_Pnt> prevPrismEndPoly;
+    PrismEndPlane prevPrismEndPlane;
     for (size_t i = 0; i < n; ++i) {
+        TopoDS_Wire thisEndCutWire;
+        std::function<TopoDS_Shape(const TopoDS_Wire&, std::string&)> thisRebuild;
+        std::vector<gp_Pnt> thisEndPoly;
+        PrismEndPlane thisEndPlane;
         // Bend at each end: a tangent joint (wrap SEG<->ARC) needs no growth and no boolean; only a
         // real corner (the entrance/exit leads) is grown and sliced on its angle-bisector plane.
         // Junctions may carry an ENDPOINT MISMATCH (layouts hand out lead ends offset from the wrap
@@ -2877,7 +3469,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // the old step stays, and says so on stderr every time.
         auto exactRound = [&](const Primitive& p) {
             return segments > 0 && p.kind == Primitive::ARC3 &&
-                   p.arc.v0.Modulus() < kFacetTightArcExactRatio * wireRadius;
+                   (p.arc.v0.Modulus() < kFacetTightArcExactRatio * wireRadius || p.arc.exactRound);
         };
         // The transition shares the arc's section through the phase handoff, so it exists only
         // while that handoff does (the MVB_NO_SECTION_HANDOFF / MVB_NO_PHASE_CONTINUATION A/B
@@ -2889,6 +3481,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             // which a radius-varying face spiral (a toroid's top chord) does not survive.
             return p.kind == Primitive::SEG ||
                    (p.kind == Primitive::SPIRAL && !p.spiral.blend && !p.spiral.levelOut &&
+                    !(p.spiral.easeIn > 0.0) &&
                     std::abs(p.spiral.r1 - p.spiral.r0) < 1e-12);
         };
         const bool hereRound = exactRound(*ptrs[i]);
@@ -2907,7 +3500,14 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                       << " where no exact round transition exists (mitred, mismatched, grown, or "
                          "an unsupported kind): the circle/polygon step remains there\n";
         const double growS0 = mitreGrow(angS) + dpS;
-        const double overS = bentS ? growS0 + curveGrow(*ptrs[i], growS0, true) : 0.0;
+        const double overS =
+            !bentS ? 0.0
+            : (ptrs[i]->kind == Primitive::SEG)
+                ? growS0 + curveGrow(*ptrs[i], growS0, true)
+                : requiredGrowth(*ptrs[i], true,
+                                 gp_Pnt(0.5 * (primEndpoints(*ptrs[i - 1]).second.XYZ() +
+                                               primEndpoints(*ptrs[i]).first.XYZ())),
+                                 nS, growS0 + curveGrow(*ptrs[i], growS0, true));
         // A bridged end grows by the WEDGE the bend opens (r*tan(theta)) as well as any endpoint
         // mismatch -- growing only by dpE left a wedge gap of up to r*tan(theta) on the outer side
         // of every near-tangent joint, open copper-to-copper. One side only, so it is never doubled.
@@ -2919,8 +3519,14 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         // copper-to-copper wedges on every near-tangent joint.
         const bool sphereFill = std::getenv("MVB_JOINT_SPHERE") != nullptr;
         const double growE0 = mitreGrow(angE) + dpE;
-        const double overE = bentE ? growE0 + curveGrow(*ptrs[i], growE0, false)
-                                   : dpE + ((!sphereFill && angE > 1e-12) ? bridgeGrow(angE) : 0.0);
+        const double overE =
+            !bentE ? dpE + ((!sphereFill && angE > 1e-12) ? bridgeGrow(angE) : 0.0)
+            : (ptrs[i]->kind == Primitive::SEG)
+                ? growE0 + curveGrow(*ptrs[i], growE0, false)
+                : requiredGrowth(*ptrs[i], false,
+                                 gp_Pnt(0.5 * (primEndpoints(*ptrs[i]).second.XYZ() +
+                                               primEndpoints(*ptrs[i + 1]).first.XYZ())),
+                                 nE, growE0 + curveGrow(*ptrs[i], growE0, false));
         // SPLIT A CLOSED REVOLUTION. ABT #685 (Alf, 2026-08-18): a SPIRAL that closes a full
         // turn has its own other end one pitch away ALONG THE COLUMN AXIS -- and a coil wound
         // with touching turns puts that end's copper exactly one wire radius from this one's
@@ -2940,6 +3546,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             std::vector<Primitive> out;
             const Spiral& sp = pr.spiral;
             const bool closed = pr.kind == Primitive::SPIRAL && !sp.blend && !sp.levelOut &&
+                                !(sp.easeIn > 0.0) &&
                                 std::abs(sp.r1 - sp.r0) < 1e-12 &&
                                 std::abs(sp.az1 - sp.az0) > 0.97 * kTwoPi;
             if (!closed) {
@@ -3241,12 +3848,59 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                 const bool staggerHere =
                     tangentIn && dv.Magnitude() > kTwoPi * wireRadius && !roundStartHere;
                 staggerHereForAudit = staggerHere;   // a staggered adoption is a half-facet rotation: NOT the same face
+                const TopoDS_Wire* startCut =
+                    (bentS && !prevEndCutWire.IsNull()) ? &prevEndCutWire : nullptr;
+                if (startCut) {
+                    std::string why =
+                        dv.Magnitude() > 3.0 * 2.0 * wireRadius * std::sin(kPi / segments)
+                            ? cutHandoffRefusal(*startCut, segments, wireRadius, Ps, gp_Dir(nsx),
+                                                A, dir, nullptr)
+                            : "the straight is shorter than three facet chords, too short to turn "
+                              "the cut face into its own section";
+                    if (!why.empty()) {
+                        std::cerr << "[cut-handoff] declined at '" << ptrs[i - 1]->label << "' -> '"
+                                  << ptrs[i]->label << "': " << why
+                                  << "; this corner keeps the knife construction\n";
+                        startCut = nullptr;
+                    }
+                }
                 std::string facetWhy;
                 TopoDS_Shape prism = mitredFacetPrism(
                     A, dir, wireRadius, segments, Ps, nsx, Pe, nex,
                     (junctionEndpointExact && prevEndCapValid) ? &prevEndCap : nullptr, &endCap,
                     /*sharedTrusted=*/prevEndCapTrusted, &startCapAdopted,
-                    /*staggerAdopt=*/staggerHere, &facetWhy, roundStartHere, roundEndHere);
+                    /*staggerAdopt=*/staggerHere, &facetWhy, roundStartHere, roundEndHere,
+                    startCut);
+                if (startCut && prism.IsNull())
+                    throw std::runtime_error("'" + ptrs[i]->label + "': the prism that must start "
+                                             "on the mitre cut of '" + ptrs[i - 1]->label +
+                                             "' was refused (" + facetWhy + "); the knife path "
+                                             "would leave the two faces overlapping in triangles");
+                // A mitred end into a curved piece: that piece is knifed at its start AFTER this
+                // prism exists, so keep what is needed to rebuild the prism onto its cut face.
+                if (!prism.IsNull() && bentE && i + 1 < n && ptrs[i + 1]->kind != Primitive::SEG) {
+                    const bool hadCapIn = junctionEndpointExact && prevEndCapValid;
+                    const std::vector<gp_Pnt> capIn = hadCapIn ? prevEndCap : std::vector<gp_Pnt>{};
+                    const TopoDS_Wire startCutCopy = startCut ? *startCut : TopoDS_Wire();
+                    const bool trustedIn = prevEndCapTrusted;
+                    const gp_Pnt Acopy = A;
+                    thisEndPoly = endCap;
+                    // A free start re-phases the prism to the cut (mitredFacetPrism), so there is
+                    // no pre-existing end polygon for the cut to pair with.
+                    thisEndPlane = {Pe, gp_Dir(nex), A, dir,
+                                    !hadCapIn && startCutCopy.IsNull() && !roundStartHere &&
+                                        !roundEndHere};
+                    thisRebuild = [=](const TopoDS_Wire& endW, std::string& why) {
+                        std::vector<gp_Pnt> ec;
+                        bool adopted = false;
+                        return mitredFacetPrism(Acopy, dir, wireRadius, segments, Ps, nsx, Pe, nex,
+                                                hadCapIn ? &capIn : nullptr, &ec, trustedIn,
+                                                &adopted, staggerHere, &why, roundStartHere,
+                                                roundEndHere,
+                                                startCutCopy.IsNull() ? nullptr : &startCutCopy,
+                                                &endW);
+                    };
+                }
                 if ((roundStartHere || roundEndHere) && prism.IsNull())
                     throw std::runtime_error("'" + ptrs[i]->label + "': the faceted prism with a "
                                              "round transition was refused (" + facetWhy +
@@ -3292,7 +3946,37 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
             // A pipe/revolve delivered its true end section: hand it on (trusted) so a
             // following riser prism starts from the section the copper actually ends with.
             auto capPts = wireToPoints(pieceEndCapWire);
-            if ((int)capPts.size() == segments) {
+            // AN EXACT ROUND ARC HANDS ITS END PHASE ONLY TO A NEIGHBOUR IT WOULD OTHERWISE
+            // MISS BY LESS THAN THE FACETING ITSELF (ABT #1528). A faceted piece that receives
+            // nothing starts on deterministicSectionFrame, whose world-axis phase keeps a
+            // vertex -- never a flat -- toward a core's own world-aligned facets (07_cmc's
+            // bore). Adopting the revolve's transported phase turned the bore run's 12-gon
+            // 7.7 deg off the T25 bore facet, a 27 um flat-to-flat air wedge whose tets Netgen
+            // flattened to zero volume (6 + 8 slivers; main meshes it clean). The hand-on is
+            // only needed where the arc's break-point lands closer to the neighbour's own
+            // vertex than the polygon's sagitta r(1 - cos(pi/n)) -- a circumferential edge
+            // below the faceted model's resolution (08_pq: 2.3-4.2 um, 22 slivers); there the
+            // neighbour turns by less than that onto the arc's section. Another round arc
+            // always takes it: its circle breaks on the received points.
+            if (hereRound && i + 1 < n && (int)capPts.size() == segments &&
+                !exactRound(*ptrs[i + 1])) {
+                const std::vector<gp_Pnt> own = wireVertices(wireProfileWire(
+                    primEndpoints(*ptrs[i + 1]).first, fs[i + 1], wireRadius, segments));
+                double miss = std::numeric_limits<double>::max();
+                for (const auto& q : own) miss = std::min(miss, q.Distance(capPts.front()));
+                const double sagitta = wireRadius * (1.0 - std::cos(kPi / segments));
+                if (!(miss < sagitta)) {
+                    if (std::getenv("MVB_CAP_DEBUG"))
+                        std::cerr << "[round-phase] '" << ptrs[i]->label << "' -> '"
+                                  << ptrs[i + 1]->label << "': break-point " << miss * 1e6
+                                  << " um from the neighbour's own vertex (sagitta "
+                                  << sagitta * 1e6 << " um); the neighbour keeps its own phase\n";
+                    capPts.clear();
+                }
+            }
+            if (capPts.empty()) {
+                prevEndCapValid = false;
+            } else if ((int)capPts.size() == segments) {
                 prevEndCap = std::move(capPts);
                 prevEndCapValid = true;
                 prevEndCapTrusted = true;
@@ -3367,6 +4051,36 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                                "'" + ptrs[i - 1]->label + "' -> '" + ptrs[i]->label + "'",
                                neighbourHere, junctionDiag(fe[i - 1], fs[i], *ptrs[i]));
             ++nCut;
+            // The previous prism ends on this cut face: rebuild it onto the face (ABT #1528).
+            const TopoDS_Wire cutS =
+                rebuildPrevPrismEnd ? mitreCutWire(parts.front(), J, nS, wireRadius) : TopoDS_Wire();
+            std::string cutWhy;
+            if (rebuildPrevPrismEnd) {
+                cutWhy = hereRound ? "the curved piece is exactly round (no facets to pair)"
+                       : cutS.IsNull() ? "the knife left no single cut face"
+                       : cutHandoffRefusal(cutS, segments, wireRadius, prevPrismEndPlane.P,
+                                           prevPrismEndPlane.n, prevPrismEndPlane.axisPt,
+                                           prevPrismEndPlane.axis,
+                                           prevPrismEndPlane.startFree ? nullptr : &prevPrismEndPoly);
+                if (!cutWhy.empty())
+                    std::cerr << "[cut-handoff] declined at '" << ptrs[i - 1]->label << "' -> '"
+                              << ptrs[i]->label << "': " << cutWhy
+                              << "; this corner keeps the knife construction\n";
+            }
+            if (rebuildPrevPrismEnd && cutWhy.empty()) {
+                const TopoDS_Wire cut = cutS;
+                std::string why;
+                const TopoDS_Shape rebuilt = rebuildPrevPrismEnd(cut, why);
+                if (rebuilt.IsNull())
+                    throw std::runtime_error("'" + ptrs[i - 1]->label + "': the prism could not "
+                                             "be rebuilt onto the mitre cut of '" + ptrs[i]->label +
+                                             "' (" + why + ")");
+                perPrimSolids.back().clear();
+                for (TopExp_Explorer sx(rebuilt, TopAbs_SOLID); sx.More(); sx.Next())
+                    perPrimSolids.back().push_back(sx.Current());
+                prevBuilt = rebuilt;
+                startCapAdopted = true;   // the two faces at this mitre are now one
+            }
         }
         if (!prismDone && bentE) {
             const gp_Pnt J(0.5 * (primEndpoints(*ptrs[i]).second.XYZ() +
@@ -3377,6 +4091,20 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                                "'" + ptrs[i]->label + "' -> '" + ptrs[i + 1]->label + "'",
                                neighbourHere, junctionDiag(fe[i], fs[i + 1], *ptrs[i]));
             ++nCut;
+            // A following prism starts on this cut face (ABT #1528).
+            if (segments > 0 && ptrs[i + 1]->kind == Primitive::SEG) {
+                if (hereRound) {
+                    std::cerr << "[cut-handoff] declined at '" << ptrs[i]->label << "' -> '"
+                              << ptrs[i + 1]->label << "': the curved piece is exactly round (no "
+                              << "facets to pair); this corner keeps the knife construction\n";
+                } else {
+                    thisEndCutWire = mitreCutWire(parts.back(), J, nE, wireRadius);
+                    if (thisEndCutWire.IsNull())
+                        std::cerr << "[cut-handoff] declined at '" << ptrs[i]->label << "' -> '"
+                                  << ptrs[i + 1]->label << "': the knife left no single cut face; "
+                                  << "this corner keeps the knife construction\n";
+                }
+            }
         }
         if (!prismDone) solid = parts.empty() ? TopoDS_Shape() : parts.front();
         if (parts.size() > 1) {
@@ -3600,6 +4328,10 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                 (int)bentE, tolBuilt, tolAfter, tolPrevBefore, tolPrevAfter);
         }
         prevBuilt = solid;
+        prevEndCutWire = thisEndCutWire;
+        rebuildPrevPrismEnd = thisRebuild;
+        prevPrismEndPoly = thisEndPoly;
+        prevPrismEndPlane = thisEndPlane;
         // Collect per PRIMITIVE instead of emitting straight into the compound: bridged
         // junctions have to be fused after the fact (see the run-fuse below), and that needs
         // the pieces grouped, not already flattened.
@@ -3971,6 +4703,15 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                         mn = std::min(mn, gp.Mass());
                     }
                     const auto tGlue0 = std::chrono::steady_clock::now();
+                    // GlueFull first; when its result fails the acceptance below, GlueShift on the
+                    // same run under the SAME acceptance, before the pairwise ladder. GlueFull is
+                    // only correct where every junction's sub-shapes coincide fully, and a lens
+                    // the weld later finds at a fillet junction breaks that: on 11_pushpull it
+                    // dropped 0.026 mm3 (no two pieces overlap at all), the run fell to the
+                    // ladder, and the welded body failed the export's B-spline conversion -- two
+                    // conductors shipped as 2-3 separate solids (ABT #1528 regression from
+                    // fa5931b; 1405aa9 glued that run with GlueShift and fused it whole).
+                    for (int glueMode = 0; glueMode < 2 && !runFused.count(s0); ++glueMode)
                     try {
                         BRepAlgoAPI_Fuse fu;
                         TopTools_ListOfShape fargs, ftools;
@@ -3990,7 +4731,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                         // census-identical to GlueShift (faces, thin faces, every conductor's
                         // volume to 14 digits). The conservation test below is what makes the
                         // stronger promise safe: a glue that drops or invents copper is refused.
-                        fu.SetGlue(BOPAlgo_GlueFull);
+                        fu.SetGlue(glueMode == 0 ? BOPAlgo_GlueFull : BOPAlgo_GlueShift);
                         fu.SetRunParallel(true);
                         fu.Build();
                         if (fu.IsDone() && !fu.Shape().IsNull() &&
@@ -4028,11 +4769,28 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                             if (ns == 1 && conserves && gf.Mass() <= sum * (1.0 + 1e-3)) {
                                 runFused[s0] = {e0, fu.Shape()};
                             } else {
+                                if (std::getenv("MVB_WELD_DEBUG")) {
+                                    // Which pieces overlap: every pair's common volume.
+                                    for (size_t a2 = 0; a2 < gs.size(); ++a2)
+                                        for (size_t b2 = a2 + 1; b2 < gs.size(); ++b2) {
+                                            BRepAlgoAPI_Common cm(gs[a2], gs[b2]);
+                                            if (!cm.IsDone()) continue;
+                                            GProp_GProps gc;
+                                            BRepGProp::VolumeProperties(cm.Shape(), gc);
+                                            if (gc.Mass() > 1e-15)
+                                                std::cerr << "[glue-overlap] run " << s0 << " pieces "
+                                                          << a2 << " & " << b2 << ": "
+                                                          << gc.Mass() * 1e9 << " mm3\n";
+                                        }
+                                }
                                 std::cerr << "[glue-fuse] run " << s0 << ".." << e0 << " ("
-                                          << gs.size() << " pieces) refused: solids=" << ns
+                                          << gs.size() << " pieces) "
+                                          << (glueMode == 0 ? "GlueFull" : "GlueShift")
+                                          << " refused: solids=" << ns
                                           << " fused=" << gf.Mass() * 1e9 << " sum=" << sum * 1e9
-                                          << " smallest=" << mn * 1e9
-                                          << " mm3; welding it pairwise instead\n";
+                                          << " smallest=" << mn * 1e9 << " mm3; "
+                                          << (glueMode == 0 ? "retrying with GlueShift\n"
+                                                            : "welding it pairwise instead\n");
                             }
                         } else {
                             std::cerr << "[glue-fuse] run " << s0 << ".." << e0 << " ("

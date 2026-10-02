@@ -79,6 +79,7 @@
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
+#include <Precision.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
 #include <BOPAlgo_GlueEnum.hxx>
@@ -17088,22 +17089,56 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 // single glued N-way fuse therefore closes the whole conductor without asking the boolean to
 // intersect anything.
 //
-// STRICTLY AN OFFER. It is accepted only when the result is ONE valid solid whose volume is the
-// sum of the parts to within the two bounds the assembler uses everywhere else (it cannot be
-// smaller than the largest part -- OCC dropped an operand -- nor larger than their sum -- copper
-// invented). Anything else returns a null shape and the caller keeps the assembly untouched.
+// STRICTLY AN OFFER. It is accepted only when the result is ONE valid solid that carries every
+// part -- no body missing (see bodiesAccountedFor below) -- and no more copper than their sum.
+// Anything else returns a null shape and the caller keeps the assembly untouched.
 // Returning the pieces is always safe; welding a bad fuse is not.
 static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::string& name) {
     std::vector<TopoDS_Shape> solids;
     for (TopExp_Explorer e(cond, TopAbs_SOLID); e.More(); e.Next()) solids.push_back(e.Current());
     if (solids.size() < 2) return {};
-    double sum = 0.0, mx = 0.0;
+    double sum = 0.0, mn = std::numeric_limits<double>::max();
+    std::vector<Bnd_Box> partBoxes;
     for (const auto& sh : solids) {
         GProp_GProps g;
         BRepGProp::VolumeProperties(sh, g);
         sum += g.Mass();
-        mx = std::max(mx, g.Mass());
+        mn = std::min(mn, g.Mass());
+        Bnd_Box b;
+        BRepBndLib::AddOptimal(sh, b, Standard_False, Standard_False);
+        partBoxes.push_back(b);
     }
+    // NO BODY MAY GO MISSING. The bound used to be "no smaller than the largest part", which
+    // accepts a close that keeps ONE body and drops the rest: on 1405aa9's 10_emi it returned
+    // 20.07 of 21.67 mm3 -- the whole exit lead gone, four of five bodies -- and the only trace
+    // was a missing FEM port face. The parts may overlap (a refused weld keeps its lens), so the
+    // volume alone cannot demand the sum; it can demand that the deficit is smaller than any
+    // whole body, and the extents that every body is inside the result.
+    auto bodiesAccountedFor = [&](const TopoDS_Shape& fused, double fusedVol, std::string& why) {
+        if (sum - fusedVol >= 0.5 * mn) {
+            why = "it is " + std::to_string((sum - fusedVol) * 1e9) + " mm^3 short of the parts, "
+                  "at least half the smallest body (" + std::to_string(mn * 1e9) + " mm^3)";
+            return false;
+        }
+        double tol = Precision::Confusion();
+        for (TopExp_Explorer vx(fused, TopAbs_VERTEX); vx.More(); vx.Next())
+            tol = std::max(tol, BRep_Tool::Tolerance(TopoDS::Vertex(vx.Current())));
+        Bnd_Box fb;
+        BRepBndLib::AddOptimal(fused, fb, Standard_False, Standard_False);
+        double f0, f1, f2, f3, f4, f5;
+        fb.Get(f0, f1, f2, f3, f4, f5);
+        for (size_t k = 0; k < partBoxes.size(); ++k) {
+            double b0, b1, b2, b3, b4, b5;
+            partBoxes[k].Get(b0, b1, b2, b3, b4, b5);
+            const double out = std::max({f0 - b0, f1 - b1, f2 - b2, b3 - f3, b4 - f4, b5 - f5});
+            if (out > tol) {
+                why = "body " + std::to_string(k) + " reaches " + std::to_string(out * 1e6) +
+                      " um outside it";
+                return false;
+            }
+        }
+        return true;
+    };
     // WHAT WENT IN, before blaming what came out. OCC raising NCollection_DataMap::Iterator::Value
     // from inside a fuse says the algorithm hit something it did not expect in its own maps, and
     // the two candidates are an INVALID operand and a DUPLICATED one (the same TShape appended
@@ -17276,9 +17311,15 @@ static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::
         }
         GProp_GProps gf;
         BRepGProp::VolumeProperties(fused, gf);
-        if (gf.Mass() > sum * (1.0 + 1e-3) || gf.Mass() < mx * (1.0 - 1e-3)) {
+        if (gf.Mass() > sum * (1.0 + 1e-3)) {
             std::cerr << "[one-body] '" << name << "': the fused body carries " << gf.Mass() * 1e9
                       << " mm^3 against " << sum * 1e9 << " mm^3 of parts; refusing it\n";
+            continue;
+        }
+        if (std::string why; !bodiesAccountedFor(fused, gf.Mass(), why)) {
+            std::cerr << "[one-body] '" << name << "': the " << (rung == 0 ? "glued" : "general")
+                      << " fuse of " << solids.size() << " bodies lost copper -- " << why
+                      << "; refusing it\n";
             continue;
         }
         // THE CLOSE MUST SURVIVE WHAT THE EXPORT WILL DO TO IT. The FEM product re-expresses

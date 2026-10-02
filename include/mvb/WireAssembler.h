@@ -107,6 +107,10 @@ struct Arc3 {
     gp_XYZ axis{0, 1, 0};  // unit rotation axis (right-handed sweep)
     gp_XYZ v0{0, 0, 0};    // centre -> start vector, |v0| = bend radius
     double sweep = 0;
+    // ABT #1528: revolve this arc exactly round in faceted mode although its bend is not tight,
+    // because it is tangent-chained to an arc that is (a fillet run must be one kind throughout:
+    // a faceted arc cannot turn round, and the polygon/circle step it left would not weld).
+    bool exactRound = false;
 };
 struct Spiral {
     double cx = 0, cz = 0;   // vertical axis position
@@ -120,6 +124,12 @@ struct Spiral {
     // here and is refused where it would be made). This is what joins a helix to the level run
     // past its station tangentially, where a plain junction left a C0 kink of the pitch angle.
     bool levelOut = false;
+    // ABT #1528: a climb easing FOLDED INTO the level run after it (assembleWire does this when
+    // the easing is shorter than one facet chord, whose facets would be micron strips). For
+    // t in [0, easeIn] the height's slope falls linearly from 2 (y1 - y0) / easeIn to zero --
+    // exactly the levelOut profile, compressed -- and for t in [easeIn, 1] the piece is level at
+    // y1. 0 means no easing. Constant radius only, like levelOut.
+    double easeIn = 0.0;
 };
 
 // THE SPIRAL'S PROFILE, ONE DEFINITION (ABT #1403). Every consumer that evaluates a SPIRAL reads
@@ -135,16 +145,22 @@ inline double spiralRadiusFracRate(const Spiral& sp, double t) {
 inline double spiralHeightFrac(const Spiral& sp, double t) {
     if (sp.blend) return 0.5 * (1.0 - std::cos(std::numbers::pi * t));
     if (sp.levelOut) return t * (2.0 - t);
+    if (sp.easeIn > 0.0) {
+        const double e = sp.easeIn;
+        return t < e ? (2.0 / e) * (t - t * t / (2.0 * e)) : 1.0;
+    }
     return t;
 }
 inline double spiralHeightFracRate(const Spiral& sp, double t) {
     if (sp.blend) return 0.5 * std::numbers::pi * std::sin(std::numbers::pi * t);
     if (sp.levelOut) return 2.0 * (1.0 - t);
+    if (sp.easeIn > 0.0) return t < sp.easeIn ? (2.0 / sp.easeIn) * (1.0 - t / sp.easeIn) : 0.0;
     return 1.0;
 }
 inline double spiralHeightFracCurvature(const Spiral& sp, double t) {
     if (sp.blend) return 0.5 * std::numbers::pi * std::numbers::pi * std::cos(std::numbers::pi * t);
     if (sp.levelOut) return -2.0;
+    if (sp.easeIn > 0.0) return t < sp.easeIn ? -2.0 / (sp.easeIn * sp.easeIn) : 0.0;
     return 0.0;
 }
 struct Blend {
