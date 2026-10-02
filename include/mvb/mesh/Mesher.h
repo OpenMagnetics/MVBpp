@@ -14,8 +14,11 @@
 //
 // WHILE THE MOVE IS UNDER WAY the recipe knobs are the ones OMFEM's MeshRecipe table names, with
 // the same keys, units and defaults, and the moved code must reproduce OMFEM's reference meshes
-// node-for-node and tet-for-tet (gmsh fork om-4.15.2, threads as pinned in the recipe), with
-// byte-identical sidecars. Any change of output is its own, separately gated step.
+// node-for-node and tet-for-tet (gmsh fork om-4.15.2, threads as pinned in the recipe). The gate
+// compares PARSED meshes, not file bytes (OMFEM has two msh2 writers today, gmsh's and the skin
+// layer's own, formatted differently): node ids with exact coordinates, element ids, types, node
+// lists, physical and elementary tags, all in order. Sidecars stay byte-identical apart from the
+// recipe's provenance (paths, cwd, timings). Any change of output is its own, separately gated step.
 //
 // This header is the API sketch for review; nothing implements it yet.
 
@@ -35,7 +38,9 @@ enum class ElementType : std::uint8_t { Point, Line2, Tri3, Quad4, Tet4, Pyramid
 
 struct ElementBlock {
     ElementType type;
-    int region = 0;                          // region tag (index into Mesh::regions)
+    int region = 0;                          // physical tag (Region::tag)
+    int entity = 0;                          // elementary tag: the geometric entity meshed
+    std::vector<std::int64_t> ids;           // element ids, one per element
     std::vector<std::int64_t> nodes;         // node ids, nodesPerElement(type) per element
 };
 
@@ -75,7 +80,8 @@ nlohmann::json recipeTemplate();
 // region), and the other writers as they gain a round-trip gate. `unit` scales the coordinates
 // written ("m" or "mm") and is stated in the file. Every writer is gated by a round trip: read
 // back, node and element counts per region, coordinates within the format's precision, tet
-// volumes recomputed with the same sign and no new |V| < 1e-18 m^3.
+// volumes recomputed with the same sign and no new |V| < 1e-18 m^3. Text formats write
+// coordinates round-trip exact (%.17g), never fewer digits.
 std::string exportMesh(const Mesh& mesh, const std::string& format, const std::string& unit);
 
 }  // namespace mvb::mesh
