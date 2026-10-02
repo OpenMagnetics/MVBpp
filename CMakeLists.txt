@@ -276,6 +276,14 @@ target_link_libraries(mvb++ PUBLIC
 )
 
 # ============================================================================
+# MAS -> FEM mesh (gmsh + MMG), ABT #1588
+# ============================================================================
+option(MVBPP_BUILD_MESH "Build mvbpp_mesh (gmsh + MMG mesher)" ON)
+if(MVBPP_BUILD_MESH)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/MvbMesh.cmake)
+endif()
+
+# ============================================================================
 # Tests
 # ============================================================================
 enable_testing()
