@@ -89,6 +89,8 @@ find_library(MVBPP_GMP_LIBRARY gmp REQUIRED)
 
 add_library(mvbpp_mesh ${_mvbpp_lib_kind}
     src/mesh/Mesher.cpp
+    src/mesh/SizeField.cpp
+    src/mesh/MeshRecipe.cpp
 )
 add_dependencies(mvbpp_mesh gmsh_external)
 target_include_directories(mvbpp_mesh
