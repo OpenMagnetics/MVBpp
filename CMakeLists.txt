@@ -46,6 +46,18 @@ foreach(_l ${OCCT_ESSENTIAL_LIBS})
     list(APPEND OCCT_BYPRODUCTS "${OCCT_PREFIX}/lib/lib${_l}.a")
 endforeach()
 
+# A prefix that already holds every toolkit is reused, never rebuilt: re-running the
+# ExternalProject from a fresh build tree reinstalls OCCT over a prefix other builds are linking.
+set(_occt_installed TRUE)
+foreach(_b ${OCCT_BYPRODUCTS})
+    if(NOT EXISTS "${_b}")
+        set(_occt_installed FALSE)
+    endif()
+endforeach()
+if(_occt_installed)
+    message(STATUS "OCCT: reusing the install at ${OCCT_PREFIX}")
+    add_custom_target(occt_external)
+else()
 ExternalProject_Add(
     occt_external
     URL https://github.com/Open-Cascade-SAS/OCCT/archive/refs/tags/V7_9_3.tar.gz
@@ -72,6 +84,7 @@ ExternalProject_Add(
     BUILD_BYPRODUCTS ${OCCT_BYPRODUCTS}
     USES_TERMINAL_BUILD TRUE
 )
+endif()
 
 add_library(occt INTERFACE)
 add_dependencies(occt occt_external)

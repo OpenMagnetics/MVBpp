@@ -16,6 +16,11 @@ set(MVBPP_MMG_PREFIX "$ENV{HOME}/OpenMagnetics/mmg-5.8.0-install"
 set(MVBPP_GMSH_PREFIX "$ENV{HOME}/OpenMagnetics/gmsh-om-4.15.2-install"
     CACHE PATH "gmsh (OpenMagnetics fork) install prefix (shared across build trees; built once)")
 
+# An install that already exists is reused, never rebuilt (same reason as OCCT's).
+if(EXISTS "${MVBPP_MMG_PREFIX}/lib/libmmg.a")
+    message(STATUS "MMG: reusing the install at ${MVBPP_MMG_PREFIX}")
+    add_custom_target(mmg_external)
+else()
 ExternalProject_Add(
     mmg_external
     GIT_REPOSITORY https://github.com/MmgTools/mmg.git
@@ -39,7 +44,12 @@ ExternalProject_Add(
     BUILD_BYPRODUCTS ${MVBPP_MMG_PREFIX}/lib/libmmg.a
     USES_TERMINAL_BUILD TRUE
 )
+endif()
 
+if(EXISTS "${MVBPP_GMSH_PREFIX}/lib/libgmsh.a")
+    message(STATUS "gmsh: reusing the install at ${MVBPP_GMSH_PREFIX}")
+    add_custom_target(gmsh_external)
+else()
 ExternalProject_Add(
     gmsh_external
     DEPENDS occt_external mmg_external
@@ -72,6 +82,7 @@ ExternalProject_Add(
     BUILD_BYPRODUCTS ${MVBPP_GMSH_PREFIX}/lib/libgmsh.a
     USES_TERMINAL_BUILD TRUE
 )
+endif()
 
 find_package(OpenMP REQUIRED)
 find_library(MVBPP_GMP_LIBRARY gmp REQUIRED)
