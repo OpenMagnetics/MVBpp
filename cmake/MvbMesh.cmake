@@ -34,6 +34,8 @@ ExternalProject_Add(
         -DUSE_SCOTCH=OFF
         -DUSE_VTK=OFF
         -DCMAKE_INSTALL_PREFIX=${MVBPP_MMG_PREFIX}
+    # The shared box builds at -j3 (memory: the machine was killed under pressure, 2026-09-12).
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> -j 3
     BUILD_BYPRODUCTS ${MVBPP_MMG_PREFIX}/lib/libmmg.a
     USES_TERMINAL_BUILD TRUE
 )
@@ -66,6 +68,7 @@ ExternalProject_Add(
         -DMMG_INC=${MVBPP_MMG_PREFIX}/include
         -DMMG_LIB=${MVBPP_MMG_PREFIX}/lib/libmmg.a
         -DCMAKE_INSTALL_PREFIX=${MVBPP_GMSH_PREFIX}
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> -j 3
     BUILD_BYPRODUCTS ${MVBPP_GMSH_PREFIX}/lib/libgmsh.a
     USES_TERMINAL_BUILD TRUE
 )
