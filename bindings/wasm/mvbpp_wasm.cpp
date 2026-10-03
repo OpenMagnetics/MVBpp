@@ -1055,6 +1055,18 @@ std::string _enrichMagnetic(const std::string& json_str) {
 // gmsh to ask its version, so it is also the proof that gmsh and MMG are in the module and run.
 std::string _meshBuildRevision() { return mvb::mesh::buildRevision().dump(); }
 
+// MAS magnetic + mesh recipe -> mesh in one export format (ABT #1588), as JSON:
+// {"mesh": <file text>, "recipe": <effective recipe>, "sidecars": {suffix: text}}.
+// The same mvb::mesh::meshMagnetic as native: the browser meshes with the same gmsh and MMG.
+std::string _meshMagnetic(const std::string& magneticJson, const std::string& recipeJson,
+                          const std::string& format, const std::string& unit) {
+    const auto r = mvb::mesh::meshMagnetic(nlohmann::json::parse(magneticJson), nlohmann::json::parse(recipeJson));
+    nlohmann::json out = {{"mesh", mvb::mesh::exportMesh(r.mesh, format, unit)},
+                          {"recipe", r.recipe},
+                          {"sidecars", r.sidecars}};
+    return out.dump();
+}
+
 // Re-exposed for the WebFrontend worker (both still exist in C++, just unbound after the
 // draw* API refactor): the symmetry-plane query the 3D viewer uses to offer half/quarter
 // cut options, and the core-gapping technical drawing (SVG) the technical-drawing exporter
@@ -1117,6 +1129,7 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
     // Metadata
     function("getSupportedFamilies", &guard<&mvb::get_supported_families>::call);
     function("meshBuildRevision",   &guard<&_meshBuildRevision>::call);
+    function("meshMagnetic",        &guard<&_meshMagnetic>::call);
 
     // Re-exposed for the WebFrontend worker (unbound after the draw* refactor)
     function("getSymmetryPlanes",   &guard<&_getSymmetryPlanes>::call);

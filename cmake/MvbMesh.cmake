@@ -134,3 +134,7 @@ target_link_libraries(mvbpp_mesh_roundtrip PRIVATE mvbpp_mesh)
 # The identity gate for meshMagnetic against an OMFEM reference run (tools/mvbpp_mesh_magnetic.cpp).
 add_executable(mvbpp_mesh_magnetic tools/mvbpp_mesh_magnetic.cpp)
 target_link_libraries(mvbpp_mesh_magnetic PRIVATE mvbpp_mesh)
+
+# The identity gate as a command: two msh2 files, parsed and compared exactly.
+add_executable(mvbpp_mesh_diff tools/mvbpp_mesh_diff.cpp)
+target_link_libraries(mvbpp_mesh_diff PRIVATE mvbpp_mesh)

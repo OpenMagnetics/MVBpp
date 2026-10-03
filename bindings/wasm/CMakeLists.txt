@@ -306,6 +306,9 @@ target_link_options(mvbpp_wasm PRIVATE
     "SHELL:-s MODULARIZE=1"
     "SHELL:-s EXPORT_NAME=createMvbpp"
     "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+    # Meshing a real magnetic peaks around 1.5 GB (15_gan, native RSS) -- past emscripten's
+    # 2 GB growth cap once wasm overheads are added. wasm32 addresses up to 4 GB.
+    "SHELL:-s MAXIMUM_MEMORY=4GB"
     "SHELL:-s INITIAL_MEMORY=256MB"
     "SHELL:-s STACK_SIZE=8MB"
     # Emscripten virtual FS for /tmp writes
