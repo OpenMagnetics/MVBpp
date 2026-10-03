@@ -133,6 +133,11 @@ target_link_libraries(mvbpp_mesh
 add_executable(mvbpp_mesh_roundtrip tools/mvbpp_mesh_roundtrip.cpp)
 target_link_libraries(mvbpp_mesh_roundtrip PRIVATE mvbpp_mesh)
 
+# The skin-layer remesh (moved from OMFEM tools/omfem_skinlayer.cpp, ABT #1588 step 5).
+add_executable(mvbpp_skinlayer tools/mvbpp_skinlayer.cpp)
+target_include_directories(mvbpp_skinlayer PRIVATE ${MVBPP_GMSH_PREFIX}/include ${MVBPP_MMG_PREFIX}/include)
+target_link_libraries(mvbpp_skinlayer PRIVATE mvbpp_mesh)
+
 # Mesh tools moved from OMFEM (ABT #1588 step 7): MMG anisotropic remesh, sliver healing, plane slice.
 foreach(_tool mvbpp_mmgadapt mvbpp_meshheal mvbpp_meshslice)
     add_executable(${_tool} tools/${_tool}.cpp)
