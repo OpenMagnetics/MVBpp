@@ -5,12 +5,15 @@
 
 #include "Definitions.h"
 #include "MAS.hpp"
+#include "constructive_models/Wire.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -294,14 +297,19 @@ std::string field16(const std::string& s) {
 // One large-field card: a name and any number of 16-char data fields, four per line.
 std::string card(const std::string& name, const std::vector<std::string>& fields) {
     std::string head = name + "*";
-    std::string out = head + std::string(8 - head.size(), ' ');
+    if (head.size() > 8) throw std::runtime_error("exportMesh(bdf): card name '" + name + "' is too long");
+    std::string out, line = head + std::string(8 - head.size(), ' ');
+    // Trailing blanks are not data; every line ends at its last field.
+    auto flush = [&]() {
+        while (!line.empty() && line.back() == ' ') line.pop_back();
+        out += line + "\n";
+    };
     for (std::size_t i = 0; i < fields.size(); ++i) {
-        if (i && i % 4 == 0) out += "\n*       ";
-        out += field16(fields[i]);
+        if (i && i % 4 == 0) { flush(); line = "*       "; }
+        line += field16(fields[i]);
     }
-    // Trailing blanks are not data; a line ends at its last field.
-    while (!out.empty() && out.back() == ' ') out.pop_back();
-    return out + "\n";
+    flush();
+    return out;
 }
 
 std::string id16(std::int64_t id, const char* what) {
@@ -313,45 +321,57 @@ std::string id16(std::int64_t id, const char* what) {
 
 // MAT4 values from the region's MAS record: K, CP, RHO in SI, or a throw that names every value
 // MAS lacks (the BDF writes a complete thermal card or none; a blank field is Nastran's default,
-// K = 0, RHO = 1, never "unknown").
-struct Mat4 { double k, cp, rho; };
+// K = 0, RHO = 1, never "unknown"). A conductor's K is a temperature table in MAS: MAT4 takes
+// MKF's value at the reference temperature, and `kTable` carries the table for MATT4/TABLEM1.
+struct Mat4 {
+    double k, cp, rho;
+    std::vector<std::pair<double, double>> kTable;   // (deg C, W/(m K)); empty when K is one number
+};
 
-Mat4 mat4From(const Region& r) {
+Mat4 mat4From(const Region& r, const std::optional<double>& temperature) {
     const auto& m = r.material.record;
     const std::string name = m.value("name", std::string("(unnamed)"));
     std::vector<std::string> missing;
-    double k = 0, cp = 0, rho = 0;
-    auto dim = [&](const char* key, double& out, const char* what) {
+    Mat4 out{0, 0, 0, {}};
+    auto dim = [&](const char* key, double& v, const char* what) {
         if (!m.contains(key) || m[key].is_null()) { missing.push_back(what); return; }
-        out = OpenMagnetics::resolve_dimensional_values(m[key].get<MAS::Dimension>());
+        v = OpenMagnetics::resolve_dimensional_values(m[key].get<MAS::Dimension>());
     };
-    auto num = [&](const char* key, double& out, const char* what) {
+    auto num = [&](const char* key, double& v, const char* what) {
         if (!m.contains(key) || m[key].is_null()) { missing.push_back(what); return; }
         if (!m[key].is_number())
             throw std::runtime_error("exportMesh(bdf): material '" + name + "' " + key + " is not a number");
-        out = m[key].get<double>();
+        v = m[key].get<double>();
     };
     switch (r.material.kind) {
     case MaterialKind::Core:
-        dim("heatConductivity", k, "heatConductivity");
-        dim("heatCapacity", cp, "heatCapacity");
-        num("density", rho, "density");
+        dim("heatConductivity", out.k, "heatConductivity");
+        dim("heatCapacity", out.cp, "heatCapacity");
+        num("density", out.rho, "density");
         break;
     case MaterialKind::Insulation:
-        num("thermalConductivity", k, "thermalConductivity");
-        num("specificHeat", cp, "specificHeat");
-        num("density", rho, "density");
+        num("thermalConductivity", out.k, "thermalConductivity");
+        num("specificHeat", out.cp, "specificHeat");
+        num("density", out.rho, "density");
         break;
     case MaterialKind::Wire:
-        // MAS gives a conductor's conductivity as a temperature table; MAT4's K is one number and
-        // choosing the temperature is not this writer's call.
-        if (m.contains("thermalConductivity"))
-            missing.push_back("thermalConductivity at one temperature (MAS gives a table; MATT4 export "
-                              "needs a reference temperature)");
-        else
+        if (!m.contains("thermalConductivity") || m["thermalConductivity"].is_null()) {
             missing.push_back("thermalConductivity");
-        missing.push_back("specific heat (the MAS wire material schema has no field for it)");
-        num("density", rho, "density");
+        } else {
+            if (!temperature)
+                throw std::runtime_error("exportMesh(bdf): region '" + r.name + "' (MAS material '" + name +
+                                         "') has a temperature-dependent conductivity; pass options.temperature "
+                                         "or options.ambientTemperature (deg C)");
+            const auto material = m.get<MAS::WireMaterial>();
+            out.k = OpenMagnetics::Wire::get_thermal_conductivity(material, *temperature);
+            // The getter returns its optional by value: hold it, or the loop walks a dead temporary.
+            const auto table = material.get_thermal_conductivity();
+            for (const auto& p : table.value())
+                out.kTable.emplace_back(p.get_temperature(), p.get_value());
+            std::sort(out.kTable.begin(), out.kTable.end());
+        }
+        num("specificHeat", out.cp, "specificHeat");
+        num("density", out.rho, "density");
         break;
     default:
         throw std::runtime_error("exportMesh(bdf): mat4From on a region without a material");
@@ -362,7 +382,7 @@ Mat4 mat4From(const Region& r) {
         throw std::runtime_error("exportMesh(bdf): region '" + r.name + "' (MAS material '" + name +
                                  "') cannot get a complete MAT4: MAS lacks " + list);
     }
-    return {k, cp, rho};
+    return out;
 }
 
 const char* kindName(MaterialKind k) {
@@ -392,7 +412,7 @@ void requireMaterial(const Region& r, const char* who) {
                                  kindName(r.material.kind) + " material with no MAS record");
 }
 
-std::string writeBdf(const Mesh& mesh, const std::string& unit) {
+std::string writeBdf(const Mesh& mesh, const std::string& unit, const std::optional<double>& temperature) {
     const auto regions = checkMesh(mesh, "exportMesh(bdf)");
     const double s = unitScale(unit, "exportMesh(bdf)");
     // Material values in the unit system that goes with the length: m-kg-s-K, or mm-t-s-K
@@ -405,6 +425,9 @@ std::string writeBdf(const Mesh& mesh, const std::string& unit) {
     out += "$ Materials are MAS's. MAT4 carries K, CP, RHO; the electromagnetic data Nastran has no\n";
     out += "$ card for is in the $ EM lines and in the .materials.json companion. A region whose\n";
     out += "$ material is 'none' (air) has a property and no MAT card, deliberately.\n";
+    if (temperature)
+        out += "$ TEMPERATURE UNIT: C. MAT4 values are at the reference temperature " + g17(*temperature) +
+               " C; MATT4/TABLEM1 carry MAS's temperature tables.\n";
     out += "BEGIN BULK\n";
     for (const auto& r : mesh.regions) {
         requireMaterial(r, "exportMesh(bdf)");
@@ -421,8 +444,16 @@ std::string writeBdf(const Mesh& mesh, const std::string& unit) {
             if (r.material.kind != MaterialKind::None) {
                 const auto em = emData(r).dump();
                 for (std::size_t i = 0; i < em.size(); i += 72) out += "$ EM " + em.substr(i, 72) + "\n";
-                const auto m = mat4From(r);
+                const auto m = mat4From(r, temperature);
                 out += card("MAT4", {pid, real16(m.k), real16(m.cp * cpScale), real16(m.rho * rhoScale)});
+                if (!m.kTable.empty()) {
+                    // K(T) as MAS tabulates it (TABLEM1: the property itself at each temperature).
+                    out += card("MATT4", {pid, pid});
+                    std::vector<std::string> f{pid, "", "", ""};
+                    for (const auto& [t, k] : m.kTable) { f.push_back(real16(t)); f.push_back(real16(k)); }
+                    f.push_back("ENDT");
+                    out += card("TABLEM1", f);
+                }
             }
         } else {
             // A boundary or port face set: named faces, not a structural shell (no MID, no T).
@@ -455,8 +486,11 @@ Mesh readBdf(const std::string& text) {
     std::map<int, Region> regions;
     std::vector<int> regionOrder;
     bool inBulk = false;
+    // Fields are by column: four 16-character fields per line, blank where the line ends early
+    // (the writer trims trailing blanks, which Nastran reads as blank fields).
     auto fieldsOf = [](const std::string& l, std::vector<std::string>& f) {
-        for (std::size_t at = 8; at < l.size(); at += 16) f.push_back(l.substr(at, 16));
+        for (std::size_t k = 0, at = 8; k < 4; ++k, at += 16)
+            f.push_back(at < l.size() ? l.substr(at, 16) : std::string());
     };
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -505,7 +539,7 @@ Mesh readBdf(const std::string& text) {
             if (c.size() < 6) throw std::runtime_error(std::string(who) + ": short GRID");
             mesh.nodeIds.push_back(integer(c[1]));
             for (int k = 0; k < 3; ++k) mesh.xyz.push_back(readReal(c[3 + k], who) / s);
-        } else if (name == "PSOLID" || name == "PSHELL" || name == "MAT4") {
+        } else if (name == "PSOLID" || name == "PSHELL" || name == "MAT4" || name == "MATT4" || name == "TABLEM1") {
             continue;
         } else {
             const auto& ti = infoFromNastran(name);
@@ -792,9 +826,23 @@ Mesh readVtk(const std::string& text) {
 
 }  // namespace
 
-std::string exportMesh(const Mesh& mesh, const std::string& format, const std::string& unit) {
+std::string exportMesh(const Mesh& mesh, const std::string& format, const std::string& unit,
+                       const nlohmann::json& options) {
+    if (!options.is_null() && !options.is_object())
+        throw std::runtime_error("exportMesh: options must be an object");
+    std::optional<double> temperature, ambient;
+    if (options.is_object())
+        for (auto it = options.begin(); it != options.end(); ++it) {
+            if (it.key() != "temperature" && it.key() != "ambientTemperature")
+                throw std::runtime_error("exportMesh: unknown option \"" + it.key() + "\" (temperature, ambientTemperature)");
+            if (!it.value().is_number())
+                throw std::runtime_error("exportMesh: option " + it.key() + " must be a number (deg C)");
+            (it.key() == "temperature" ? temperature : ambient) = it.value().get<double>();
+        }
+    // The reference temperature: the one asked for, else the ambient (Alf, 2026-10-03).
+    if (!temperature) temperature = ambient;
     if (format == "msh2") return writeMsh2(mesh, unit);
-    if (format == "bdf") return writeBdf(mesh, unit);
+    if (format == "bdf") return writeBdf(mesh, unit, temperature);
     if (format == "inp") return writeInp(mesh, unit);
     if (format == "vtk") return writeVtk(mesh, unit);
     throw std::runtime_error("exportMesh: unknown format \"" + format + "\" (msh2, bdf, inp, vtk)");
@@ -820,6 +868,24 @@ nlohmann::json exportMaterials(const Mesh& mesh) {
         out.push_back(e);
     }
     return out;
+}
+
+double ambientTemperature(const nlohmann::json& mas) {
+    if (!mas.contains("inputs") || !mas["inputs"].contains("operatingPoints") || !mas["inputs"]["operatingPoints"].is_array() ||
+        mas["inputs"]["operatingPoints"].empty())
+        throw std::runtime_error("ambientTemperature: the MAS document has no inputs.operatingPoints");
+    std::optional<double> t;
+    for (const auto& op : mas["inputs"]["operatingPoints"]) {
+        if (!op.contains("conditions") || !op["conditions"].contains("ambientTemperature") ||
+            !op["conditions"]["ambientTemperature"].is_number())
+            throw std::runtime_error("ambientTemperature: an operating point states no conditions.ambientTemperature");
+        const double v = op["conditions"]["ambientTemperature"].get<double>();
+        if (t && *t != v)
+            throw std::runtime_error("ambientTemperature: the operating points state different ambients (" +
+                                     g17(*t) + " and " + g17(v) + " C); pass the temperature explicitly");
+        t = v;
+    }
+    return *t;
 }
 
 Mesh importMesh(const std::string& text, const std::string& format) {

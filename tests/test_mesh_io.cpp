@@ -144,11 +144,44 @@ TEST_CASE("Nastran BDF refuses a material MAS cannot complete", "[mesh-io]") {
     m.regions[0].material.record.erase("heatConductivity");
     REQUIRE_THROWS_WITH(exportMesh(m, "bdf", "m"),
                         ContainsSubstring("MAS lacks heatConductivity"));
-    // A conductor: MAS has no specific heat field for wire materials at all.
+    // A conductor's conductivity is a temperature table: no reference temperature, no MAT4.
     m = cell();
     m.regions[0].material = {MaterialKind::Wire, nlohmann::json{
-        {"name", "copper"}, {"density", 8890.0}, {"thermalConductivity", {{{"temperature", 0}, {"value", 401}}}}}};
-    REQUIRE_THROWS_WITH(exportMesh(m, "bdf", "m"), ContainsSubstring("specific heat"));
+        {"name", "copper"}, {"permeability", 0.999994}, {"density", 8890.0},
+        {"resistivity", {{"referenceValue", 1.678e-08}, {"referenceTemperature", 20}, {"temperatureCoefficient", 0.004041}}},
+        {"thermalConductivity", {{{"temperature", 0}, {"value", 401}}, {{"temperature", 127}, {"value", 392}}}}}};
+    REQUIRE_THROWS_WITH(exportMesh(m, "bdf", "m"), ContainsSubstring("options.temperature"));
+    // With one, it still needs the specific heat.
+    REQUIRE_THROWS_WITH(exportMesh(m, "bdf", "m", {{"temperature", 63.5}}), ContainsSubstring("MAS lacks specificHeat"));
+}
+
+TEST_CASE("Nastran BDF writes a conductor at the reference temperature, with its MAS table", "[mesh-io]") {
+    Mesh m = cell();
+    m.regions[0].material = {MaterialKind::Wire, nlohmann::json{
+        {"name", "copper"}, {"permeability", 0.999994}, {"density", 8890.0}, {"specificHeat", 385.2},
+        {"resistivity", {{"referenceValue", 1.678e-08}, {"referenceTemperature", 20}, {"temperatureCoefficient", 0.004041}}},
+        {"thermalConductivity", {{{"temperature", 127}, {"value", 392}}, {{"temperature", 0}, {"value", 401}}}}}};
+    // The ambient stands in when no temperature is asked for; an asked one wins.
+    const std::string a = exportMesh(m, "bdf", "m", {{"ambientTemperature", 63.5}});
+    REQUIRE_THAT(a, ContainsSubstring("MAT4*   1               3.965+2         3.852+2         8.89+3"));
+    REQUIRE_THAT(a, ContainsSubstring("MATT4*  1               1\n"));
+    REQUIRE_THAT(a, ContainsSubstring("TABLEM1*1\n*       0.              4.01+2          1.27+2          3.92+2\n*       ENDT"));
+    REQUIRE_THAT(a, ContainsSubstring("reference temperature 63.5 C"));
+    const std::string t = exportMesh(m, "bdf", "m", {{"ambientTemperature", 63.5}, {"temperature", 0.0}});
+    REQUIRE_THAT(t, ContainsSubstring("MAT4*   1               4.01+2"));
+    requireBdfRoundTrip(m, importMesh(a, "bdf"));
+    REQUIRE_THROWS_WITH(exportMesh(m, "bdf", "m", {{"temperatur", 20.0}}), ContainsSubstring("unknown option"));
+}
+
+TEST_CASE("The ambient temperature comes from the MAS operating points, and only when they agree", "[mesh-io]") {
+    auto mas = [](std::vector<double> ts) {
+        nlohmann::json ops = nlohmann::json::array();
+        for (double t : ts) ops.push_back({{"conditions", {{"ambientTemperature", t}}}});
+        return nlohmann::json{{"inputs", {{"operatingPoints", ops}}}};
+    };
+    REQUIRE(ambientTemperature(mas({40.0, 40.0})) == 40.0);
+    REQUIRE_THROWS_WITH(ambientTemperature(mas({25.0, 40.0})), ContainsSubstring("different ambients"));
+    REQUIRE_THROWS_WITH(ambientTemperature(nlohmann::json::object()), ContainsSubstring("no inputs.operatingPoints"));
 }
 
 TEST_CASE("Exporters refuse a volume region with no material stated", "[mesh-io]") {

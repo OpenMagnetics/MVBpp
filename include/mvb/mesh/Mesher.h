@@ -101,7 +101,16 @@ nlohmann::json buildRevision();
 // back, node and element counts per region, coordinates within the format's precision, tet
 // volumes recomputed with the same sign and no new |V| < 1e-18 m^3. Text formats write
 // coordinates round-trip exact (%.17g), never fewer digits.
-std::string exportMesh(const Mesh& mesh, const std::string& format, const std::string& unit);
+// options (JSON object, all optional): "temperature" and "ambientTemperature", deg C. The BDF's
+// reference temperature is "temperature", else "ambientTemperature"; a region whose MAS
+// property depends on temperature (a conductor's conductivity) throws when neither is given.
+// Unknown option keys throw.
+std::string exportMesh(const Mesh& mesh, const std::string& format, const std::string& unit,
+                       const nlohmann::json& options = nlohmann::json::object());
+
+// The ambient temperature (deg C) a MAS document's operating points state, for the export's
+// reference temperature. Throws when none is stated or when the operating points disagree.
+double ambientTemperature(const nlohmann::json& mas);
 
 // The BDF's companion: per region, its PID, name, MAS material name and kind, and the material's
 // electromagnetic data (permeability, resistivity, permittivity) exactly as MAS gives it, which
