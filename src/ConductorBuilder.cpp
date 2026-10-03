@@ -4128,7 +4128,8 @@ std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
 //
 // MKF decides everything here: Coil::assign_pins writes the pin on connections[], and the terminal
 // ConnectionRoute of that end carries `pinName` plus `pinWaypoints`, the run from the window exit
-// to the pin BASE in this builder's concentric frame (column axis Y, leads on the -Z front face).
+// to where its wrap starts (on the wrap circle, arriving tangent to it: ABT #1640) in this builder's
+// concentric frame (column axis Y, leads on the -Z front face).
 // MVB++ replays those points and wraps the wire around the pin; it routes nothing of its own.
 struct PinLead {
     const OpenMagnetics::ConnectionRoute* route = nullptr;
@@ -4330,23 +4331,34 @@ std::vector<Primitive> roundedLeadChain(const std::vector<gp_Pnt>& pts, double b
 // bobbin (-Y). Emitted as half-turn SPIRALs so no single piece closes a revolution; the free end
 // is the assembler's flat perpendicular cap, which buildAllImpl picks as the FEM terminal.
 // `reverse` emits it end -> start (an entrance travels pin -> winding).
-std::vector<Primitive> pinWrap(const PinAxis& axis, const gp_Pnt& start, double wireRadius,
-                               int wrapTurns, const std::string& label, size_t ordinal,
-                               int terminal, bool reverse) {
-    const double R = axis.radius + wireRadius;
-    const double pitch = 2.0 * wireRadius;
+std::vector<Primitive> pinWrap(const PinAxis& axis, const gp_Pnt& start, const gp_Vec& arrival,
+                               double wireRadius, int wrapTurns, const std::string& label,
+                               size_t ordinal, int terminal, bool reverse) {
+    // ABT #1640: the wrap circle is MKF's, where the route ends (pin radius + coated radius).
+    // Its turns lie a coated diameter apart, the extent MKF planned the wrap for (wrapTurns coated
+    // diameters down the pin from the route's end).
+    const double R = std::hypot(start.X() - axis.x, start.Z() - axis.z);
+    const double pitch = 2.0 * (R - axis.radius);
     const double az0 = std::atan2(-(start.Z() - axis.z), start.X() - axis.x);
-    const double r0 = std::hypot(start.X() - axis.x, start.Z() - axis.z);
-    if (std::abs(r0 - R) > 1e-9)
-        throw std::runtime_error("ConductorBuilder: '" + label + "' starts " +
-                                 std::to_string(r0 * 1e3) + " mm from the pin axis, not on the " +
-                                 std::to_string(R * 1e3) + " mm wrap radius");
+    if (R < axis.radius + wireRadius - 1e-9)
+        throw std::runtime_error("ConductorBuilder: '" + label + "' starts " + std::to_string(R * 1e3) +
+                                 " mm from the pin axis, inside the " +
+                                 std::to_string((axis.radius + wireRadius) * 1e3) +
+                                 " mm its copper needs");
+    // ABT #1640: the wrap goes on round the pin the way the run arrives (exit order), so the run
+    // meets it tangentially. d/daz of (cx + R cos az, cz - R sin az) is (-R sin az, -R cos az).
+    const gp_Vec ccw(-std::sin(az0), 0.0, -std::cos(az0));
+    const double along = arrival.Magnitude() > 0.0 ? arrival.Dot(ccw) / arrival.Magnitude() : 0.0;
+    if (std::abs(std::abs(along) - 1.0) > 1e-9)
+        throw std::runtime_error("ConductorBuilder: '" + label + "' is not arrived at tangentially "
+                                 "(cosine to the wrap's tangent " + std::to_string(along) + ")");
+    const double sense = along > 0.0 ? 1.0 : -1.0;
     std::vector<Primitive> out;
     const int halves = 2 * wrapTurns;
     for (int k = 0; k < halves; ++k) {
         Primitive pr;
         pr.kind = Primitive::SPIRAL;
-        const double a0 = az0 + kPi * k, a1 = az0 + kPi * (k + 1);
+        const double a0 = az0 + sense * kPi * k, a1 = az0 + sense * kPi * (k + 1);
         const double y0 = start.Y() - 0.5 * pitch * k, y1 = start.Y() - 0.5 * pitch * (k + 1);
         if (reverse)
             pr.spiral = {axis.x, axis.z, R, y1, a1, R, y0, a0};
@@ -4400,8 +4412,12 @@ void stitchPinLead(std::vector<Primitive>& prims, const PendingPinLead& pl, doub
     }
     const gp_Pnt inner = pl.exit ? tipSeg.seg.a : tipSeg.seg.b;   // the run's in-window end
     const int terminal = pl.exit ? 1 : 0;
-    auto wrap = pinWrap(pl.axis, pl.run.back(), wireRadius, pl.wrapTurns, pl.label + " wrap",
-                        pl.ordinal, terminal, /*reverse=*/!pl.exit);
+    if (pl.run.size() < 2)
+        throw std::runtime_error("ConductorBuilder: " + pl.label + " has no leg arriving at pin '" +
+                                 pl.pinName + "'");
+    auto wrap = pinWrap(pl.axis, pl.run.back(), gp_Vec(pl.run[pl.run.size() - 2], pl.run.back()),
+                        wireRadius, pl.wrapTurns, pl.label + " wrap", pl.ordinal, terminal,
+                        /*reverse=*/!pl.exit);
     // MKF's exit at the in-window run's own end (the exit depth IS the lifted border): the run to
     // the tip plane goes entirely, and the pin run starts at that corner.
     if (inner.Distance(pl.run.front()) <= 1e-9) {
@@ -14715,16 +14731,25 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     throw std::runtime_error(m.str());
                 }
                 const PinAxis axis = pinAxisOf(pinLead->pin, who);
-                // The route ends ON the pin axis, one wire radius or more under the pin's base (the
-                // rail underside; a second strand sharing the pin wraps lower): the wrap starts
-                // there.
+                // The route ends where the wrap starts: on MKF's wrap circle (pin radius + the
+                // COATED wire radius about the axis: the enamel rests on the pin), one wire radius
+                // or more under the pin's base (the rail underside; a second strand sharing the pin
+                // wraps lower), arriving tangent to the circle (ABT #1640, checked with the last
+                // leg below). The copper drawn there may be thinner than the coated wire; it may
+                // not reach into the pin.
                 const gp_Pnt pinEnd = run.back();
-                if (std::abs(pinEnd.X() - axis.x) > 1e-9 || std::abs(pinEnd.Z() - axis.z) > 1e-9 ||
-                    pinEnd.Y() > axis.baseY - wireRadius + 1e-9 || pinEnd.Y() < axis.tipY)
-                    throw std::runtime_error("ConductorBuilder: MKF's route of " + who +
-                                             " does not end on the axis of pin '" +
-                                             pinLead->route->pinName +
-                                             "' between a wire radius under its base and its tip");
+                const double wrapR = std::hypot(pinEnd.X() - axis.x, pinEnd.Z() - axis.z);
+                if (wrapR < axis.radius + wireRadius - 1e-9 ||
+                    pinEnd.Y() > axis.baseY - wireRadius + 1e-9 || pinEnd.Y() < axis.tipY) {
+                    std::ostringstream m;
+                    m.precision(9);
+                    m << "ConductorBuilder: MKF's route of " << who << " ends " << wrapR * 1e3
+                      << " mm from the axis of pin '" << pinLead->route->pinName << "' (the copper needs "
+                      << (axis.radius + wireRadius) * 1e3 << " mm) at height " << pinEnd.Y() * 1e3
+                      << " mm (base " << axis.baseY * 1e3 << ", tip " << axis.tipY * 1e3
+                      << " mm, a wire radius under the base at least)";
+                    throw std::runtime_error(m.str());
+                }
                 // The fan drew this run at MKF's exit x, or moved it outward by at most one wire
                 // radius where the 3-D lead could not be proven clear there (ABT #1237). The run is
                 // cut at MKF's exit depth; a level leg along x bridges it to MKF's exit when the move
@@ -14746,7 +14771,6 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                     throw std::runtime_error("ConductorBuilder: MKF's pin run of " + who + " is empty");
                 const gp_XYZ lastLeg = run.back().XYZ() - run[run.size() - 2].XYZ();
                 const double lastLen = lastLeg.Modulus();
-                const double wrapR = axis.radius + wireRadius;
                 for (size_t k = 0; k + 1 < run.size(); ++k) {
                     const gp_Vec leg(run[k], run[k + 1]);
                     bool bad = leg.Magnitude() < 1e-12;
@@ -14763,13 +14787,13 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         throw std::runtime_error(m.str());
                     }
                 }
-                if (std::abs(lastLeg.Y()) > 1e-12 || lastLen < wrapR + wireRadius)
+                const gp_XYZ radial(pinEnd.X() - axis.x, 0.0, pinEnd.Z() - axis.z);
+                if (std::abs(lastLeg.Y()) > 1e-12 || lastLen < wireRadius ||
+                    std::abs(lastLeg.Dot(radial)) > 1e-9 * lastLen * wrapR)
                     throw std::runtime_error("ConductorBuilder: " + who + " arrives at pin '" +
                                              pinLead->route->pinName +
-                                             "' on a leg that is not level or is shorter than the "
-                                             "wrap radius plus a wire radius");
-                // The run stops where the wire meets the wrap circle, on the side it comes from.
-                run.back() = gp_Pnt(run.back().XYZ() - lastLeg / lastLen * wrapR);
+                                             "' on a leg that is not level, not tangent to the wrap "
+                                             "circle or shorter than a wire radius");
                 PendingPinLead pending;
                 pending.exit = isExitLead;
                 pending.oldTip = leadPts[tip];

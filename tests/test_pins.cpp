@@ -262,16 +262,16 @@ mvb::ConductorBuilder::Options builder_options(const OpenMagnetics::Magnetic& ma
     return opts;
 }
 
-// Where MKF's route of each terminal ends (on the pin axis, under the rail): the wrap's top.
-std::map<std::pair<std::string, int>, double> route_end_heights(const OpenMagnetics::Magnetic& magnetic) {
+// Where MKF's route of each terminal ends (on the wrap circle, under the rail): the wrap's start.
+std::map<std::pair<std::string, int>, std::array<double, 3>> route_ends(const OpenMagnetics::Magnetic& magnetic) {
     mvb::ConductorBuilder::LeadBendPolicy bendPolicy;   // see route_exits (ABT #1172)
     auto coil = magnetic.get_coil();
-    std::map<std::pair<std::string, int>, double> out;
+    std::map<std::pair<std::string, int>, std::array<double, 3>> out;
     for (const auto& r : coil.get_connection_layout().routes) {
         if (r.pinName.empty()) continue;
         const int terminal = r.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE ? 0 : 1;
         const auto& end = terminal == 0 ? r.pinWaypoints.front() : r.pinWaypoints.back();
-        out[{r.winding + " parallel " + std::to_string(r.parallel), terminal}] = end[1];
+        out[{r.winding + " parallel " + std::to_string(r.parallel), terminal}] = {end[0], end[1], end[2]};
     }
     return out;
 }
@@ -359,7 +359,7 @@ TEST_CASE("Every terminal lead of the boost ends in a wrap around the pin MKF as
     for (const auto& [key, pin] : assigned)
         UNSCOPED_INFO(key.first << " terminal " << key.second << " -> pin " << pin.name);
     REQUIRE(assigned.size() == 4u);   // Primary, 2 parallels, start + finish
-    const auto ends = route_end_heights(enriched);
+    const auto ends = route_ends(enriched);
     REQUIRE(ends.size() == 4u);
 
     const auto paths = mvb::ConductorBuilder::buildAllPaths(enriched.get_coil(), bobbin_pd(enriched), false,
@@ -376,8 +376,14 @@ TEST_CASE("Every terminal lead of the boost ends in a wrap around the pin MKF as
         REQUIRE(path.prims.size() > 2 * wrapPieces);
         for (int terminal = 0; terminal < 2; ++terminal) {
             const auto& pin = assigned.at({path.name, terminal});
-            const double wrapTop = ends.at({path.name, terminal});
-            const double wrapRadius = pin.radius + path.wireRadius;
+            // ABT #1640: MKF's wrap circle, where its route ends -- pin radius + the COATED wire
+            // radius (the enamel rests on the pin) -- with the drawn copper no closer than its own
+            // radius; the turns a coated diameter apart.
+            const auto& routeEnd = ends.at({path.name, terminal});
+            const double wrapTop = routeEnd[1];
+            const double wrapRadius = std::hypot(routeEnd[0] - pin.x, routeEnd[2] - pin.z);
+            const double coatedDiameter = 2 * (wrapRadius - pin.radius);
+            CHECK(wrapRadius >= pin.radius + path.wireRadius - 1e-12);
             INFO(path.name << " terminal " << terminal << " on pin " << pin.name << ", wrap radius " << wrapRadius);
             double yMin = 1e9, yMax = -1e9;
             for (std::size_t k = 0; k < wrapPieces; ++k) {
@@ -389,10 +395,10 @@ TEST_CASE("Every terminal lead of the boost ends in a wrap around the pin MKF as
                 }
             }
             // Starts where MKF's route ends (at least a wire radius under the pin base) and advances
-            // along the pin, one wire OD per turn, staying on the pin.
+            // along the pin, one coated wire OD per turn, staying on the pin.
             CHECK(std::abs(yMax - wrapTop) <= 1e-9);
             CHECK(yMax <= pin.baseY - path.wireRadius + 1e-9);
-            CHECK(std::abs((yMax - yMin) - 2 * 2 * path.wireRadius) <= 1e-9);
+            CHECK(std::abs((yMax - yMin) - 2 * coatedDiameter) <= 1e-9);
             CHECK(yMin > pin.tipY);
             // The free end (the FEM port) is the wrap's end, on the wrap circle.
             const auto& end = terminal == 0 ? path.end0 : path.end1;
@@ -464,12 +470,16 @@ TEST_CASE("The PQ 32/30 flyback draws each lead at MKF's slot, primary and secon
     require_runs_at_mkf_slots(enriched, paths,
                               {{{"Primary parallel 0", 0}, 0.0}, {{"Primary parallel 0", 1}, 0.534e-3},
                                {{"Secondary parallel 0", 0}, 0.0}, {{"Secondary parallel 0", 1}, 0.0}});
+    const auto ends = route_ends(enriched);
     for (const auto& path : paths)
         for (int terminal = 0; terminal < 2; ++terminal) {
             const auto& pin = assigned.at({path.name, terminal});
             const auto& end = terminal == 0 ? path.end0 : path.end1;
             INFO(path.name << " terminal " << terminal << " on pin " << pin.name);
-            CHECK(std::abs(std::hypot(end[0] - pin.x, end[2] - pin.z) - (pin.radius + path.wireRadius)) <= 1e-9);
+            // The wrap's free end is on MKF's wrap circle (ABT #1640).
+            const auto& routeEnd = ends.at({path.name, terminal});
+            CHECK(std::abs(std::hypot(end[0] - pin.x, end[2] - pin.z) -
+                           std::hypot(routeEnd[0] - pin.x, routeEnd[2] - pin.z)) <= 1e-9);
         }
 }
 
@@ -538,7 +548,7 @@ TEST_CASE("The boost's FEM assembly: wraps and pin runs keep out of the pins, th
     REQUIRE(!uncutBobbin.shape.IsNull());
 
     std::vector<const mvb::NamedShape*> obstacles;
-    std::size_t terminals = 0, conductors = 0, wraps = 0, runs = 0;
+    std::size_t terminals = 0, conductors = 0;
     for (const auto& ns : all) {
         if (ns.role == mvb::Role::Pin || ns.role == mvb::Role::Core) obstacles.push_back(&ns);
         // The FEM port caps: planar faces named "<conductor> terminal <k>" (they arrive as
@@ -547,31 +557,27 @@ TEST_CASE("The boost's FEM assembly: wraps and pin runs keep out of the pins, th
         if (ns.name.find(" terminal ") != std::string::npos && ns.shape.ShapeType() == TopAbs_FACE) ++terminals;
     }
     REQUIRE(obstacles.size() > 12u);
+    // A FEM-ready conductor is ONE solid (ABT #1265): with the pin wrap arriving tangentially
+    // (ABT #1640) its wrap and pin run fuse into it like every other piece, so they are checked as
+    // part of that body -- which also covers every other piece of it.
     for (const auto& ns : all) {
-        if (ns.role != mvb::Role::Turn || ns.partNames.empty()) continue;
+        if (ns.role != mvb::Role::Turn) continue;
         ++conductors;
-        std::size_t k = 0;
-        for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next(), ++k) {
-            REQUIRE(k < ns.partNames.size());
-            const auto& part = ns.partNames[k];
-            const bool wrap = part.find("lead wrap") != std::string::npos;
-            const bool run = part.find("lead pin run") != std::string::npos;
-            if (!wrap && !run) continue;
-            (wrap ? wraps : runs)++;
-            std::vector<const mvb::NamedShape*> against = obstacles;
-            against.push_back(&uncutBobbin);
-            for (const auto* other : against) {
-                BRepAlgoAPI_Common common(e.Current(), other->shape);
-                REQUIRE(common.IsDone());
-                UNSCOPED_INFO(part << " vs " << other->name);
-                CHECK(volume_of(common.Shape()) < 1e-15);
-            }
+        std::size_t solids = 0;
+        for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next()) ++solids;
+        INFO(ns.name);
+        CHECK(solids == 1u);
+        std::vector<const mvb::NamedShape*> against = obstacles;
+        against.push_back(&uncutBobbin);
+        for (const auto* other : against) {
+            BRepAlgoAPI_Common common(ns.shape, other->shape);
+            REQUIRE(common.IsDone());
+            UNSCOPED_INFO(ns.name << " vs " << other->name);
+            CHECK(volume_of(common.Shape()) < 1e-15);
         }
     }
     CHECK(conductors == 2u);
     CHECK(terminals == 2u * conductors);   // the FEM ports: one planar cap per free end, unchanged
-    CHECK(wraps == 2u * 4u * conductors);
-    CHECK(runs > 0u);
 }
 
 TEST_CASE("A design whose bobbin has no pins draws no wraps and no pin runs", "[pins][pinroute][abt1172]") {
