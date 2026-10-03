@@ -26,7 +26,8 @@ struct TypeInfo {
     int dimension;
     int gmsh;                // msh2 element type code
     const char* nastran;     // bulk-data card, nullptr where Nastran has none we write
-    const char* abaqus;      // INP element type, as gmsh's own INP writer names it
+    const char* abaqus;      // INP element type: gmsh's for volumes; faces are surface elements
+                             // (SFM3D3/4), not gmsh's 2-D CPS3/4, which a 3-D model rejects
     int vtk;                 // VTK cell type
     std::array<int, 8> vtkOrder;  // VTK node k = gmsh node vtkOrder[k] (gmsh's getVertexVTK)
 };
@@ -34,8 +35,8 @@ struct TypeInfo {
 constexpr TypeInfo kTypes[] = {
     {ElementType::Point,    1, 0, 15, nullptr,  nullptr, 1,  {0}},
     {ElementType::Line2,    2, 1, 1,  nullptr,  nullptr, 3,  {0, 1}},
-    {ElementType::Tri3,     3, 2, 2,  "CTRIA3", "CPS3",  5,  {0, 1, 2}},
-    {ElementType::Quad4,    4, 2, 3,  "CQUAD4", "CPS4",  9,  {0, 1, 2, 3}},
+    {ElementType::Tri3,     3, 2, 2,  "CTRIA3", "SFM3D3", 5,  {0, 1, 2}},
+    {ElementType::Quad4,    4, 2, 3,  "CQUAD4", "SFM3D4", 9,  {0, 1, 2, 3}},
     {ElementType::Tet4,     4, 3, 4,  "CTETRA", "C3D4",  10, {0, 1, 2, 3}},
     {ElementType::Pyramid5, 5, 3, 7,  "CPYRAM", "C3D5",  14, {0, 1, 2, 3, 4}},
     {ElementType::Prism6,   6, 3, 6,  "CPENTA", "C3D6",  13, {0, 2, 1, 3, 5, 4}},
