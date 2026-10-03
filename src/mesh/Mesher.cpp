@@ -34,8 +34,5 @@ nlohmann::json buildRevision() {
             {"mmg", MMG_VERSION_RELEASE}};
 }
 
-std::string exportMesh(const Mesh&, const std::string&, const std::string&) {
-    throw std::runtime_error("mvb::mesh::exportMesh: not implemented yet (ABT #1588 move in progress)");
-}
 
 }  // namespace mvb::mesh

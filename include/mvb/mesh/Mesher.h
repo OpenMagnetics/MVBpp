@@ -20,7 +20,8 @@
 // lists, physical and elementary tags, all in order. Sidecars stay byte-identical apart from the
 // recipe's provenance (paths, cwd, timings). Any change of output is its own, separately gated step.
 //
-// This header is the API sketch for review; nothing implements it yet.
+// meshMagnetic and recipeTemplate are still to be moved; the exporters, importer and the identity
+// diff below are implemented.
 
 #include <nlohmann/json.hpp>
 
@@ -44,10 +45,21 @@ struct ElementBlock {
     std::vector<std::int64_t> nodes;         // node ids, nodesPerElement(type) per element
 };
 
+// What a region is made of, as MAS states it. `Unset` is the state of a region nobody filled in,
+// and an exporter that needs a material throws on it. `None` is a deliberate statement that the
+// region has no MAS material (air, a boundary face).
+enum class MaterialKind : std::uint8_t { Unset, None, Core, Wire, Insulation };
+
+struct RegionMaterial {
+    MaterialKind kind = MaterialKind::Unset;
+    nlohmann::json record;                   // the MAS core/wire/insulation material record, verbatim
+};
+
 struct Region {
-    int tag = 0;
+    int tag = 0;                             // unique across all dimensions of one mesh
     int dimension = 0;                       // 3 volume, 2 boundary/port, 1 CAD edge
     std::string name;                        // "core", "winding_<w>", "air", "outer", "port_..."
+    RegionMaterial material;
 };
 
 struct Mesh {
@@ -89,5 +101,19 @@ nlohmann::json buildRevision();
 // volumes recomputed with the same sign and no new |V| < 1e-18 m^3. Text formats write
 // coordinates round-trip exact (%.17g), never fewer digits.
 std::string exportMesh(const Mesh& mesh, const std::string& format, const std::string& unit);
+
+// The BDF's companion: per region, its PID, name, MAS material name and kind, and the material's
+// electromagnetic data (permeability, resistivity, permittivity) exactly as MAS gives it, which
+// Nastran has no cards for. Every 3D region must have its material set (None for air).
+nlohmann::json exportMaterials(const Mesh& mesh);
+
+// Reads what exportMesh writes ("msh2", "bdf"), for the round-trip gate and for comparing meshes
+// made elsewhere. Coordinates come back in metres whatever unit the file states.
+Mesh importMesh(const std::string& text, const std::string& format);
+
+// The identity gate: empty when the two meshes are the same -- node ids and exact coordinates,
+// regions, and every block's type, region, entity, element ids and node lists, all in order --
+// otherwise the first difference found. Materials are not compared (msh2 carries none).
+std::string diffMeshes(const Mesh& a, const Mesh& b);
 
 }  // namespace mvb::mesh

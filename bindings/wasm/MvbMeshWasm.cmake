@@ -98,6 +98,7 @@ add_library(mvbpp_mesh STATIC
     ${_mvbpp_root}/src/mesh/Mesher.cpp
     ${_mvbpp_root}/src/mesh/SizeField.cpp
     ${_mvbpp_root}/src/mesh/MeshRecipe.cpp
+    ${_mvbpp_root}/src/mesh/MeshIO.cpp
 )
 add_dependencies(mvbpp_mesh gmsh_wasm mvbpp_buildrev)
 target_compile_options(mvbpp_mesh PRIVATE -fexceptions)

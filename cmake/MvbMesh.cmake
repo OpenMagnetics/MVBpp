@@ -108,6 +108,7 @@ add_library(mvbpp_mesh ${_mvbpp_lib_kind}
     src/mesh/Mesher.cpp
     src/mesh/SizeField.cpp
     src/mesh/MeshRecipe.cpp
+    src/mesh/MeshIO.cpp
 )
 add_dependencies(mvbpp_mesh gmsh_external mvbpp_buildrev)
 target_include_directories(mvbpp_mesh
@@ -117,3 +118,7 @@ target_link_libraries(mvbpp_mesh
     PUBLIC  mvb++ nlohmann_json::nlohmann_json
     PRIVATE ${MVBPP_GMSH_PREFIX}/lib/libgmsh.a ${MVBPP_MMG_PREFIX}/lib/libmmg.a
             occt ${MVBPP_GMP_LIBRARY} OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
+
+# The round-trip gate on real meshes (tools/mvbpp_mesh_roundtrip.cpp).
+add_executable(mvbpp_mesh_roundtrip tools/mvbpp_mesh_roundtrip.cpp)
+target_link_libraries(mvbpp_mesh_roundtrip PRIVATE mvbpp_mesh)

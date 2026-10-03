@@ -333,6 +333,10 @@ add_executable(mvb_tests
     tests/test_sleeves.cpp
     tests/test_slab_cores.cpp
 )
+if(MVBPP_BUILD_MESH)
+    target_sources(mvb_tests PRIVATE tests/test_mesh_io.cpp)
+    target_link_libraries(mvb_tests PRIVATE mvbpp_mesh)
+endif()
 
 target_compile_definitions(mvb_tests PRIVATE
     REFERENCE_STEPS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/reference_steps"
