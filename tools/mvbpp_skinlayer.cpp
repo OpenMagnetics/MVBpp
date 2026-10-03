@@ -447,7 +447,36 @@ int main(int argc_in, char** argv_in) {
     auto t0 = clk::now();
     MMG5_pMesh mmg=nullptr; MMG5_pSol sol=nullptr;
     MMG3D_Init_mesh(MMG5_ARG_start, MMG5_ARG_ppMesh,&mmg, MMG5_ARG_ppMet,&sol, MMG5_ARG_end);
-    MMG3D_Set_meshSize(mmg, np, (int)tets.size(), 0, (int)tris.size(), 0, (int)cadEdges.size());
+    // FROZEN COPPER INTERFACES ONLY (2026-10-03, ABT #1564). OMFEM_SKIN_NOSURF=1 freezes EVERY surface
+    // (MMG nosurf), and that includes the flat port faces: buck_inductor's 12 NOSURF slivers all lie flat
+    // on the terminal plane y = -6.0448 mm (11 copper tets at term0/term1, 1 air tet on the outer face;
+    // all four nodes on the plane), which MMG may not repair with the plane frozen; the default pass has
+    // none there. OMFEM_SKIN_NOSURF=copper freezes only what moves the copper volume: every face between
+    // a copper tet and a tet of another ref is handed to MMG as a REQUIRED triangle, and the port and
+    // outer faces stay free (they are planar; remeshing them moves no volume).
+    const char* nosurfEnv = std::getenv("OMFEM_SKIN_NOSURF");
+    const bool nosurfAll = nosurfEnv && std::string(nosurfEnv) != "copper";
+    const bool nosurfCu  = nosurfEnv && std::string(nosurfEnv) == "copper";
+    if (nosurfAll && std::string(nosurfEnv) != "1") {
+        std::fprintf(stderr, "ERROR: OMFEM_SKIN_NOSURF=%s: expected 1 (freeze every surface) or copper (freeze copper interfaces)\n", nosurfEnv); return 2; }
+    std::vector<std::array<int,3>> cuIface;
+    if (nosurfCu) {
+        struct F { std::array<int,3> s; std::array<int,3> v; int ref; };
+        std::vector<F> faces; faces.reserve(4*tets.size());
+        static const int fv[4][3] = {{1,2,3},{0,3,2},{0,1,3},{0,2,1}};
+        for (auto& t : tets) for (auto& q : fv) {
+            F f; f.v = {t.v[q[0]], t.v[q[1]], t.v[q[2]]}; f.s = f.v; std::sort(f.s.begin(), f.s.end()); f.ref = t.ref; faces.push_back(f); }
+        std::sort(faces.begin(), faces.end(), [](const F& a, const F& b){ return a.s < b.s; });
+        for (size_t i = 0; i < faces.size(); ) {
+            size_t j = i + 1; while (j < faces.size() && faces[j].s == faces[i].s) ++j;
+            if (j - i > 2) { std::fprintf(stderr, "ERROR: face shared by %zu tets in %s (non-manifold input mesh)\n", j - i, argv[1]); return 1; }
+            if (j - i == 2 && faces[i].ref != faces[i+1].ref && (copperRef[faces[i].ref-1] || copperRef[faces[i+1].ref-1]))
+                cuIface.push_back(copperRef[faces[i].ref-1] ? faces[i].v : faces[i+1].v);
+            i = j;
+        }
+        std::printf("nosurf=copper: %zu copper interface triangles required; port/outer faces free\n", cuIface.size());
+    }
+    MMG3D_Set_meshSize(mmg, np, (int)tets.size(), 0, (int)(tris.size() + cuIface.size()), 0, (int)cadEdges.size());
     for (int i=0;i<np;i++) MMG3D_Set_vertex(mmg, P[i].x,P[i].y,P[i].z, 0, i+1);
     for (size_t k=0;k<tets.size();k++) MMG3D_Set_tetrahedron(mmg, tets[k].v[0],tets[k].v[1],tets[k].v[2],tets[k].v[3], tets[k].ref, (int)k+1);
     // NON-CONDUCTING SOLIDS ARE FROZEN (2026-10-01, ABT #1564). The core and bobbin carry no skin layer and
@@ -470,6 +499,11 @@ int main(int argc_in, char** argv_in) {
         }
     std::printf("solids: %ld tet(s) of non-conducting solids frozen%s\n", nFrozen, freeSolid ? " (OMFEM_SKIN_FREE_SOLID: none, A/B)" : "");
     for (size_t k=0;k<tris.size();k++) MMG3D_Set_triangle(mmg, tris[k].v[0],tris[k].v[1],tris[k].v[2], tris[k].ref, (int)k+1);
+    // ref 0: an interface, not one of our boundary groups, so the output filter (ref > nvol) drops it
+    for (size_t k=0;k<cuIface.size();k++) {
+        const int pos = (int)(tris.size() + k) + 1;
+        if (!MMG3D_Set_triangle(mmg, cuIface[k][0], cuIface[k][1], cuIface[k][2], 0, pos) || !MMG3D_Set_requiredTriangle(mmg, pos)) {
+            std::fprintf(stderr, "ERROR: MMG3D refused copper interface triangle %zu\n", k+1); return 1; } }
     for (size_t k=0;k<cadEdges.size();k++) {
         if (!MMG3D_Set_edge(mmg, cadEdges[k][0], cadEdges[k][1], 0, (int)k+1) || !MMG3D_Set_ridge(mmg, (int)k+1)) {
             std::fprintf(stderr, "ERROR: MMG3D refused CAD edge %zu\n", k+1); return 1; } }
@@ -648,7 +682,7 @@ int main(int argc_in, char** argv_in) {
     // measured on the bar for a 0.02 mm first layer: normal extent 0.021 -> 0.033 -> 0.052 ->
     // 0.089 mm with depth, tangential 0.05-0.07 mm, along the wire 0.15-0.18 mm, 126k copper tets.
     // Interfaces move at most hausd off the CAD facets. OMFEM_SKIN_NOSURF=1 freezes them.
-    if (std::getenv("OMFEM_SKIN_NOSURF")) MMG3D_Set_iparameter(mmg, sol, MMG3D_IPARAM_nosurf, 1);
+    if (nosurfAll) MMG3D_Set_iparameter(mmg, sol, MMG3D_IPARAM_nosurf, 1);
     MMG3D_Set_dparameter(mmg, sol, MMG3D_DPARAM_hgrad, hgrad);
     // NO GRADATION FROM THE FROZEN SOLIDS (2026-10-01, ABT #1564). MMG grades the size away from REQUIRED
     // entities with its own hgradreq, independently of hgrad and of the metric we hand it. With the solids
