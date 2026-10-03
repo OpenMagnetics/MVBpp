@@ -3224,14 +3224,21 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         if (clearance(g0) > margin) return g0;
         double lo = g0, hi = g0;
         const double step = 0.25 * wireRadius, cap = g0 + 20.0 * wireRadius;
+        double best = clearance(g0), bestAt = g0;
         while (!(clearance(hi) > margin)) {
             lo = hi;
             hi += step;
-            if (hi > cap)
-                throw std::runtime_error("'" + pr.label + "': no growth up to " +
-                                         std::to_string(cap * 1e6) + " um carries its " +
-                                         (atStart ? "start" : "end") + " section past the mitre "
-                                         "plane");
+            if (clearance(hi) > best) { best = clearance(hi); bestAt = hi; }
+            if (hi > cap) {
+                std::ostringstream why;
+                why << "'" << pr.label << "': no growth up to " << cap * 1e6 << " um carries its "
+                    << (atStart ? "start" : "end") << " section past the mitre plane ("
+                    << (pr.kind == Primitive::ARC3 ? "arc" : pr.kind == Primitive::SPIRAL ? "spiral" : "segment")
+                    << ", wire radius " << wireRadius * 1e6 << " um, initial growth " << g0 * 1e6
+                    << " um, clearance at it " << clearance(g0) * 1e6 << " um, best "
+                    << best * 1e6 << " um at " << bestAt * 1e6 << " um)";
+                throw std::runtime_error(why.str());
+            }
         }
         for (int it = 0; it < 40; ++it) {
             const double mid = 0.5 * (lo + hi);
@@ -3519,6 +3526,10 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         // copper-to-copper wedges on every near-tangent joint.
         const bool sphereFill = std::getenv("MVB_JOINT_SPHERE") != nullptr;
         const double growE0 = mitreGrow(angE) + dpE;
+        if (diag && bentE)
+            std::cerr << "[mitre-grow] '" << ptrs[i]->label << "' end -> '" << ptrs[i + 1]->label
+                      << "' angle " << angE * 180.0 / kPi << " deg, kinds " << int(ptrs[i]->kind)
+                      << "->" << int(ptrs[i + 1]->kind) << ", growE0 " << growE0 * 1e6 << " um\n";
         const double overE =
             !bentE ? dpE + ((!sphereFill && angE > 1e-12) ? bridgeGrow(angE) : 0.0)
             : (ptrs[i]->kind == Primitive::SEG)
