@@ -1210,11 +1210,11 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
     }
     gmsh::option::setNumber("Mesh.AngleToleranceFacetOverlap", facet_tol);
     // The option is PROCESS-GLOBAL gmsh state; restore the stock default on every exit
-    // (success or throw) so it cannot leak into a caller's later, winding-less meshes.
+    // (success or throw) so it cannot leak into a caller's later, winding-less meshes. A session
+    // this function opened is finalized before the guard runs, and takes the option with it.
     struct FacetTolRestore {
         ~FacetTolRestore() {
-            try { gmsh::option::setNumber("Mesh.AngleToleranceFacetOverlap", 0.1); }
-            catch (...) {}   // session may already be finalized
+            if (gmsh::isInitialized()) gmsh::option::setNumber("Mesh.AngleToleranceFacetOverlap", 0.1);
         }
     } facet_tol_restore;
     // Optional geometry healing (env OMFEM_HEAL=1) for faceted turns. NOTE: OCCSewFaces

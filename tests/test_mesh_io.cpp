@@ -10,6 +10,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
+#include <unistd.h>
 
 using namespace mvb::mesh;
 using Catch::Matchers::ContainsSubstring;
@@ -230,6 +235,40 @@ TEST_CASE("meshMagnetic refuses knobs from the environment and leaves none behin
     REQUIRE(std::getenv("OMFEM_AIR_TARGET") == nullptr);
     REQUIRE_THROWS_WITH(meshMagnetic(nlohmann::json::array(), nlohmann::json::object()),
                         ContainsSubstring("expects a MAS magnetic"));
+}
+
+// The mesher opens and closes its own gmsh session; nothing it leaves behind may call gmsh after
+// the close (gmsh reports "Gmsh has not been initialized" on stderr, ABT #1659).
+TEST_CASE("meshMagnetic calls no gmsh after closing the session it opened", "[mesh-api]") {
+    std::ifstream f(MAS_EXAMPLES_DIR "/000_debug.json");
+    REQUIRE(f);
+    const auto mas = nlohmann::json::parse(f);
+    char path[] = "/tmp/mvbpp_mesh_stderr_XXXXXX";
+    const int fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    std::fflush(stderr);
+    const int saved = dup(2);
+    dup2(fd, 2);
+    std::size_t tets = 0;
+    try {
+        const auto r = meshMagnetic(mas.at("magnetic"), nlohmann::json::object());
+        for (const auto& b : r.mesh.blocks)
+            if (b.type == ElementType::Tet4) tets += b.ids.size();
+    } catch (...) {
+        std::fflush(stderr);
+        dup2(saved, 2);
+        throw;
+    }
+    std::fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    close(fd);
+    std::ifstream e(path);
+    const std::string log((std::istreambuf_iterator<char>(e)), std::istreambuf_iterator<char>());
+    std::remove(path);
+    REQUIRE(tets > 0);
+    REQUIRE(log.find("[mesh3d]") != std::string::npos);   // the capture saw the mesher's own log
+    REQUIRE(log.find("has not been initialized") == std::string::npos);
 }
 
 TEST_CASE("Abaqus INP and VTK round-trip a mesh exactly, ids, regions and entities included", "[mesh-io]") {
