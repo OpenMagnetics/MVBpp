@@ -117,6 +117,7 @@ add_library(mvbpp_mesh ${_mvbpp_lib_kind}
     src/mesh/MeshParts.cpp
     src/mesh/MeshSupport.cpp
     src/mesh/Mesh3d.cpp
+    src/mesh/Mesh2d.cpp
     src/mesh/StepAudit.cpp
 )
 add_dependencies(mvbpp_mesh gmsh_external mvbpp_buildrev)

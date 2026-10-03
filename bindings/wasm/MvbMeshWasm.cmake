@@ -102,6 +102,7 @@ add_library(mvbpp_mesh STATIC
     ${_mvbpp_root}/src/mesh/MeshParts.cpp
     ${_mvbpp_root}/src/mesh/MeshSupport.cpp
     ${_mvbpp_root}/src/mesh/Mesh3d.cpp
+    ${_mvbpp_root}/src/mesh/Mesh2d.cpp
 )
 add_dependencies(mvbpp_mesh gmsh_wasm mvbpp_buildrev)
 target_compile_options(mvbpp_mesh PRIVATE -fexceptions)
