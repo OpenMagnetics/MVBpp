@@ -17,7 +17,7 @@ for (const [sec, v] of Object.entries(eff)) {
 require(JS)().then(m => {
     const t0 = Date.now();
     const r = JSON.parse(m.meshMagnetic(JSON.stringify(JSON.parse(fs.readFileSync(mas, 'utf8')).magnetic),
-                                        JSON.stringify(recipe), 'msh2', 'm'));
+                                        JSON.stringify(recipe), 'msh2', 'm', '{}'));
     fs.writeFileSync(out, r.mesh);
     for (const [suffix, text] of Object.entries(r.sidecars)) fs.writeFileSync(out + suffix, text);
     console.log(`meshed in ${((Date.now() - t0) / 1000).toFixed(1)} s -> ${out}`);

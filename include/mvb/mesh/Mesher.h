@@ -80,8 +80,9 @@ struct MeshResult {
 };
 
 // Throws on any malformed MAS, unknown recipe key, or a mesh with an inverted or zero-volume
-// element -- never returns a degraded mesh.
-MeshResult meshMagnetic(const nlohmann::json& magnetic, const nlohmann::json& recipe);
+// element -- never returns a degraded mesh. withStep: also return the STEP the mesher handed to
+// gmsh (millimetres, the conductors and core exactly as meshed) as sidecars[".step"].
+MeshResult meshMagnetic(const nlohmann::json& magnetic, const nlohmann::json& recipe, bool withStep = false);
 
 // The recipe schema: every knob with section, key, unit, default and one documentation line.
 nlohmann::json recipeTemplate();
@@ -104,9 +105,19 @@ nlohmann::json buildRevision();
 // options (JSON object, all optional): "temperature" and "ambientTemperature", deg C. The BDF's
 // reference temperature is "temperature", else "ambientTemperature"; a region whose MAS
 // property depends on temperature (a conductor's conductivity) throws when neither is given.
-// Unknown option keys throw.
+// "partsOnly": true writes partsOnly(mesh) instead of the mesh (see below). Unknown option keys
+// throw.
 std::string exportMesh(const Mesh& mesh, const std::string& format, const std::string& unit,
                        const nlohmann::json& options = nlohmann::json::object());
+
+// The meshed magnetic alone: the same mesh (same nodes, elements and numbering, so it matches the
+// FEM mesh it came from) with the air left out. Kept: every volume region but 'air', by its own
+// name ("core", "winding_<w>"); each face, edge or point set where it lies on those parts (the
+// terminals stay, the air box's "outer" goes); and the nodes they use. Added: each part's
+// boundary as a face set "<part> skin", oriented outwards (faces it shares with another part are
+// in both skins), material None. Throws when there is no "air" volume to leave out, when a
+// "<part> skin" name is taken, or on a non-manifold part.
+Mesh partsOnly(const Mesh& mesh);
 
 // The ambient temperature (deg C) a MAS document's operating points state, for the export's
 // reference temperature. Throws when none is stated or when the operating points disagree.

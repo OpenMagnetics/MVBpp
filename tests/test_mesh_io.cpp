@@ -7,6 +7,8 @@
 
 #include "mvb/mesh/Mesher.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 
 using namespace mvb::mesh;
@@ -252,4 +254,71 @@ TEST_CASE("Abaqus INP and VTK round-trip a mesh exactly, ids, regions and entiti
     const std::string vtk = exportMesh(p, "vtk", "m");
     REQUIRE_THAT(vtk, ContainsSubstring("CELLS 1 7\n6 0 2 1 3 5 4\n"));
     REQUIRE(diffMeshes(p, importMesh(vtk, "vtk")) == "");
+}
+
+TEST_CASE("partsOnly leaves out the air and its box, keeps the parts and their terminals, and adds each part's skin", "[mesh-io]") {
+    Mesh m = cell();
+    // A terminal on the core: the tet's face {1, 2, 3}.
+    m.regions.push_back(Region{5, 2, "term0", {MaterialKind::None, {}}});
+    m.blocks.push_back({ElementType::Tri3, 5, 32, {43}, {1, 3, 2}});
+    const Mesh p = partsOnly(m);
+
+    std::vector<std::string> names;
+    for (const auto& r : p.regions) names.push_back(r.name);
+    CHECK(names == std::vector<std::string>{"core", "term0", "core skin"});
+    CHECK(p.nodeIds == std::vector<std::int64_t>{1, 2, 3, 4, 7, 8, 9});   // node 5 was the air's alone
+    REQUIRE(p.xyz.size() == 3 * p.nodeIds.size());
+    CHECK(p.xyz[3 * 4] == m.xyz[3 * 5]);                                  // node 7, coordinates kept exactly
+    // The core's elements and the terminal are kept as they were.
+    REQUIRE(p.blocks.size() == 5);
+    CHECK(p.blocks[0].ids == m.blocks[0].ids);
+    CHECK(p.blocks[1].nodes == m.blocks[1].nodes);
+    CHECK(p.blocks[2].ids == std::vector<std::int64_t>{43});
+    // The skin: the tet's 4 faces and the pyramid's 4 triangles and base (they share none), new ids
+    // after the mesh's last, every face's normal pointing out of the element it bounds.
+    const auto& tris = p.blocks[3];
+    const auto& quads = p.blocks[4];
+    CHECK(tris.type == ElementType::Tri3);
+    CHECK(quads.type == ElementType::Quad4);
+    CHECK(tris.region == p.regions[2].tag);
+    CHECK(tris.ids.size() == 8);
+    CHECK(quads.ids.size() == 1);
+    CHECK(tris.ids.front() == 44);
+    auto at = [&](std::int64_t id) {
+        for (std::size_t i = 0; i < m.nodeIds.size(); ++i)
+            if (m.nodeIds[i] == id) return std::array<double, 3>{m.xyz[3 * i], m.xyz[3 * i + 1], m.xyz[3 * i + 2]};
+        FAIL("no node " << id);
+        return std::array<double, 3>{};
+    };
+    auto centre = [&](const std::vector<std::int64_t>& ids) {
+        std::array<double, 3> c{0, 0, 0};
+        for (auto id : ids)
+            for (int k = 0; k < 3; ++k) c[k] += at(id)[k] / double(ids.size());
+        return c;
+    };
+    const auto tet = centre({1, 2, 3, 4}), pyramid = centre({1, 2, 8, 7, 9});
+    for (std::size_t e = 0; e < tris.ids.size(); ++e) {
+        const std::vector<std::int64_t> f(tris.nodes.begin() + 3 * e, tris.nodes.begin() + 3 * e + 3);
+        const bool ofTet = std::all_of(f.begin(), f.end(), [](std::int64_t id) { return id <= 4; });
+        const auto a = at(f[0]), b = at(f[1]), c = at(f[2]);
+        const double u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, v[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        const double n[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+        const auto mid = centre(f), owner = ofTet ? tet : pyramid;
+        INFO("skin face " << f[0] << " " << f[1] << " " << f[2]);
+        CHECK(n[0] * (mid[0] - owner[0]) + n[1] * (mid[1] - owner[1]) + n[2] * (mid[2] - owner[2]) > 0);
+    }
+    // It writes and reads back like any mesh; the export option is the same thing.
+    CHECK(diffMeshes(p, importMesh(exportMesh(p, "msh2", "m"), "msh2")).empty());
+    CHECK(exportMesh(m, "msh2", "m", {{"partsOnly", true}}) == exportMesh(p, "msh2", "m"));
+    CHECK(exportMesh(m, "bdf", "mm", {{"partsOnly", true}}) == exportMesh(p, "bdf", "mm"));
+    CHECK_THROWS_WITH(exportMesh(m, "msh2", "m", {{"partsOnly", 1}}), ContainsSubstring("true or false"));
+}
+
+TEST_CASE("partsOnly refuses a mesh with no air to leave out, and a skin name already taken", "[mesh-io]") {
+    Mesh noAir = cell();
+    noAir.regions[1].name = "gap air";
+    CHECK_THROWS_WITH(partsOnly(noAir), ContainsSubstring("no volume region named 'air'"));
+    Mesh taken = cell();
+    taken.regions[2].name = "core skin";
+    CHECK_THROWS_WITH(partsOnly(taken), ContainsSubstring("already has a region named 'core skin'"));
 }

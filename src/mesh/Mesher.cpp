@@ -46,6 +46,7 @@ struct RecipeEnvironment {
     }
     ~RecipeEnvironment() {
         for (const auto& k : mesh_recipe_knobs()) unsetenv(k.env);
+        unsetenv("OMFEM_KEEP_STEP");
     }
     RecipeEnvironment(const RecipeEnvironment&) = delete;
     RecipeEnvironment& operator=(const RecipeEnvironment&) = delete;
@@ -128,7 +129,7 @@ void assignMaterials(Mesh& mesh, const nlohmann::json& magnetic, bool outerWireD
 
 }  // namespace
 
-MeshResult meshMagnetic(const nlohmann::json& magnetic, const nlohmann::json& recipe) {
+MeshResult meshMagnetic(const nlohmann::json& magnetic, const nlohmann::json& recipe, bool withStep) {
     if (!magnetic.is_object() || !magnetic.contains("core") || !magnetic.contains("coil"))
         throw std::runtime_error("meshMagnetic: expects a MAS magnetic (an object with core and coil)");
     if (!recipe.is_object()) throw std::runtime_error("meshMagnetic: the recipe must be a JSON object");
@@ -139,6 +140,8 @@ MeshResult meshMagnetic(const nlohmann::json& magnetic, const nlohmann::json& re
         r << recipe.dump();
     }
     apply_mesh_recipe((dir.path / "recipe.json").string());
+    // The moved mesher deletes its STEP unless told to keep it (unset again on exit, above).
+    if (withStep) setenv("OMFEM_KEEP_STEP", "1", 1);
 
     // The options exactly as omfem_mesh3d builds them (its positional defaults, then the
     // recipe's environment), in the same order, so one recipe makes one mesh.
@@ -168,7 +171,9 @@ MeshResult meshMagnetic(const nlohmann::json& magnetic, const nlohmann::json& re
     result.mesh = importMesh(slurp(out, "mesh"), "msh2");
     for (const char* suffix : {".cadedges", ".path", ".leads.json"})
         result.sidecars[suffix] = slurp(out + suffix, suffix);
-    if (std::filesystem::exists(out + ".step"))
+    if (withStep)
+        result.sidecars[".step"] = slurp(out + ".step", "STEP");
+    else if (std::filesystem::exists(out + ".step"))
         throw std::runtime_error("meshMagnetic: the mesher left its STEP behind (" + out + ".step)");
     nlohmann::json provenance = {{"tool", "mvb::mesh::meshMagnetic"},
                                  {"segments", opt.polygon_segments},

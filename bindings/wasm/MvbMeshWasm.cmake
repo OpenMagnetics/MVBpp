@@ -99,6 +99,7 @@ add_library(mvbpp_mesh STATIC
     ${_mvbpp_root}/src/mesh/SizeField.cpp
     ${_mvbpp_root}/src/mesh/MeshRecipe.cpp
     ${_mvbpp_root}/src/mesh/MeshIO.cpp
+    ${_mvbpp_root}/src/mesh/MeshParts.cpp
     ${_mvbpp_root}/src/mesh/MeshSupport.cpp
     ${_mvbpp_root}/src/mesh/Mesh3d.cpp
 )

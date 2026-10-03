@@ -831,16 +831,28 @@ std::string exportMesh(const Mesh& mesh, const std::string& format, const std::s
     if (!options.is_null() && !options.is_object())
         throw std::runtime_error("exportMesh: options must be an object");
     std::optional<double> temperature, ambient;
+    bool parts = false;
     if (options.is_object())
         for (auto it = options.begin(); it != options.end(); ++it) {
+            if (it.key() == "partsOnly") {
+                if (!it.value().is_boolean()) throw std::runtime_error("exportMesh: option partsOnly must be true or false");
+                parts = it.value().get<bool>();
+                continue;
+            }
             if (it.key() != "temperature" && it.key() != "ambientTemperature")
-                throw std::runtime_error("exportMesh: unknown option \"" + it.key() + "\" (temperature, ambientTemperature)");
+                throw std::runtime_error("exportMesh: unknown option \"" + it.key() +
+                                         "\" (temperature, ambientTemperature, partsOnly)");
             if (!it.value().is_number())
                 throw std::runtime_error("exportMesh: option " + it.key() + " must be a number (deg C)");
             (it.key() == "temperature" ? temperature : ambient) = it.value().get<double>();
         }
     // The reference temperature: the one asked for, else the ambient (Alf, 2026-10-03).
     if (!temperature) temperature = ambient;
+    if (parts) {
+        nlohmann::json rest = options;
+        rest.erase("partsOnly");
+        return exportMesh(partsOnly(mesh), format, unit, rest);
+    }
     if (format == "msh2") return writeMsh2(mesh, unit);
     if (format == "bdf") return writeBdf(mesh, unit, temperature);
     if (format == "inp") return writeInp(mesh, unit);

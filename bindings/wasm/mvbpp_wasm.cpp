@@ -1058,10 +1058,12 @@ std::string _meshBuildRevision() { return mvb::mesh::buildRevision().dump(); }
 // MAS magnetic + mesh recipe -> mesh in one export format (ABT #1588), as JSON:
 // {"mesh": <file text>, "recipe": <effective recipe>, "sidecars": {suffix: text}}.
 // The same mvb::mesh::meshMagnetic as native: the browser meshes with the same gmsh and MMG.
+// optionsJson: exportMesh's options ("{}" for none; {"partsOnly": true} for the parts without air).
 std::string _meshMagnetic(const std::string& magneticJson, const std::string& recipeJson,
-                          const std::string& format, const std::string& unit) {
+                          const std::string& format, const std::string& unit,
+                          const std::string& optionsJson) {
     const auto r = mvb::mesh::meshMagnetic(nlohmann::json::parse(magneticJson), nlohmann::json::parse(recipeJson));
-    nlohmann::json out = {{"mesh", mvb::mesh::exportMesh(r.mesh, format, unit)},
+    nlohmann::json out = {{"mesh", mvb::mesh::exportMesh(r.mesh, format, unit, nlohmann::json::parse(optionsJson))},
                           {"recipe", r.recipe},
                           {"sidecars", r.sidecars}};
     return out.dump();

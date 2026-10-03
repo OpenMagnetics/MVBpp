@@ -114,6 +114,7 @@ add_library(mvbpp_mesh ${_mvbpp_lib_kind}
     src/mesh/SizeField.cpp
     src/mesh/MeshRecipe.cpp
     src/mesh/MeshIO.cpp
+    src/mesh/MeshParts.cpp
     src/mesh/MeshSupport.cpp
     src/mesh/Mesh3d.cpp
     src/mesh/StepAudit.cpp
@@ -130,6 +131,10 @@ target_link_libraries(mvbpp_mesh
 # The round-trip gate on real meshes (tools/mvbpp_mesh_roundtrip.cpp).
 add_executable(mvbpp_mesh_roundtrip tools/mvbpp_mesh_roundtrip.cpp)
 target_link_libraries(mvbpp_mesh_roundtrip PRIVATE mvbpp_mesh)
+
+# MAS -> mesh -> one export format, optionally without the air and with the meshed STEP.
+add_executable(mvbpp_mesh_export tools/mvbpp_mesh_export.cpp)
+target_link_libraries(mvbpp_mesh_export PRIVATE mvbpp_mesh)
 
 # The identity gate for meshMagnetic against an OMFEM reference run (tools/mvbpp_mesh_magnetic.cpp).
 add_executable(mvbpp_mesh_magnetic tools/mvbpp_mesh_magnetic.cpp)
