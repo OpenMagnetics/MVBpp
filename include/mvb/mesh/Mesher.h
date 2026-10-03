@@ -88,7 +88,7 @@ nlohmann::json recipeTemplate();
 
 // What THIS library was built from, for a mesh's provenance (ABT #1592): the MVB++, MKF and MAS
 // commits compiled in (a "-dirty" suffix when the checkout had uncommitted changes), and the
-// gmsh and MMG versions linked. The gmsh version is asked of the linked gmsh at run time, never
+// gmsh and MMG versions linked (and gmsh's compiled-in modules). The gmsh values are asked of the linked gmsh at run time, never
 // read from a checkout. Before/after builds of a move step must report identical values.
 nlohmann::json buildRevision();
 
