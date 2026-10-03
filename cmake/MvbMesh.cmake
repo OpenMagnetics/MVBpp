@@ -8,8 +8,10 @@
 #
 # gmsh comes from our fork (github.com/AlfVII/gmsh, branch om-4.15.2: upstream 4.15.2 plus the
 # OMFEM patches -- Steiner re-homing, pyramid apices inside the tet region, the O(1) OCC _unbind,
-# the RAII generator lock). Its options are those of the build OMFEM's reference meshes were made
-# with; a module switched on or off changes which algorithms exist and so the mesh.
+# the RAII generator lock). Its options and compile flags are those of the shared gmsh OMFEM's
+# reference meshes were made with (gmsh-om415-build), checked object by object: every ENABLE_*
+# the same (METIS off, gmsh's default is on) and -fvisibility=hidden as gmsh gives its shared
+# target. A module switched on or off changes which algorithms exist, and so the mesh.
 
 set(MVBPP_MMG_PREFIX "$ENV{HOME}/OpenMagnetics/mmg-5.8.0-install"
     CACHE PATH "MMG install prefix (shared across build trees; built once)")
@@ -60,6 +62,11 @@ ExternalProject_Add(
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON
         -DENABLE_BUILD_LIB=ON
+        # gmsh compiles only its SHARED target with -fvisibility=hidden. OMFEM's reference meshes
+        # were made with that shared library, and without the flag GCC inlines differently in
+        # 460 of gmsh's 624 objects; with it, the static objects disassemble to the shared ones.
+        "-DCMAKE_C_FLAGS=-fvisibility=hidden"
+        "-DCMAKE_CXX_FLAGS=-fvisibility=hidden"
         -DENABLE_BUILD_SHARED=OFF
         -DENABLE_BUILD_DYNAMIC=OFF
         -DENABLE_FLTK=OFF
@@ -67,7 +74,7 @@ ExternalProject_Add(
         -DENABLE_BLAS_LAPACK=OFF
         -DENABLE_ALGLIB=ON -DENABLE_ANN=ON -DENABLE_BAMG=ON -DENABLE_BLOSSOM=ON
         -DENABLE_DINTEGRATION=ON -DENABLE_DOMHEX=ON -DENABLE_EIGEN=ON -DENABLE_GMM=ON
-        -DENABLE_GMP=ON -DENABLE_HXT=ON -DENABLE_KBIPACK=ON -DENABLE_MATHEX=ON -DENABLE_MESH=ON
+        -DENABLE_GMP=ON -DENABLE_HXT=ON -DENABLE_KBIPACK=ON -DENABLE_MATHEX=ON -DENABLE_MESH=ON -DENABLE_METIS=OFF
         -DENABLE_MMG=ON -DENABLE_NETGEN=ON -DENABLE_NII2MESH=ON -DENABLE_OCC=ON
         -DENABLE_OCC_CAF=ON -DENABLE_ONELAB=ON -DENABLE_ONELAB_METAMODEL=ON -DENABLE_OPENMP=ON
         -DENABLE_OPTHOM=ON -DENABLE_PARSER=ON -DENABLE_PLUGINS=ON -DENABLE_POST=ON

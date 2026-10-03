@@ -53,6 +53,11 @@ ExternalProject_Add(
         -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
         -DCMAKE_BUILD_TYPE=Release
         -DENABLE_BUILD_LIB=ON
+        # gmsh compiles only its SHARED target with -fvisibility=hidden. OMFEM's reference meshes
+        # were made with that shared library, and without the flag GCC inlines differently in
+        # 460 of gmsh's 624 objects; with it, the static objects disassemble to the shared ones.
+        "-DCMAKE_C_FLAGS=-fvisibility=hidden"
+        "-DCMAKE_CXX_FLAGS=-fvisibility=hidden"
         -DENABLE_BUILD_SHARED=OFF
         -DENABLE_BUILD_DYNAMIC=OFF
         -DENABLE_FLTK=OFF
@@ -62,7 +67,7 @@ ExternalProject_Add(
         -DENABLE_GMP=OFF
         -DENABLE_ALGLIB=ON -DENABLE_ANN=ON -DENABLE_BAMG=ON -DENABLE_BLOSSOM=ON
         -DENABLE_DINTEGRATION=ON -DENABLE_DOMHEX=ON -DENABLE_EIGEN=ON -DENABLE_GMM=ON
-        -DENABLE_HXT=ON -DENABLE_KBIPACK=ON -DENABLE_MATHEX=ON -DENABLE_MESH=ON
+        -DENABLE_HXT=ON -DENABLE_KBIPACK=ON -DENABLE_MATHEX=ON -DENABLE_MESH=ON -DENABLE_METIS=OFF
         -DENABLE_MMG=ON -DENABLE_NETGEN=ON -DENABLE_NII2MESH=ON -DENABLE_OCC=ON
         -DENABLE_OCC_CAF=ON -DENABLE_ONELAB=ON -DENABLE_ONELAB_METAMODEL=ON
         -DENABLE_OPTHOM=ON -DENABLE_PARSER=ON -DENABLE_PLUGINS=ON -DENABLE_POST=ON
