@@ -240,7 +240,20 @@ get_target_property(_mvb_wasm_srcs mvb++ SOURCES)
 get_target_property(_mvb_mesh_wasm_srcs mvbpp_mesh SOURCES)
 list(APPEND _mvb_wasm_srcs ${_mvb_mesh_wasm_srcs})
 file(GLOB_RECURSE _mvb_all_srcs "${REPO_ROOT}/src/*.cpp")
+# Deliberately native-only sources, each with its reason. A listed file that no longer exists
+# stops the configure too, so an exception cannot outlive what it excuses.
+#  - StepAudit.cpp (ABT #1588 step 3): the CAD overlap audit runs its OCCT booleans in a fork()
+#    pool (waitpid); wasm has no fork. Only OMFEM's audit tools call it, never the mesher.
+set(_mvb_native_only "${REPO_ROOT}/src/mesh/StepAudit.cpp")
+foreach(_s ${_mvb_native_only})
+    if(NOT EXISTS "${_s}")
+        message(FATAL_ERROR "bindings/wasm/CMakeLists.txt excuses ${_s} as native-only, but it does not exist; drop the exception")
+    endif()
+endforeach()
 foreach(_s ${_mvb_all_srcs})
+    if("${_s}" IN_LIST _mvb_native_only)
+        continue()
+    endif()
     if(NOT "${_s}" IN_LIST _mvb_wasm_srcs)
         message(FATAL_ERROR
             "bindings/wasm/CMakeLists.txt does not list ${_s}. Every src/**/*.cpp must appear in "
