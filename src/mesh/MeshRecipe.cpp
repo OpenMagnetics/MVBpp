@@ -44,6 +44,17 @@ const std::vector<RecipeKnob>& mesh_recipe_knobs() {
         {"mesher", "fragment_tolerance_m", "OMFEM_FRAG_TOL", "number", "m", "0", "OCC fuzzy value for the solid fragment (0 = exact)"},
         {"mesher", "port_inset", "OMFEM_PORT_INSET", "number", "x cap radius", "0.5 axis-aligned caps, 1.5 oblique",
          "how far a lead-end port face is pulled inside the air box, in cap radii"},
+        // ---- knobs every corpus design plan sets but the table did not name (ABT #1588, 2026-10-03): a mesh made
+        // with them recorded nothing in its recipe, so it could not be reproduced from it. Same env, same code
+        // path: adding them changes no mesh, only what the recipe records.
+        {"mesher", "algo3d_chain", "OMFEM_ALGO3D_CHAIN", "string", "gmsh ids", "10,1 (HXT first, Delaunay fallback)",
+         "comma-separated 3D algorithm chain, in order; the real-winding corpus asks Delaunay first (\"1,10\")"},
+        {"conductor", "target_per_winding", "OMFEM_COND_TARGET_WINDINGS", "string", "name=m;...", "off (one design-wide target)",
+         "per-winding copper target, e.g. \"winding_Primary=1e-4;winding_Secondary=1.25e-4\"; a winding missing from the map throws"},
+        {"geometry", "no_bobbin", "OMFEM_NO_BOBBIN", "flag", "-", "off (the bobbin is meshed when the MAS has one)",
+         "leave the bobbin out of the meshed geometry"},
+        {"geometry", "weld_all", "MVB_WELD_ALL", "flag", "-", "off (weld only the junctions the overlap gate selects)",
+         "MVB++ welds EVERY bridged junction, tangent ones included (meshability over build speed)"},
         // ---- omfem_skinlayer: MMG anisotropic layers on the conformal mesh (round wire) --------
         {"layers", "enabled", "OMFEM_LAYERS_ENABLED", "flag", "-", "off", "run omfem_skinlayer after the conformal mesh (round/litz wire)"},
         {"layers", "delta_m", "OMFEM_LAYERS_DELTA", "number", "m", "required when enabled",
@@ -71,7 +82,11 @@ std::vector<std::string> apply_mesh_recipe(const std::string& path) {
     nlohmann::json r; in >> r;
     if (!r.is_object()) throw std::runtime_error("mesh recipe: top level must be an object");
     const auto& K = mesh_recipe_knobs();
-    std::vector<std::string> overridden, unknown;
+    // VALIDATE EVERYTHING FIRST, THEN SET (2026-10-03): the old single pass called setenv for every good key it met
+    // before throwing on an unknown or mistyped one, so a bad recipe left part of itself in the environment of a
+    // process that might catch the exception and go on meshing.
+    struct Change { const RecipeKnob* k; bool unset; std::string value; std::string key; bool byNull = false; };
+    std::vector<Change> changes; std::vector<std::string> overridden, unknown;
     for (auto it = r.begin(); it != r.end(); ++it) {
         const std::string sec = it.key();
         if (sec == "recipe_version" || sec == "provenance" || sec == "_doc" || sec == "name" || sec == "notes") continue;
@@ -83,28 +98,33 @@ std::vector<std::string> apply_mesh_recipe(const std::string& path) {
             for (const auto& kk : K) if (sec == kk.section && key == kk.key) { k = &kk; break; }
             if (!k) { unknown.push_back(sec + "." + key); continue; }
             const auto& v = jt.value();
-            const bool had = std::getenv(k->env) != nullptr;
-            if (v.is_null()) { if (had) { unsetenv(k->env); overridden.push_back(std::string(k->env) + " (unset by null)"); } continue; }
-            std::string sv;
+            if (v.is_null()) { changes.push_back({k, true, {}, sec + "." + key, true}); continue; }
             if (std::string(k->kind) == "flag") {
                 if (!v.is_boolean()) throw std::runtime_error("mesh recipe: " + sec + "." + key + " must be true/false");
-                if (!v.get<bool>()) { if (had) { unsetenv(k->env); overridden.push_back(k->env); } continue; }
-                sv = "1";
+                if (!v.get<bool>()) { changes.push_back({k, true, {}, sec + "." + key}); continue; }
+                changes.push_back({k, false, "1", sec + "." + key});
             } else if (std::string(k->kind) == "number") {
                 if (!v.is_number()) throw std::runtime_error("mesh recipe: " + sec + "." + key + " must be a number (" + k->unit + ")");
-                sv = num_to_env(v);
+                changes.push_back({k, false, num_to_env(v), sec + "." + key});
             } else {
                 if (!v.is_string()) throw std::runtime_error("mesh recipe: " + sec + "." + key + " must be a string");
-                sv = v.get<std::string>();
+                changes.push_back({k, false, v.get<std::string>(), sec + "." + key});
             }
-            if (had && sv != std::getenv(k->env)) overridden.push_back(std::string(k->env) + "=" + std::getenv(k->env) + " -> " + sv);
-            setenv(k->env, sv.c_str(), 1);
         }
     }
     if (!unknown.empty()) {
         std::string m = "mesh recipe " + path + ": unknown key(s):";
         for (const auto& u : unknown) m += " " + u;
         throw std::runtime_error(m + " (see omfem_mesh3d --recipe-template for the accepted set)");
+    }
+    for (const auto& c : changes) {
+        const char* was = std::getenv(c.k->env);
+        if (c.unset) {
+            if (was) { overridden.push_back(std::string(c.k->env) + (c.byNull ? " (unset by null)" : "")); unsetenv(c.k->env); }
+            continue;
+        }
+        if (was && c.value != was) overridden.push_back(std::string(c.k->env) + "=" + was + " -> " + c.value);
+        setenv(c.k->env, c.value.c_str(), 1);
     }
     return overridden;
 }
