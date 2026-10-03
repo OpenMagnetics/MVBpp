@@ -196,3 +196,27 @@ TEST_CASE("meshMagnetic refuses knobs from the environment and leaves none behin
     REQUIRE_THROWS_WITH(meshMagnetic(nlohmann::json::array(), nlohmann::json::object()),
                         ContainsSubstring("expects a MAS magnetic"));
 }
+
+TEST_CASE("Abaqus INP and VTK round-trip a mesh exactly, ids, regions and entities included", "[mesh-io]") {
+    const Mesh m = cell();
+    for (const char* format : {"inp", "vtk"}) {
+        INFO("format " << format);
+        REQUIRE(diffMeshes(m, importMesh(exportMesh(m, format, "m"), format)) == "");
+        // In millimetres the coordinates are scaled and back: equal to the last ulp or so.
+        const Mesh mm = importMesh(exportMesh(m, format, "mm"), format);
+        for (std::size_t i = 0; i < m.xyz.size(); ++i)
+            REQUIRE(std::abs(m.xyz[i] - mm.xyz[i]) <= 4e-16 * std::max(std::abs(m.xyz[i]), 1e-9));
+        Mesh same = mm;
+        same.xyz = m.xyz;
+        REQUIRE(diffMeshes(m, same) == "");
+    }
+    // The prism is the one cell whose VTK node order differs from gmsh's.
+    Mesh p;
+    p.nodeIds = {1, 2, 3, 4, 5, 6};
+    p.xyz = {0, 0, 0, 1e-3, 0, 0, 0, 1e-3, 0, 0, 0, 1e-3, 1e-3, 0, 1e-3, 0, 1e-3, 1e-3};
+    p.regions = {Region{1, 3, "prism", {MaterialKind::None, {}}}};
+    p.blocks = {{ElementType::Prism6, 1, 1, {7}, {1, 2, 3, 4, 5, 6}}};
+    const std::string vtk = exportMesh(p, "vtk", "m");
+    REQUIRE_THAT(vtk, ContainsSubstring("CELLS 1 7\n6 0 2 1 3 5 4\n"));
+    REQUIRE(diffMeshes(p, importMesh(vtk, "vtk")) == "");
+}

@@ -104,6 +104,11 @@ int main(int argc, char** argv) {
             const auto d = diffMeshes(m, importMesh(exportMesh(m, "msh2", "m"), "msh2"));
             std::cout << "  msh2: " << (d.empty() ? "identical" : "DIFF " + d) << "\n";
             if (!d.empty()) return 1;
+            for (const char* format : {"inp", "vtk"}) {
+                const auto e = diffMeshes(m, importMesh(exportMesh(m, format, "m"), format));
+                std::cout << "  " << format << ": " << (e.empty() ? "identical" : "DIFF " + e) << "\n";
+                if (!e.empty()) return 1;
+            }
             for (const char* unit : {"m", "mm"}) {
                 const auto r = checkBdf(m, unit);
                 std::cout << "  bdf " << unit << ": " << r << "\n";

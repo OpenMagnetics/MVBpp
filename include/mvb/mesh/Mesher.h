@@ -95,7 +95,8 @@ nlohmann::json buildRevision();
 // ---- Export ----------------------------------------------------------------------------------
 // format: "msh2" (gmsh 2.2, what OMFEM writes today: the identity-gate reference), "msh4", "bdf" (Nastran bulk data: large-field
 // GRID* only, PSOLID/MAT1 or PSHELL per region with the region name, throws on an element with no
-// region), and the other writers as they gain a round-trip gate. `unit` scales the coordinates
+// region), "inp" (Abaqus: *NODE/*ELEMENT with ELSET = region name), "vtk" (legacy ASCII
+// unstructured grid, ParaView), and further writers as they gain a round-trip gate. `unit` scales the coordinates
 // written ("m" or "mm") and is stated in the file. Every writer is gated by a round trip: read
 // back, node and element counts per region, coordinates within the format's precision, tet
 // volumes recomputed with the same sign and no new |V| < 1e-18 m^3. Text formats write

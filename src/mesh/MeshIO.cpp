@@ -6,6 +6,8 @@
 #include "Definitions.h"
 #include "MAS.hpp"
 
+#include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -24,17 +26,20 @@ struct TypeInfo {
     int dimension;
     int gmsh;                // msh2 element type code
     const char* nastran;     // bulk-data card, nullptr where Nastran has none we write
+    const char* abaqus;      // INP element type, as gmsh's own INP writer names it
+    int vtk;                 // VTK cell type
+    std::array<int, 8> vtkOrder;  // VTK node k = gmsh node vtkOrder[k] (gmsh's getVertexVTK)
 };
 
 constexpr TypeInfo kTypes[] = {
-    {ElementType::Point,    1, 0, 15, nullptr},
-    {ElementType::Line2,    2, 1, 1,  nullptr},
-    {ElementType::Tri3,     3, 2, 2,  "CTRIA3"},
-    {ElementType::Quad4,    4, 2, 3,  "CQUAD4"},
-    {ElementType::Tet4,     4, 3, 4,  "CTETRA"},
-    {ElementType::Pyramid5, 5, 3, 7,  "CPYRAM"},
-    {ElementType::Prism6,   6, 3, 6,  "CPENTA"},
-    {ElementType::Hex8,     8, 3, 5,  "CHEXA"},
+    {ElementType::Point,    1, 0, 15, nullptr,  nullptr, 1,  {0}},
+    {ElementType::Line2,    2, 1, 1,  nullptr,  nullptr, 3,  {0, 1}},
+    {ElementType::Tri3,     3, 2, 2,  "CTRIA3", "CPS3",  5,  {0, 1, 2}},
+    {ElementType::Quad4,    4, 2, 3,  "CQUAD4", "CPS4",  9,  {0, 1, 2, 3}},
+    {ElementType::Tet4,     4, 3, 4,  "CTETRA", "C3D4",  10, {0, 1, 2, 3}},
+    {ElementType::Pyramid5, 5, 3, 7,  "CPYRAM", "C3D5",  14, {0, 1, 2, 3, 4}},
+    {ElementType::Prism6,   6, 3, 6,  "CPENTA", "C3D6",  13, {0, 2, 1, 3, 5, 4}},
+    {ElementType::Hex8,     8, 3, 5,  "CHEXA",  "C3D8",  12, {0, 1, 2, 3, 4, 5, 6, 7}},
 };
 
 const TypeInfo& info(ElementType t) {
@@ -516,12 +521,282 @@ Mesh readBdf(const std::string& text) {
     return mesh;
 }
 
+
+// ---- Abaqus INP ------------------------------------------------------------------------------
+// The mesh and its named element sets (one *ELEMENT block per mesh block, ELSET = the region's
+// name), coordinates %.17g so they read back bit-exact. INP has no unit field: the unit is
+// stated in a ** comment, as are each region's tag/dimension and each block's gmsh entity, so the
+// reader rebuilds the mesh exactly. No *MATERIAL or *SECTION: the materials go in the
+// .materials.json companion (exportMaterials), named per region in ** MATERIAL lines.
+
+std::string abaqusName(const std::string& n) {
+    for (char c : n)
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-'))
+            return "\"" + n + "\"";
+    return n;
+}
+
+std::string writeInp(const Mesh& mesh, const std::string& unit) {
+    const auto regions = checkMesh(mesh, "exportMesh(inp)");
+    const double s = unitScale(unit, "exportMesh(inp)");
+    std::string out = "*HEADING\nMVB++ mvbpp_mesh mesh\n";
+    out += "** LENGTH UNIT: " + unit + "\n";
+    for (const auto& r : mesh.regions) {
+        if (r.name.find('"') != std::string::npos)
+            throw std::runtime_error("exportMesh(inp): region name '" + r.name + "' contains a quote");
+        out += "** REGION " + std::to_string(r.tag) + " " + std::to_string(r.dimension) + " " + r.name + "\n";
+        if (r.material.kind != MaterialKind::Unset && r.material.kind != MaterialKind::None)
+            out += std::string("** MATERIAL ") + r.name + " = " + r.material.record["name"].get<std::string>() + "\n";
+    }
+    out += "*NODE\n";
+    for (std::size_t i = 0; i < mesh.nodeIds.size(); ++i)
+        out += std::to_string(mesh.nodeIds[i]) + ", " + g17(mesh.xyz[3 * i] * s) + ", " +
+               g17(mesh.xyz[3 * i + 1] * s) + ", " + g17(mesh.xyz[3 * i + 2] * s) + "\n";
+    for (const auto& b : mesh.blocks) {
+        const auto& ti = info(b.type);
+        if (!ti.abaqus)
+            throw std::runtime_error("exportMesh(inp): no Abaqus element type written for element type " +
+                                     std::to_string(int(b.type)));
+        out += "** ENTITY " + std::to_string(b.entity) + "\n*ELEMENT, TYPE=" + ti.abaqus +
+               ", ELSET=" + abaqusName(regions.at(b.region)->name) + "\n";
+        for (std::size_t e = 0; e < b.ids.size(); ++e) {
+            out += std::to_string(b.ids[e]);
+            for (int k = 0; k < ti.nodes; ++k) out += ", " + std::to_string(b.nodes[e * ti.nodes + k]);
+            out += "\n";
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> splitCommas(const std::string& line) {
+    std::vector<std::string> f;
+    std::string cur;
+    bool quoted = false;
+    for (char c : line) {
+        if (c == '"') { quoted = !quoted; continue; }
+        if (c == ',' && !quoted) { f.push_back(cur); cur.clear(); continue; }
+        cur += c;
+    }
+    f.push_back(cur);
+    for (auto& x : f) {
+        while (!x.empty() && std::isspace(static_cast<unsigned char>(x.back()))) x.pop_back();
+        while (!x.empty() && std::isspace(static_cast<unsigned char>(x.front()))) x.erase(0, 1);
+    }
+    return f;
+}
+
+Mesh readInp(const std::string& text) {
+    const char* who = "importMesh(inp)";
+    std::istringstream in(text);
+    std::string line, unit;
+    Mesh mesh;
+    std::map<std::string, int> tagByName;
+    enum { None, Nodes, Elements } section = None;
+    const TypeInfo* ti = nullptr;
+    int entity = 0;
+    bool haveEntity = false;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("** LENGTH UNIT: ", 0) == 0) { unit = line.substr(16); continue; }
+        if (line.rfind("** REGION ", 0) == 0) {
+            std::istringstream r(line.substr(10));
+            Region reg;
+            r >> reg.tag >> reg.dimension;
+            std::getline(r >> std::ws, reg.name);
+            tagByName[reg.name] = reg.tag;
+            mesh.regions.push_back(reg);
+            continue;
+        }
+        if (line.rfind("** ENTITY ", 0) == 0) { entity = std::stoi(line.substr(10)); haveEntity = true; continue; }
+        if (line.rfind("**", 0) == 0 || line.empty()) continue;
+        if (line[0] == '*') {
+            auto f = splitCommas(line);
+            std::string kw = f[0];
+            for (auto& c : kw) c = char(std::toupper(static_cast<unsigned char>(c)));
+            if (kw == "*NODE") { section = Nodes; continue; }
+            if (kw == "*ELEMENT") {
+                std::string type, set;
+                for (std::size_t i = 1; i < f.size(); ++i) {
+                    auto eq = f[i].find('=');
+                    std::string k = f[i].substr(0, eq), v = eq == std::string::npos ? "" : f[i].substr(eq + 1);
+                    for (auto& c : k) c = char(std::toupper(static_cast<unsigned char>(c)));
+                    if (k == "TYPE") type = v;
+                    if (k == "ELSET") set = v;
+                }
+                ti = nullptr;
+                for (const auto& t : kTypes)
+                    if (t.abaqus && type == t.abaqus) ti = &t;
+                if (!ti) throw std::runtime_error(std::string(who) + ": element type '" + type + "' is not one this model reads");
+                auto it = tagByName.find(set);
+                if (it == tagByName.end())
+                    throw std::runtime_error(std::string(who) + ": ELSET '" + set + "' has no ** REGION line");
+                if (!haveEntity) throw std::runtime_error(std::string(who) + ": *ELEMENT without its ** ENTITY line");
+                mesh.blocks.push_back(ElementBlock{ti->type, it->second, entity, {}, {}});
+                haveEntity = false;
+                section = Elements;
+                continue;
+            }
+            if (kw == "*HEADING") { std::getline(in, line); section = None; continue; }
+            throw std::runtime_error(std::string(who) + ": keyword " + kw + " is not one this model reads");
+        }
+        auto f = splitCommas(line);
+        if (section == Nodes) {
+            if (f.size() != 4) throw std::runtime_error(std::string(who) + ": node line '" + line + "'");
+            mesh.nodeIds.push_back(std::stoll(f[0]));
+            for (int k = 1; k <= 3; ++k) mesh.xyz.push_back(std::stod(f[k]));
+        } else if (section == Elements) {
+            if (f.size() != std::size_t(1 + ti->nodes))
+                throw std::runtime_error(std::string(who) + ": element line '" + line + "'");
+            mesh.blocks.back().ids.push_back(std::stoll(f[0]));
+            for (int k = 1; k <= ti->nodes; ++k) mesh.blocks.back().nodes.push_back(std::stoll(f[k]));
+        } else {
+            throw std::runtime_error(std::string(who) + ": data outside *NODE/*ELEMENT: '" + line + "'");
+        }
+    }
+    if (unit.empty()) throw std::runtime_error(std::string(who) + ": no '** LENGTH UNIT:' line");
+    const double s = unitScale(unit, who);
+    if (s != 1.0) for (auto& x : mesh.xyz) x /= s;
+    return mesh;
+}
+
+// ---- VTK legacy (ASCII unstructured grid) ----------------------------------------------------
+// ParaView-readable. Coordinates %.17g; gmsh's node and element ids, each cell's region tag and
+// gmsh entity travel as POINT_DATA/CELL_DATA arrays, and each region as a field array
+// "region_<tag>" holding [dimension, character codes of the name] (legacy VTK has no string
+// arrays), so the reader rebuilds the mesh exactly. The unit is in the title line.
+
+std::string writeVtk(const Mesh& mesh, const std::string& unit) {
+    checkMesh(mesh, "exportMesh(vtk)");
+    const double s = unitScale(unit, "exportMesh(vtk)");
+    std::map<std::int64_t, std::size_t> index;
+    for (std::size_t i = 0; i < mesh.nodeIds.size(); ++i) index[mesh.nodeIds[i]] = i;
+    std::string out = "# vtk DataFile Version 3.0\nMVB++ mvbpp_mesh mesh, LENGTH UNIT: " + unit +
+                      "\nASCII\nDATASET UNSTRUCTURED_GRID\n";
+    out += "FIELD FieldData " + std::to_string(mesh.regions.size()) + "\n";
+    for (const auto& r : mesh.regions) {
+        out += "region_" + std::to_string(r.tag) + " 1 " + std::to_string(r.name.size() + 1) + " int\n" +
+               std::to_string(r.dimension);
+        for (unsigned char c : r.name) out += " " + std::to_string(int(c));
+        out += "\n";
+    }
+    out += "POINTS " + std::to_string(mesh.nodeIds.size()) + " double\n";
+    for (std::size_t i = 0; i < mesh.nodeIds.size(); ++i)
+        out += g17(mesh.xyz[3 * i] * s) + " " + g17(mesh.xyz[3 * i + 1] * s) + " " + g17(mesh.xyz[3 * i + 2] * s) + "\n";
+    std::size_t cells = 0, size = 0;
+    for (const auto& b : mesh.blocks) { cells += b.ids.size(); size += b.ids.size() * (1 + info(b.type).nodes); }
+    out += "CELLS " + std::to_string(cells) + " " + std::to_string(size) + "\n";
+    for (const auto& b : mesh.blocks) {
+        const auto& ti = info(b.type);
+        for (std::size_t e = 0; e < b.ids.size(); ++e) {
+            out += std::to_string(ti.nodes);
+            for (int k = 0; k < ti.nodes; ++k)
+                out += " " + std::to_string(index.at(b.nodes[e * ti.nodes + ti.vtkOrder[k]]));
+            out += "\n";
+        }
+    }
+    out += "CELL_TYPES " + std::to_string(cells) + "\n";
+    for (const auto& b : mesh.blocks)
+        for (std::size_t e = 0; e < b.ids.size(); ++e) out += std::to_string(info(b.type).vtk) + "\n";
+    out += "CELL_DATA " + std::to_string(cells) + "\n";
+    auto cellArray = [&](const char* name, auto value) {
+        out += std::string("SCALARS ") + name + " long 1\nLOOKUP_TABLE default\n";
+        for (const auto& b : mesh.blocks)
+            for (std::size_t e = 0; e < b.ids.size(); ++e) out += std::to_string(value(b, e)) + "\n";
+    };
+    cellArray("region", [](const ElementBlock& b, std::size_t) { return std::int64_t(b.region); });
+    cellArray("entity", [](const ElementBlock& b, std::size_t) { return std::int64_t(b.entity); });
+    cellArray("elementId", [](const ElementBlock& b, std::size_t e) { return b.ids[e]; });
+    out += "POINT_DATA " + std::to_string(mesh.nodeIds.size()) + "\nSCALARS nodeId long 1\nLOOKUP_TABLE default\n";
+    for (auto id : mesh.nodeIds) out += std::to_string(id) + "\n";
+    return out;
+}
+
+Mesh readVtk(const std::string& text) {
+    const char* who = "importMesh(vtk)";
+    std::istringstream in(text);
+    std::string line;
+    std::getline(in, line);
+    if (line.rfind("# vtk DataFile", 0) != 0) throw std::runtime_error(std::string(who) + ": not a legacy VTK file");
+    std::getline(in, line);
+    const auto at = line.find("LENGTH UNIT: ");
+    if (at == std::string::npos) throw std::runtime_error(std::string(who) + ": the title states no LENGTH UNIT");
+    const double s = unitScale(line.substr(at + 13), who);
+    std::string word;
+    in >> word;
+    if (word != "ASCII") throw std::runtime_error(std::string(who) + ": only ASCII files are read");
+    Mesh mesh;
+    std::vector<std::vector<std::int64_t>> conn;
+    std::vector<int> types;
+    std::map<std::string, std::vector<std::int64_t>> cellData;
+    std::vector<std::int64_t> nodeIds;
+    std::string mode;
+    while (in >> word) {
+        if (word == "DATASET") { in >> word; if (word != "UNSTRUCTURED_GRID") throw std::runtime_error(std::string(who) + ": not an unstructured grid"); }
+        else if (word == "FIELD") {
+            std::string name; std::size_t n; in >> name >> n;
+            for (std::size_t i = 0; i < n; ++i) {
+                std::string arr, type; std::size_t comps, tuples; in >> arr >> comps >> tuples >> type;
+                if (arr.rfind("region_", 0) != 0 || comps != 1 || type != "int" || tuples < 1)
+                    throw std::runtime_error(std::string(who) + ": unexpected field array " + arr);
+                Region r; r.tag = std::stoi(arr.substr(7)); in >> r.dimension;
+                for (std::size_t k = 1; k < tuples; ++k) { int c; in >> c; r.name += char(c); }
+                mesh.regions.push_back(r);
+            }
+        } else if (word == "POINTS") {
+            std::size_t n; std::string type; in >> n >> type;
+            mesh.xyz.resize(3 * n);
+            for (auto& x : mesh.xyz) { in >> x; x /= s; }
+        } else if (word == "CELLS") {
+            std::size_t n, size; in >> n >> size;
+            conn.resize(n);
+            for (auto& c : conn) { std::size_t k; in >> k; c.resize(k); for (auto& v : c) in >> v; }
+        } else if (word == "CELL_TYPES") {
+            std::size_t n; in >> n; types.resize(n);
+            for (auto& t : types) in >> t;
+        } else if (word == "CELL_DATA" || word == "POINT_DATA") {
+            mode = word; std::size_t n; in >> n;
+        } else if (word == "SCALARS") {
+            std::string name, type; int comps; in >> name >> type >> comps >> word >> word;  // LOOKUP_TABLE default
+            std::vector<std::int64_t> v(mode == "CELL_DATA" ? conn.size() : mesh.xyz.size() / 3);
+            for (auto& x : v) in >> x;
+            if (mode == "POINT_DATA" && name == "nodeId") nodeIds = v;
+            else if (mode == "CELL_DATA") cellData[name] = v;
+            else throw std::runtime_error(std::string(who) + ": unexpected point array " + name);
+        } else {
+            throw std::runtime_error(std::string(who) + ": unexpected keyword " + word);
+        }
+        if (!in) throw std::runtime_error(std::string(who) + ": truncated at " + word);
+    }
+    for (const char* a : {"region", "entity", "elementId"})
+        if (!cellData.count(a)) throw std::runtime_error(std::string(who) + ": no cell array " + a);
+    if (nodeIds.size() != mesh.xyz.size() / 3) throw std::runtime_error(std::string(who) + ": no nodeId array");
+    mesh.nodeIds = nodeIds;
+    for (std::size_t c = 0; c < conn.size(); ++c) {
+        const TypeInfo* ti = nullptr;
+        for (const auto& t : kTypes) if (t.vtk == types[c]) ti = &t;
+        if (!ti || conn[c].size() != std::size_t(ti->nodes))
+            throw std::runtime_error(std::string(who) + ": cell " + std::to_string(c) + " has VTK type " + std::to_string(types[c]));
+        const int region = int(cellData["region"][c]), entity = int(cellData["entity"][c]);
+        if (mesh.blocks.empty() || mesh.blocks.back().type != ti->type || mesh.blocks.back().region != region ||
+            mesh.blocks.back().entity != entity)
+            mesh.blocks.push_back(ElementBlock{ti->type, region, entity, {}, {}});
+        auto& b = mesh.blocks.back();
+        b.ids.push_back(cellData["elementId"][c]);
+        std::array<std::int64_t, 8> nodes{};
+        for (int k = 0; k < ti->nodes; ++k) nodes[ti->vtkOrder[k]] = nodeIds.at(std::size_t(conn[c][k]));
+        for (int k = 0; k < ti->nodes; ++k) b.nodes.push_back(nodes[k]);
+    }
+    return mesh;
+}
+
 }  // namespace
 
 std::string exportMesh(const Mesh& mesh, const std::string& format, const std::string& unit) {
     if (format == "msh2") return writeMsh2(mesh, unit);
     if (format == "bdf") return writeBdf(mesh, unit);
-    throw std::runtime_error("exportMesh: unknown format \"" + format + "\" (msh2, bdf)");
+    if (format == "inp") return writeInp(mesh, unit);
+    if (format == "vtk") return writeVtk(mesh, unit);
+    throw std::runtime_error("exportMesh: unknown format \"" + format + "\" (msh2, bdf, inp, vtk)");
 }
 
 nlohmann::json exportMaterials(const Mesh& mesh) {
@@ -549,7 +824,9 @@ nlohmann::json exportMaterials(const Mesh& mesh) {
 Mesh importMesh(const std::string& text, const std::string& format) {
     if (format == "msh2") return readMsh2(text);
     if (format == "bdf") return readBdf(text);
-    throw std::runtime_error("importMesh: unknown format \"" + format + "\" (msh2, bdf)");
+    if (format == "inp") return readInp(text);
+    if (format == "vtk") return readVtk(text);
+    throw std::runtime_error("importMesh: unknown format \"" + format + "\" (msh2, bdf, inp, vtk)");
 }
 
 std::string diffMeshes(const Mesh& a, const Mesh& b) {
