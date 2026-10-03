@@ -26,8 +26,8 @@ namespace mvb::mesh {
 namespace {
 
 // The sections omfem_mesh3d records in its effective recipe (the skin layer's "layers" is not
-// part of a mesh3d run).
-const std::vector<std::string> kMesh3dSections{"wire", "conductor", "core", "air", "gap", "skin_mapped", "mesher"};
+// part of a mesh3d run; "geometry" holds the MVB++ drawing knobs a corpus plan sets).
+const std::vector<std::string> kMesh3dSections{"wire", "conductor", "core", "air", "gap", "skin_mapped", "mesher", "geometry"};
 
 // While the move is under way the knobs travel as OMFEM_* environment variables, read inside the
 // moved code, and MVB++'s geometry reads MVB_* ones. A library call must not take hidden inputs
