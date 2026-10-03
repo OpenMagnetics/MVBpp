@@ -179,3 +179,20 @@ TEST_CASE("Writers refuse a structurally broken mesh", "[mesh-io]") {
     m.regions[2].tag = 1;
     REQUIRE_THROWS_WITH(exportMesh(m, "msh2", "m"), ContainsSubstring("tag 1 used twice"));
 }
+
+// meshMagnetic takes every knob from its recipe: an ambient OMFEM_*/MVB_* is refused before any
+// work, and a recipe the table rejects leaves no knob behind in the environment.
+TEST_CASE("meshMagnetic refuses knobs from the environment and leaves none behind", "[mesh-api]") {
+    const nlohmann::json magnetic = {{"core", nlohmann::json::object()}, {"coil", nlohmann::json::object()}};
+    for (const char* var : {"OMFEM_NO_BOBBIN", "MVB_WELD_ALL"}) {
+        setenv(var, "1", 1);
+        REQUIRE_THROWS_WITH(meshMagnetic(magnetic, nlohmann::json::object()), ContainsSubstring(var));
+        unsetenv(var);
+    }
+    // A known knob next to an unknown one: the table sets the first, then throws on the second.
+    const nlohmann::json bad = {{"air", {{"target_m", 0.006}}}, {"air_typo", {{"x", 1}}}};
+    REQUIRE_THROWS_WITH(meshMagnetic(magnetic, bad), ContainsSubstring("unknown key"));
+    REQUIRE(std::getenv("OMFEM_AIR_TARGET") == nullptr);
+    REQUIRE_THROWS_WITH(meshMagnetic(nlohmann::json::array(), nlohmann::json::object()),
+                        ContainsSubstring("expects a MAS magnetic"));
+}

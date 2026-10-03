@@ -129,3 +129,7 @@ target_link_libraries(mvbpp_mesh
 # The round-trip gate on real meshes (tools/mvbpp_mesh_roundtrip.cpp).
 add_executable(mvbpp_mesh_roundtrip tools/mvbpp_mesh_roundtrip.cpp)
 target_link_libraries(mvbpp_mesh_roundtrip PRIVATE mvbpp_mesh)
+
+# The identity gate for meshMagnetic against an OMFEM reference run (tools/mvbpp_mesh_magnetic.cpp).
+add_executable(mvbpp_mesh_magnetic tools/mvbpp_mesh_magnetic.cpp)
+target_link_libraries(mvbpp_mesh_magnetic PRIVATE mvbpp_mesh)
