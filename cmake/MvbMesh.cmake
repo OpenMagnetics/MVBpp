@@ -109,6 +109,8 @@ add_library(mvbpp_mesh ${_mvbpp_lib_kind}
     src/mesh/SizeField.cpp
     src/mesh/MeshRecipe.cpp
     src/mesh/MeshIO.cpp
+    src/mesh/MeshSupport.cpp
+    src/mesh/Mesh3d.cpp
 )
 add_dependencies(mvbpp_mesh gmsh_external mvbpp_buildrev)
 target_include_directories(mvbpp_mesh
