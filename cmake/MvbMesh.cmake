@@ -140,6 +140,14 @@ foreach(_tool mvbpp_mmgadapt mvbpp_meshheal mvbpp_meshslice)
     target_link_libraries(${_tool} PRIVATE mvbpp_mesh)
 endforeach()
 
+# CAD/STEP diagnostics moved from OMFEM (ABT #1588 step 8): meshability, healing, overlaps, probes.
+foreach(_tool mvbpp_anisotest mvbpp_faceknots mvbpp_selfint_probe mvbpp_solidstats mvbpp_step_probe
+              mvbpp_stepheal mvbpp_stepcheck mvbpp_step_intersect mvbpp_cadbench)
+    add_executable(${_tool} tools/${_tool}.cpp)
+    target_include_directories(${_tool} PRIVATE ${MVBPP_GMSH_PREFIX}/include ${MVBPP_MMG_PREFIX}/include)
+    target_link_libraries(${_tool} PRIVATE mvbpp_mesh)
+endforeach()
+
 # MAS -> mesh -> one export format, optionally without the air and with the meshed STEP.
 add_executable(mvbpp_mesh_export tools/mvbpp_mesh_export.cpp)
 target_link_libraries(mvbpp_mesh_export PRIVATE mvbpp_mesh)
