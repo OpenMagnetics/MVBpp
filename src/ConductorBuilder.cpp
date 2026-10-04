@@ -444,10 +444,24 @@ inline Verdict provePairClears(const Primitive& A, const Primitive& B, double th
     }
     if (!work.empty()) {
         // The guard tripped with boxes unresolved: this pair CANNOT be certified. Saying
-        // "clear" here would be a silent fallback; refuse loudly instead.
-        throw std::runtime_error(
-            "cert::provePairClears: box budget exhausted before the pair resolved -- cannot "
-            "certify; the geometry is degenerate or the bounds are too loose");
+        // "clear" here would be a silent fallback; refuse loudly instead, naming the pair and
+        // how close the unresolved boxes are to the threshold.
+        double lowest = std::numeric_limits<double>::max();
+        for (const Box& bx : work) {
+            const double hA = bx.a1 - bx.a0, hB = bx.b1 - bx.b0;
+            lowest = std::min(lowest, segSegDistance(evalPrim(A, bx.a0), evalPrim(A, bx.a1), evalPrim(B, bx.b0),
+                                                     evalPrim(B, bx.b1)) -
+                                          ddA * hA * hA / 8.0 - ddB * hB * hB / 8.0);
+        }
+        static const char* const kinds[] = {"SEG", "ARC3", "SPIRAL", "BLEND"};
+        std::ostringstream m;
+        m.precision(6);
+        m << "cert::provePairClears: box budget exhausted before the pair resolved -- cannot certify; the "
+             "geometry is degenerate or the bounds are too loose. Pair '"
+          << A.label << "' (" << kinds[A.kind] << ") vs '" << B.label << "' (" << kinds[B.kind]
+          << "): threshold " << threshold * 1e6 << " um, " << work.size()
+          << " boxes unresolved, lowest box bound " << lowest * 1e6 << " um";
+        throw std::runtime_error(m.str());
     }
     v.clears = true;
     return v;
@@ -11913,6 +11927,18 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             for (size_t g = 0; g < group.size(); ++g) {
                 az[group[g]] = azMember(g, best);
+                // azMember's NaN means "this parallel has no slot at that anchor". The search only
+                // accepts anchors where every member has one, except under the plane pin, which
+                // takes the plane unconditionally; a NaN slot then became the lead's azimuth, a
+                // wrap helix starting at NaN, and a clearance certificate that never resolved
+                // ("box budget exhausted": 14_dab_xfmr_pm8770_n97 in corpus C2). Refuse instead.
+                if (std::isnan(az[group[g]]))
+                    throw std::runtime_error(
+                        "ConductorBuilder: the terminal leads of '" + verts[group[0]].wname + "' (" +
+                        std::to_string(group.size()) + " parallels) cannot all end on " +
+                        (forcePlane ? "the terminal plane MVB_FAN_TERMINALS_ON_PLANE pins them to (the FEM port face)"
+                                    : "the anchor the block was placed at") +
+                        ": parallel " + std::to_string(g) + " has no slot clear of the others there.");
                 azAssigned[group[g]] = 1;
             }
         }

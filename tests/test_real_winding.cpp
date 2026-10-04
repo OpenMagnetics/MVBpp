@@ -2349,3 +2349,32 @@ TEST_CASE("Real winding: every port plane clears the copper it does not cut -- t
                  worstMargin * 1e3);
     REQUIRE(capsChecked > 0);
 }
+
+// Under the FEM plane pin (MVB_FAN_TERMINALS_ON_PLANE, set by the 3-D mesher: the port is one
+// planar face) a block of parallels whose members do not all fit on the plane is refused by name.
+// It used to take the plane anyway: the member with no slot got a NaN azimuth, its wrap helix
+// started at NaN, and the clearance certificate spun until "box budget exhausted"
+// (14_dab_xfmr_pm8770_n97, corpus C2).
+TEST_CASE("Real winding: parallels that cannot all end on the FEM terminal plane are refused by name",
+          "[realwinding][terminal-plane]") {
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/14_dab_xfmr_pm8770_n97.json");
+    REQUIRE(f.good());
+    const json mas = json::parse(f);
+    auto enriched = mvb::magnetic_autocomplete_safe(mas.at("magnetic"), /*useRealWindingGeometry=*/true);
+    REQUIRE(std::getenv("MVB_FAN_TERMINALS_ON_PLANE") == nullptr);
+    setenv("MVB_FAN_TERMINALS_ON_PLANE", "1", 1);
+    std::string error;
+    try {
+        mvb::MagneticBuilder builder;
+        builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                              mvb::DEFAULT_WIRE_POLYGON_SEGMENTS, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                              /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                              /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                              /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    unsetenv("MVB_FAN_TERMINALS_ON_PLANE");
+    INFO(error);
+    CHECK(error.find("cannot all end on the terminal plane") != std::string::npos);
+}
