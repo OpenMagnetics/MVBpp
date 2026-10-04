@@ -1,6 +1,7 @@
 #pragma once
 // Moved verbatim from OMFEM src/meshing/MasMesher.cpp at 59cc050 (ABT #1588, step 6): namespace omfem ->
 // mvb::mesh, MasMeshOptions -> MeshOptions, mesh_from_mas -> mesh2d_from_mas. No logic changed.
+// Since then, followed from OMFEM: ed92804 (ABT #1314 a, one region per parallel of a turn).
 
 #include <string>
 

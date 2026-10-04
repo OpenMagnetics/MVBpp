@@ -113,6 +113,28 @@ static std::vector<CoreColumnX> core_columns_x(const json& enr) {
     return cols;
 }
 
+// ABT #1314 (a): the parallel index of a per-turn solid named "... <winding> parallel <p> turn <t>"
+// (STEP prefixes / child suffixes allowed around it). Throws when the name carries none: a turn of
+// a multi-parallel winding with no parallel index cannot be given its own conductor.
+static int turn_parallel_of(const std::string& name) {
+    static const std::regex re(R"( parallel (\d+) turn \d+)");
+    std::smatch m;
+    if (!std::regex_search(name, m, re))
+        throw std::runtime_error("mesh: turn solid '" + name + "' carries no 'parallel <p> turn <t>' label, "
+                                 "so its parallel cannot be meshed as its own conductor (ABT #1314)");
+    return std::stoi(m[1].str());
+}
+
+// ABT #1314 (a): the windings whose parallels become separate 2D conductors (magnetic meshes of
+// windings with numberParallels > 1).
+static std::set<std::string> parallel_split_windings(const OpenMagnetics::Magnetic& enriched, const MeshOptions& opt) {
+    std::set<std::string> out;
+    if (opt.electrostatic) return out;
+    for (const auto& w : enriched.get_coil().get_functional_description())
+        if (w.get_number_parallels() > 1) out.insert(w.get_name());
+    return out;
+}
+
 
 std::string mesh2d_from_mas(json magnetic, const MeshOptions& opt) {
 
@@ -389,6 +411,13 @@ std::string mesh2d_from_mas(json magnetic, const MeshOptions& opt) {
     // inert (the field solver treats any non-core/non-turn region as air).
     const std::string& bobbin_name = nctx.bobbin_name;
     int bobbin_idx = 0;
+    // ABT #1314 (a): a winding wound with several parallels gets ONE region per parallel of each
+    // turn ("turn_<w>_<t>_par<p>_<leg>"), so the solver can let the turn current split between
+    // them (they are joined at both ends of the turn: one voltage, currents free). The parallels
+    // used to be merged into one region per turn, which hid the split and the per-parallel loss.
+    // A single-parallel winding keeps its names. The electrostatic mesh keeps the parallels of a
+    // turn as one electrode (they are one node of the circuit).
+    const std::set<std::string> split_parallels = parallel_split_windings(enriched, opt);
     for (const auto& ns : named) {
         std::string winding; int index = 0;
         std::string role;
@@ -404,7 +433,9 @@ std::string mesh2d_from_mas(json magnetic, const MeshOptions& opt) {
         // ("winding") keeps that spelling here so the 2D tagging is unchanged by ABT #1169
         // (the 2D mesher never asks MVB++ for real-winding geometry, but the mapping stays
         // where it was rather than being quietly redefined).
-        const std::string turnRegion = "turn_" + winding + "_" + std::to_string(index);
+        std::string turnRegion = "turn_" + winding + "_" + std::to_string(index);
+        if (role == "turn" && split_parallels.count(winding))
+            turnRegion += "_par" + std::to_string(turn_parallel_of(ns.name));
         const std::string region =
             region_for_role(role == "pin" ? "bobbin" : (role == "winding" ? "turn" : role),
                             winding, index, turnRegion);
@@ -433,7 +464,9 @@ std::string mesh2d_from_mas(json magnetic, const MeshOptions& opt) {
         std::map<std::string, std::array<double,5>> ext;  // [rmin,rmax,ymin,ymax,count]
         for (const auto& nc : name_centroids) {
             if (nc.region.rfind("turn_", 0) != 0) continue;
-            std::string w = nc.region.substr(5); w = w.substr(0, w.find_last_of('_'));
+            static const std::regex kParTag(R"(_par\d+$)");
+            std::string w = std::regex_replace(nc.region.substr(5), kParTag, "");   // drop a parallel tag
+            w = w.substr(0, w.find_last_of('_'));
             auto& e = ext.try_emplace(w, std::array<double,5>{DBL_MAX,-DBL_MAX,DBL_MAX,-DBL_MAX,0}).first->second;
             e[0]=std::min(e[0],nc.cx); e[1]=std::max(e[1],nc.cx);
             e[2]=std::min(e[2],nc.cy); e[3]=std::max(e[3],nc.cy); e[4]+=1;
@@ -584,8 +617,9 @@ std::string mesh2d_from_mas(json magnetic, const MeshOptions& opt) {
                 const auto addl = t.get_additional_coordinates();
                 if (!addl || addl->empty() || (*addl)[0].empty()) continue;
                 if (t.get_coordinates().empty()) continue;
-                turn_crossings["turn_" + m[1].str() + "_" + m[3].str()] =
-                    {t.get_coordinates()[0], (*addl)[0][0]};
+                std::string key = "turn_" + m[1].str() + "_" + m[3].str();
+                if (split_parallels.count(m[1].str())) key += "_par" + m[2].str();
+                turn_crossings[key] = {t.get_coordinates()[0], (*addl)[0][0]};
             }
         }
     }

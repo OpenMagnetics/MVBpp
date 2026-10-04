@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include "mvb/mesh/Mesh2d.h"
 #include "mvb/mesh/Mesher.h"
 
 #include <algorithm>
@@ -14,6 +15,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <set>
+#include <sstream>
 #include <unistd.h>
 
 using namespace mvb::mesh;
@@ -360,4 +363,58 @@ TEST_CASE("partsOnly refuses a mesh with no air to leave out, and a skin name al
     Mesh taken = cell();
     taken.regions[2].name = "core skin";
     CHECK_THROWS_WITH(partsOnly(taken), ContainsSubstring("already has a region named 'core skin'"));
+}
+
+namespace {
+
+// The 2-D regions a msh2 file names: its $PhysicalNames entries of dimension 2.
+std::set<std::string> regions2d(const std::string& path) {
+    std::ifstream f(path);
+    REQUIRE(f);
+    std::set<std::string> out;
+    std::string line;
+    bool in = false;
+    while (std::getline(f, line)) {
+        if (line == "$PhysicalNames") { in = true; std::getline(f, line); continue; }
+        if (line == "$EndPhysicalNames") break;
+        if (!in) continue;
+        std::istringstream s(line);
+        int dim = 0, tag = 0;
+        std::string name;
+        s >> dim >> tag >> name;
+        if (dim == 2) out.insert(name.substr(1, name.size() - 2));
+    }
+    return out;
+}
+
+}  // namespace
+
+// ABT #1314 (a): a turn wound with P parallels is P conductors in the 2-D section, one region per
+// parallel ("turn_<w>_<t>_par<p>_<leg>"), so the solver can let the turn current split between
+// them. The fixture is MKF's one-turn, 16-parallel planar winding (OMFEM's own acceptance case).
+TEST_CASE("mesh2d_from_mas gives each parallel of a turn its own region", "[mesh-2d]") {
+    std::ifstream f(MAS_COMPLETE_DIR "/planar_one_turn_16_parallels_100k.json");
+    REQUIRE(f);
+    const auto mas = nlohmann::json::parse(f);
+    std::set<std::string> expected;
+    for (const auto& t : mas.at("magnetic").at("coil").at("turnsDescription")) {
+        REQUIRE(t.at("coordinates")[0].get<double>() > 0.0);   // all on the +x half the section keeps
+        expected.insert("turn_Primary_0_par" + std::to_string(t.at("parallel").get<int>()) + "_plus");
+    }
+    REQUIRE(expected.size() == 16);
+
+    const auto turns = [](const std::set<std::string>& regions) {
+        std::set<std::string> out;
+        for (const auto& r : regions)
+            if (r.rfind("turn_", 0) == 0) out.insert(r);
+        return out;
+    };
+
+    MeshOptions magnetic;
+    magnetic.out_msh = "/tmp/mvbpp_mesh2d_parallels16.msh";
+    magnetic.conductor_conducting_diameter = true;
+    REQUIRE(mesh2d_from_mas(mas.at("magnetic"), magnetic) == magnetic.out_msh);
+    CHECK(turns(regions2d(magnetic.out_msh)) == expected);
+
+    std::remove(magnetic.out_msh.c_str());
 }
