@@ -2,6 +2,7 @@
 // Moved verbatim from OMFEM src/meshing/MasMesher.cpp (ABT #1588, step 2): namespace omfem -> mvb::mesh,
 // MasMeshOptions -> MeshOptions, file-local helpers shared with OMFEM's 2D mesher made external. No logic changed.
 
+#include <map>
 #include <optional>
 #include <regex>
 #include <string>
@@ -55,5 +56,11 @@ std::string fem_region_for_role(const std::string& role, const std::string& wind
 struct CoreGap { double yc; double len; double xc; };
 std::vector<CoreGap> extract_core_gaps(const nlohmann::json& enr);
 double central_column_half_width(const nlohmann::json& enr);
+
+// The curves of one closed ring, in the order a curve loop joins them: each one shares an end
+// point with the next, and the last with the first. `ends` gives each curve's two end points.
+// Throws when the curves do not form one closed ring. (Mapped copper: gmsh's addCurveLoop joins
+// curves in the order given, and a ring found as a set comes out sorted by tag instead.)
+std::vector<int> walk_ring(const std::vector<int>& ring, const std::map<int, std::vector<int>>& ends);
 
 }  // namespace mvb::mesh

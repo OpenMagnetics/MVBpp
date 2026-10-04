@@ -6,6 +6,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "mvb/mesh/Mesh2d.h"
+#include "mvb/mesh/MeshSupport.h"
 #include "mvb/mesh/Mesher.h"
 
 #include <algorithm>
@@ -417,4 +418,24 @@ TEST_CASE("mesh2d_from_mas gives each parallel of a turn its own region", "[mesh
     CHECK(turns(regions2d(magnetic.out_msh)) == expected);
 
     std::remove(magnetic.out_msh.c_str());
+}
+
+// Mapped copper cuts a rectangular wire at its section rings; gmsh's addCurveLoop joins the
+// four section curves in the order it is given. The ring found on 18_stacked came out sorted by
+// tag as width, width, thickness, thickness (a fused junction had renumbered one edge), and gmsh
+// refused it: "Curve loop is not closed".
+TEST_CASE("walk_ring hands a section ring over end to end, whatever order it was found in", "[mesh-3d]") {
+    // 154 and 161: the two 5 mm sides; 166 and 2051: the two 1 mm sides. Corners 1..4.
+    const std::map<int, std::vector<int>> ends{{154, {1, 2}}, {161, {3, 4}}, {166, {2, 3}}, {2051, {4, 1}}};
+    const auto walk = walk_ring({154, 161, 166, 2051}, ends);
+    REQUIRE(walk.size() == 4);
+    REQUIRE(std::set<int>(walk.begin(), walk.end()) == std::set<int>{154, 161, 166, 2051});
+    const auto shareAnEnd = [&](int a, int b) {
+        for (int p : ends.at(a)) for (int q : ends.at(b)) if (p == q) return true;
+        return false;
+    };
+    for (std::size_t k = 0; k < walk.size(); ++k) CHECK(shareAnEnd(walk[k], walk[(k + 1) % walk.size()]));
+    // Four curves that touch but do not close are refused, not handed to gmsh.
+    const std::map<int, std::vector<int>> open{{1, {1, 2}}, {2, {2, 3}}, {3, {3, 4}}, {4, {4, 5}}};
+    REQUIRE_THROWS_WITH(walk_ring({1, 2, 3, 4}, open), ContainsSubstring("does not return"));
 }

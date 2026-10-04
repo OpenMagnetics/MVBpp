@@ -290,4 +290,31 @@ std::string fem_region_for_role(const std::string& role, const std::string& wind
     return region_for_role(role, winding, index, turnRegion);
 }
 
+std::vector<int> walk_ring(const std::vector<int>& ring, const std::map<int, std::vector<int>>& ends) {
+    const auto endsOf = [&](int c) -> const std::vector<int>& {
+        auto it = ends.find(c);
+        if (it == ends.end() || it->second.size() != 2)
+            throw std::runtime_error("walk_ring: curve " + std::to_string(c) + " does not have two end points");
+        return it->second;
+    };
+    if (ring.size() < 2) throw std::runtime_error("walk_ring: a ring needs at least two curves");
+    std::vector<int> walk{ring.front()};
+    int at = endsOf(ring.front())[1];
+    while (walk.size() < ring.size()) {
+        int next = 0;
+        for (int c : ring)
+            if (std::find(walk.begin(), walk.end(), c) == walk.end() && (endsOf(c)[0] == at || endsOf(c)[1] == at)) {
+                next = c;
+                break;
+            }
+        if (next == 0)
+            throw std::runtime_error("walk_ring: no curve of the ring continues from curve " + std::to_string(walk.back()));
+        walk.push_back(next);
+        at = endsOf(next)[0] == at ? endsOf(next)[1] : endsOf(next)[0];
+    }
+    if (at != endsOf(ring.front())[0])
+        throw std::runtime_error("walk_ring: the ring does not return to curve " + std::to_string(ring.front()));
+    return walk;
+}
+
 }  // namespace mvb::mesh

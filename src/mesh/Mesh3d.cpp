@@ -316,7 +316,12 @@ std::vector<int> mapped_split_at_rings(int solid, double W, double T, const std:
         bool cap = false; const std::set<int> rs(r.begin(), r.end());
         for (int f : faces) if (faceCurves[f] == rs) { cap = true; break; }
         if (cap) { ++nCap; continue; }
-        const int loop = gmsh::model::occ::addCurveLoop(r);
+        // addCurveLoop joins the curves in the order given, so hand them over walking the ring end
+        // to end. The component comes out sorted by tag, which alternates width and thickness only
+        // by luck: on 18_stacked a fused junction renumbered one edge (c2051), the two 5 mm sides
+        // came first, and gmsh refused "Curve loop is not closed".
+        const std::vector<int> walk = walk_ring(r, ends);
+        const int loop = gmsh::model::occ::addCurveLoop(walk);
         tools.push_back({2, gmsh::model::occ::addPlaneSurface({loop})});
     }
     gmsh::model::occ::synchronize();
