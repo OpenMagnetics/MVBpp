@@ -44,6 +44,7 @@
 #include <Interface_Static.hxx>
 #include <STEPCAFControl_Reader.hxx>
 #include <STEPCAFControl_Writer.hxx>
+#include <STEPControl_Controller.hxx>
 #include <StlAPI_Writer.hxx>
 #include <TDF_Label.hxx>
 #include <TDF_LabelSequence.hxx>
@@ -360,6 +361,34 @@ TopoDS_Shape unitParametrised(const TopoDS_Shape& shapeMm, const std::string& na
     return out;
 }
 
+// OCCT's STEP translators work in a PROCESS-GLOBAL length unit, the static "xstep.cascade.unit"
+// (millimetres by default). exportSTEP writes millimetre numbers under a millimetre header and
+// importSTEP hands back millimetres, so both need that unit, and neither may assume nobody else
+// changed it: gmsh's Geometry.OCCTargetUnit sets it on every OCC import and never resets it,
+// not even on gmsh::finalize(). After one gmsh import of a STEP with OCCTargetUnit "M" in a
+// process, every later export there wrote the geometry with a wrong unit: the next 2D mesh of
+// another design found a gap mouth corner at x = 1550 mm on a 30 mm core and refined
+// towards it until it took 39 GB (ABT #1588). This guard sets millimetres for one translation
+// and gives the caller back its unit.
+class CascadeUnitMillimetres {
+public:
+    CascadeUnitMillimetres() {
+        STEPControl_Controller::Init();   // registers the xstep statics
+        const Standard_CString unit = Interface_Static::CVal("xstep.cascade.unit");
+        if (unit == nullptr)
+            throw std::runtime_error("mvb STEP: OCCT has no xstep.cascade.unit static to set");
+        previous_ = unit;
+        if (!Interface_Static::SetCVal("xstep.cascade.unit", "MM"))
+            throw std::runtime_error("mvb STEP: OCCT refused xstep.cascade.unit = MM");
+    }
+    ~CascadeUnitMillimetres() { Interface_Static::SetCVal("xstep.cascade.unit", previous_.c_str()); }
+    CascadeUnitMillimetres(const CascadeUnitMillimetres&) = delete;
+    CascadeUnitMillimetres& operator=(const CascadeUnitMillimetres&) = delete;
+
+private:
+    std::string previous_;
+};
+
 } // namespace
 
 bool exportSTEP(const std::vector<NamedShape>& shapes, const std::string& filepath) {
@@ -370,6 +399,7 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
                 const std::string& filepath,
                 const StepExportOptions& options) {
     if (shapes.empty()) return false;
+    const CascadeUnitMillimetres millimetres;
 
     Handle(TDocStd_Document) doc =
         new TDocStd_Document(TCollection_ExtendedString("BinXCAF"));
@@ -551,6 +581,7 @@ bool exportSTEP(const std::vector<TopoDS_Shape>& shapes,
 
 std::vector<NamedShape> importSTEP(const std::string& filepath) {
     std::vector<NamedShape> out;
+    const CascadeUnitMillimetres millimetres;
 
     Handle(TDocStd_Document) doc =
         new TDocStd_Document(TCollection_ExtendedString("BinXCAF"));

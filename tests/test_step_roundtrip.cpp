@@ -39,6 +39,11 @@
 #include <cstdlib>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
+#include <BRepBndLib.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <Bnd_Box.hxx>
+#include <Interface_Static.hxx>
+#include <STEPControl_Controller.hxx>
 #include <GProp_GProps.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
@@ -46,6 +51,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -321,4 +327,49 @@ TEST_CASE("Real-winding fixtures: every solid manifold and self-intersection fre
         CHECK(copperSolids > 0);
         CHECK(solids == copperSolids);
     }
+}
+
+// OCCT's STEP length unit is one process-wide static, and gmsh's Geometry.OCCTargetUnit "M" sets
+// it on every import without ever resetting it. A STEP written or read afterwards in the same
+// process must come out the same as on a fresh process, and the caller's unit must be left as
+// it was (ABT #1588: the second 2D mesh in one process found a gap corner 1.5 m away).
+TEST_CASE("STEP export and import ignore the unit a previous gmsh import left behind", "[step-unit]") {
+    const TopoDS_Shape box = BRepPrimAPI_MakeBox(gp_Pnt(0.001, 0.002, 0.003), 0.010, 0.020, 0.030).Shape();
+    const std::vector<mvb::NamedShape> shapes{mvb::NamedShape(box, "box")};
+    const std::string path = (std::filesystem::temp_directory_path() / "mvb_step_unit.step").string();
+    // What the file says, read as text: its points and its length unit. A round trip through
+    // importSTEP would cancel a wrong unit (written and read the same wrong way); gmsh reads the
+    // file with its own unit, so the file itself must not change.
+    const auto written = [&]() {
+        REQUIRE(mvb::exportSTEP(shapes, path));
+        std::ifstream f(path);
+        std::vector<std::string> facts;
+        std::string line;
+        while (std::getline(f, line))
+            if (line.find("CARTESIAN_POINT") != std::string::npos || line.find("SI_UNIT") != std::string::npos)
+                facts.push_back(line.substr(line.find('=') + 1));
+        REQUIRE_FALSE(facts.empty());
+        return facts;
+    };
+    const auto readBackX = [&]() {
+        const auto back = mvb::importSTEP(path);
+        REQUIRE(back.size() == 1);
+        Bnd_Box b;
+        BRepBndLib::Add(back.front().shape, b);
+        double x0, y0, z0, x1, y1, z1;
+        b.Get(x0, y0, z0, x1, y1, z1);
+        return x1 - x0;
+    };
+    STEPControl_Controller::Init();
+    const std::string unitBefore = Interface_Static::CVal("xstep.cascade.unit");
+    const auto fresh = written();
+    REQUIRE(std::abs(readBackX() - 10.0) < 1e-6);   // millimetres, as importSTEP promises
+    REQUIRE(Interface_Static::SetCVal("xstep.cascade.unit", "M"));   // what a gmsh import leaves
+    const auto afterGmsh = written();
+    const double xAfterGmsh = readBackX();
+    CHECK(std::string(Interface_Static::CVal("xstep.cascade.unit")) == "M");   // the caller's unit is kept
+    REQUIRE(Interface_Static::SetCVal("xstep.cascade.unit", unitBefore.c_str()));
+    CHECK(afterGmsh == fresh);
+    CHECK(std::abs(xAfterGmsh - 10.0) < 1e-6);
+    std::filesystem::remove(path);
 }
