@@ -149,25 +149,40 @@ int main(int argc_in, char** argv_in) {
     // smallest N that reaches h_deep is the right one -- which is what this formula returns.
     // Unset or 'auto' uses it; auto+K asks for K layers beyond it (a deliberate check); a plain N
     // asks for exactly N (the convergence runs above).
-    if (!(hDeep > hs)) { std::fprintf(stderr, "h_deep (%.4g mm) is not coarser than h_surface (%.4g mm): nothing to grow across\n", hDeep*1e3, hs*1e3); return 2; }
+    // ONE LAYER (Alf, 2026-10-11, OMFEM's fast fidelity: "one skin layer at the skin depth"). When
+    // h_deep IS h_surface there is nothing to grow across: the stack is the single wall layer of
+    // normal size hs, and the conductor keeps hs through its thickness (the nearest face's cap). Past
+    // the wall the size hands over to the bulk at MMG's gradation -- the fastest growth MMG keeps, the
+    // one the derived N below grows at. h_deep FINER than h_surface is a contradiction, refused.
+    const bool sameSize = std::abs(hDeep - hs) <= 1e-12 * hs;
+    if (!(hDeep > hs) && !sameSize) { std::fprintf(stderr, "h_deep (%.4g mm) is finer than h_surface (%.4g mm): the layers would have to shrink into the conductor\n", hDeep*1e3, hs*1e3); return 2; }
     const char* envLayers = std::getenv("OMFEM_SKIN_LAYERS");
     const std::string ls = envLayers ? envLayers : "auto";
     int nLayers = 0;
     if (ls.rfind("auto", 0) == 0) {
         if (ls.size() > 4 && ls[4] != '+') { std::fprintf(stderr, "OMFEM_SKIN_LAYERS: expected 'auto', 'auto+K' or N, got '%s'\n", ls.c_str()); return 2; }
         const int plus = ls.size() > 4 ? std::atoi(ls.c_str() + 5) : 0;
-        // hDeep > hs, so the log ratio is positive and derived >= 2: a wall layer and the deep layer.
-        const int derived = 1 + (int)std::ceil(std::log(hDeep/hs) / std::log(hgrad));
+        // hDeep > hs gives derived >= 2 (a wall layer and the deep layer); hDeep == hs gives 1.
+        const int derived = sameSize ? 1 : 1 + (int)std::ceil(std::log(hDeep/hs) / std::log(hgrad));
         nLayers = derived + plus;
         std::printf("layers: N=%d derived from h_deep/h_surface=%.4g and hgrad=%.4g (1 + ceil(ln %.4g / ln %.4g) = %d)%s\n",
                     nLayers, hDeep/hs, hgrad, hDeep/hs, hgrad, derived,
                     plus ? (" plus " + std::to_string(plus) + " requested").c_str() : "");
     } else {
-        nLayers = std::atoi(ls.c_str());
-        if (nLayers < 2) { std::fprintf(stderr,"OMFEM_SKIN_LAYERS must be >= 2 (one layer is not a stack)\n"); return 2; }
+        char* end = nullptr;
+        const long asked = std::strtol(ls.c_str(), &end, 10);
+        if (end == ls.c_str() || *end != '\0') { std::fprintf(stderr, "OMFEM_SKIN_LAYERS: expected 'auto', 'auto+K' or N, got '%s'\n", ls.c_str()); return 2; }
+        nLayers = (int)asked;
+        if (nLayers < 1) { std::fprintf(stderr,"OMFEM_SKIN_LAYERS must be >= 1 (got %d)\n", nLayers); return 2; }
     }
-    const double growthK = std::pow(hDeep/hs, 1.0/(nLayers - 1));   // > 1 because hDeep > hs
-    // Total thickness of the N-layer stack, hs*(g^N-1)/(g-1): the depth the layers actually occupy.
+    if (nLayers == 1 && !sameSize) {
+        std::fprintf(stderr, "OMFEM_SKIN_LAYERS=1 is one wall layer of h_surface (%.4g mm), so it needs h_deep equal to it; h_deep is %.4g mm\n", hs*1e3, hDeep*1e3); return 2; }
+    if (nLayers > 1 && sameSize) {
+        std::fprintf(stderr, "OMFEM_SKIN_LAYERS=%d needs h_deep coarser than h_surface (%.4g mm): with h_deep equal to it the stack is the one wall layer\n", nLayers, hs*1e3); return 2; }
+    // N > 1: hs*g^(N-1) = h_deep. N = 1: the hand-over past the wall layer grows at hgrad (above).
+    const double growthK = nLayers == 1 ? hgrad : std::pow(hDeep/hs, 1.0/(nLayers - 1));   // > 1
+    // Total thickness of the N-layer stack, hs*(g^N-1)/(g-1): the depth the layers actually occupy
+    // (hs for the one wall layer).
     const double band = hs*(std::pow(growthK, nLayers) - 1.0)/(growthK - 1.0);
 
     gmsh::initialize();
