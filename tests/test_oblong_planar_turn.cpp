@@ -13,8 +13,21 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "mvb/MagneticBuilder.h"
+#include "mvb/NamedShape.h"
+#include "mvb/Utils.h"
 #include "MAS.hpp"
+#include "constructive_models/Bobbin.h"
+#include "constructive_models/Coil.h"
+#include "constructive_models/Core.h"
+#include "constructive_models/Magnetic.h"
+#include "support/Settings.h"
+
+#include <nlohmann/json.hpp>
+#include <BRepAlgoAPI_Common.hxx>
+#include <BRepClass3d_SolidClassifier.hxx>
+#include <gp_Pnt.hxx>
 
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
@@ -25,6 +38,9 @@
 
 #include <vector>
 #include <cmath>
+#include <fstream>
+#include <optional>
+#include <string>
 
 using Catch::Matchers::WithinAbs;
 
@@ -219,5 +235,175 @@ TEST_CASE("Oblong round wire turn: round cross-section preserved",
             REQUIRE_THAT(y1 - y0, WithinAbs(diameter, 5e-5));
             REQUIRE_THAT(x1 - x0, WithinAbs(y1 - y0, 1e-5));  // round → square bbox
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ABT #1729. The FR4 board of a planar coil must stop at the core: its cut-out is the column face
+// plus the board-to-column clearance the data states, never inside the ferrite. The cut-out used
+// to be the group's inner edge minus an invented 250 um, so a group wound 0.1 mm from the column
+// (the 16-parallel E 64/10/50 planar fixture) put the board edge 0.15 mm inside the 5.1 mm column
+// face, and the 2D fragment handed that sliver to the board: every OMFEM planar mesh had a
+// recessed column.
+//
+//   ./mvb_tests "[fr4]"
+namespace {
+
+nlohmann::json planar_core_shape(const std::string& shapeName) {
+    std::ifstream f(std::string(MAS_DATA_DIR) + "/core_shapes.ndjson");
+    REQUIRE(f.is_open());
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        auto candidate = nlohmann::json::parse(line, nullptr, false);
+        if (candidate.is_discarded()) continue;
+        if (candidate.value("name", "") == shapeName) {
+            mvb::patch_dimension_nominals(candidate);
+            return candidate;
+        }
+    }
+    FAIL("core shape '" << shapeName << "' is not in MAS core_shapes.ndjson");
+    return {};
+}
+
+// A two-layer planar winding on `shapeName`, wound by MKF itself at `coreToLayerDistance`.
+// `pcb` (optional) rides on the printed group the way MAS-RFC 0012 carries it.
+OpenMagnetics::Magnetic planar_magnetic(const std::string& shapeName, double coreToLayerDistance,
+                                        const std::optional<MAS::Pcb>& pcb) {
+    nlohmann::json coreJson;
+    coreJson["functionalDescription"] = {
+        {"name", "dummy"}, {"type", "two-piece set"}, {"material", "3C95"},
+        {"shape", planar_core_shape(shapeName)}, {"gapping", nlohmann::json::array()},
+        {"numberStacks", 1},
+    };
+    OpenMagnetics::Core core(coreJson);
+    auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, /*nullDimensions=*/true);
+
+    OpenMagnetics::Wire wire;
+    wire.set_nominal_value_conducting_width(0.0005);
+    wire.set_nominal_value_conducting_height(0.00007);
+    wire.set_number_conductors(1);
+    wire.set_material("copper");
+    wire.set_type(MAS::WireType::PLANAR);
+
+    OpenMagnetics::Winding winding;
+    winding.set_number_turns(4);
+    winding.set_number_parallels(1);
+    winding.set_name("Primary");
+    winding.set_isolation_side(MAS::IsolationSide::PRIMARY);
+    winding.set_wire(wire);
+
+    OpenMagnetics::Coil coil;
+    coil.get_mutable_functional_description().push_back(winding);
+    coil.set_bobbin(bobbin);
+    if (pcb) {
+        MAS::Group group;
+        group.set_name("Board");
+        group.set_type(MAS::WiringTechnology::PRINTED);
+        group.set_sections_orientation(MAS::WindingOrientation::CONTIGUOUS);
+        group.set_partial_windings({});
+        group.set_dimensions({0.001, 0.001});   // rebuilt by the wind; the pcb survives it
+        group.set_coordinates({0.001, 0.0});
+        group.set_pcb(*pcb);
+        coil.set_groups_description(std::vector<MAS::Group>{group});
+    }
+    REQUIRE(coil.wind_planar({0, 0}, std::nullopt, {}, {}, coreToLayerDistance));
+
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+    return magnetic;
+}
+
+MAS::Pcb pcb_with(double coreToTrack, std::optional<double> coreCutoutClearance) {
+    MAS::Pcb pcb;
+    MAS::PcbVias vias;
+    MAS::DimensionWithTolerance d; d.set_nominal(0.0004);
+    MAS::DimensionWithTolerance dr; dr.set_nominal(0.0003);
+    vias.set_diameter(d); vias.set_drill_diameter(dr);
+    pcb.set_vias(vias);
+    MAS::PcbDesignRules rules;
+    rules.set_track_to_track(0.0001); rules.set_core_to_track(coreToTrack);
+    rules.set_via_to_via(0.0003); rules.set_via_to_track(0.0003);
+    pcb.set_design_rules(rules);
+    MAS::PcbOutline outline;
+    outline.set_width(0.08); outline.set_depth(0.06);
+    if (coreCutoutClearance) outline.set_core_cutout_clearance(*coreCutoutClearance);
+    pcb.set_outline(outline);
+    return pcb;
+}
+
+bool inside(const TopoDS_Shape& shape, const gp_Pnt& p) {
+    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next()) {
+        BRepClass3d_SolidClassifier cls(ex.Current(), p, 1e-9);
+        if (cls.State() == TopAbs_IN) return true;
+    }
+    return false;
+}
+
+// Builds the part, then checks (1) the board shares no volume with any core piece and (2) the
+// board's cut-out edge sits exactly at column face + `clearance` on the section plane z = 0.
+void check_board_clears_core(const OpenMagnetics::Magnetic& magnetic, double clearance) {
+    mvb::MagneticBuilder builder;
+    auto all = builder.buildAllNamed(magnetic, /*includeBobbin=*/false);
+    const TopoDS_Shape* board = nullptr;
+    std::vector<const TopoDS_Shape*> cores;
+    for (const auto& ns : all) {
+        if (ns.role == mvb::Role::FR4) board = &ns.shape;
+        if (ns.role == mvb::Role::Core) cores.push_back(&ns.shape);
+    }
+    REQUIRE(board != nullptr);
+    REQUIRE(!cores.empty());
+
+    for (const auto* core : cores) {
+        BRepAlgoAPI_Common common(*board, *core);
+        REQUIRE(common.IsDone());
+        GProp_GProps gp;
+        BRepGProp::VolumeProperties(common.Shape(), gp);
+        INFO("board/core overlap " << gp.Mass() * 1e9 << " mm^3");
+        CHECK(gp.Mass() < 1e-15);   // 1e-6 mm^3: no shared volume, only shared faces at most
+    }
+
+    const auto corePd = magnetic.get_core().get_processed_description().value();
+    const double columnFace = corePd.get_columns()[0].get_width() / 2.0;
+    const auto group = magnetic.get_coil().get_groups_description().value().front();
+    const double boardY = group.get_coordinates()[1];
+    const double edge = columnFace + clearance;
+    INFO("column face " << columnFace * 1e3 << " mm, expected cut-out edge " << edge * 1e3 << " mm");
+    CHECK_FALSE(inside(*board, gp_Pnt(edge - 20e-6, boardY, 0.0)));
+    CHECK(inside(*board, gp_Pnt(edge + 20e-6, boardY, 0.0)));
+}
+
+}  // namespace
+
+TEST_CASE("A planar board without a pcb is cut out at the group's own inset from the column",
+          "[fr4][planar]") {
+    // 0.1 mm: the inset the 16-parallel E 64/10/50 OMFEM fixture was wound with.
+    const double coreToLayerDistance = 0.0001;
+    for (const std::string shape : {"E 64/10/50", "ER 32/6/25", "ER 64/13/51", "PQ 32/20",
+                                    "EQ 25/6", "EFD 25/13/9", "RM 10"}) {
+        DYNAMIC_SECTION(shape) {
+            check_board_clears_core(planar_magnetic(shape, coreToLayerDistance, std::nullopt),
+                                    coreToLayerDistance);
+        }
+    }
+}
+
+TEST_CASE("A planar board with a pcb is cut out at its coreCutoutClearance, else at coreToTrack",
+          "[fr4][planar]") {
+    const double coreToLayerDistance = 0.00025;
+    SECTION("coreToTrack") {
+        check_board_clears_core(planar_magnetic("E 64/10/50", coreToLayerDistance,
+                                                pcb_with(0.0001, std::nullopt)), 0.0001);
+    }
+    SECTION("coreCutoutClearance") {
+        check_board_clears_core(planar_magnetic("ER 32/6/25", coreToLayerDistance,
+                                                pcb_with(0.0001, 0.0002)), 0.0002);
+    }
+    SECTION("a clearance past the copper is refused") {
+        auto magnetic = planar_magnetic("E 64/10/50", coreToLayerDistance, pcb_with(0.0001, 0.0004));
+        mvb::MagneticBuilder builder;
+        CHECK_THROWS_WITH(builder.buildAllNamed(magnetic, /*includeBobbin=*/false),
+                          Catch::Matchers::ContainsSubstring("copper would hang off the board"));
     }
 }

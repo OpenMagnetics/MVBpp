@@ -16,16 +16,10 @@ namespace mvb {
 //   - the coil has no groupsDescription, or
 //   - the first group is not a PCB (WiringTechnology::PRINTED).
 //
-// Parameters:
-//   borderToWireDistance : extra margin on the outer edge of the PCB
-//   coreToLayerDistance  : margin between the column cut-out and the PCB
-//                          inner edge
+// The core cut-out is the column face plus the board-to-column clearance from the data
+// (coreCutoutClearance below); the board never reaches into the ferrite (ABT #1729).
 class FR4Builder {
 public:
-    static constexpr double DEFAULT_BORDER_TO_WIRE_DISTANCE = 90e-6;   // 90 µm
-    static constexpr double DEFAULT_CORE_TO_LAYER_DISTANCE  = 250e-6;  // 250 µm
-    static constexpr double MIN_FR4_THICKNESS               = 0.5e-3;  // 0.5 mm
-
     // The caller is responsible for handing in:
     //   - groups: the coil's `groupsDescription` (non-empty; first group's
     //             type must be PRINTED — else this returns a null shape)
@@ -37,9 +31,15 @@ public:
     // for a planar group — the caller must populate it upstream.
     static TopoDS_Shape buildFR4Board(
         const std::vector<MAS::Group>& groups,
-        const MAS::CoreBobbinProcessedDescription& bobbinPd,
-        double borderToWireDistance = DEFAULT_BORDER_TO_WIRE_DISTANCE,
-        double coreToLayerDistance  = DEFAULT_CORE_TO_LAYER_DISTANCE);
+        const MAS::CoreBobbinProcessedDescription& bobbinPd);
+
+    // Gap between the central column face (`columnFace`, measured from the column axis) and the
+    // board's cut-out edge. With a `pcb` on the group: pcb.outline.coreCutoutClearance, or
+    // pcb.designRules.coreToTrack when absent (the MAS-stated rule). Without one: the group's own
+    // inset from the column face -- the coreToLayerDistance MKF wound the group with. Throws when
+    // the group's inner edge is inside the column, or when the PCB clearance would leave the
+    // group's copper off the board.
+    static double coreCutoutClearance(const MAS::Group& group, double columnFace);
 };
 
 } // namespace mvb

@@ -573,10 +573,33 @@ std::string mesh2d_from_mas(json magnetic, const MeshOptions& opt) {
     std::vector<size_t> order(imps.size());
     for (size_t i=0;i<imps.size();++i) order[i]=i;
     std::sort(order.begin(), order.end(), [&](size_t a,size_t b){return imps[a].area>imps[b].area;});
+    std::map<int,std::vector<std::string>> surf_claims;
     for (size_t k=0;k<order.size();++k) {
         size_t i = order[k];
         const auto& mp = outMap[i+1];                 // outMap[0]=air, [i+1]=tools[i]
-        for (auto& dt : mp) if (dt.first==2) surf_region[dt.second]=imps[i].region;
+        for (auto& dt : mp) if (dt.first==2) {
+            surf_region[dt.second]=imps[i].region;
+            surf_claims[dt.second].push_back(imps[i].region);
+        }
+    }
+    // ABT #1729: no other solid may overlap the ferrite. The descending-area rule above hands an
+    // overlap to the SMALLER face, so a board or bobbin reaching into a column silently recessed
+    // the core (an FR4 cut-out 0.15 mm inside the column face took 0.34 mm^2 of core_1 on every
+    // planar mesh). A piece of the section claimed by a core face and by anything else is a
+    // geometry error: refuse it with the witness instead of meshing a different core.
+    for (const auto& [surf, claims] : surf_claims) {
+        if (claims.size() < 2) continue;
+        const bool core = std::any_of(claims.begin(), claims.end(),
+                                      [](const std::string& r){ return r.rfind("core_", 0) == 0; });
+        if (!core) continue;
+        double gx, gy, gz; gmsh::model::occ::getCenterOfMass(2, surf, gx, gy, gz);
+        double area = 0.0; gmsh::model::occ::getMass(2, surf, area);
+        std::string who;
+        for (const auto& r : claims) who += (who.empty() ? "" : ", ") + r;
+        throw std::runtime_error(
+            "mesh_from_mas: the 2D section overlaps the core: " + std::to_string(area * 1e6) +
+            " mm^2 around (" + std::to_string(gx * 1e3) + ", " + std::to_string(gy * 1e3) +
+            ") mm is claimed by " + who + ". The geometry puts a solid inside the ferrite.");
     }
 
     // group surfaces; unassigned = air. Split turns by centroid x sign (+/-).

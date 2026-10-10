@@ -15,14 +15,65 @@
 #include <cmath>
 #include <numbers>
 #include <optional>
+#include <stdexcept>
+#include <string>
 
 namespace mvb {
 
+namespace {
+// An OCCT boolean that fails would otherwise leave the uncut solid: a board with no core cut-out,
+// sitting in the ferrite. Refuse it by name instead (ABT #1729).
+template <class Op>
+TopoDS_Shape booleanResult(Op& op, const char* what)
+{
+    if (!op.IsDone()) {
+        throw std::runtime_error(std::string("FR4Builder::buildFR4Board: OCCT failed to ") + what +
+                                 "; the board would keep no core cut-out");
+    }
+    return op.Shape();
+}
+}  // namespace
+
+double FR4Builder::coreCutoutClearance(const MAS::Group& group, double columnFace)
+{
+    const auto& coords = group.get_coordinates();
+    const auto& dims   = group.get_dimensions();
+    if (coords.empty() || dims.empty()) {
+        throw std::runtime_error(
+            "FR4Builder: the printed group has no coordinates/dimensions, so the core cut-out "
+            "of its board cannot be placed");
+    }
+    // The copper region (the group) starts where MKF placed it: coreToLayerDistance (or the
+    // PCB's coreToTrack) out from the column face. That inset IS the board's clearance to the
+    // column when the group carries no PCB description; it is never invented here.
+    const double groupInnerEdge = coords[0] - dims[0] / 2.0;
+    const double groupInset     = groupInnerEdge - columnFace;
+    if (groupInset < 0.0) {
+        throw std::runtime_error(
+            "FR4Builder: the printed group's inner edge (" + std::to_string(groupInnerEdge * 1e3) +
+            " mm) lies inside the central column face (" + std::to_string(columnFace * 1e3) +
+            " mm): its copper would sit in the ferrite");
+    }
+    const auto& pcb = group.get_pcb();
+    if (!pcb) return groupInset;
+
+    // MAS pcbOutline.coreCutoutClearance: "Gap between the core column faces and the cut-out
+    // edges. Defaults to coreToTrack when absent (stated rule)."
+    const auto stated = pcb->get_outline().get_core_cutout_clearance();
+    const double clearance = stated ? *stated : pcb->get_design_rules().get_core_to_track();
+    if (clearance > groupInset) {
+        throw std::runtime_error(
+            "FR4Builder: the PCB's core cut-out clearance (" + std::to_string(clearance * 1e3) +
+            " mm) puts the board edge beyond the printed group's inner edge (" +
+            std::to_string(groupInset * 1e3) + " mm from the column face): the copper would hang "
+            "off the board");
+    }
+    return clearance;
+}
+
 TopoDS_Shape FR4Builder::buildFR4Board(
     const std::vector<MAS::Group>& groups,
-    const MAS::CoreBobbinProcessedDescription& bobbinPd,
-    double borderToWireDistance,
-    double coreToLayerDistance)
+    const MAS::CoreBobbinProcessedDescription& bobbinPd)
 {
     if (groups.empty()) return TopoDS_Shape();
 
@@ -59,21 +110,32 @@ TopoDS_Shape FR4Builder::buildFR4Board(
     const double columnDepth          = bobbinPd.get_column_depth();
     const MAS::ColumnShape columnShape = bobbinPd.get_column_shape();
 
-    // Board thickness: group height minus a 4 µm clearance so the FR4 plane
-    // doesn't Z-fight with turn planes — with a MIN_FR4_THICKNESS floor.
-    const double clearance    = 4e-6;
-    const double fr4Thickness = std::max(groupHeight - clearance,
-                                          MIN_FR4_THICKNESS - clearance);
+    // Board thickness: the group height minus a 4 µm clearance so the FR4 plane doesn't
+    // Z-fight with the turn planes. No thickness floor: a floor thicker than the group pushed
+    // the board out of the winding window into the yokes (ABT #1729).
+    const double zFightClearance = 4e-6;
+    const double fr4Thickness    = groupHeight - zFightClearance;
+    if (fr4Thickness <= 0.0) {
+        throw std::runtime_error(
+            "FR4Builder::buildFR4Board: the printed group is " + std::to_string(groupHeight * 1e6) +
+            " um high, too thin to hold a board");
+    }
 
-    // Radial extents come straight from the group's own dimensions — no
-    // border/margin additions. The group already describes the FR4 footprint.
-    const double innerRadius     = groupX - groupWidth / 2.0;
-    const double outerRadius     = groupX + groupWidth / 2.0;
-    const double holeInnerRadius = innerRadius - coreToLayerDistance;
+    // The board's outer edge is the group's own outer edge (the group is the board footprint,
+    // already inset from the lateral legs). The core cut-out is the column face plus the
+    // board-to-column clearance from the data, so the board never reaches into the ferrite
+    // (ABT #1729: the hole used to be the group edge minus an invented 250 µm, which put the
+    // board 0.15 mm inside a 5.1 mm column face and recessed the column in every planar mesh).
+    const double outerRadius = groupX + groupWidth / 2.0;
+    const double clearance   = coreCutoutClearance(group0, columnWidth);
 
     // Y-depth of the board: use bobbin column depth + widest layer width.
-    double groupDepth = columnDepth + maxLayerWidth;
-    if (groupDepth <= 0.0) groupDepth = outerRadius;  // defensive fallback
+    const double groupDepth = columnDepth + maxLayerWidth;
+    if (!(groupDepth > 0.0)) {
+        throw std::runtime_error(
+            "FR4Builder::buildFR4Board: column depth + widest layer width is not positive; the "
+            "board depth is undefined");
+    }
 
     TopoDS_Shape board;
 
@@ -86,10 +148,10 @@ TopoDS_Shape FR4Builder::buildFR4Board(
         // Hole extends slightly beyond so the cut is clean.
         const double holeExtra = 2e-3;
         gp_Ax2 axHole(gp_Pnt(0.0, 0.0, groupZ - fr4Thickness / 2.0 - holeExtra / 2.0), gp_Dir(0, 0, 1));
-        TopoDS_Shape hole = BRepPrimAPI_MakeCylinder(axHole, holeInnerRadius,
+        TopoDS_Shape hole = BRepPrimAPI_MakeCylinder(axHole, columnWidth + clearance,
                                                        fr4Thickness + holeExtra).Shape();
         BRepAlgoAPI_Cut cutter(outerDisc, hole);
-        board = cutter.IsDone() ? cutter.Shape() : outerDisc;
+        board = booleanResult(cutter, "cut the round column hole");
     }
     else if (columnShape == MAS::ColumnShape::OBLONG) {
         // Rectangular plate, stadium-shaped hole.
@@ -100,7 +162,7 @@ TopoDS_Shape FR4Builder::buildFR4Board(
 
         const double fullColDepth = columnDepth * 2.0;
         const double fullColWidth = columnWidth * 2.0;
-        const double holeRadius   = columnWidth + coreToLayerDistance;
+        const double holeRadius   = columnWidth + clearance;
         const double straightLen  = std::max(fullColDepth - fullColWidth, 0.0);
         const double holeExtra    = 2e-3;
         const double holeThickness = fr4Thickness + holeExtra;
@@ -120,11 +182,11 @@ TopoDS_Shape FR4Builder::buildFR4Board(
         TopoDS_Shape capBot = BRepPrimAPI_MakeCylinder(axBot, holeRadius, holeThickness).Shape();
 
         TopoDS_Shape hole = rect;
-        { BRepAlgoAPI_Fuse f(hole, capTop); if (f.IsDone()) hole = f.Shape(); }
-        { BRepAlgoAPI_Fuse f(hole, capBot); if (f.IsDone()) hole = f.Shape(); }
+        { BRepAlgoAPI_Fuse f(hole, capTop); hole = booleanResult(f, "fuse the oblong hole's top cap"); }
+        { BRepAlgoAPI_Fuse f(hole, capBot); hole = booleanResult(f, "fuse the oblong hole's bottom cap"); }
 
         BRepAlgoAPI_Cut cutter(plate, hole);
-        board = cutter.IsDone() ? cutter.Shape() : plate;
+        board = booleanResult(cutter, "cut the oblong column hole");
     }
     else {
         // Rectangular column → rectangular board with rectangular hole.
@@ -133,20 +195,22 @@ TopoDS_Shape FR4Builder::buildFR4Board(
         gp_Pnt boardCorner(-boardW / 2.0, -boardD / 2.0, groupZ - fr4Thickness / 2.0);
         TopoDS_Shape plate = BRepPrimAPI_MakeBox(boardCorner, boardW, boardD, fr4Thickness).Shape();
 
-        const double holeW = (innerRadius - coreToLayerDistance) * 2.0;
-        const double holeD = (columnDepth + coreToLayerDistance) * 2.0;
+        const double holeW = (columnWidth + clearance) * 2.0;
+        const double holeD = (columnDepth + clearance) * 2.0;
         const double holeExtra    = 2e-3;
         const double holeThickness = fr4Thickness + holeExtra;
 
-        if (holeW > 0.0 && holeD > 0.0) {
-            gp_Pnt holeCorner(-holeW / 2.0, -holeD / 2.0,
-                              groupZ - holeThickness / 2.0);
-            TopoDS_Shape hole = BRepPrimAPI_MakeBox(holeCorner, holeW, holeD, holeThickness).Shape();
-            BRepAlgoAPI_Cut cutter(plate, hole);
-            board = cutter.IsDone() ? cutter.Shape() : plate;
-        } else {
-            board = plate;
+        if (!(holeW > 0.0 && holeD > 0.0)) {
+            throw std::runtime_error(
+                "FR4Builder::buildFR4Board: the rectangular column hole is not positive (" +
+                std::to_string(holeW * 1e3) + " x " + std::to_string(holeD * 1e3) +
+                " mm); the column dimensions are invalid");
         }
+        gp_Pnt holeCorner(-holeW / 2.0, -holeD / 2.0,
+                          groupZ - holeThickness / 2.0);
+        TopoDS_Shape hole = BRepPrimAPI_MakeBox(holeCorner, holeW, holeD, holeThickness).Shape();
+        BRepAlgoAPI_Cut cutter(plate, hole);
+        board = booleanResult(cutter, "cut the rectangular column hole");
     }
 
     // The board is built with the column axis along Z (flat face in XY).
