@@ -16,6 +16,8 @@
 
 #include <sys/wait.h>
 #include <unistd.h>
+#include <chrono>
+#include <thread>
 
 namespace mvb::mesh {
 
@@ -283,6 +285,109 @@ static int fork_attempt(int dim, int algo, const std::string& algo_opt, bool esc
     _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
 }
 
+// REFINEMENT-RATE MONITOR (ABT #1637). A Delaunay attempt that "stalls" is not silent and not stuck:
+// measured 2026-10-12 on OMFEM's C2 plan, active_clamp's 3D refinement ran ~7 'It.' per second for
+// two hours (worst tet radius 79 -> 1.087, still converging to the 1.0 stop), where a good mesh
+// (02_flyback) runs ~3400 per second and finishes. Wall time cannot tell them apart -- good corpus
+// meshes take up to 7338 s -- but the RATE can, by about 500x. This monitor measures it and reports
+// it; it never kills. The kill threshold is set only once the rate has been logged on more designs.
+//
+// How it reads the rate: gmsh prints 'It. N - ... worst tet radius R' every 500 iterations to
+// stdout (and flushes), but only with General.Terminal on, and its public logger copies its buffer
+// without a lock, so it cannot be read from a second thread while generate() runs. So for the 3D
+// generate only, fd 1 goes into a pipe and a reader thread parses it. gmsh's terminal output is
+// forwarded to the real stdout only when OMFEM_GMSH_VERBOSE asked for it, so a default run prints
+// exactly what it printed before plus the rate lines on stderr. Anything else that writes to
+// stdout during the generate step is captured too -- the mesher writes its own logs to stderr.
+class RefinementRateMonitor {
+public:
+    RefinementRateMonitor() {
+        go::getNumber("General.Terminal", _terminalWas);
+        _forward = std::getenv("OMFEM_GMSH_VERBOSE") != nullptr;
+        std::fflush(stdout);
+        int fds[2];
+        if (pipe(fds) != 0)
+            throw std::runtime_error(std::string("refinement-rate monitor: pipe failed: ") + std::strerror(errno));
+        _savedStdout = dup(STDOUT_FILENO);
+        if (_savedStdout < 0 || dup2(fds[1], STDOUT_FILENO) < 0) {
+            const int e = errno;
+            close(fds[0]); close(fds[1]);
+            if (_savedStdout >= 0) close(_savedStdout);
+            throw std::runtime_error(std::string("refinement-rate monitor: dup failed: ") + std::strerror(e));
+        }
+        close(fds[1]);
+        _readEnd = fds[0];
+        go::setNumber("General.Terminal", 1);
+        _reader = std::thread([this] { read_loop(); });
+    }
+    ~RefinementRateMonitor() {
+        go::setNumber("General.Terminal", _terminalWas);
+        std::fflush(stdout);
+        dup2(_savedStdout, STDOUT_FILENO);     // closes the pipe's last write end: the reader sees EOF
+        close(_savedStdout);
+        _reader.join();
+        close(_readEnd);
+        if (_iterations > 0)
+            std::fprintf(stderr, "[mesh] 3D refinement: It. %ld in %.0f s (%.0f it/s overall), worst tet "
+                                 "radius %g at the end\n",
+                         _iterations, _lastTime - _firstTime,
+                         _lastTime > _firstTime ? (_iterations - _firstIt) / (_lastTime - _firstTime) : 0.0,
+                         _lastRadius);
+    }
+    RefinementRateMonitor(const RefinementRateMonitor&) = delete;
+    RefinementRateMonitor& operator=(const RefinementRateMonitor&) = delete;
+
+private:
+    static double now() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void line(const std::string& l) {
+        if (_forward) {
+            const std::string out = l + "\n";
+            (void)!write(_savedStdout, out.data(), out.size());
+        }
+        long it = 0; double radius = 0.0;
+        const auto p = l.find("It. ");
+        if (p == std::string::npos || std::sscanf(l.c_str() + p, "It. %ld - %*d nodes created - worst tet radius %lf",
+                                                  &it, &radius) != 2)
+            return;
+        const double t = now();
+        if (it == 0) {                 // a refinement pass starts (gmsh may run more than one)
+            if (_iterations > 0)
+                std::fprintf(stderr, "[mesh] 3D refinement pass: It. %ld in %.0f s, worst tet radius %g\n",
+                             _iterations, _lastTime - _firstTime, _lastRadius);
+            _firstTime = _windowTime = t; _firstIt = _windowIt = 0;
+        }
+        _iterations = it; _lastTime = t; _lastRadius = radius;
+        if (t - _windowTime >= 60.0) {
+            std::fprintf(stderr, "[mesh] 3D refinement rate: %.0f it/s over the last %.0f s (It. %ld, worst "
+                                 "tet radius %g, %.0f s into refinement)\n",
+                         (it - _windowIt) / (t - _windowTime), t - _windowTime, it, radius, t - _firstTime);
+            _windowTime = t; _windowIt = it;
+        }
+    }
+    void read_loop() {
+        std::string pending;
+        char buf[4096];
+        for (;;) {
+            const ssize_t n = read(_readEnd, buf, sizeof buf);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            pending.append(buf, static_cast<std::size_t>(n));
+            for (std::size_t nl; (nl = pending.find('\n')) != std::string::npos; pending.erase(0, nl + 1))
+                line(pending.substr(0, nl));
+        }
+        if (!pending.empty()) line(pending);
+    }
+
+    double _terminalWas = 0;
+    bool _forward = false;
+    int _savedStdout = -1, _readEnd = -1;
+    std::thread _reader;
+    long _iterations = 0, _firstIt = 0, _windowIt = 0;
+    double _firstTime = 0, _windowTime = 0, _lastTime = 0, _lastRadius = 0;
+};
+
 int generate_robust(int dim, const std::vector<int>& chain) {
     const std::string algo_opt = (dim == 3) ? "Mesh.Algorithm3D" : "Mesh.Algorithm";
     // ISOLATION IS OFF BY DEFAULT -- it CAUSED more crashes than it caught (2026-09-20).
@@ -316,7 +421,12 @@ int generate_robust(int dim, const std::vector<int>& chain) {
             }
             go::setNumber(algo_opt, algo);
             if (i > 0) go::setNumber("Mesh.ToleranceInitialDelaunay", 1e-9);  // escalate on retry
-            gmsh::model::mesh::generate(dim);
+            if (dim == 3) {
+                RefinementRateMonitor rate;
+                gmsh::model::mesh::generate(dim);
+            } else {
+                gmsh::model::mesh::generate(dim);
+            }
             if (element_count(dim) > 0) {
                 std::fprintf(stderr, "[mesh] %dD meshed by algo %d%s\n", dim, algo,
                              i ? " (after an earlier algorithm failed)" : "");
