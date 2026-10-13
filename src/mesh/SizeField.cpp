@@ -361,6 +361,11 @@ private:
             const std::string out = l + "\n";
             (void)!write(_savedStdout, out.data(), out.size());
         }
+        // tetgen prints WHERE a boundary recovery failed (the point, the segment's nodes and curve, the
+        // facet's nodes and surface) straight to stdout; gmsh's own error keeps only the first line. Those
+        // three lines are the whole diagnosis of a self-intersecting surface mesh, so they are kept.
+        if (l.find("PLC Error") != std::string::npos || l.rfind("  Segment:", 0) == 0 || l.rfind("  Facet:", 0) == 0)
+            std::fprintf(stderr, "[mesh] %s\n", l.c_str());
         long it = 0; double radius = 0.0;
         const auto p = l.find("It. ");
         if (p == std::string::npos || std::sscanf(l.c_str() + p, "It. %ld - %*d nodes created - worst tet radius %lf",

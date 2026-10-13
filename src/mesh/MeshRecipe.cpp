@@ -44,6 +44,8 @@ const std::vector<RecipeKnob>& mesh_recipe_knobs() {
         {"mesher", "optimize_netgen", "OMFEM_MESH_NETGEN", "number", "0|1", "0",
          "run the Netgen optimiser before gmsh's own (serial, and it refines: 15_gan +65 % tets, +70-90 s, worst gamma 1e-6 -> 1e-3)"},
         {"mesher", "fragment_tolerance_m", "OMFEM_FRAG_TOL", "number", "m", "0", "OCC fuzzy value for the solid fragment (0 = exact)"},
+        {"mesher", "fragment_parallel", "OMFEM_FRAG_PARALLEL", "number", "0|1", "0",
+         "run the solid fragment on the recipe's threads (21_interleaved_flyback: 1120 s -> 180 s, but 7.6 GB -> 23.5 GB peak)"},
         {"mesher", "port_inset", "OMFEM_PORT_INSET", "number", "x cap radius", "0.5 axis-aligned caps, 1.5 oblique",
          "how far a lead-end port face is pulled inside the air box, in cap radii"},
         // ---- knobs every corpus design plan sets but the table did not name (ABT #1588, 2026-10-03): a mesh made

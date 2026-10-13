@@ -49,6 +49,7 @@
 #include "Definitions.h"                          // resolve_dimensional_values
 #include "processors/Inputs.h"
 #include "support/Utils.h"
+#include <OSD_ThreadPool.hxx>
 #include <TopExp_Explorer.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <GeomAbs_SurfaceType.hxx>
@@ -1653,6 +1654,27 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
             gmsh::option::setNumber("Geometry.OCCBooleanGlue", 1);
             gmsh::option::setNumber("Geometry.OCCBooleanNonDestructive", 1);
         }
+        // The fragment is the longest single step of a big design (21_interleaved_flyback: 1120 s of
+        // 2167; 24: 2995 s of 4786; 06 and single_switch_forward never left it in 90 min), and OCCT runs
+        // it on one thread unless told otherwise.
+        double nThreads = 1.0;
+        gmsh::option::getNumber("General.NumThreads", nThreads);
+        // OPT-IN (mesher.fragment_parallel = 1), because it trades memory for time: on
+        // 21_interleaved_flyback the fragment fell from 1120 s to 178-194 s and the run from 2167 s to
+        // 1446 s, but the peak rose from 7.6 GB to 23.5 GB -- with 6 threads as with 24, so the cost is
+        // the parallel filler's, not the thread count's. The recipe's thread count still caps the pool.
+        bool fragParallel = false;
+        if (const char* v = std::getenv("OMFEM_FRAG_PARALLEL")) {
+            const std::string fp(v);
+            if (fp == "1") fragParallel = true;
+            else if (fp != "0") throw std::runtime_error("mesher.fragment_parallel must be 0 or 1, got '" + fp + "'");
+        }
+        fragParallel = fragParallel && nThreads > 1.0;
+        if (fragParallel) {
+            OSD_ThreadPool::DefaultPool()->SetNbDefaultThreadsToLaunch(static_cast<int>(nThreads));
+            gmsh::option::setNumber("Geometry.OCCParallel", 1);
+        }
+        const double tFrag0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
         const double tolLadder[] = {fragTol0, 1e-9, 1e-7};
         std::string ferrs;
         bool done = false;
@@ -1675,6 +1697,10 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         gmsh::option::setNumber("Geometry.ToleranceBoolean", 0.0);   // never leak into meshing
         gmsh::option::setNumber("Geometry.OCCBooleanGlue", 0);
         gmsh::option::setNumber("Geometry.OCCBooleanNonDestructive", 0);
+        gmsh::option::setNumber("Geometry.OCCParallel", 0);
+        std::fprintf(stderr, "[mesh3d] fragment: %.0f s (%s)\n",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - tFrag0,
+                     fragParallel ? "OCCT parallel" : "one thread");
         if (!done)
             throw std::runtime_error("mesh3d_from_mas: fragment failed at every boolean "
                                      "tolerance [" + ferrs + "]");
@@ -2151,13 +2177,44 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                                 if (gname.rfind("winding", 0) == 0 || gname.rfind("turn_", 0) == 0)
                                     for (int v : gvs) cvols.push_back(v);
                             const size_t nck = std::min<size_t>(cp->h.size(), 256), stride = std::max<size_t>(1, cp->h.size() / nck);
+                            // HOW FAR inside decides it. A corridor point sits gap/2 from two centreline-derived
+                            // surfaces, and the solids differ from those by the centreline's own chord sagitta: in
+                            // a corridor a few microns wide the point can land a micron under the copper skin
+                            // (flyback_transformer_complete: 1.09 um inside the Primary, in an 11 um corridor
+                            // between two of its turns) while its refinement ball, 1.5 h wide, still covers the
+                            // whole gap. It is a disagreement only when the point is deeper than the size h it
+                            // asks for -- then the ball no longer reaches the corridor it was placed for.
+                            size_t skinDeep = 0; double deepest = 0.0;
                             for (size_t i = 0; i < cp->h.size(); i += stride)
-                                for (int v : cvols)
-                                    if (gmsh::model::isInside(3, v, {cp->x[i], cp->y[i], cp->z[i]}) > 0)
+                                for (int v : cvols) {
+                                    if (gmsh::model::isInside(3, v, {cp->x[i], cp->y[i], cp->z[i]}) <= 0) continue;
+                                    const double px = cp->x[i], py = cp->y[i], pz = cp->z[i];
+                                    double depth = std::numeric_limits<double>::max();
+                                    gmsh::vectorpair bd; gmsh::model::getBoundary({{3, v}}, bd, false, false, false);
+                                    for (auto& dt : bd) {
+                                        double a0, b0, c0, a1, b1, c1;
+                                        gmsh::model::getBoundingBox(2, std::abs(dt.second), a0, b0, c0, a1, b1, c1);
+                                        const double dx = std::max({a0 - px, 0.0, px - a1}), dy = std::max({b0 - py, 0.0, py - b1}),
+                                                     dz = std::max({c0 - pz, 0.0, pz - c1});
+                                        if (std::sqrt(dx * dx + dy * dy + dz * dz) >= depth) continue;   // cannot be nearer
+                                        std::vector<double> cpt, par;
+                                        gmsh::model::getClosestPoint(2, std::abs(dt.second), {px, py, pz}, cpt, par);
+                                        depth = std::min(depth, std::sqrt((cpt[0] - px) * (cpt[0] - px) + (cpt[1] - py) * (cpt[1] - py) +
+                                                                          (cpt[2] - pz) * (cpt[2] - pz)));
+                                    }
+                                    if (depth > cp->h[i])
                                         throw std::runtime_error("mesh3d: chord-bound corridor point (" +
-                                            std::to_string(cp->x[i] * 1e3) + ", " + std::to_string(cp->y[i] * 1e3) + ", " +
-                                            std::to_string(cp->z[i] * 1e3) + ") mm lies inside conductor volume " +
-                                            std::to_string(v) + ": the centrelines disagree with the solids");
+                                            std::to_string(px * 1e3) + ", " + std::to_string(py * 1e3) + ", " +
+                                            std::to_string(pz * 1e3) + ") mm lies " + std::to_string(depth * 1e6) +
+                                            " um inside conductor volume " + std::to_string(v) + ", deeper than the " +
+                                            std::to_string(cp->h[i] * 1e6) + " um size it asks for: the centrelines "
+                                            "disagree with the solids");
+                                    ++skinDeep; deepest = std::max(deepest, depth);
+                                }
+                            if (skinDeep)
+                                std::fprintf(stderr, "[mesh3d] chord bound: %zu checked corridor point(s) lie under the copper "
+                                             "skin, at most %.3g um deep (each within the size it asks for)\n",
+                                             skinDeep, deepest * 1e6);
                             const double ct = cond_t;
                             gmsh::model::mesh::setSizeCallback([cp, ct](int, int, double x, double y, double z, double lc) {
                                 return std::min(lc, cp->size_at(x, y, z, ct));
