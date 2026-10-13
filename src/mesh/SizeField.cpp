@@ -509,11 +509,17 @@ void optimize_mesh(int topdim) {
         gmsh::option::setNumber("Mesh.Optimize", 1);
         if (topdim == 3) {
             report_tet_quality("before the optimiser");
-            bool netgen = true;
+            // NETGEN IS OFF BY DEFAULT (2026-10-13). It is serial and it REFINES: 15_gan went from 254k to
+            // 418k tets in 69-90 s, for a worst gamma of ~1e-3 instead of ~1e-6 and no fewer poor tets; on
+            // 21_interleaved_flyback (5.4M tets) it ran over an hour without finishing. OMFEM solved
+            // 15_gan on both meshes: P_total -0.12 %, P_ac -1.6 %, 183 vs 186 FGMRES iterations, no
+            // sliver below the solver's volume floor. One small single-winding inductor is the evidence,
+            // so mesher.optimize_netgen = 1 keeps the pass available.
+            bool netgen = false;
             if (const char* v = std::getenv("OMFEM_MESH_NETGEN")) {
                 const std::string s(v);
-                if (s == "0") netgen = false;
-                else if (s != "1") throw std::invalid_argument("mesher.optimize_netgen must be 0 or 1, got '" + s + "'");
+                if (s == "1") netgen = true;
+                else if (s != "0") throw std::invalid_argument("mesher.optimize_netgen must be 0 or 1, got '" + s + "'");
             }
             if (netgen) {
                 const double t0 = seconds_now();
@@ -522,7 +528,7 @@ void optimize_mesh(int topdim) {
                 std::fprintf(stderr, "[mesh] Netgen optimiser: %.0f s\n", seconds_now() - t0);
                 report_tet_quality("after Netgen");
             } else {
-                std::fprintf(stderr, "[mesh] Netgen optimiser: off (mesher.optimize_netgen = 0)\n");
+                std::fprintf(stderr, "[mesh] Netgen optimiser: off (mesher.optimize_netgen = 1 runs it)\n");
             }
         }
         const double t0 = seconds_now();
