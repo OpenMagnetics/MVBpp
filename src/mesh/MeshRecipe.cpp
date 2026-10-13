@@ -41,6 +41,8 @@ const std::vector<RecipeKnob>& mesh_recipe_knobs() {
          "gmsh threads for surface + HXT volume meshing (ETD34 base: 12 threads 175 s vs 337 s; mesh differs, re-validate before default)"},
         {"mesher", "retries", "OMFEM_MESH_RETRIES", "number", "-", "3", "extra attempts of the algorithm/size ladder after a failed 3D pass"},
         {"mesher", "quality_floor", "OMFEM_MESH_QMIN", "number", "-", "1e-6", "minimum accepted tet quality (gamma) before the mesh is refused"},
+        {"mesher", "optimize_netgen", "OMFEM_MESH_NETGEN", "number", "0|1", "1",
+         "run the Netgen optimiser after gmsh's own (serial; 21_interleaved_flyback: over an hour without finishing)"},
         {"mesher", "fragment_tolerance_m", "OMFEM_FRAG_TOL", "number", "m", "0", "OCC fuzzy value for the solid fragment (0 = exact)"},
         {"mesher", "port_inset", "OMFEM_PORT_INSET", "number", "x cap radius", "0.5 axis-aligned caps, 1.5 oblique",
          "how far a lead-end port face is pulled inside the air box, in cap radii"},

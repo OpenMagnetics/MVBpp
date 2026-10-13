@@ -45,13 +45,28 @@ void SizeFieldBuilder::add_distance_refinement(const std::vector<double>& entiti
     if (dist_max <= 0.0) dist_max = policy_.dist_band * size_min;
     const int df = gf::add("Distance");
     gf::setNumbers(df, dim_ == 2 ? "CurvesList" : "SurfacesList", entities);
-    gf::setNumber(df, "Sampling", static_cast<double>(sampling));
+    // SAMPLING AT AN ABSOLUTE SPACING. gmsh's Distance is the distance to a POINT CLOUD on the entities, and
+    // "Sampling" spaces that cloud relative to each face (bbox diagonal / Sampling), whatever the band it feeds:
+    //  - a long face is under-sampled. 21_interleaved_flyback's welded wire is 27 mm x 0.1 mm strips, sampled every
+    //    ~0.25 mm, against a 0.02-0.04 mm band (fast mode, halo 0.2): between two samples the copper surface itself
+    //    was outside the band and took the 10 mm air size. Triangles that long on a curved wire cut the next turn,
+    //    64 um away -- tetgen's "PLC Error: a segment and a facet intersect", then a winding with zero elements;
+    //  - a small face is over-sampled. 02_flyback's 20,552 copper faces (13,488 under 0.01 mm^2) got ~1e4 points
+    //    each, ~2e8 points and >13 GB of a 16.6 GB mesher peak.
+    // The fork's "SamplingDistance" spaces the cloud at an absolute s on every face (~area/s^2 points). The
+    // distance to such a cloud overestimates the true one by at most s/sqrt(3), so both thresholds move out by
+    // that much: every point within dist_min of the entities is then guaranteed the fine size, at half an element
+    // of spacing, without needing a cloud finer than the elements it sizes.
+    const double spacing = 0.5 * size_min;
+    const double cloud_error = spacing / std::numbers::sqrt3;
+    gf::setNumber(df, "Sampling", static_cast<double>(sampling));   // unused once SamplingDistance is set
+    gf::setNumber(df, "SamplingDistance", spacing);
     const int tf = gf::add("Threshold");
     gf::setNumber(tf, "InField", df);
     gf::setNumber(tf, "SizeMin", size_min);
     gf::setNumber(tf, "SizeMax", air_target_);
-    gf::setNumber(tf, "DistMin", dist_min);
-    gf::setNumber(tf, "DistMax", dist_max);
+    gf::setNumber(tf, "DistMin", dist_min + cloud_error);
+    gf::setNumber(tf, "DistMax", dist_max + cloud_error);
     gf::setNumber(tf, "StopAtDistMax", 1);   // far field defers to the ceiling, not this threshold
     fields_.push_back(tf);
     finest_ = std::min(finest_, size_min);
@@ -461,14 +476,63 @@ void validate_regions_nonempty(int topdim) {
                                  "fragment or mis-classified): " + empty);
 }
 
+namespace {
+// What the optimiser was given and what it returned, in the one number MFEM cares about: gamma
+// (inscribed/circumscribed radius, 1 = regular tet). Printed so an optimiser pass can be judged by
+// what it bought, not assumed.
+void report_tet_quality(const char* when) {
+    std::vector<int> et; std::vector<std::vector<std::size_t>> en, ev;
+    gmsh::model::mesh::getElements(et, en, ev, 3);
+    std::vector<std::size_t> tets;
+    for (std::size_t i = 0; i < et.size(); ++i)
+        if (et[i] == 4) tets.insert(tets.end(), en[i].begin(), en[i].end());
+    if (tets.empty()) return;
+    std::vector<double> q;
+    gmsh::model::mesh::getElementQualities(tets, q, "gamma");
+    double qmin = std::numeric_limits<double>::max();
+    std::size_t below001 = 0, below01 = 0;
+    for (double v : q) {
+        qmin = std::min(qmin, v);
+        if (v < 0.01) ++below001;
+        if (v < 0.1) ++below01;
+    }
+    std::fprintf(stderr, "[mesh] tet quality %s: %zu tets, min gamma %.3g, %zu below 0.01, %zu below 0.1\n",
+                 when, q.size(), qmin, below001, below01);
+}
+double seconds_now() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+
 void optimize_mesh(int topdim) {
     try {
         gmsh::option::setNumber("Mesh.Optimize", 1);
         if (topdim == 3) {
-            gmsh::option::setNumber("Mesh.OptimizeNetgen", 1);
-            gmsh::model::mesh::optimize("Netgen");
+            report_tet_quality("before the optimiser");
+            bool netgen = true;
+            if (const char* v = std::getenv("OMFEM_MESH_NETGEN")) {
+                const std::string s(v);
+                if (s == "0") netgen = false;
+                else if (s != "1") throw std::invalid_argument("mesher.optimize_netgen must be 0 or 1, got '" + s + "'");
+            }
+            if (netgen) {
+                const double t0 = seconds_now();
+                gmsh::option::setNumber("Mesh.OptimizeNetgen", 1);
+                gmsh::model::mesh::optimize("Netgen");
+                std::fprintf(stderr, "[mesh] Netgen optimiser: %.0f s\n", seconds_now() - t0);
+                report_tet_quality("after Netgen");
+            } else {
+                std::fprintf(stderr, "[mesh] Netgen optimiser: off (mesher.optimize_netgen = 0)\n");
+            }
         }
+        const double t0 = seconds_now();
         gmsh::model::mesh::optimize("");
+        if (topdim == 3) {
+            std::fprintf(stderr, "[mesh] gmsh optimiser: %.0f s\n", seconds_now() - t0);
+            report_tet_quality("after the gmsh optimiser");
+        }
+    } catch (const std::invalid_argument&) {
+        throw;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[mesh] optimize warning: %s\n", e.what());
     }

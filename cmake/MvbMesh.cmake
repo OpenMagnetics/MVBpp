@@ -19,8 +19,10 @@ set(MVBPP_MMG_PREFIX "$ENV{HOME}/OpenMagnetics/mmg-5.8.0-install"
 # never rebuilt, so new flags need a new prefix. gmsh-om-4.15.2-install was built before the
 # flags below (METIS on, no -fvisibility=hidden) and meshes differently from the reference;
 # -vis- is the matched build (OMFEM 15_gan at 1 thread: byte-identical to the shared
-# reference gmsh, where the old install was not).
-set(MVBPP_GMSH_PREFIX "$ENV{HOME}/OpenMagnetics/gmsh-om-4.15.2-vis-install"
+# reference gmsh, where the old install was not). -vis-sd- is -vis- plus the Distance field's
+# "SamplingDistance" option (fork commit 9d6c39f51c), which SizeField.cpp requires: with the
+# option left at 0 it meshes exactly as -vis- does.
+set(MVBPP_GMSH_PREFIX "$ENV{HOME}/OpenMagnetics/gmsh-om-4.15.2-vis-sd-install"
     CACHE PATH "gmsh (OpenMagnetics fork) install prefix (shared across build trees; built once)")
 
 # An install that already exists is reused, never rebuilt (same reason as OCCT's).
