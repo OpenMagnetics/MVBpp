@@ -1855,6 +1855,59 @@ TEST_CASE("Real winding: faceted mode revolves tight arcs exactly, and only tigh
     CHECK(minorMax < 1.0e-3);
 }
 
+TEST_CASE("Real winding: a toroid's face chords turn round into their exactly round corners",
+          "[realwinding][tightarc]") {
+    // ABT #1853. A toroid's window corners are revolved exactly round, and the face chord between
+    // them is a radius-varying spiral. Without a round transition the chord's 12-gon met the
+    // corner's circle on one plane and left 12 circular-segment faces per joint, each
+    // r^2 (pi/6 - sin(pi/6)) / 2 = 0.0118 r^2 in area and r (1 - cos(pi/12)) = 3.4% r deep -- the
+    // micron lunes OMFEM's surface mesher fails on (current_transformer: 7,152 of them).
+    auto magneticJson = loadFixture("realwinding_toroid.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                       /*wirePolygonSegments=*/12,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    REQUIRE_FALSE(named.empty());
+    // The wire radius is the round corners' own: their torus minor radius.
+    double r = 0.0;
+    int planar = 0, lunes = 0, tori = 0;
+    for (const auto& ns : named) {
+        if (ns.name.find(" parallel ") == std::string::npos) continue;
+        for (TopExp_Explorer fe(ns.shape, TopAbs_FACE); fe.More(); fe.Next()) {
+            BRepAdaptor_Surface ad(TopoDS::Face(fe.Current()), false);
+            if (ad.GetType() != GeomAbs_Torus) continue;
+            ++tori;
+            r = std::max(r, ad.Torus().MinorRadius());
+        }
+    }
+    REQUIRE(tori > 0);   // the round corners exist, so there are joints to test
+    for (const auto& ns : named) {
+        if (ns.name.find(" parallel ") == std::string::npos) continue;
+        for (TopExp_Explorer fe(ns.shape, TopAbs_FACE); fe.More(); fe.Next()) {
+            BRepAdaptor_Surface ad(TopoDS::Face(fe.Current()), false);
+            if (ad.GetType() != GeomAbs_Plane) continue;
+            ++planar;
+            GProp_GProps g;
+            BRepGProp::SurfaceProperties(fe.Current(), g);
+            if (g.Mass() >= 0.05 * r * r) continue;
+            // A lune is bounded by an arc of the circle. The staggered continuation's flat rim
+            // wedges between two collinear prisms (straight-edged triangles, by design -- see
+            // mitredFacetPrism) are not lunes.
+            bool arc = false;
+            for (TopExp_Explorer ee(fe.Current(), TopAbs_EDGE); ee.More() && !arc; ee.Next())
+                arc = BRepAdaptor_Curve(TopoDS::Edge(ee.Current())).GetType() != GeomAbs_Line;
+            if (arc) ++lunes;
+        }
+    }
+    INFO("wire radius " << r * 1e6 << " um: " << tori << " torus faces, " << planar
+                        << " planar faces, " << lunes << " arc-bounded under 0.05 r^2");
+    CHECK(lunes == 0);
+}
+
 // ---------------------------------------------------------------------------------------
 // TOROID TERMINALS DROP TO ONE PLANE (Alf, 2026-09-12; ABT #1159, superseding the #1155 x/z tip
 // pinning). ABT #1248 moved these checks to the EXPORTED frame (buildRealWindingPaths now returns

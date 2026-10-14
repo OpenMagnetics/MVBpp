@@ -2824,7 +2824,7 @@ static TopoDS_Shape localMitreTrim(const TopoDS_Shape& solid, const gp_Pnt& P, c
 //
 // That is not assumed here, it is MEASURED on the solids as built. capDiscAt reads the planar
 // boundary faces a solid actually presents in the junction plane and requires them to add up to
-// the whole nominal disc: same plane to 0.1 nm, total area pi*r^2 to 1e-6 relative, area-
+// the whole nominal disc: same plane to 0.1 nm, total area pi*r^2 to a rim of Precision::Confusion(), area-
 // weighted centroid on the junction point to 1e-6 r. An exact revolve or prism passes; a sweep
 // whose cap landed where MakePipeShell transported it does not (the [pipe-cap] probe has
 // measured 0.13 r off nominal), and keeps its booleans. So the exemption follows the geometry,
@@ -2867,8 +2867,15 @@ static bool capDiscAt(const TopoDS_Shape& s, const gp_Pnt& j, const gp_Dir& n, d
     if (areaOut) *areaOut = area;
     if (planeOffOut) *planeOffOut = nf ? worstOff : -1.0;
     if (nf == 0) return false;
+    // Not the whole section? The test must tell a disc from the faceted n-gon (12-gon: 4.5% of
+    // the disc short), and must not refuse a disc whose rim is a B-spline: a round transition is
+    // a two-section MakePipeShell, so its round end is the swept surface's approximation of the
+    // circle, 4e-6 of the area short on 05_pfc (a 0.8 nm rim) -- under the old 1e-6 every one of
+    // those joints fell back to the two-frame Common (ABT #1853: 176 joints, +114 s on 05). The
+    // bound is a rim within the model's own length resolution of the circle; the lens bound
+    // above rests on the plane test, which is unchanged.
     const double want = kPi * r * r;
-    if (std::abs(area - want) > 1e-6 * want) return false;   // not the whole section
+    if (std::abs(area - want) > 2.0 * kPi * r * Precision::Confusion()) return false;
     return gp_Pnt(moment / area).Distance(j) <= 1e-6 * r;    // and centred on the junction
 }
 
@@ -3483,13 +3490,13 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         // switches turn both off together).
         auto transitionable = [&](const Primitive& p) {
             if (handoffDisabled() || !phaseContinuationEnabled()) return false;
-            // A SPIRAL only when it is a true HELIX (constant radius, linear height): the split
-            // below measures its arc length as a helix's and sweeps it between two profiles,
-            // which a radius-varying face spiral (a toroid's top chord) does not survive.
+            // A SPIRAL whose radius and height are both LINEAR in azimuth: a helix, or a toroid's
+            // face chord (constant height, radius linear -- ABT #1853: its tight inner corner and
+            // round chord bend left a circle/12-gon step at both ends of every chord). The split
+            // below is then exact, and its arc length per radian is measured with dr/daz too.
             return p.kind == Primitive::SEG ||
                    (p.kind == Primitive::SPIRAL && !p.spiral.blend && !p.spiral.levelOut &&
-                    !(p.spiral.easeIn > 0.0) &&
-                    std::abs(p.spiral.r1 - p.spiral.r0) < 1e-12);
+                    !(p.spiral.easeIn > 0.0));
         };
         const bool hereRound = exactRound(*ptrs[i]);
         const bool roundNbrS = i > 0 && !hereRound && exactRound(*ptrs[i - 1]);
@@ -3589,9 +3596,9 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         bool staggerHereForAudit = false;
         std::vector<Primitive> pieces = revolutionHalves(*ptrs[i]);
         // A SPIRAL with a round neighbour sheds one facet chord at that end as its own
-        // transition piece (swept round -> polygon). Radius and height are linear in azimuth on
-        // a plain helix (transitionable() above), so the split is exact, and the arc length per
-        // radian is exactly sqrt(R^2 + (dy/daz)^2).
+        // transition piece (swept round -> polygon). Radius and height are linear in azimuth
+        // (transitionable() above), so the split is exact, and the arc length per radian at that
+        // end is sqrt(R^2 + (dr/daz)^2 + (dy/daz)^2).
         bool pieceRoundStart = false, pieceRoundEnd = false;
         if (ptrs[i]->kind == Primitive::SPIRAL && (roundStartHere || roundEndHere)) {
             const double chord = 2.0 * wireRadius * std::sin(kPi / double(segments));
@@ -3600,7 +3607,8 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
                 const double sweep = sp.az1 - sp.az0;
                 const double R = fromStart ? sp.r0 : sp.r1;
                 const double dyDaz = (sp.y1 - sp.y0) / sweep;
-                const double dAz = chord / std::sqrt(R * R + dyDaz * dyDaz);
+                const double drDaz = (sp.r1 - sp.r0) / sweep;
+                const double dAz = chord / std::sqrt(R * R + drDaz * drDaz + dyDaz * dyDaz);
                 if (!(dAz < std::abs(sweep)))
                     throw std::runtime_error("'" + pr.label + "': spiral shorter than its round "
                                              "transition (" + std::to_string(chord * 1e6) +
