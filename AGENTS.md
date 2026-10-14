@@ -129,6 +129,7 @@ cd bindings/wasm && npm run build   # requires emsdk: source ~/emsdk/emsdk_env.s
 node tests/test_mvbpp.js            # 27 tests, all pass
 ```
 The embind surface is the `draw*` family: `drawMagnetic`, `drawCore`, `drawCorePiece`, `drawBobbin`, `drawTurns`, `drawWinding`, `drawSpacer`, `drawBoard`, `drawView`, plus `*ToPath` variants and the test helper `_enrichMagnetic`. All take the trailing 9-arg config pack `(mode, plane, offset, format, scale, polygonSegments, symmetry, side)` documented in `bindings/wasm/mvbpp_wasm.cpp`.
+Module-level switches (no arity change): `mvbppSetSkipChecks(bool)`, and `mvbppSetWeldMode("off"|"auto"|"all")` / `mvbppGetWeldMode()` -- how real-winding conductors are welded (`mvb::WeldMode`; C++: `DrawConfig::weld` or `MagneticBuilder::setWeldMode`).
 
 ## Test data
 

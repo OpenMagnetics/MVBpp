@@ -1855,6 +1855,48 @@ TEST_CASE("Real winding: faceted mode revolves tight arcs exactly, and only tigh
     CHECK(minorMax < 1.0e-3);
 }
 
+TEST_CASE("Real winding: the weld mode decides whether a conductor ships as one body or as its pieces",
+          "[realwinding][weld]") {
+    CHECK(mvb::parseWeldMode("off") == mvb::WeldMode::Off);
+    CHECK(mvb::parseWeldMode("auto") == mvb::WeldMode::Auto);
+    CHECK(mvb::parseWeldMode("all") == mvb::WeldMode::All);
+    CHECK_THROWS_AS(mvb::parseWeldMode("On"), std::invalid_argument);
+    CHECK(std::string(mvb::weldModeName(mvb::WeldMode::All)) == "all");
+
+    auto magneticJson = loadFixture("realwinding_toroid.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    auto conductorSolids = [&](std::optional<mvb::WeldMode> mode) {
+        mvb::MagneticBuilder builder;
+        if (mode) builder.setWeldMode(*mode);
+        auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                           /*wirePolygonSegments=*/12,
+                                           mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                           /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                           /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                           /*useRealWindingGeometry=*/true, /*femReady=*/true);
+        int solids = 0, conductors = 0;
+        for (const auto& ns : named) {
+            if (ns.name.find(" parallel ") == std::string::npos ||
+                ns.name.find(" terminal ") != std::string::npos)
+                continue;
+            ++conductors;
+            for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next()) ++solids;
+        }
+        REQUIRE(conductors > 0);
+        return std::pair<int, int>(conductors, solids);
+    };
+    const auto off = conductorSolids(mvb::WeldMode::Off);
+    const auto autoMode = conductorSolids(mvb::WeldMode::Auto);
+    const auto all = conductorSolids(mvb::WeldMode::All);
+    INFO("conductors " << autoMode.first << ": solids off " << off.second << ", auto "
+                       << autoMode.second << ", all " << all.second);
+    // Auto and All close every conductor into one body; Off ships the abutting pieces.
+    CHECK(autoMode.second == autoMode.first);
+    CHECK(all.second == all.first);
+    CHECK(off.first == autoMode.first);
+    CHECK(off.second > 10 * off.first);
+}
+
 TEST_CASE("Real winding: a toroid's face chords turn round into their exactly round corners",
           "[realwinding][tightarc]") {
     // ABT #1853. A toroid's window corners are revolved exactly round, and the face chord between

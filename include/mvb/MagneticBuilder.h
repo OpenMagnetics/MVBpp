@@ -1,5 +1,6 @@
 #pragma once
 #include <limits>
+#include <optional>
 
 #include "MAS.hpp"
 #include "Utils.h"
@@ -40,6 +41,9 @@ struct DrawConfig {
     // Minimum radius for ANY drawn corner/fillet, metres; 0 = each site's policy radius.
     // Floors, never tightens (see ConductorBuilder::Options::minBendRadius).
     double      minBendRadius          = 0.0;
+    // Real-winding only: how each conductor's pieces are welded (WeldMode, WireAssembler.h).
+    // Unset = the builder's own mode (MagneticBuilder::setWeldMode), else the environment's.
+    std::optional<WeldMode> weld;
 };
 
 class MagneticBuilder {
@@ -334,7 +338,15 @@ public:
                                const OpenMagnetics::Magnetic& magnetic,
                                const AccessoryOptions& opts) const;
 
+    // How every real-winding conductor this builder draws is welded (WeldMode, WireAssembler.h):
+    // Off ships each conductor as its abutting pieces, Auto welds where a junction overlaps and
+    // closes the conductor into one body, All welds every junction. Unset (the default) leaves
+    // ConductorBuilder::Options' own default, which follows MVB_WELD_ALL.
+    void setWeldMode(WeldMode mode) { weldMode_ = mode; }
+    std::optional<WeldMode> weldMode() const { return weldMode_; }
+
   private:
+    std::optional<WeldMode> weldMode_;
     // Shared by buildRealWindingConductorsNamed and measureTerminalLeadLengths.
     ConductorBuilder::Options realWindingConductorOptions(
         const OpenMagnetics::Magnetic& magnetic, const std::vector<NamedShape>& coreShapes,

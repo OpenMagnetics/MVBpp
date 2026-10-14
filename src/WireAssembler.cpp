@@ -2936,10 +2936,30 @@ size_t requireManifoldCopper(const TopoDS_Shape& shape, const std::string& condu
     return checked;
 }
 
+WeldMode weldModeFromEnv() {
+    return std::getenv("MVB_WELD_ALL") != nullptr ? WeldMode::All : WeldMode::Auto;
+}
+
+WeldMode parseWeldMode(const std::string& name) {
+    if (name == "off") return WeldMode::Off;
+    if (name == "auto") return WeldMode::Auto;
+    if (name == "all") return WeldMode::All;
+    throw std::invalid_argument("weld mode must be \"off\", \"auto\" or \"all\", got \"" + name + "\"");
+}
+
+const char* weldModeName(WeldMode mode) {
+    switch (mode) {
+        case WeldMode::Off: return "off";
+        case WeldMode::Auto: return "auto";
+        case WeldMode::All: return "all";
+    }
+    throw std::invalid_argument("weldModeName: not a WeldMode");
+}
+
 static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
                                      double wireRadius, int segments, CornerStyle corners,
                                      std::vector<size_t>* primIndexPerSolid, bool skipWeld,
-                                     const std::string& conductorName);
+                                     const std::string& conductorName, WeldMode weld);
 
 // FOLD A SUB-FACET CLIMB EASING INTO ITS LEVEL RUN (ABT #1528). The easing ConductorBuilder
 // puts between a helix and its level run (ABT #1403) is as long as MKF's bend radius makes it:
@@ -2953,10 +2973,10 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wireRadius,
                           int segments, CornerStyle corners,
                           std::vector<size_t>* primIndexPerSolid, bool skipWeld,
-                          const std::string& conductorName) {
+                          const std::string& conductorName, WeldMode weld) {
     if (segments <= 0)
         return assembleWireImpl(ptrs, wireRadius, segments, corners, primIndexPerSolid,
-                                skipWeld, conductorName);
+                                skipWeld, conductorName, weld);
     const double chord = 2.0 * wireRadius * std::sin(kPi / segments);
     std::deque<Primitive> folded;
     std::vector<const Primitive*> use;
@@ -3058,7 +3078,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     }
     const size_t base = primIndexPerSolid ? primIndexPerSolid->size() : 0;
     TopoDS_Shape out = assembleWireImpl(use, wireRadius, segments, corners, primIndexPerSolid,
-                                        skipWeld, conductorName);
+                                        skipWeld, conductorName, weld);
     if (primIndexPerSolid)
         for (size_t j = base; j < primIndexPerSolid->size(); ++j) {
             size_t& v = (*primIndexPerSolid)[j];
@@ -3069,8 +3089,11 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
 
 static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
                                      double wireRadius, int segments, CornerStyle corners,
-                                     std::vector<size_t>* primIndexPerSolid, bool skipWeld,
-                                     const std::string& conductorName) {
+                                     std::vector<size_t>* primIndexPerSolid, bool skipWeldIn,
+                                     const std::string& conductorName, WeldMode weld) {
+    // A cutting tool never welds (ABT #1265), and WeldMode::Off ships the abutting pieces as they
+    // are; both take the same unwelded path, manifold gate included.
+    const bool skipWeld = skipWeldIn || weld == WeldMode::Off;
     // WHEN IS A JUNCTION A CORNER? ABT #685 (Alf, 2026-08-18). Not "below 3 degrees", which was
     // another chosen number. A junction that is NOT mitred is BRIDGED: the earlier piece grows
     // flush past the joint until it fills the wedge the direction change opens on the outer side
@@ -4419,7 +4442,7 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         // tangent junction's two pieces abut on bit-identical 16-gon faces, and gmsh's
         // fragment+recovery handles ONE welded body better than a glued pair there. The A/B
         // knob exists so speed vs meshability is a measurement, not an argument.
-        const bool weldAll = std::getenv("MVB_WELD_ALL") != nullptr;
+        const bool weldAll = weld == WeldMode::All;
         // Mitre corners (bentS) weld ONLY when this piece was built on its predecessor's EXACT
         // cap polygon (startCapAdopted). Welding every mitre was tried on 2026-08-28 and made
         // the geometry worse -- 4 non-manifold solids, 0/24 meshed -- but that was before the

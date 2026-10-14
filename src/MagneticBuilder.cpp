@@ -286,6 +286,13 @@ std::string MagneticBuilder::drawMagnetic(const MAS::Magnetic& magnetic,
 std::string MagneticBuilder::drawMagnetic(const MAS::Magnetic& magnetic,
                                            const std::string& outputPath,
                                            const DrawConfig& cfg) const {
+    if (cfg.weld) {   // a per-call weld mode: draw with a builder that carries it
+        MagneticBuilder withWeld = *this;
+        withWeld.setWeldMode(*cfg.weld);
+        DrawConfig rest = cfg;
+        rest.weld.reset();
+        return withWeld.drawMagnetic(magnetic, outputPath, rest);
+    }
     auto named = buildAllNamed(magnetic, cfg.includeBobbin, cfg.symmetryPlanes,
                                cfg.wirePolygonSegments, cfg.corePolygonSegments,
                                cfg.paintCoating, /*emitCoatingShells=*/false,
@@ -311,6 +318,13 @@ std::string MagneticBuilder::drawMagnetic(const OpenMagnetics::Magnetic& magneti
 std::string MagneticBuilder::drawMagnetic(const OpenMagnetics::Magnetic& magnetic,
                                            const std::string& outputPath,
                                            const DrawConfig& cfg) const {
+    if (cfg.weld) {   // a per-call weld mode: draw with a builder that carries it
+        MagneticBuilder withWeld = *this;
+        withWeld.setWeldMode(*cfg.weld);
+        DrawConfig rest = cfg;
+        rest.weld.reset();
+        return withWeld.drawMagnetic(magnetic, outputPath, rest);
+    }
     auto named = buildAllNamed(magnetic, cfg.includeBobbin, cfg.symmetryPlanes,
                                cfg.wirePolygonSegments, cfg.corePolygonSegments,
                                cfg.paintCoating, /*emitCoatingShells=*/false,
@@ -1419,6 +1433,7 @@ ConductorBuilder::Options MagneticBuilder::realWindingConductorOptions(
     }
     copts.wirePolygonSegments = wirePolygonSegments;
     copts.femReady = femReady;   // OM drawing -> fast compound; FEM export -> one-piece/conformal
+    if (weldMode_) copts.weld = *weldMode_;
     // Hand the CORE solids to the conductor builder so it can aim the terminal leads at
     // the true window opening (classified from the real geometry -- column metadata
     // under-describes cores like PQ whose plates wrap most of the perimeter; measured on

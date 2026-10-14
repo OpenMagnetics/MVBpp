@@ -203,6 +203,24 @@ struct Primitive {
     bool terminalFillet = false;
 };
 
+// HOW A REAL-WINDING CONDUCTOR'S PIECES ARE WELDED. The conformal assembly is one solid per
+// centreline piece, abutting exactly; welding fuses them into the body that is shipped.
+//   Off  -- no weld at all: every conductor ships as its abutting pieces (no junction fuse, no
+//           closing one-body fuse). Fastest; a viewer is happy with it, a mesher is not.
+//   Auto -- weld a junction only where its bridge actually overlaps (the junction angle opens a
+//           wedge), then close the conductor into one body. The default.
+//   All  -- weld EVERY bridged junction, tangent ones included (meshability over build speed:
+//           01_etd34 at segments 16 builds in 665 s instead of 29 s, but meshes 32/32).
+// A rectangular-wire conductor built per primitive and fused is that construction, not a weld,
+// and is the same in every mode.
+enum class WeldMode { Off, Auto, All };
+// The build default when nothing asks for a mode: All when the environment sets MVB_WELD_ALL
+// (the step tools and the mesh recipe's geometry.weld_all), else Auto.
+WeldMode weldModeFromEnv();
+// "off" | "auto" | "all"; anything else throws std::invalid_argument naming it.
+WeldMode parseWeldMode(const std::string& name);
+const char* weldModeName(WeldMode mode);
+
 // THE TWO APPROVED CORNER CONSTRUCTIONS (Alf, ABT #685: "any corner can be made in two
 // ways: round corner, or bisection mitre"). Nothing else may join two centreline pieces.
 enum class CornerStyle {
@@ -245,7 +263,8 @@ TopoDS_Shape loftRuledPrism(const std::vector<gp_Pnt>& start, const std::vector<
 TopoDS_Shape assembleWire(const std::vector<const Primitive*>& centreline, double wireRadius,
                           int polygonSegments, CornerStyle corners = CornerStyle::BisectionMitre,
                           std::vector<size_t>* primIndexPerSolid = nullptr,
-                          bool skipWeld = false, const std::string& conductorName = {});
+                          bool skipWeld = false, const std::string& conductorName = {},
+                          WeldMode weld = weldModeFromEnv());
 
 // THE JUNCTION VERDICT (ABT #685 / #1403), the one rule assembleWire applies at every junction
 // between consecutive centreline pieces, exposed so a test can read it off a path without

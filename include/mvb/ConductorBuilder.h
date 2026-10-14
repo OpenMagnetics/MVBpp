@@ -172,6 +172,10 @@ public:
         // fusing the bodies does not move or remove them.
         // FEM product only; a viewer gains nothing from it and a cutting tool even less.
         bool oneBodyPerConductor = true;
+        // How each real-winding conductor's pieces are welded (see WeldMode in WireAssembler.h).
+        // Off also skips the closing one-body fuse above. Default: the environment's
+        // (MVB_WELD_ALL -> All, else Auto), so the step tools and the mesh recipe keep working.
+        WeldMode weld = weldModeFromEnv();
         double effectiveBend(double policyBend) const {
             return policyBend < minBendRadius ? minBendRadius : policyBend;
         }

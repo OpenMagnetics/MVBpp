@@ -32,6 +32,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <vector>
 
 using namespace emscripten;
@@ -471,6 +472,11 @@ std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int polyg
 // is no faster is worth nothing. The switch stays because it is what priced them, and
 // mvbppSetSkipChecks(true) prices them again on any design; timing comes from mvbppLastTimingMs().
 bool g_skipGeometryChecks = false;
+// mvbppSetWeldMode("off" | "auto" | "all"): how every real-winding conductor drawn from now on
+// is welded (mvb::WeldMode). A module-level switch like mvbppSetSkipChecks, not another trailing
+// argument: embind enforces exact arity, so a new argument would break every existing caller of
+// drawMagnetic/drawTurns. Unset = the library default ("auto"; the browser has no MVB_WELD_ALL).
+std::optional<mvb::WeldMode> g_weldMode;
 bool g_reportTiming = false;
 double g_lastEnrichMs = 0.0, g_lastBuildMs = 0.0, g_lastCoreMs = 0.0;
 
@@ -483,6 +489,7 @@ std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygo
                                          bool femReady = false) {
     auto j = json::parse(json_str);
     mvb::MagneticBuilder b;
+    if (g_weldMode) b.setWeldMode(*g_weldMode);
     if (useRealWindingGeometry) {
         // Real winding needs MKF to (re-)wind, which needs the whole magnetic — a bare
         // turnsDescription array carries no wire, bobbin or core to route against. Say so
@@ -590,6 +597,7 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
             "drawMagnetic: the JSON has no 'core'/'coil'. Pass a magnetic object "
             "({core, coil, ...}) or a full MAS file that contains one under 'magnetic'.");
     mvb::MagneticBuilder b;
+    if (g_weldMode) b.setWeldMode(*g_weldMode);
     // useRealWindingGeometry: replace the per-turn closed loops with ONE continuous copper body per
     // (winding, parallel). MKF must (re)wind, so re-enrich through the real-winding autocomplete.
     // Drawing (femReady false): the conductor cross-section stays an exact circle; polygonSegments
@@ -805,6 +813,8 @@ std::string _drawBobbinToPath(const std::string& json_str,
 // drawTurns
 // Measurement/inspection handles for the viewer (see g_skipGeometryChecks above).
 void _setSkipChecks(bool on) { g_skipGeometryChecks = on; }
+void _setWeldMode(const std::string& mode) { g_weldMode = mvb::parseWeldMode(mode); }   // throws on a bad name
+std::string _getWeldMode() { return mvb::weldModeName(g_weldMode.value_or(mvb::WeldMode::Auto)); }
 void _setReportTiming(bool on) { g_reportTiming = on; }
 std::string _lastTimingMs() {
     char buf[128];
@@ -1109,6 +1119,8 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
     function("drawBobbin",          &guard<&_drawBobbin>::call);
     function("drawBobbinToPath",    &guard<&_drawBobbinToPath>::call);
     function("mvbppSetSkipChecks",  &_setSkipChecks);
+    function("mvbppSetWeldMode",    &guard<&_setWeldMode>::call);
+    function("mvbppGetWeldMode",    &_getWeldMode);
     function("mvbppSetReportTiming", &_setReportTiming);
     function("mvbppLastTimingMs",   &_lastTimingMs);
     function("drawTurns",           &guard<&_drawTurns>::call);
