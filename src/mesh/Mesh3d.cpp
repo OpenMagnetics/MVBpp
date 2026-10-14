@@ -1320,7 +1320,9 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
             for (auto& kv : byreg) {
                 const std::string& reg = kv.first.first;
                 auto& tags = kv.second;
-                if (tags.size()==1) { double m; gmsh::model::occ::getMass(3,tags[0],m); fused.push_back({tags[0],reg,m,0}); continue; }
+                // kv.first.second is the conductor's own label on a gate-certified build (empty otherwise):
+                // it stays on a conductor that is ONE solid, which is what the fragment's grouping asks.
+                if (tags.size()==1) { double m; gmsh::model::occ::getMass(3,tags[0],m); fused.push_back({tags[0],reg,m,0,kv.first.second}); continue; }
                 std::vector<Imp> got; bool ok=false;
                 // ITERATIVE pairwise fusion, biggest piece first, each step COVERAGE-GUARDED.
                 // One N-way BRepAlgo fuse can silently DROP an input (measured on ETD34: the
@@ -1393,7 +1395,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                             catch (...) {}
                         }
                     gmsh::model::occ::synchronize();
-                    { double m; gmsh::model::occ::getMass(3,acc,m); got.push_back({acc,reg,m,0}); }
+                    { double m; gmsh::model::occ::getMass(3,acc,m); got.push_back({acc,reg,m,0,loose.empty() ? kv.first.second : std::string()}); }
                     for (int t : loose) { double m; gmsh::model::occ::getMass(3,t,m); got.push_back({t,reg,m,0}); }
                     ok = true;
                 } catch (...) { ok=false; got.clear(); }
@@ -1634,10 +1636,31 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
             }
         }
     }
+    // DISJOINT CONDUCTORS GO IN AS ONE ARGUMENT. OpenCASCADE's fragment tests every argument against
+    // every other, and that is where a multi-winding design's time goes: on 21_interleaved_flyback each
+    // conductor alone fragments against the box in under 3 s, two take 20-28 s, three 51 s, and all of
+    // them ~1100 s -- interleaved turns have overlapping bounding boxes, so every face is tried against
+    // every face of the neighbouring winding. Conductors the enamel gate has CERTIFIED disjoint cannot
+    // intersect, so they are handed over as one compound (the fork's Geometry.OCCBooleanDisjointTools):
+    // still cut against the box and the core, never against each other. Only a conductor that is ONE
+    // solid qualifies -- two solids of one conductor abut on a cap and must share that face -- and the
+    // result is verified below. imps is reordered, not just the tool list: outMap[i+1] is imps[i].
+    int nDisjoint = 0;
+    std::vector<int> disjointTags;
+    if (gateCertified) {
+        std::map<std::string, int> perLabel;
+        auto conductor = [](const Imp& im) { return im.region.rfind("winding", 0) == 0 || im.region.rfind("turn_", 0) == 0; };
+        for (const auto& im : imps) if (conductor(im) && !im.label.empty()) ++perLabel[im.label];
+        auto grouped = [&](const Imp& im) { return conductor(im) && !im.label.empty() && perLabel.at(im.label) == 1; };
+        std::stable_partition(imps.begin(), imps.end(), [&](const Imp& im) { return !grouped(im); });
+        for (const auto& im : imps) if (grouped(im)) disjointTags.push_back(im.tag);
+        nDisjoint = disjointTags.size() >= 2 ? static_cast<int>(disjointTags.size()) : 0;
+    }
     std::vector<gmsh::vectorpair> outMap;
     {
         gmsh::vectorpair obj{{3, box_tag}}, tools;
         for (auto& im : imps) tools.push_back({3, im.tag});
+        gmsh::option::setNumber("Geometry.OCCBooleanDisjointTools", nDisjoint);
         gmsh::vectorpair outdt; std::vector<gmsh::vectorpair> outMap0;
         // OMFEM_FRAG_TOL starts the ladder at a given fuzzy value: a butt-joined conductor
         // CHAIN can fragment "successfully" at exact tolerance yet leave a face with a broken
@@ -1698,15 +1721,56 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         gmsh::option::setNumber("Geometry.OCCBooleanGlue", 0);
         gmsh::option::setNumber("Geometry.OCCBooleanNonDestructive", 0);
         gmsh::option::setNumber("Geometry.OCCParallel", 0);
-        std::fprintf(stderr, "[mesh3d] fragment: %.0f s (%s)\n",
+        gmsh::option::setNumber("Geometry.OCCBooleanDisjointTools", 0);
+        std::fprintf(stderr, "[mesh3d] fragment: %.0f s (%s; %d certified-disjoint conductor(s) as one argument)\n",
                      std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - tFrag0,
-                     fragParallel ? "OCCT parallel" : "one thread");
+                     fragParallel ? "OCCT parallel" : "one thread", nDisjoint);
         if (!done)
             throw std::runtime_error("mesh3d_from_mas: fragment failed at every boolean "
                                      "tolerance [" + ferrs + "]");
         outMap = outMap0;
     }
     gmsh::model::occ::synchronize();
+    // THE GROUPING IS VERIFIED, NOT TRUSTED. Had two grouped conductors touched after all, the fragment
+    // would have left their contact as two coincident faces that share nothing, and the mesh would be
+    // silently disconnected there. In a conformal result every face of a conductor bounds exactly two
+    // volumes -- the conductor and the air (or the core) -- except where a lead ends on the air box.
+    if (nDisjoint > 0) {
+        const size_t first = imps.size() - static_cast<size_t>(nDisjoint);
+        for (size_t i = first; i < imps.size(); ++i)
+            for (auto& dt : outMap[i + 1]) {
+                if (dt.first != 3) continue;
+                gmsh::vectorpair bd; gmsh::model::getBoundary({{3, dt.second}}, bd, false, false, false);
+                for (auto& f : bd) {
+                    std::vector<int> up, down;
+                    gmsh::model::getAdjacencies(2, std::abs(f.second), up, down);
+                    if (up.size() >= 2) continue;
+                    double a0, b0, c0, a1, b1, c1;
+                    gmsh::model::getBoundingBox(2, std::abs(f.second), a0, b0, c0, a1, b1, c1);
+                    // "on the box" as the port code above judges it: the boolean leaves a cut face a
+                    // few microns off the nominal plane (ETD34: 5 um), so the tolerance is a quarter
+                    // of the smallest lead cap's radius, far below any other face's distance from it.
+                    double tolB = 1e-6 * std::max({bx1 - bx0, by1 - by0, bz1 - bz0});
+                    if (!termFaces.empty()) {
+                        double rmin = std::numeric_limits<double>::max();
+                        for (const auto& tf : termFaces) rmin = std::min(rmin, tf.rad);
+                        tolB = 0.25 * rmin;
+                    }
+                    const bool onBox = (std::fabs(a0 - bx0) < tolB && std::fabs(a1 - bx0) < tolB) || (std::fabs(a0 - bx1) < tolB && std::fabs(a1 - bx1) < tolB) ||
+                                       (std::fabs(b0 - by0) < tolB && std::fabs(b1 - by0) < tolB) || (std::fabs(b0 - by1) < tolB && std::fabs(b1 - by1) < tolB) ||
+                                       (std::fabs(c0 - bz0) < tolB && std::fabs(c1 - bz0) < tolB) || (std::fabs(c0 - bz1) < tolB && std::fabs(c1 - bz1) < tolB);
+                    if (onBox) continue;
+                    // a lead stub beyond the port plane is outside the box and is trimmed below
+                    double mx, my, mz; gmsh::model::occ::getCenterOfMass(3, dt.second, mx, my, mz);
+                    if (mx < bx0 - tolB || mx > bx1 + tolB || my < by0 - tolB || my > by1 + tolB || mz < bz0 - tolB || mz > bz1 + tolB) continue;
+                    throw std::runtime_error("mesh3d_from_mas: conductor '" + imps[i].label + "' (" + imps[i].region +
+                        ") was fragmented as certified-disjoint, but its face " + std::to_string(std::abs(f.second)) +
+                        " at (" + std::to_string(0.5e3 * (a0 + a1)) + ", " + std::to_string(0.5e3 * (b0 + b1)) + ", " +
+                        std::to_string(0.5e3 * (c0 + c1)) + ") mm bounds no other volume: it touches another "
+                        "grouped conductor, which the enamel gate certified it does not");
+                }
+            }
+    }
 
     // TRIM TO THE BOX (2026-09-08). The fragment keeps every piece, including the part of a lead
     // that now lies OUTSIDE the air box after the port snap. Leaving it there means the conduction
