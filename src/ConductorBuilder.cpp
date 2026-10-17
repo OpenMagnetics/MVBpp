@@ -110,6 +110,25 @@
 
 namespace mvb {
 
+// MVB_LEAD_NO_VALIDATE: diagnostic export mode (see emitToroLead). A rect-wire lead MKF routes
+// through an L (its waypoints are more than the straight pair) has no tangent corner; in the
+// diagnostic mode it is drawn as MKF's route instead, so the rest of the build can be looked at.
+static bool diagnosticLRouteAsDrawn(size_t waypointCount, const std::string& lead) {
+    if (waypointCount == 2 || !std::getenv("MVB_LEAD_NO_VALIDATE")) return false;
+    std::cerr << "[ConductorBuilder] MVB_LEAD_NO_VALIDATE set: " << lead
+              << " is an L-route on a rect wire, which has no tangent corner; drawn as MKF's route\n";
+    return true;
+}
+
+bool leadRectIsAxial(double width, double height, const LeadRectReading& reading) {
+    if (reading.foilRadial > 0.0) return width <= 1.5 * reading.foilRadial;
+    // A stub carries the section plus a bend allowance; a run carries it along the column
+    // for more than one wire thickness (realwinding_rect_wire_rect: a 5.1 x 1.1 mm wire's
+    // 5.1 x 1.26 mm stub is 0.16 mm proud, a PQ 35/40 strip secondary's run 3.3 mm).
+    const double axialBeyondWire = height - reading.wireHeight;
+    return axialBeyondWire > width - reading.wireWidth && axialBeyondWire > reading.wireHeight;
+}
+
 namespace {
 
 // OPT-IN tight sweep tolerance (metres) for the single-body MakePipeShell sweep, via
@@ -4004,16 +4023,23 @@ struct PlanePt {
 // so the axial one is the rect whose WIDTH is the foil's thickness, and that is what
 // `foilRadial` (the sheet's radial thickness, 0 for any other wire) selects on. Data-driven from
 // MKF's own drawing; nothing about the route is invented (ABT #970).
-bool rectIsVertical(const RSpace& s, double foilRadial = 0.0) {
-    if (foilRadial > 0.0) return s.dimensions.at(0) <= 1.5 * foilRadial;
-    return s.dimensions.at(1) > s.dimensions.at(0);
+//
+// A RECTANGULAR wire breaks the aspect rule the other way (a PQ 35/40 transformer, an 8-turn 5.645 x 0.4725 mm
+// strip): its radial run is one wire HEIGHT thick (10.9 x 0.473 mm) and its axial stub one wire
+// WIDTH wide, so a stub shorter than the strip is wide (5.65 x 3.77 mm) reads as a run and the
+// leads split into three groups. What a rect exceeds the wire's own section by tells them apart:
+// a stub is longer than the wire is tall by more than it is wider than the wire is wide. A
+// sleeve adds the same to both sides and cancels. A round wire (width == height) reduces to the
+// aspect rule.
+bool rectIsVertical(const RSpace& s, const LeadRectReading& reading = {}) {
+    return leadRectIsAxial(s.dimensions.at(0), s.dimensions.at(1), reading);
 }
 
 // Terminal waypoints from MKF's terminal rect group (1 rect = leave at own level;
 // stub + run = L-route along the window edge). `station` = the connecting turn.
 std::vector<PlanePt> terminalWaypoints(const std::vector<const RSpace*>& group,
                                        const PlanePt& station, const std::string& who,
-                                       double foilRadial,
+                                       const LeadRectReading& foilRadial,
                                        // The connecting turn's radial in MKF's OWN frame (its
                                        // coordinates[0]): the reference the drawn stub's x is
                                        // measured against. NaN = no off-face reading (foils).
@@ -4484,7 +4510,7 @@ void stitchPinLead(std::vector<Primitive>& prims, const PendingPinLead& pl, doub
 // missing lead is an MKF gap to fix upstream (seen on 13_current_sense_er95).
 std::pair<std::vector<const RSpace*>, std::vector<const RSpace*>>
 splitTerminalGroups(const std::vector<const RSpace*>& terminalRects, const std::string& who,
-                    double foilRadial = 0.0) {
+                    const LeadRectReading& foilRadial = {}) {
     std::vector<std::vector<const RSpace*>> groups;
     std::vector<const RSpace*> hs;
     for (const RSpace* s : terminalRects)
@@ -9549,12 +9575,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 ct.winding + " parallel " + std::to_string(ct.parallel);
             // A foil's rects are all sheet-tall: classify them by the sheet's own thickness
             // (see rectIsVertical). Zero for every other wire, which keeps the aspect rule.
-            double foilRadialV = 0.0;
+            LeadRectReading foilRadialV;
             {
                 const MAS::Wire& wv = wireMap.at(ct.winding);
                 if (wv.get_type() == MAS::WireType::FOIL && !ct.turns.empty())
-                    foilRadialV = TurnBuilder::wireDimensions(wv, *ct.turns.front(),
-                                                              opts.paintCoating).first;
+                    foilRadialV.foilRadial = TurnBuilder::wireDimensions(wv, *ct.turns.front(),
+                                                                         opts.paintCoating).first;
+                else if ((wv.get_type() == MAS::WireType::RECTANGULAR ||
+                          wv.get_type() == MAS::WireType::PLANAR) && !ct.turns.empty())
+                    std::tie(foilRadialV.wireWidth, foilRadialV.wireHeight) =
+                        TurnBuilder::wireDimensions(wv, *ct.turns.front(), opts.paintCoating);
             }
             auto [egrp, xgrp] = splitTerminalGroups(tRects, whoV, foilRadialV);
             auto routeVert = [&](std::vector<PlanePt> wpv, bool entrance,
@@ -9628,7 +9658,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // foil branch of the emission loop, not laid out by this fan. Giving the fan a
             // 25.9 mm tall "lead" packed one coated OD per lane is what put six of eight exits
             // a sheet-height outside the window (ABT #1000).
-            if (foilRadialV <= 0.0) {
+            if (foilRadialV.foilRadial <= 0.0) {
             routeVert(terminalWaypoints(egrp, pf, whoV + " entrance", foilRadialV,
                                         ct.turns.front()->get_coordinates()[0]),
                       true, pf, advIn, 0);
@@ -11894,14 +11924,24 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // slot can change. Ask the block why, at the plane, and quote it (2026-09-03).
                 setBlockCand(cMax);
                 std::string bindingWhy;
+                bool planeFitsRadius = true;
                 for (size_t g = 0; g < group.size() && bindingWhy.empty(); ++g) {
                     const double cg = azMember(g, cMax);
-                    if (std::isnan(cg)) { bindingWhy = "does not fit on its radius"; break; }
+                    if (std::isnan(cg)) { bindingWhy = "does not fit on its radius"; planeFitsRadius = false; break; }
                     std::string w;
                     if (!leadRowsClearAnyFillet(verts[group[g]], cg, &w)) bindingWhy = w;
                 }
                 clearBlockCand();
-                throw std::runtime_error(
+                // MVB_LEAD_NO_VALIDATE: diagnostic export mode (see emitToroLead) -- the block is
+                // laid on the plane through the conductor it hits, so the collision can be looked at.
+                if (std::getenv("MVB_LEAD_NO_VALIDATE") && planeFitsRadius) {
+                    std::cerr << "[ConductorBuilder] MVB_LEAD_NO_VALIDATE set: the terminal leads of '"
+                              << verts[group[0]].wname << "' are laid on the plane THROUGH: "
+                              << bindingWhy << "\n";
+                    best = cMax;
+                    have = true;
+                }
+                if (!have) throw std::runtime_error(
                     "ConductorBuilder: the terminal leads of '" + verts[group[0]].wname +
                     "' (" + std::to_string(group.size()) + " parallel" +
                     (group.size() == 1 ? "" : "s") + ", " +
@@ -12402,7 +12442,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                  "slots -- REFUSED (" << fanViolations.size() << " violation(s)). The layout is "
                  "infeasible, so no geometry is built from it:";
             for (const auto& v : fanViolations) m << "\n  - " << v;
-            throw std::runtime_error(m.str());
+            // MVB_LEAD_NO_VALIDATE: diagnostic export mode (see emitToroLead) -- emit the leads at
+            // these slots, through each other, so the collision can be looked at.
+            if (std::getenv("MVB_LEAD_NO_VALIDATE")) {
+                std::cerr << "[ConductorBuilder] MVB_LEAD_NO_VALIDATE set: emitting the leads THROUGH "
+                             "each other. " << m.str() << "\n";
+            } else {
+                throw std::runtime_error(m.str());
+            }
         }
         // CONSECUTIVE dragback transitions of one conductor (a single-turn layer) chain end to
         // start: force them onto one azimuth so the chain stays connected.
@@ -12671,7 +12718,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // Charging it the diagonal asked for a 13.2 mm corner radius on a column whose half-width
         // is 2.6 mm and the build was refused ("adjacent corner arcs would cross").
         // The sheet's radial thickness, for reading MKF's terminal rects (rectIsVertical).
-        const double foilRadial = foilWire ? wireW : 0.0;
+        LeadRectReading foilRadial;
+        if (foilWire) foilRadial.foilRadial = wireW;
+        else if (rectWire) { foilRadial.wireWidth = wireW; foilRadial.wireHeight = wireH; }
         double wireRadius = foilWire ? 0.5 * wireW
                                      : (rectWire ? 0.5 * std::hypot(wireW, wireH)
                                                  : std::min(wireW, wireH) / 2.0);
@@ -15692,7 +15741,10 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // ABT #1423: the entrance arrives straight along the -X face; no route on the
                 // connection face, no corner. The first wrap begins at MKF's departure point.
                 path.prims.push_back(tangentLeadSeg(*tangentIn, /*isExit=*/false));
-            } else if (effectivelyRound && rectWire) {
+            } else if (effectivelyRound && rectWire &&
+                       !diagnosticLRouteAsDrawn(terminalWaypoints(entranceGroup, first, path.name + " entrance", foilRadial,
+                                                                  turns.front()->get_coordinates()[0]).size(),
+                                                path.name + " entrance")) {
                 // The tangent corner replaces the straight radial attach; it is only
                 // defined for MKF routes WITHOUT a vertical connection. If MKF draws an
                 // L here, the corner-through-a-stub geometry is unspecified -- refuse.
@@ -16223,7 +16275,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // ABT #1423: the exit leaves straight off the end of the +X face straight, where the
                 // last wrap ended (checked against MKF's departure point in the wrap loop).
                 path.prims.push_back(tangentLeadSeg(*tangentOut, /*isExit=*/true));
-            } else if (effectivelyRound && rectWire) {
+            } else if (effectivelyRound && rectWire &&
+                       !(!exitGroup.empty() &&
+                         diagnosticLRouteAsDrawn(terminalWaypoints(exitGroup, last, path.name + " exit", foilRadial,
+                                                                   turns.back()->get_coordinates()[0]).size(),
+                                                 path.name + " exit"))) {
                 if (!exitGroup.empty() &&
                     terminalWaypoints(exitGroup, last, path.name + " exit", foilRadial,
                                       turns.back()->get_coordinates()[0]).size() != 2)

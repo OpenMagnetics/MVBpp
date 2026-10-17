@@ -994,6 +994,37 @@ TEST_CASE("Real winding: LITZ wire builds ONE continuous body", "[realwinding]")
     REQUIRE(BRepCheck_Analyzer(conductor->shape).IsValid());
 }
 
+TEST_CASE("Real winding: a flat strip's terminal stub shorter than the strip is wide is read as a stub", "[realwinding][terminal]") {
+    // MKF's rects for a PQ 35/40 transformer's 8-turn secondary, a 5.645 x 0.4725 mm strip between litz
+    // sections (w x h, metres): the climb from its section to the band above, and the radial
+    // runs out of the window. Read by aspect alone the 3.77 mm climb was a run, the leads split
+    // into three groups and the build was refused.
+    mvb::LeadRectReading strip;
+    strip.wireWidth = 5.645e-3;
+    strip.wireHeight = 0.4725e-3;
+    CHECK(mvb::leadRectIsAxial(5.65e-3, 3.77e-3, strip));     // short climb: a stub
+    CHECK(mvb::leadRectIsAxial(5.65e-3, 17.9e-3, strip));     // long climb: a stub
+    CHECK_FALSE(mvb::leadRectIsAxial(10.9e-3, 0.473e-3, strip));   // radial run
+    // A sleeve thickens both the same and changes nothing.
+    CHECK(mvb::leadRectIsAxial(5.65e-3 + 0.8e-3, 3.77e-3 + 0.8e-3, strip));
+    CHECK_FALSE(mvb::leadRectIsAxial(10.9e-3 + 0.8e-3, 0.473e-3 + 0.8e-3, strip));
+    // A rect no taller than the wire plus less than one wire thickness is no climb at all
+    // (realwinding_rect_wire_rect: 5.1 x 1.26 mm for a 5.1 x 1.1 mm wire; read as a climb, MKF's
+    // exit route went missing and "rectangular-column RECTANGULAR wire builds" was refused).
+    mvb::LeadRectReading onEdge;
+    onEdge.wireWidth = 5.1e-3;
+    onEdge.wireHeight = 1.1e-3;
+    CHECK_FALSE(mvb::leadRectIsAxial(5.1e-3, 1.26e-3, onEdge));
+    // A round wire keeps the aspect rule: the long side is the travel.
+    CHECK(mvb::leadRectIsAxial(0.5e-3, 3.0e-3));
+    CHECK_FALSE(mvb::leadRectIsAxial(3.0e-3, 0.5e-3));
+    // A foil: every rect is sheet-tall, the stub is the one a sheet thick (two_switch_forward).
+    mvb::LeadRectReading foil;
+    foil.foilRadial = 0.2e-3;
+    CHECK(mvb::leadRectIsAxial(0.200e-3, 39.205e-3, foil));
+    CHECK_FALSE(mvb::leadRectIsAxial(5.012e-3, 25.935e-3, foil));
+}
+
 TEST_CASE("Real winding: round-column RECTANGULAR wire is ONE body", "[realwinding]") {
     // 03_buck (PQ32, 3x0.5 mm rectangular wire) -> fixed-binormal single solid.
     auto magneticJson = loadFixture("realwinding_rect_wire_round.json");

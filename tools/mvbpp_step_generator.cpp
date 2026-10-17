@@ -53,6 +53,13 @@ static void printUsage(const char* prog) {
               << "  --toroid-mounting <vertical|horizontal>  How a toroid is mounted (ABT #1248;\n"
               << "                        sets MKF Settings toroid_mounting, default vertical; a\n"
               << "                        toroid base record's base.mounting still overrides it)\n"
+              << "  --weld <off|auto|all> How each real-winding conductor's pieces are welded:\n"
+              << "                        off ships the abutting pieces unwelded (debugging),\n"
+              << "                        auto welds where a junction overlaps, all welds every\n"
+              << "                        junction. Default: the build default (MVB_WELD_ALL)\n"
+              << "  --litz-deformation    Let MKF flatten litz turns into ovals when the round\n"
+              << "                        bundle does not fit (ABT #1531; sets MKF Settings\n"
+              << "                        coil_litz_deformation, default off)\n"
               << "  -h, --help            Show this help\n";
 }
 
@@ -101,6 +108,9 @@ static void paintProjections(const MAS::Magnetic& rawMagnetic, bool useRealWindi
         }
     }
 }
+
+// --weld: how each real-winding conductor's pieces are welded (unset: the build default).
+static std::optional<mvb::WeldMode> g_weldMode;
 
 static bool processFile(const fs::path& inputPath, const fs::path& outputPath, bool useMkf,
                         bool useRealWinding, int segments, int coreSegments, bool coatedFootprint = false,
@@ -173,6 +183,7 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
             cfg.useRealWindingGeometry = true;
             cfg.paintCoating = coatedFootprint;   // CD by default (ABT #1261); --coated => OUTER envelope
             cfg.femReady = femReady;              // --fem => slow one-piece/conformal meshable geometry
+            if (g_weldMode) cfg.weld = *g_weldMode;   // --weld off|auto|all
             if (segments >= 0) cfg.wirePolygonSegments = segments;
             // --core-segments defaults to EXACT for the FEM product. Faceting the core is not
             // free the way faceting the wire is: a round centre column discretised to an
@@ -334,6 +345,14 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --toroid-mounting takes vertical or horizontal, got '" << m << "'\n";
                 return 1;
             }
+        } else if (arg == "--weld") {
+            if (++i >= argc) {
+                std::cerr << "Error: --weld takes off, auto or all\n";
+                return 1;
+            }
+            g_weldMode = mvb::parseWeldMode(argv[i]);
+        } else if (arg == "--litz-deformation") {
+            OpenMagnetics::Settings::GetInstance().set_coil_litz_deformation(true);
         } else if (arg == "--segments") {
             if (++i < argc) segments = std::stoi(argv[i]);
         } else if (arg[0] != '-') {

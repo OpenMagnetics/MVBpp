@@ -339,4 +339,18 @@ public:
                                             const Options& opts = {});
 };
 
+// How MVB++ reads one of MKF's drawn terminal rects (width radial x height axial): an AXIAL stub
+// along the window edge, or a RADIAL run. MKF draws a box one wire thick across its travel, so
+// for a round wire the long side is the travel. A rectangular wire is one wire WIDTH wide on its
+// stub and one wire HEIGHT tall on its run, so the rect is a stub when it is longer than the wire
+// is tall by more than it is wider than the wire is wide (a sleeve adds the same to both and
+// cancels); a 5.65 x 3.77 mm stub of a 5.645 x 0.4725 mm strip is no run. A foil's rects are all
+// sheet-tall, so its stub is the one a sheet thickness wide.
+struct LeadRectReading {
+    double foilRadial = 0.0;    // the sheet's radial thickness; 0 for any other wire
+    double wireWidth = 0.0;     // a rectangular wire's drawn section; 0 x 0 = round (aspect rule)
+    double wireHeight = 0.0;
+};
+bool leadRectIsAxial(double width, double height, const LeadRectReading& reading = {});
+
 } // namespace mvb
