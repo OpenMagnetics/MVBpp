@@ -860,12 +860,37 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
     // Certified is a proof that no two conductors share volume; the same-region weld below relies
     // on it and on nothing weaker.
     mvb::EnamelGateVerdict gateVerdict = mvb::EnamelGateVerdict::NotRun;
-    std::vector<mvb::NamedShape> named =
-        builder.buildAllNamed(enriched, include_bobbin, symPlanes,
-                              opt.polygon_segments, opt.polygon_segments, opt.paint_coating,
-                              emit_coating, incl_insul, core_coat_t,
-                              /*useRealWindingGeometry=*/continuous, /*femReady=*/continuous,
-                              /*skipGeometryChecks=*/false, &gateVerdict);
+    // FACETED GEOMETRY BUILDS ON ONE BOOLEAN THREAD, as mvbpp_step_generator has since ABT #1111:
+    // every OCC worker builds its own Extrema grid on the faceted B-spline strips, so the build's
+    // peak memory scales with the thread count. This exporter never took that cap and ran the same
+    // booleans on every core: 13_current_sense peaked at 28.3 GB and segfaulted against its 30 GB
+    // limit in the one-body union, which completes at 7.2 GB on 4 threads (ABT #1905). Scoped to
+    // the build: the fragment below sizes the pool itself (mesher.fragment_parallel).
+    std::vector<mvb::NamedShape> named;
+    {
+        // Init() resizes the pool itself (what the step tool does); SetNbDefaultThreadsToLaunch
+        // alone left OCC's parallel loops on every core (measured: still 28.3 GB).
+        const Handle(OSD_ThreadPool)& pool = OSD_ThreadPool::DefaultPool();
+        const int threadsBefore = pool->NbThreads();
+        const int launchBefore = pool->NbDefaultThreadsToLaunch();
+        auto restore = [&] {
+            pool->Init(threadsBefore);
+            pool->SetNbDefaultThreadsToLaunch(launchBefore);
+        };
+        if (opt.polygon_segments > 0) pool->Init(1);
+        try {
+            named = builder.buildAllNamed(enriched, include_bobbin, symPlanes,
+                                          opt.polygon_segments, opt.polygon_segments,
+                                          opt.paint_coating, emit_coating, incl_insul, core_coat_t,
+                                          /*useRealWindingGeometry=*/continuous,
+                                          /*femReady=*/continuous,
+                                          /*skipGeometryChecks=*/false, &gateVerdict);
+        } catch (...) {
+            restore();
+            throw;
+        }
+        restore();
+    }
     if (named.empty()) throw std::runtime_error("mesh3d_from_mas: MVB++ produced no solids");
     if (!accessories) {
         // (b) of ACCESSORIES OUT above. Solder and FR4 are NOT accessories in this sense: solder is the

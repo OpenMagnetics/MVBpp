@@ -1609,6 +1609,19 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
             else if (m == "cfrenet")     ps.SetMode(Standard_False);  // corrected Frenet
             else if (m == "approxc1")    ps.SetForceApproxC1(Standard_True);
             else if (m == "tight")       ps.SetTolerance(1e-7, 1e-7, 1e-4);
+        } else if (pr.kind == Primitive::SPIRAL &&
+                   (pr.spiral.levelOut || pr.spiral.easeIn > 0.0)) {
+            // AN EASED CLIMB KEEPS ITS SECTION SQUARE TO THE COLUMN (ABT #1905). Its curvature
+            // jumps where the easing's parabola meets the level run, and the default corrected-
+            // Frenet trihedron answers that jump by swinging the section about the wire: on
+            // 13_current_sense's pinned layer ends one facet edge wandered from -35 to -41 to -19
+            // deg around the 12-gon over the last 50 um. The 45-deg knife of the square corner
+            // after it then crossed that facet twice, left a 38 um2 lens and 14 cut vertices,
+            // and the abutment proof fell to OCC's Common on the wandering surface: 322 s per
+            // corner. Every other wrap piece is a helix or a level arc, whose Frenet binormal is
+            // (near enough) the column axis; holding the binormal on that axis gives the eased
+            // piece the same section its neighbours have, with no swing.
+            ps.SetMode(gp_Dir(0, 1, 0));
         }
         // ROUND END(S) (ABT #1528): this piece is the one-facet-chord transition beside an
         // exactly round neighbour, so it is swept between the ROUND section (the circle split at
