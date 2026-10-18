@@ -426,6 +426,20 @@ int generate_robust(int dim, const std::vector<int>& chain) {
     // created (a supervisor at process start that re-runs the whole job), not here.
     const bool isolate = dim == 3 && std::getenv("OMFEM_MESH_ISOLATE")
                       && std::atoi(std::getenv("OMFEM_MESH_ISOLATE")) != 0;
+    // THE INSERTION VOLUME FLOOR (ABT #1853). gmsh's cavity test is exact, so a refinement
+    // point coplanar with a cavity face up to rounding passes it and leaves a tet of no
+    // volume: refinement circumcentres stack on lines parallel to straight copper edges
+    // (482 such lines on 12_boost), and two from a pair of parallel lines are coplanar
+    // with any two from the other (gamma 1e-28), or one lands 49 nm from a surface node
+    // (05_pfc). The fork's Mesh.MinInsertedTetVolumeRatio refuses such a point.
+    double insertVolumeFloor = 1e-6;
+    if (const char* v = std::getenv("OMFEM_MESH_INSERT_VFLOOR")) {
+        char* end = nullptr;
+        insertVolumeFloor = std::strtod(v, &end);
+        if (end == v || *end != '\0' || !(insertVolumeFloor >= 0.0))
+            throw std::invalid_argument(std::string("mesher.insert_volume_floor must be a number >= 0, got '") + v + "'");
+    }
+    if (dim == 3) go::setNumber("Mesh.MinInsertedTetVolumeRatio", insertVolumeFloor);
     std::string failures;
     for (std::size_t i = 0; i < chain.size(); ++i) {
         const int algo = chain[i];

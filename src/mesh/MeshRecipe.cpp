@@ -40,6 +40,9 @@ const std::vector<RecipeKnob>& mesh_recipe_knobs() {
         {"mesher", "threads", "OMFEM_GMSH_THREADS", "number", "-", "1 (gmsh default)",
          "gmsh threads for surface + HXT volume meshing (ETD34 base: 12 threads 175 s vs 337 s; mesh differs, re-validate before default)"},
         {"mesher", "retries", "OMFEM_MESH_RETRIES", "number", "-", "3", "extra attempts of the algorithm/size ladder after a failed 3D pass"},
+        {"mesher", "insert_volume_floor", "OMFEM_MESH_INSERT_VFLOOR", "number", "x lmax^3", "1e-6",
+         "Delaunay refinement refuses a point whose new tets would fall below this volume times their longest edge "
+         "cubed (a point coplanar with a cavity face up to rounding: 12_boost min gamma 1e-28); 0 inserts every point"},
         {"mesher", "quality_floor", "OMFEM_MESH_QMIN", "number", "-", "1e-6", "minimum accepted tet quality (gamma) before the mesh is refused"},
         {"mesher", "optimize_netgen", "OMFEM_MESH_NETGEN", "number", "0|1", "0",
          "run the Netgen optimiser before gmsh's own (serial, and it refines: 15_gan +65 % tets, +70-90 s, worst gamma 1e-6 -> 1e-3)"},
