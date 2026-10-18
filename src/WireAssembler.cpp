@@ -2987,10 +2987,14 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
                           int segments, CornerStyle corners,
                           std::vector<size_t>* primIndexPerSolid, bool skipWeld,
                           const std::string& conductorName, WeldMode weld) {
-    if (segments <= 0)
-        return assembleWireImpl(ptrs, wireRadius, segments, corners, primIndexPerSolid,
-                                skipWeld, conductorName, weld);
-    const double chord = 2.0 * wireRadius * std::sin(kPi / segments);
+    // EXACT ROUND MODE FOLDS AN EASING NO LONGER THAN THE WIRE IS THICK (ABT #1905). There is
+    // no facet chord, but a piece whose spine is no longer than its own diameter cannot be swept
+    // or glued cleanly (the short-spine doctrine of ABT #958 in rawGrownSolid): 13_current_sense's
+    // 1 um easings with the leads pinned to the FEM plane (a 0.11 mm wire) made every Secondary
+    // layer's glued weld drop 2e-5..9e-5 mm3, each glue attempt took ~5 min before it was
+    // refused, and the pairwise ladder after it ran the build past 30 min.
+    const double chord = segments > 0 ? 2.0 * wireRadius * std::sin(kPi / segments)
+                                      : 2.0 * wireRadius;
     std::deque<Primitive> folded;
     std::vector<const Primitive*> use;
     std::vector<size_t> orig;
@@ -3037,8 +3041,8 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
         if (!why.empty()) {
             std::cerr << "[ease-fold] '" << L.label << "' is a " << primLength(L) * 1e6
                       << " um climb easing, shorter than a " << chord * 1e6
-                      << " um facet chord, and is NOT folded (" << why
-                      << "): its facets stay that short\n";
+                      << (segments > 0 ? " um facet chord" : " um wire diameter")
+                      << ", and is NOT folded (" << why << "): it stays its own piece\n";
             use.push_back(ptrs[k]);
             orig.push_back(k);
             continue;
@@ -3054,7 +3058,7 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     // fillets, whose lens would not weld and whose conductor then shipped as 2-3 solids. Every
     // arc tangent-chained to a tight arc is made round too: the chain's straight and helical
     // neighbours turn round over a chord as they already do beside a tight arc.
-    {
+    if (segments > 0) {
         const size_t m = use.size();
         std::vector<bool> rnd(m, false);
         for (size_t k = 0; k < m; ++k)
