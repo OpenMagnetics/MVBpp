@@ -4499,42 +4499,54 @@ void stitchPinLead(std::vector<Primitive>& prims, const PendingPinLead& pl, doub
     }
 }
 
-// Split one conductor's drawn terminal rects (MKF emission order: the ENTRANCE lead's
-// rects first, then the EXIT lead's, each as [vertical stub?, horizontal run] -- the run
-// closes its group) into the entrance and exit lead groups. With exactly two runs, every
-// stub pairs to the run whose centre is nearest: pure emission order misgroups whenever
-// MKF draws a route run-first instead of stub-first (09_planar's CONTIGUOUS secondary:
-// [H V H V] split into three sequential groups). ONE drawn lead is still usable: it
-// becomes the entrance and the exit group returns EMPTY -- the caller synthesizes the
-// minimal straight-out exit, LOUDLY, because that is builder-invented routing and the
-// missing lead is an MKF gap to fix upstream (seen on 13_current_sense_er95).
+}  // namespace
+
+// Split one conductor's drawn terminal rects into the entrance and exit lead groups.
+//
+// MKF SAYS WHICH LEAD EACH RECT BELONGS TO (ABT #685): every drawn terminal rect carries the
+// ConnectionKind of its route, TERMINAL_ENTRANCE or TERMINAL_EXIT, and names the turn it attaches
+// to. The groups are read from that tag, nothing else. Both geometric readings this replaced
+// misgrouped real designs:
+//   - emission order with "the run closes its group" split 09_planar's CONTIGUOUS secondary
+//     ([H V H V], run-first) into three groups;
+//   - "each stub pairs with the nearest run centre" handed 14_dab's Primary parallel 1 EXIT stub
+//     (0.855 x 1.361 mm at r 19.7025, the outer layer's climb from -19.634 to the exit row
+//     -20.567 mm) to the ENTRANCE (ABT #1336): it lies 6.85 mm from the entrance run's centre and
+//     7.19 mm from the exit run's, because both runs are 15 mm long and centred on the window.
+//     terminalWaypoints then read that stub as an off-face vertical of the entrance and drew a
+//     0.855 mm radial jog at the turn that MKF never planned (route (18.8475, -20.559) ->
+//     (19.7025, -20.559) -> (19.7025, -21.4223) -> border, against MKF's L (18.8475, -20.559) ->
+//     (18.8475, -21.4223) -> border), whose two corners no bend of the wire's radius fits.
+// ONE drawn lead (no exit rects) still returns an EMPTY exit group, and the caller refuses
+// loudly unless asked to synthesize it (the missing lead is an MKF gap, seen on
+// 13_current_sense_er95).
 std::pair<std::vector<const RSpace*>, std::vector<const RSpace*>>
 splitTerminalGroups(const std::vector<const RSpace*>& terminalRects, const std::string& who,
-                    const LeadRectReading& foilRadial = {}) {
+                    const LeadRectReading& foilRadial) {
     std::vector<std::vector<const RSpace*>> groups;
-    std::vector<const RSpace*> hs;
-    for (const RSpace* s : terminalRects)
-        if (!rectIsVertical(*s, foilRadial)) hs.push_back(s);
-    if (hs.size() == 2) {
-        groups.assign(2, {});
-        groups[0].push_back(hs[0]);
-        groups[1].push_back(hs[1]);
-        for (const RSpace* s : terminalRects) {
-            if (!rectIsVertical(*s, foilRadial)) continue;
-            double d[2];
-            for (int g = 0; g < 2; ++g)
-                d[g] = std::hypot(s->coordinates.at(0) - hs[g]->coordinates.at(0),
-                                  s->coordinates.at(1) - hs[g]->coordinates.at(1));
-            groups[d[0] <= d[1] ? 0 : 1].push_back(s);
+    std::vector<const RSpace*> entranceRects, exitRects;
+    for (const RSpace* s : terminalRects) {
+        if (s->kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE)
+            entranceRects.push_back(s);
+        else if (s->kind == OpenMagnetics::ConnectionKind::TERMINAL_EXIT)
+            exitRects.push_back(s);
+        else {
+            std::ostringstream m;
+            m.precision(9);
+            m << "ConductorBuilder: a drawn terminal rect of " << who << " ("
+              << s->dimensions.at(0) * 1e3 << " x " << s->dimensions.at(1) * 1e3 << " mm @ "
+              << s->coordinates.at(0) * 1e3 << ", " << s->coordinates.at(1) * 1e3
+              << " mm) carries ConnectionKind " << static_cast<int>(s->kind)
+              << ", neither TERMINAL_ENTRANCE nor TERMINAL_EXIT: MKF did not say which lead it "
+                 "belongs to (ABT #685)";
+            throw std::runtime_error(m.str());
         }
-    } else {
-        groups.emplace_back();
-        for (const RSpace* s : terminalRects) {
-            groups.back().push_back(s);
-            if (!rectIsVertical(*s, foilRadial)) groups.emplace_back();   // run closes the group
-        }
-        if (!groups.empty() && groups.back().empty()) groups.pop_back();
     }
+    if (!entranceRects.empty()) groups.push_back(entranceRects);
+    if (!exitRects.empty()) groups.push_back(exitRects);
+    if (entranceRects.empty() && !exitRects.empty())
+        throw std::runtime_error("ConductorBuilder: MKF drew an exit lead but no entrance lead for " +
+                                 who + " in its connection reserved spaces");
     if (groups.size() == 1) {
         // MVB++ FOLLOWS MKF'S GEOMETRY, ALWAYS (Alf, 2026-08-10). Synthesizing the missing
         // exit is builder-invented routing: it is not MKF's data, nothing verifies it against
@@ -4570,6 +4582,8 @@ splitTerminalGroups(const std::vector<const RSpace*>& terminalRects, const std::
     }
     return {groups[0], groups[1]};
 }
+
+namespace {
 
 // ---------------------------------------------------------------------------------------
 // Wrap planners. Each appends the connecting geometry of ONE wrap — crossing k-1 to
@@ -9641,6 +9655,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (!xgrp.empty())
                     dump("OUT", xgrp, terminalWaypoints(xgrp, pl, whoV + " exit", foilRadialV,
                                                         ct.turns[nEmitP - 1]->get_coordinates()[0]));
+                // MKF's own ConnectionRoute for the same leads (ABT #1336): what MKF planned, to
+                // read against what is drawn from the rects above.
+                for (const auto& r : connectionLayout.routes) {
+                    if (r.winding != ct.winding || r.parallel != ct.parallel) continue;
+                    if (r.kind != OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE &&
+                        r.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT)
+                        continue;
+                    std::fprintf(stderr, "[mkf-route] %s %s: R=%.4f mm ramp=%s slot=%s side=%d wp:",
+                                 whoV.c_str(),
+                                 r.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE ? "IN" : "OUT",
+                                 r.plannedBendRadius * 1e3,
+                                 r.rampLength ? std::to_string(*r.rampLength * 1e3).c_str() : "none",
+                                 r.exitSlot ? std::to_string(*r.exitSlot * 1e3).c_str() : "none", r.side);
+                    for (const auto& w : r.waypoints) std::fprintf(stderr, " (%.4f,%.4f)", w[0] * 1e3, w[1] * 1e3);
+                    std::fprintf(stderr, "\n");
+                }
             }
             // The attach advances mirror the emission's gates: helical first/last wrap only
             // (a radius-step transition — link or steep landing — attaches AT its station).
@@ -14526,10 +14556,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         PlanePt first = station(turns.front());
         PlanePt last = station(turns.back());
 
-        // Terminal grouping follows MKF's emission order: per (winding, parallel) the
-        // ENTRANCE lead's rects are pushed first, then the EXIT lead's, each as
-        // [vertical stub?, horizontal run] — the run closes its group. Proximity-based
-        // grouping is ambiguous when a crossing sits within a wire of the window edge.
+        // Terminal grouping reads MKF's own tag on each rect (its route's ConnectionKind), never
+        // emission order or proximity (see splitTerminalGroups, ABT #1336).
         std::vector<const RSpace*> entranceGroup, exitGroup;
         std::tie(entranceGroup, exitGroup) = splitTerminalGroups(terminalRects, path.name, foilRadial);
         // ABT #1172 (WP3): the pins MKF assigned this conductor's two ends to, with its routes.

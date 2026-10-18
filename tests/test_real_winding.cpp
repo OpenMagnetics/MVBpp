@@ -994,6 +994,43 @@ TEST_CASE("Real winding: LITZ wire builds ONE continuous body", "[realwinding]")
     REQUIRE(BRepCheck_Analyzer(conductor->shape).IsValid());
 }
 
+TEST_CASE("Real winding: terminal rects are grouped by MKF's ConnectionKind, not by proximity", "[realwinding][terminal]") {
+    // ABT #1336: 14_dab_xfmr_pm8770_n97's Primary parallel 1 (round wire, 0.855 mm OD; metres).
+    // Both radial runs are ~15 mm long and centred on the window, so the EXIT's climb (at r 19.7 mm)
+    // lies nearer the ENTRANCE run's centre than its own run's. Pairing each stub with the nearest
+    // run handed it to the entrance and drew a radial jog MKF never planned.
+    auto rect = [](OpenMagnetics::ConnectionKind kind, double x, double y, double w, double h) {
+        OpenMagnetics::ConnectionReservedSpace s;
+        s.winding = "Primary";
+        s.parallel = 1;
+        s.kind = kind;
+        s.coordinates = {x, y};
+        s.dimensions = {w, h};
+        return s;
+    };
+    using K = OpenMagnetics::ConnectionKind;
+    const auto inStub = rect(K::TERMINAL_ENTRANCE, 18.8475e-3, -20.99e-3, 0.855e-3, 0.863e-3);
+    const auto inRun = rect(K::TERMINAL_ENTRANCE, 26.675e-3, -21.4223e-3, 15.655e-3, 0.855e-3);
+    const auto outStub = rect(K::TERMINAL_EXIT, 19.7025e-3, -20.10e-3, 0.855e-3, 1.361e-3);
+    const auto outRun = rect(K::TERMINAL_EXIT, 27.5e-3, -20.567e-3, 15.6e-3, 0.855e-3);
+    // The premise: the exit stub IS nearer the entrance run.
+    REQUIRE(std::hypot(outStub.coordinates[0] - inRun.coordinates[0], outStub.coordinates[1] - inRun.coordinates[1]) <
+            std::hypot(outStub.coordinates[0] - outRun.coordinates[0], outStub.coordinates[1] - outRun.coordinates[1]));
+
+    const std::vector<const OpenMagnetics::ConnectionReservedSpace*> rects{&inStub, &inRun, &outStub, &outRun};
+    const auto [entrance, exit] = mvb::splitTerminalGroups(rects, "Primary parallel 1");
+    CHECK(entrance == std::vector<const OpenMagnetics::ConnectionReservedSpace*>{&inStub, &inRun});
+    CHECK(exit == std::vector<const OpenMagnetics::ConnectionReservedSpace*>{&outStub, &outRun});
+
+    // A rect MKF did not tag as a terminal lead is refused, not guessed.
+    const auto untagged = rect(K::U_ADJACENT, 19.7025e-3, -20.10e-3, 0.855e-3, 1.361e-3);
+    CHECK_THROWS_WITH(mvb::splitTerminalGroups({&inStub, &inRun, &untagged, &outRun}, "Primary parallel 1"),
+                      Catch::Matchers::ContainsSubstring("neither TERMINAL_ENTRANCE nor TERMINAL_EXIT"));
+    // An exit lead with no entrance lead is refused.
+    CHECK_THROWS_WITH(mvb::splitTerminalGroups({&outStub, &outRun}, "Primary parallel 1"),
+                      Catch::Matchers::ContainsSubstring("exit lead but no entrance lead"));
+}
+
 TEST_CASE("Real winding: a flat strip's terminal stub shorter than the strip is wide is read as a stub", "[realwinding][terminal]") {
     // MKF's rects for a PQ 35/40 transformer's 8-turn secondary, a 5.645 x 0.4725 mm strip between litz
     // sections (w x h, metres): the climb from its section to the band above, and the radial

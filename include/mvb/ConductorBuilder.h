@@ -12,10 +12,11 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <utility>
 #include <string>
 #include <vector>
 
-namespace OpenMagnetics { class Coil; }
+namespace OpenMagnetics { class Coil; struct ConnectionReservedSpace; }
 
 namespace mvb {
 
@@ -352,5 +353,14 @@ struct LeadRectReading {
     double wireHeight = 0.0;
 };
 bool leadRectIsAxial(double width, double height, const LeadRectReading& reading = {});
+
+// Split one conductor's drawn terminal rects into its ENTRANCE and EXIT lead groups by the
+// ConnectionKind MKF tags each rect with (TERMINAL_ENTRANCE / TERMINAL_EXIT), never by emission
+// order or proximity. Throws on any other kind, on an exit lead without an entrance lead, and on a
+// single drawn lead unless MVB_SYNTHESIZE_MISSING_LEAD is set (then the exit group is empty).
+std::pair<std::vector<const OpenMagnetics::ConnectionReservedSpace*>,
+          std::vector<const OpenMagnetics::ConnectionReservedSpace*>>
+splitTerminalGroups(const std::vector<const OpenMagnetics::ConnectionReservedSpace*>& terminalRects,
+                    const std::string& who, const LeadRectReading& foilRadial = {});
 
 } // namespace mvb
