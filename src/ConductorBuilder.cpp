@@ -8683,19 +8683,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // #1237 path: draw the run at MKF's x, prove it against the rows and every placed
         // vertical, nudge outward at most one wire radius, otherwise throw.
         //
-        // SCOPE AS FIRST LANDED (widened below, ABT #1336): only a conductor whose two
+        // SCOPE, deliberately the narrowest that fixes the defect: only a conductor whose two
         // terminal routes are the SAME polyline (in either direction). That is the case -- and
         // only that case -- where this builder demonstrably has no separation of its own, and it
         // is read from the layout MKF emitted, not re-derived from turn coordinates or turn
         // counts. MKF now hands a slot to EVERY terminal route, and it pushes an exit off the
         // entrance's lane in ordinary designs too (02_flyback's Primary: 0.000 vs 0.430 mm),
-        // where the fan used to separate the two leads by its own packing.
-        //
-        // ABT #1336 (Alf: "MKF decides, MVB++ draws"): EVERY terminal is now drawn at MKF's slot,
-        // not only the one-polyline case. The fan's own packing put siblings one OD apart from
-        // the plane outward, which ignores what MKF reserved beside a lead for its ramp (14_dab
-        // Primary: entrances at 0 / 3.561 / 4.416 / 5.271 mm, the 2.706 mm after p0 being p1's
-        // ramp plus its bend), and on 14_dab it could not satisfy its own clearances.
+        // where the fan already separates the two leads by its own proven packing. Consuming the
+        // slots there as well would move the terminals of much of the corpus in one step; that
+        // wider consumption is a separate change, recorded as the follow-up on ABT #1354.
         auto terminalRouteFor = [&](const std::string& winding, int64_t parallel,
                                     bool entrance) -> const OpenMagnetics::ConnectionRoute* {
             const auto wantKind = entrance ? OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE
@@ -8718,18 +8714,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             const auto* out = terminalRouteFor(conductors[c].winding, conductors[c].parallel, false);
             if (!in || !out) continue;
             const auto reversed = std::vector<std::vector<double>>(out->waypoints.rbegin(), out->waypoints.rend());
-            const bool onePolyline = in->waypoints == out->waypoints || in->waypoints == reversed;
-            // A lead MKF sends off tangentially carries no slot (ConnectionRoute::tangentDeparture):
-            // it is drawn from its departure, not by the fan.
-            if (!onePolyline && (in->tangentDeparture || out->tangentDeparture)) continue;
+            if (in->waypoints != out->waypoints && in->waypoints != reversed) continue;
             if (!in->exitSlot || !out->exitSlot)
                 throw std::runtime_error(
-                    "ConductorBuilder: the " + std::string(in->exitSlot ? "exit" : "entrance") +
-                    " terminal route of " + who + " carries no exit slot (Coil::terminal_exit_slots, ABT "
-                    "#1354/#1336). MKF decides where every terminal leaves the window; MVB++ draws it there" +
-                    std::string(onePolyline ? ", and here the two leads share one polyline, so without "
-                                              "the slots they would be drawn at one point -- a short" : "") + ".");
-            if (onePolyline && *in->exitSlot == *out->exitSlot)
+                    "ConductorBuilder: MKF draws the entrance and the exit of " + who +
+                    " as one polyline, so only their exit slots keep the two terminals apart, but the " +
+                    std::string(in->exitSlot ? "exit" : "entrance") + " route carries none "
+                    "(Coil::terminal_exit_slots, ABT #1354). Drawing them would emit both leads at one "
+                    "point, which is a short.");
+            if (*in->exitSlot == *out->exitSlot)
                 throw std::runtime_error(
                     "ConductorBuilder: MKF draws the entrance and the exit of " + who +
                     " as one polyline AND puts both on the same exit slot (" +
@@ -8739,7 +8732,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             mkfExitXOf[{c, true}] = *in->exitSlot;
             mkfExitXOf[{c, false}] = *out->exitSlot;
             if (std::getenv("MVB_LEAD_DIAG"))
-                std::fprintf(stderr, "[mkf-slot] %s: MKF's slots -- entrance at x %.9f mm, exit at x %.9f mm\n",
+                std::fprintf(stderr, "[mkf-slot] %s: MKF draws one polyline for both terminals and "
+                             "separates them by slot -- entrance at x %.9f mm, exit at x %.9f mm\n",
                              who.c_str(), *in->exitSlot * 1e3, *out->exitSlot * 1e3);
         }
     }
