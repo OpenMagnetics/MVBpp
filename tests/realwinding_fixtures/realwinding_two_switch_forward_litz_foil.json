@@ -2311,6 +2311,18 @@
      }
     },
     {
+     "connections": [
+      {
+       "end": "start",
+       "exit": "axial",
+       "leadConductor": "Round 0.5 - Grade 1"
+      },
+      {
+       "end": "finish",
+       "exit": "axial",
+       "leadConductor": "Round 0.5 - Grade 1"
+      }
+     ],
      "isolationSide": "secondary",
      "name": "Secondary",
      "numberParallels": 8,

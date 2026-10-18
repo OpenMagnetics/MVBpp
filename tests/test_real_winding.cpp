@@ -1683,56 +1683,43 @@ TEST_CASE("Real winding: the drum's connections stay out of the core flange (ABT
     CHECK(inCore == 0);
 }
 
-// A SOLDERED WIRE TERMINAL NEVER TOUCHES THE FOIL (the mesher's veto on an exact tangency).
+// A FOIL TERMINAL IS MKF'S AXIAL LEAD (ABT #1907, Alf 2026-10-18: "lead touches the foil").
 //
-// The terminal was drawn tangent to its sheet -- bare copper on bare copper, no standoff -- so
-// that the bump the next turn rides is exactly one OD and the wire cannot reach the turn above
-// (Alf, 2026-09-04). The CAD gate liked it: WATERTIGHT, NO OVERLAPS, and the enamel rule
-// CERTIFIED at 0 nm. It is nevertheless unmeshable, and no element size fixes it: a cylinder
-// laid on a plane meets it at a ZERO dihedral angle, and every way of decomposing that corner --
-// two solids in contact, one fused body, fillets that stop short of the tangent line or run all
-// the way to it -- still contains a feature of zero thickness. tetgen said exactly that on
-// two_switch_forward:
-//     PLC Error: A segment and a facet intersect at point (-0.267, 5.183, 15.9845) mm
-// which is the bottom generatrix of 'Secondary parallel 0 exit lead' on the face of 'Secondary
-// parallel 0' -- the tangent line itself.
-//
-// The physics agrees with the mesher: a soldered wire floats on the joint, it never touches bare
-// copper. So the wire is lifted by a solder film and the solder fills its whole footprint. Alf's
-// reason for asking for tangency is kept exactly -- the LANE the stack rides over the terminals
-// grew by the film too, so the wire still cannot reach the turn above.
-//
-// This test pins the invariant that the tangency must not come back: a strictly positive gap
-// between the terminal and its sheet, of the film's size, BRIDGED by the solder. Revert the film
-// to zero and the first REQUIRE fails (the gap goes to 0).
-TEST_CASE("Real winding: a foil terminal floats on its solder film, never tangent to the sheet",
+// The example states each foil end's lead: connections[].exit "axial" with the round
+// connections[].leadConductor "Round 0.5 - Grade 1". MKF plans it (ConnectionRoute::axialLead):
+// tangent to the sheet's outer face along the sheet's height, copper on copper, then straight
+// along the column axis through the end face to one lead diameter past the flange's outer face.
+// MVB++ draws exactly that. This holds every lead of every parallel to it: drawn on the stated
+// conductor's copper diameter, TOUCHING its own sheet (distance 0) without overlapping it
+// (common volume 0), running from MKF's attach to MKF's end, which lies past the flange, and no
+// solder body anywhere. The former solder film (a 0.05 mm gap under the wire, bridged by a
+// solder body) is gone: a lead that does not touch the sheet fails the distance check.
+TEST_CASE("Real winding: a foil terminal is MKF's axial lead, touching its sheet and leaving "
+          "through the end face",
           "[realwinding][foil]") {
     auto magneticJson = loadFixture("two_switch_forward_transformer_complete.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    const auto routes = enriched.get_mutable_coil().get_connection_layout().routes;
+    const double wall = enriched.get_mutable_coil().resolve_bobbin().get_processed_description().value().get_wall_thickness();
 
     mvb::MagneticBuilder builder;
-    // --copper: the terminal is drawn on its CONDUCTING diameter, which is the surface that is
-    // soldered. The outer diameter is what the bump RESERVES, not what is drawn.
     auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
                                        /*wirePolygonSegments=*/0,
                                        mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
                                        /*paintCoating=*/false, /*emitCoatingShells=*/false,
                                        /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
                                        /*useRealWindingGeometry=*/true, /*femReady=*/true);
-
+    for (const auto& ns : named) {
+        INFO("solid '" << ns.name << "'");
+        CHECK(ns.role != mvb::Role::Solder);
+        CHECK(ns.name.find("solder") == std::string::npos);
+    }
     auto find = [&](const std::string& n) {
         for (const auto& ns : named)
             if (ns.name == n) return ns.shape;
         FAIL("no solid named '" << n << "' in the build");
         return TopoDS_Shape{};
     };
-    auto gap = [](const TopoDS_Shape& a, const TopoDS_Shape& b) {
-        BRepExtrema_DistShapeShape d(a, b);
-        REQUIRE(d.IsDone());
-        return d.Value();
-    };
-    // A failure here is a CONTACT, and the only useful thing to say about a contact is where it
-    // is: the point names the feature that is touching.
     auto whereClosest = [](const TopoDS_Shape& a, const TopoDS_Shape& b) {
         BRepExtrema_DistShapeShape d(a, b);
         std::ostringstream o;
@@ -1745,52 +1732,50 @@ TEST_CASE("Real winding: a foil terminal floats on its solder film, never tangen
         return o.str();
     };
 
-    int joints = 0;
-    for (const std::string& which : {std::string("entrance"), std::string("exit")}) {
-        const std::string lead = "Secondary parallel 0 " + which + " lead";
-        const TopoDS_Shape sheet = find("Secondary parallel 0");
-        const TopoDS_Shape joint = find(lead + " solder joint");
-        // The lead is an L: the SOLDERED RUN down the sheet's height, and a radial piece that
-        // elbows out through the margin to the tip. Only the soldered run is measured here. The
-        // radial piece grazes the sheet's top edge on its way out and that is not a defect --
-        // they are the same conductor, and the meshing fragment welds a same-region contact into
-        // one volume. What killed the mesher was the SOLDERED RUN lying on the face.
-        TopoDS_Shape wire;
-        {
-            double best = -1.0;
-            for (TopExp_Explorer e(find(lead), TopAbs_SOLID); e.More(); e.Next()) {
-                Bnd_Box b;
-                BRepBndLib::Add(e.Current(), b);
-                double x0, y0, z0, x1, y1, z1;
-                b.Get(x0, y0, z0, x1, y1, z1);
-                if (y1 - y0 > best) { best = y1 - y0; wire = e.Current(); }
-            }
-            REQUIRE(best > 0.0);
-        }
+    int leads = 0;
+    for (const auto& route : routes) {
+        if (route.winding != "Secondary") continue;
+        const bool entrance = route.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE;
+        if (!entrance && route.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT) continue;
+        const std::string sheetName = "Secondary parallel " + std::to_string(route.parallel);
+        const std::string lead = sheetName + (entrance ? " entrance lead" : " exit lead");
+        INFO(lead);
+        REQUIRE(route.axialLead);
+        const auto& axial = route.axialLead.value();
+        // MKF's plan is the stated conductor, through the flange.
+        CHECK(axial.outerDiameter > axial.conductingDiameter);
+        CHECK(std::abs(axial.flangeOuterFace - axial.windowEdge) == Catch::Approx(wall).margin(1e-12));
+        CHECK(std::abs(axial.end - axial.flangeOuterFace) == Catch::Approx(axial.outerDiameter).margin(1e-12));
+        REQUIRE(wall > 0.0);
 
-        // The wire's drawn diameter, measured, so the check is independent of the unit the
-        // builder works in: the soldered run is a cylinder, its X extent is one diameter.
+        const TopoDS_Shape sheet = find(sheetName);
+        const TopoDS_Shape wire = find(lead);
         Bnd_Box wb;
-        BRepBndLib::Add(wire, wb);
+        BRepBndLib::AddOptimal(wire, wb, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
         double xlo, ylo, zlo, xhi, yhi, zhi;
         wb.Get(xlo, ylo, zlo, xhi, yhi, zhi);
-        const double diameter = xhi - xlo;
-        REQUIRE(diameter > 0.0);
-
-        const double film = gap(sheet, wire);
-        INFO(lead << ": film " << film << ", diameter " << diameter
-                  << ", ratio " << film / diameter
-                  << ", closest " << whereClosest(sheet, wire));
-        // NOT TANGENT. This is the assertion the PLC error asked for; at tangency it is 0.
-        REQUIRE(film > 0.1 * diameter * 0.5);
-        // ...and it is the film, not an accidental drift: 0.05 mm under a 0.501 mm wire.
-        REQUIRE(film / diameter == Catch::Approx(0.05 / 0.501).epsilon(0.05));
-        // BRIDGED. A gap that nothing crosses would be an open circuit, not a joint.
-        REQUIRE(gap(joint, sheet) < 1e-9 * diameter + 1e-12);
-        REQUIRE(gap(joint, wire) < 1e-9 * diameter + 1e-12);
-        ++joints;
+        // Drawn on the stated conductor's copper, one straight run along the column axis.
+        CHECK((xhi - xlo) == Catch::Approx(axial.conductingDiameter).margin(1e-7));
+        CHECK((zhi - zlo) == Catch::Approx(axial.conductingDiameter).margin(1e-7));
+        CHECK(std::abs(0.5 * (xlo + xhi)) == Catch::Approx(axial.alongFace).margin(1e-9));
+        // From MKF's attach to MKF's end, past the flange's outer face.
+        CHECK(std::min(ylo, yhi) == Catch::Approx(std::min(axial.attachFrom, axial.end)).margin(1e-9));
+        CHECK(std::max(ylo, yhi) == Catch::Approx(std::max(axial.attachFrom, axial.end)).margin(1e-9));
+        // TOUCHING its own sheet...
+        BRepExtrema_DistShapeShape d(sheet, wire);
+        REQUIRE(d.IsDone());
+        INFO("distance " << d.Value() * 1e3 << " mm, closest " << whereClosest(sheet, wire));
+        CHECK(d.Value() < 1e-9);
+        // ...without overlapping it.
+        BRepAlgoAPI_Common common(sheet, wire);
+        REQUIRE(common.IsDone());
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(common.Shape(), props);
+        const double leadVolume = 0.25 * std::numbers::pi * axial.conductingDiameter * axial.conductingDiameter * axial.length;
+        CHECK(std::abs(props.Mass()) < 1e-9 * leadVolume);
+        ++leads;
     }
-    REQUIRE(joints == 2);
+    REQUIRE(leads == 16);   // 8 parallels, two ends each
 }
 
 // ABT #1111 (2026-09-06). The FEM product's periodic-face -> B-spline pass used to run in

@@ -162,10 +162,11 @@ TEST_CASE("buck_inductor_complete real winding: terminal caps are Terminal, not 
                 /*realWinding=*/true);
 }
 
-TEST_CASE("two_switch_forward real winding: foil solder joints are Solder, caps are Terminal",
+// ABT #1907: the foil's leads are MKF's axial leads, touching the sheet; there is no solder body.
+TEST_CASE("two_switch_forward real winding: foil leads are Turn, caps are Terminal",
           "[roles][abt1245]") {
     check_roles("two_switch_forward_transformer_complete.json", /*expectedBobbins=*/0,
-                /*accessories=*/false, /*realWinding=*/true, /*expectSolder=*/true);
+                /*accessories=*/false, /*realWinding=*/true, /*expectSolder=*/false);
 }
 
 TEST_CASE("role_name covers every Role", "[roles][abt1169]") {

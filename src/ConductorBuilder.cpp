@@ -579,7 +579,7 @@ struct ConductorPath {
     std::string name;
     // ABT #1215: the MAS identity of this conductor, set where it is constructed, so the lead
     // measurement never parses `name`. leadOnlyTerminal: -1 for a conductor that carries turns;
-    // 0/1 for a conductor that is ENTIRELY one terminal's lead (a foil's soldered lead wire).
+    // 0/1 for a conductor that is ENTIRELY one terminal's lead (a foil's lead wire).
     std::string winding;
     size_t parallel = 0;
     int leadOnlyTerminal = -1;
@@ -609,11 +609,9 @@ struct ConductorPath {
     // primitive is built as its own rect solid -- straights as prisms, corners as REVOLVED rect
     // (annular wedges, clean at any corner radius) -- and the solids fused (useRectSolids).
     bool isRectangular = false;
-    // ABT #1265: a FOIL sheet and its round lead wires are joined by a SOLDER FILM that must stay
-    // a gap -- 0.05 mm under a 0.501 mm wire, measured, and the reason the mesher's PLC error went
-    // away ([realwinding][foil] asserts the soldered run is NOT tangent to the sheet). Closing a
-    // foil conductor into one body puts the sheet's body in contact with that run and the film
-    // measures zero, so the one-body close skips foil.
+    // ABT #1265 / #1907: a FOIL sheet and its round lead wires are separate conductors that touch
+    // -- the lead lies tangent to the sheet along the attach MKF plans (ConnectionRoute::axialLead)
+    // -- so the one-body close skips foil: it would fuse two bodies across a tangent contact.
     bool isFoil = false;
     bool useRectSolids = false;
     // ROUND wire on a toroid / rect column also goes through the per-primitive analytic path (SEG ->
@@ -1175,7 +1173,62 @@ EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
                     // AZIMUTHAL tangent (the direction adjacent turns are spaced) at the contact.
                     // (Approximate: the in-plane part lumps radial with tangential; round pairs keep
                     // the exact capsule test above unchanged.)
-                    if (rectPair && d < 0.5 * std::hypot(A.condWidth + A.condHeight,
+                    // ABT #1907: a ROUND straight against a RECTANGULAR straight on a concentric
+                    // column is measured EXACTLY: the rectangle's straight is a box (along the
+                    // segment, its width across it in the plane normal to the column axis, its
+                    // height along the axis), and the round one overlaps it iff the distance from
+                    // its centreline to that box is below its copper radius. That distance is
+                    // convex along the round centreline, so a golden-section search finds its
+                    // minimum. The lumped test below rounds the box's flat end by its half-width,
+                    // which reads a foil's axial lead lying past the next sheet's leading edge
+                    // (17 um clear) as 55 um inside it.
+                    const bool exactBoxPair =
+                        rectPair && A.isRectangular != B.isRectangular && !A.toroidal && !B.toroidal &&
+                        pa.kind == Primitive::SEG && pb.kind == Primitive::SEG;
+                    bool boxMeasured = false;
+                    if (exactBoxPair) {
+                        const ConductorPath& R = A.isRectangular ? A : B;
+                        const ConductorPath& C = A.isRectangular ? B : A;
+                        const Primitive& pr = A.isRectangular ? pa : pb;
+                        const Primitive& pc = A.isRectangular ? pb : pa;
+                        const gp_XYZ ra = pr.seg.a.XYZ(), rb = pr.seg.b.XYZ();
+                        gp_XYZ u = rb - ra;
+                        const double len = u.Modulus();
+                        const gp_XYZ axialY(0, 1, 0);
+                        gp_XYZ w = u.Crossed(axialY);
+                        if (len > 1e-12 && w.Modulus() > 1e-9 * len) {
+                            u /= len;
+                            w /= w.Modulus();
+                            const gp_XYZ mid = (ra + rb) * 0.5;
+                            const double hu = 0.5 * len, hw = 0.5 * R.condWidth, hy = 0.5 * R.condHeight;
+                            auto distToBox = [&](const gp_XYZ& p) {
+                                const gp_XYZ q = p - mid;
+                                const double su = q.Dot(u), sw = q.Dot(w), sy = q.Dot(axialY);
+                                const double eu = std::max(0.0, std::abs(su) - hu);
+                                const double ew = std::max(0.0, std::abs(sw) - hw);
+                                const double ey = std::max(0.0, std::abs(sy) - hy);
+                                return std::sqrt(eu * eu + ew * ew + ey * ey);
+                            };
+                            const gp_XYZ c0 = pc.seg.a.XYZ(), c1 = pc.seg.b.XYZ();
+                            auto f = [&](double t) { return distToBox(c0 + (c1 - c0) * t); };
+                            double lo = 0.0, hi = 1.0;
+                            const double g = 0.5 * (std::sqrt(5.0) - 1.0);
+                            double x1 = hi - g * (hi - lo), x2 = lo + g * (hi - lo);
+                            double f1 = f(x1), f2 = f(x2);
+                            for (int it = 0; it < 200 && hi - lo > 1e-15; ++it) {
+                                if (f1 <= f2) { hi = x2; x2 = x1; f2 = f1; x1 = hi - g * (hi - lo); f1 = f(x1); }
+                                else          { lo = x1; x1 = x2; f1 = f2; x2 = lo + g * (hi - lo); f2 = f(x2); }
+                            }
+                            const double dBox = std::min({f(0.0), f(1.0), f1, f2});
+                            if (dBox >= C.condRadius - cert::kCoordinateGridHalf) continue;
+                            d = dBox;
+                            boxMeasured = true;
+                        }
+                        // A straight along the column axis has no box frame here: the lumped test.
+                    }
+                    if (boxMeasured) {
+                        // overlap measured exactly above: report it
+                    } else if (rectPair && d < 0.5 * std::hypot(A.condWidth + A.condHeight,
                                                          B.condWidth + B.condHeight)) {
                         gp_Pnt ca, cb;
                         double best = std::numeric_limits<double>::max();
@@ -7856,7 +7909,7 @@ std::pair<double, double> primCopperExtentAlong(const ConductorPath& p, const Pr
 }
 
 // Every port of the finished paths: the free ends that are terminal lead tips. A foil sheet's two
-// ends and a foil lead wire's soldered end are JOINTS, not ports (they sit in the solder film);
+// ends and a foil lead wire's attached end are JOINTS, not ports (the lead touches the sheet);
 // a pin-routed end ends on its pin, not on a port plane (`pinEnds`: name -> {entrance, exit}).
 std::vector<PortTip> collectPortTips(std::vector<ConductorPath>& paths,
                                      const std::set<std::pair<std::string, bool>>& pinEnds) {
@@ -15054,8 +15107,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             return out;
         };
         // ==================================================================================
-        // FOIL: THE SHEET WRAP WITH SOLDERED WIRE TERMINALS (ABT #970; Alf 2026-09-04: "the
-        // terminals should be on the Z side, like the others; a solder wire").
+        // FOIL: THE SHEET WRAP WITH ITS AXIAL LEAD WIRES (ABT #970, #1907; Alf 2026-09-04: "the
+        // terminals should be on the Z side, like the others"; 2026-10-18: "lead touches the foil").
         //
         // The sheet: a rectangular section -- thickness radially, MKF's cut height axially --
         // laid FLAT on the former and on the layer beneath it, one racetrack per MKF station,
@@ -15067,15 +15120,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // curves, so parallels never interpenetrate (a cosine ramp measured 10-20 um of overlap,
         // sheets on a tilt being p*cos(theta) apart along their normals).
         //
-        // The terminals: a foil's start and finish are round WIRES soldered to the sheet
-        // (Electronic Design copper-foil inductor guide; Power Integrations: 2 x 23 AWG on the
-        // foil), not tabs -- a straight sheet tab from an inner layer is crossed by every outer
-        // layer's corner, and an E core's yoke closes the axial way out. Each wire lies along the
-        // sheet's EDGE at the seam for a solder lap and then runs radially out through the
-        // MARGIN -- the band between the foil's edge and the flange, which is exactly where SMPS
-        // practice routes a foil's lead-out (PI AN-18, sleeved) -- so it crosses no outer sheet.
-        // Entrance wires take the top margin on the +x side of the seam, exit wires the bottom
-        // margin on the -x side: two parallels' laps never share an edge.
+        // The terminals: a foil's start and finish leave by the round lead conductor MAS states
+        // for each end, axially through the end face, exactly as MKF plans them
+        // (ConnectionRoute::axialLead, ABT #1907): the lead lies tangent to the sheet's outer
+        // face along its height -- the lead touches the foil -- and runs straight on through the
+        // flange. Entrance leads lie at +x of the seam, exit leads at -x.
         // ==================================================================================
         if (foilWire) {
             if (turns.empty()) {
@@ -15152,55 +15201,49 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             };
             auto P3 = [&](double x, double y, double z) { return gp_Pnt(x, y, zs * z); };
 
-            // The lead wire (its OD is the input lane's bump, so it is resolved first). Not in
-            // MAS (connection.diameter is a PIN diameter): MVB_FOIL_LEAD_WIRE, default
-            // "Round 0.5 - Grade 1" -- the 23 AWG class Power Integrations solders to a foil
-            // secondary, and the largest standard round wire that fits this design's margins.
-            const char* leadName = std::getenv("MVB_FOIL_LEAD_WIRE");
-            const std::string leadWireName = leadName ? leadName : "Round 0.5 - Grade 1";
-            OpenMagnetics::Wire leadWire = OpenMagnetics::find_wire_by_name(leadWireName);
-            if (!leadWire.get_outer_diameter()) {
-                throw std::runtime_error("ConductorBuilder: foil lead wire '" + leadWireName +
-                                         "' has no outer diameter");
+            // THE LEADS ARE MKF'S (ABT #1907, Alf 2026-10-18). A foil end leaves by the conductor
+            // MAS states for it (connections[].leadConductor, a round wire) through the END FACE
+            // (connections[].exit: axial), and MKF plans that lead -- ConnectionRoute::axialLead:
+            // tangent to the sheet's outer face along the sheet's height, copper on copper, then
+            // straight along the column axis through the flange to one lead diameter past its
+            // outer face, each end's leads side by side along the face in parallel order. This
+            // draws exactly that, and refuses a foil end MKF did not plan so: nothing about the
+            // lead -- its wire, its place, its length -- is chosen here.
+            const OpenMagnetics::ConnectionRoute* axialRouteIn = nullptr;
+            const OpenMagnetics::ConnectionRoute* axialRouteOut = nullptr;
+            for (const auto& r : connectionLayout.routes) {
+                if (r.winding != ct.winding || r.parallel != ct.parallel) continue;
+                const bool in = r.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE;
+                if (!in && r.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT) continue;
+                const OpenMagnetics::ConnectionRoute*& slotRef = in ? axialRouteIn : axialRouteOut;
+                if (slotRef)
+                    throw std::runtime_error("ConductorBuilder: MKF's connection layout carries two " +
+                                             std::string(in ? "entrance" : "exit") + " routes for foil conductor '" +
+                                             path.name + "'");
+                slotRef = &r;
             }
-            const double foilLeadOD = OpenMagnetics::resolve_dimensional_values(leadWire.get_outer_diameter().value());
-            // THE SOLDER JOINT (Alf, 2026-09-04: "think of a proper way to emulate that soldered
-            // connection"). Not an overlap -- the audit exists to catch those and a fused body
-            // made from one self-intersects. What is physically there: the wire sits on a thin
-            // solder FILM (it never touches bare copper), and the solder rises on both sides
-            // towards the wire's equator. One U-shaped solid per joint, sharing a flat face with
-            // the sheet and a cylindrical face with the wire, minimum thickness = the film, so it
-            // meshes; named "... solder joint" so the mesher can give it solder's conductivity.
-            // THE WIRE SITS ON A SOLDER FILM, NOT ON THE FOIL. A wire laid EXACTLY tangent to
-            // the sheet (the 2026-09-04 shape) is unbuildable as a mesh: the cylinder and the
-            // plane meet at a zero dihedral angle, and every decomposition of that corner --
-            // separate solids, a fused body, fillets that stop short or run all the way in --
-            // still contains a feature of zero thickness. tetgen said so on complete_two_switch
-            // in exactly those words, "PLC Error: a segment and a facet intersect", at
-            // (-0.267, 5.183, 15.9845) mm, which is the bottom generatrix of
-            // 'Secondary parallel 0 exit lead' on the face of 'Secondary parallel 0'.
-            // The physics agrees with the mesher: a soldered wire never touches bare copper, it
-            // floats on the joint. So the wire is lifted by the film and the solder fills the
-            // whole footprint under it -- one body, minimum thickness = the film, no cusp.
-            // Alf's reason for asking for tangency is preserved exactly: the wire must not reach
-            // the turn riding over it, so the LANE grows by the film too (see rideFirst/rideRet
-            // below). The film is a stated choice; IPC-A-610 speaks of wetting, not millimetres.
-            const double foilSolderFilm = std::getenv("MVB_FOIL_SOLDER_FILM")
-                                              ? std::atof(std::getenv("MVB_FOIL_SOLDER_FILM")) * 1e-3
-                                              : 0.05e-3;
-            // THE SOLDER STAYS INSIDE THE WIRE'S FOOTPRINT (Alf, 2026-09-04: "make the welding
-            // not spread farther than the diameter -- it goes out of the wire"). The joint is
-            // bounded by |x| <= r, so it is never wider than the wire it joins; it rises to half
-            // a radius below the equator, which leaves a real 34 um-wide top face instead of the
-            // zero-angle cusp a fillet carried all the way to the equator would make (the
-            // rectangle would meet the cylinder tangentially there -- unmeshable).
-            // (the rise is half the DRAWN radius -- see the terminal block below)
-            // THE LANE the stack rides over the terminal wires: the enamelled envelope plus the
-            // film the wire floats on. Under --copper the wire is drawn on its CONDUCTING
-            // diameter, so the coating still has (OD - conducting)/2 of room above it.
-            const double foilLeadLane = foilLeadOD + foilSolderFilm;
-            // Staircase pitch: the wire (solder included, it spreads no further) plus a hair.
-            const double foilSlotPitch = 1.1 * foilLeadOD;
+            for (const auto* r : {axialRouteIn, axialRouteOut}) {
+                if (!r || !r->axialLead)
+                    throw std::runtime_error(
+                        "ConductorBuilder: foil conductor '" + path.name + "': MKF plans no axial lead for its " +
+                        std::string(r == axialRouteIn ? "start" : "finish") + " (ConnectionRoute::axialLead). A foil "
+                        "end is drawn only as the lead MKF plans for it: state connections[].exit \"axial\" with a "
+                        "round connections[].leadConductor for that end (ABT #1907)");
+            }
+            const OpenMagnetics::AxialLead axIn = *axialRouteIn->axialLead;
+            const OpenMagnetics::AxialLead axOut = *axialRouteOut->axialLead;
+            // Copper on copper is what MKF planned; a coated drawing would put the lead's enamel
+            // inside the sheet's film along the whole attach. The bobbin's CUTTER build is the
+            // exception: it is coated on purpose (the enamel owns the flange slot it passes
+            // through) and may overlap itself, so there the lead is its enamelled envelope on
+            // MKF's centreline.
+            if (opts.paintCoating && !opts.cutterOnly)
+                throw std::runtime_error(
+                    "ConductorBuilder: foil conductor '" + path.name + "': its leads are planned copper on copper "
+                    "(ConnectionRoute::axialLead, tangent to the sheet), which a coated drawing cannot show without "
+                    "putting the lead's enamel inside the sheet; draw it on copper (paintCoating off) (ABT #1907)");
+            // THE LANE the stack rides over the entrance leads: the lead's enamelled envelope.
+            const double foilLeadLane = axIn.outerDiameter;
             // Where the sheet starts and ends on its connection face, for the terminal wires.
             double zFaceStart = 0.0, zFaceEnd = 0.0;
             double seamGapForLeads = 0.0;
@@ -15252,12 +15295,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // one wire OD thick above the outermost first layer -- the bump the second turn
                 // rides by. The ends mirror it on the -x half: the OUTERMOST sheet stops first,
                 // each inner sheet runs one slot closer to the seam, its wire on its end.
-                // Slot pitch 1.1 OD: the wires are a hair apart, not touching. The collision
-                // gate models a sheet as a capsule, so a sheet's flat leading edge reads as a
-                // rounded one 0.1 mm beyond it; at exactly one OD a wire that truly clears the
-                // next sheet's edge by 8 um read as 35 um inside. The lane stays one OD THICK.
-                const double slotPitch = foilSlotPitch;
-                const double xStart = (j == 0) ? double(ct.parallel) * slotPitch : 0.0;
+                // The slots are MKF's (AxialLead::alongFace): one lead outer diameter per
+                // parallel, so a sheet begins exactly past the previous parallel's lead.
+                // The sheet begins at its lead's back generatrix (MKF's alongFace less half the
+                // lead), which is where the previous parallel's lead ends (ABT #1907).
+                const double xStart = (j == 0) ? axIn.alongFace - 0.5 * axIn.outerDiameter : 0.0;
                 pushSegF(path, P3(xStart, y, zF), P3(segX, y, zF), wl + " connection face (seam side)", j, false);
                 pushCornerF(segX, cF, R, 1.5 * kPi, y, wl + " corner +X", j);
                 pushSegF(path, P3(xPos, y, cF), P3(xPos, y, -cO), wl + " +X face", j, false);
@@ -15280,7 +15322,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                            ? std::atof(std::getenv("MVB_FOIL_SEAM_GAP")) * 1e-3
                                            : 0.0;
                 const double xReturnEnd = (j + 1 == turns.size())
-                                              ? -(double(ct.parallel) * slotPitch + seamGap) : 0.0;
+                                              ? -(axOut.alongFace - 0.5 * axOut.outerDiameter + seamGap) : 0.0;
                 seamGapForLeads = seamGap;
                 if (j == 0) { rs0ForLeads = rs0; rideBaseForLeads = rideBase; }
                 pushSegF(path, P3(-segX, y, zR + G), P3(xReturnEnd, y, zR + G), wl + " connection face (return)", j, false);
@@ -15288,143 +15330,83 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             paths.push_back(std::move(path));
 
-            // ---- THE SOLDERED WIRE TERMINALS (Alf, 2026-09-04) ------------------------------
-            // A wire soldered VERTICALLY to the foil at the seam -- the joint runs the sheet's
-            // full height -- then out through the margin to the tip, like every other lead's
-            // L-route. The parallels are wound together, so all N input wires sit side by side
-            // in ONE lane just inside the stack's start (the stack rides over them by one OD,
-            // see rideOwn), and all N output wires side by side on the OUTER face of the stack's
-            // end. Input wires on the +x half of the face and elbow into the top margin, output
-            // wires on the -x half into the bottom margin.
-            const double leadOD = foilLeadOD;          // the ENAMELLED envelope: the bump
-            double leadBare = leadOD;
-            if (leadWire.get_conducting_diameter())
-                leadBare = OpenMagnetics::resolve_dimensional_values(leadWire.get_conducting_diameter().value());
-            // WHAT IS DRAWN vs WHAT IS RESERVED (Alf, 2026-09-04: "is the terminal wire drawn
-            // using outer diameters instead of conducting diameter? the bump must be outer
-            // diameter, but the drawn terminal, which is the one that must touch the foil, must
-            // be conducting diameter"). Exactly so, and the terminal was the one conductor in
-            // the build not obeying it: every other solid follows opts.paintCoating (--copper
-            // draws the bare conducting footprint), while this wire was hardcoded to its outer
-            // diameter -- drawn 34 um too fat on a Round 0.5, and touching the sheet at its
-            // ENAMEL rather than its copper. The joint is soldered, so bare copper meets bare
-            // copper there; the enamel still has to fit between the wire and the turn riding
-            // over it, which is what the outer-diameter BUMP reserves: the next sheet's face
-            // sits OD above the foil while the wire's copper reaches only `conducting`, leaving
-            // OD - conducting of room for the coating.
-            const double leadRw = opts.paintCoating ? 0.5 * leadOD : 0.5 * leadBare;
+            // ---- THE AXIAL LEADS (ABT #1907): MKF's ConnectionRoute::axialLead, drawn ----------
+            // Each lead is ONE straight run along the column axis at (alongFace, the sheet's drawn
+            // face plus MKF's tangency offset): from the attach's far end, along the sheet it lies
+            // on, out through the end face to MKF's end. The entrance lies on the first layer's
+            // outer face at the seam (+x of it, the way the sheet leaves), the exit on the last
+            // return's (-x, the way it arrives). The bobbin flange is cut by the lead like by
+            // every conductor (cut_bobbin).
             const double sheetTop = y + 0.5 * wireH, sheetBot = y - 0.5 * wireH;
-            if (const auto& wb = windowBoundsPerPath[ci]) {
-                const double marginTop = wb->hi - sheetTop, marginBot = sheetBot - wb->lo;
-                if (marginTop < leadOD - 1e-12 || marginBot < leadOD - 1e-12) {
+            for (const auto* ax : {&axIn, &axOut}) {
+                const double lo = std::min(ax->attachFrom, ax->attachTo), hi = std::max(ax->attachFrom, ax->attachTo);
+                if (std::abs(lo - sheetBot) > 1e-9 || std::abs(hi - sheetTop) > 1e-9) {
                     std::ostringstream w;
-                    w.precision(4);
-                    w << "ConductorBuilder: foil lead wire '" << leadWireName << "' (OD "
-                      << leadOD * 1e3 << " mm) does not fit the margins of '" << path.name
-                      << "' (top " << marginTop * 1e3 << " mm, bottom " << marginBot * 1e3
-                      << " mm); a foil's lead-out runs in the margin";
+                    w.precision(6);
+                    w << "ConductorBuilder: foil conductor '" << path.name << "': MKF attaches its "
+                      << (ax == &axIn ? "start" : "finish") << " lead along " << lo * 1e3 << " .. " << hi * 1e3
+                      << " mm, but the sheet is drawn over " << sheetBot * 1e3 << " .. " << sheetTop * 1e3
+                      << " mm (ABT #1907)";
+                    throw std::runtime_error(w.str());
+                }
+                if (ax->alongFace + 0.5 * ax->outerDiameter > rs0ForLeads.segX + 1e-12) {
+                    std::ostringstream w;
+                    w.precision(6);
+                    w << "ConductorBuilder: foil conductor '" << path.name << "': MKF lays its "
+                      << (ax == &axIn ? "start" : "finish") << " lead " << ax->alongFace * 1e3
+                      << " mm along the connection face, past the face's straight ("
+                      << rs0ForLeads.segX * 1e3 << " mm from the seam to the corner) (ABT #1907)";
                     throw std::runtime_error(w.str());
                 }
             }
-            if (double(numParallels) * foilSlotPitch > rs0ForLeads.segX) {
-                std::ostringstream w;
-                w.precision(4);
-                w << "ConductorBuilder: " << numParallels << " foil lead wires of '" << leadWireName
-                  << "' (OD " << leadOD * 1e3 << " mm) side by side do not fit the connection face of '"
-                  << ct.winding << "' (" << rs0ForLeads.segX * 1e3 << " mm from the seam to the corner)";
-                throw std::runtime_error(w.str());
-            }
-            const double slot = double(ct.parallel) * foilSlotPitch + 0.5 * leadOD;   // this sheet's own slot (enamel pitch)
-            // On the sheet's OUTER face, on the solder film: input at the first layer's own
-            // (unlifted) height, output on the last return.
-            const double zWireIn  = zFaceStart + 0.5 * wireW + foilSolderFilm + leadRw;
-            const double zWireOut = zFaceEnd + 0.5 * wireW + foilSolderFilm + leadRw;
-            // The tip plane every lead ends on is set by the ROUND windings' outer turn plus four
-            // ODs; a foil stack with its step-outs and rides reaches past it (this design: stack
-            // to z = 16.97 mm against a 15.84 mm plane). The foil's leads end beyond the whole
-            // stack: the outermost parallel's last return, wire included.
-            const double leadTipRadiusFoil = [&]() {
-                const double xOuter = (firstX.empty() ? station(turns.front()).x : firstX.back())
-                                      + double(turns.size()) * double(numParallels) * parallelPitch;
-                const RectStation rsO = rectStation(PlanePt{xOuter, y}, rectHalfW, rectHalfD,
-                                                    minBend, formerCornerRadius, path.name);
-                return std::max(leadTipRadius, rsO.zPos + rideBaseForLeads + leadOD + 0.5 * wireW + leadOD + 2.0 * leadOD);
-            }();
-            auto makeLead = [&](bool entrance, double zWire, double slotX, double yElbow,
-                                double yJointEnd, const std::string& nm) {
+            // The sheet MKF's lead is tangent to: the first station (entrance) and the last
+            // (exit), at their own drawn depth on the connection face.
+            if (axialRouteIn->toTurn != turns.front()->get_name() || axialRouteOut->fromTurn != turns.back()->get_name())
+                throw std::runtime_error("ConductorBuilder: foil conductor '" + path.name + "': MKF attaches its leads to '" +
+                                         axialRouteIn->toTurn + "' and '" + axialRouteOut->fromTurn +
+                                         "', not to its first and last turns '" + turns.front()->get_name() + "' and '" +
+                                         turns.back()->get_name() + "' (ABT #1907)");
+            const double tangencyIn = axIn.layerAxis - station(turns.front()).x;
+            const double tangencyOut = axOut.layerAxis - station(turns.back()).x;
+            auto makeLead = [&](bool entrance, const OpenMagnetics::AxialLead& ax, double zWire, double slotX,
+                                const std::string& nm) {
                 ConductorPath L;
                 L.name = nm;
                 L.winding = ct.winding;
                 L.parallel = static_cast<size_t>(ct.parallel);
                 L.leadOnlyTerminal = entrance ? 0 : 1;
-                L.wireRadius = leadRw;
-                L.condRadius = 0.5 * leadBare;
-                L.condWidth = leadBare; L.condHeight = leadBare;
+                L.wireRadius = 0.5 * (opts.paintCoating ? ax.outerDiameter : ax.conductingDiameter);
+                L.condRadius = 0.5 * ax.conductingDiameter;
+                L.condWidth = ax.conductingDiameter; L.condHeight = ax.conductingDiameter;
                 L.isRectangular = false;
-                L.isFoil = true;   // ABT #1265: a foil lead keeps its solder film (see isFoil)
-                L.wireWidth = leadOD; L.wireHeight = leadOD;
+                L.isFoil = true;   // its attached end is a joint on the sheet, not a port
+                L.wireWidth = ax.outerDiameter; L.wireHeight = ax.outerDiameter;
                 L.femReady = opts.femReady;
                 L.singleBodyCapable = false;
                 L.toroidal = false;
                 const bool rectColumnAnalytic = !isToroidal && columnShape == MAS::ColumnShape::RECTANGULAR;
                 L.useRectSolids = rectColumnAnalytic;
                 L.roundProfile = rectColumnAnalytic;
-                const gp_Pnt jointEnd = P3(slotX, yJointEnd, zWire);   // far end of the soldered run
-                const gp_Pnt elbow    = P3(slotX, yElbow, zWire);      // where it leaves the sheet
-                const gp_Pnt tip      = P3(slotX, yElbow, leadTipRadiusFoil);
-                if (entrance) {
-                    pushSegF(L, tip, elbow, "entrance lead seg 0 (radial, in the margin)", 0, true);
-                    pushSegF(L, elbow, jointEnd, "entrance lead seg 1 (soldered vertically on the foil)", 0, true);
-                } else {
-                    pushSegF(L, jointEnd, elbow, "exit lead seg 0 (soldered vertically on the foil)", turns.size() - 1, true);
-                    pushSegF(L, elbow, tip, "exit lead seg 1 (radial, in the margin)", turns.size() - 1, true);
-                }
+                const gp_Pnt attached = P3(slotX, ax.attachFrom, zWire);
+                const gp_Pnt tip      = P3(slotX, ax.end, zWire);
+                if (entrance)
+                    pushSegF(L, tip, attached, "entrance lead seg 0 (axial, through the end face and along the sheet)", 0, true);
+                else
+                    pushSegF(L, attached, tip, "exit lead seg 0 (axial, along the sheet and through the end face)",
+                             turns.size() - 1, true);
                 paths.push_back(std::move(L));
-                // The solder: ONE body per joint, the wire's own footprint |x - slotX| <= r,
-                // from the sheet's outer face up to half a radius below the equator, extruded
-                // along the soldered run, minus the wire. The wire floats on it by the film, so
-                // the body is nowhere thinner than the film and no face of it is tangent to the
-                // bore -- the cylinder's half-width at the top face is 0.866 r, well inside the
-                // block's r. Local z is the face's outward normal; P3 applies the face's sign.
-                {
-                    const double zFace = zWire - foilSolderFilm - leadRw;  // the sheet's outer face
-                    const double zTop  = zWire - 0.5 * leadRw;   // half a DRAWN radius below the equator
-                    // Solder exists only where there is sheet under the wire: the joint runs the
-                    // sheet's height, never into the margin the wire elbows through.
-                    const double yLo = sheetBot, yHi = sheetTop;
-                    const double xa = slotX - leadRw, xb = slotX + leadRw;
-                    BRepBuilderAPI_MakePolygon poly;
-                    poly.Add(P3(xa, yLo, zFace));
-                    poly.Add(P3(xb, yLo, zFace));
-                    poly.Add(P3(xb, yLo, zTop));
-                    poly.Add(P3(xa, yLo, zTop));
-                    poly.Close();
-                    TopoDS_Shape block = BRepPrimAPI_MakePrism(BRepBuilderAPI_MakeFace(poly.Wire(), Standard_True).Face(),
-                                                               gp_Vec(0, yHi - yLo, 0)).Shape();
-                    TopoDS_Shape bore = BRepPrimAPI_MakeCylinder(gp_Ax2(P3(slotX, yLo - 1e-6, zWire), gp_Dir(0, 1, 0)),
-                                                                 leadRw, yHi - yLo + 2e-6).Shape();
-                    BRepAlgoAPI_Cut cut(block, bore);
-                    if (!cut.IsDone()) {
-                        throw std::runtime_error("ConductorBuilder: solder joint for '" + nm + "' failed to build");
-                    }
-                    NamedShape sd;
-                    sd.shape = cut.Shape();
-                    sd.name = nm + " solder joint";
-                    sd.role = Role::Solder;   // ABT #1169
-                    solderShapes.push_back(std::move(sd));
-                }
             };
-            makeLead(true,  zWireIn,  +slot, sheetTop + leadRw, sheetBot,
+            makeLead(true, axIn, zFaceStart + tangencyIn, +axIn.alongFace,
                      ct.winding + " parallel " + std::to_string(ct.parallel) + " entrance lead");
-            makeLead(false, zWireOut, -slot, sheetBot - leadRw, sheetTop,
+            makeLead(false, axOut, zFaceEnd + tangencyOut, -axOut.alongFace,
                      ct.winding + " parallel " + std::to_string(ct.parallel) + " exit lead");
             if (std::getenv("MVB_FOIL_DIAG")) {
                 std::fprintf(stderr,
                              "[foil] %s: %zu turn(s), parallels=%d pitch=%.4f mm y=%.4f mm face=%s "
-                             "lead='%s' OD=%.4f mm slot=%.4f mm tip=%.4f mm\n",
+                             "lead OD=%.4f mm along-face in=%.4f out=%.4f mm end in=%.4f out=%.4f mm\n",
                              ct.winding.c_str(), turns.size(), numParallels, parallelPitch * 1e3,
-                             y * 1e3, zs > 0 ? "+Z" : "-Z", leadWireName.c_str(), leadOD * 1e3,
-                             slot * 1e3, leadTipRadiusFoil * 1e3);
+                             y * 1e3, zs > 0 ? "+Z" : "-Z", axIn.outerDiameter * 1e3,
+                             axIn.alongFace * 1e3, axOut.alongFace * 1e3, axIn.end * 1e3, axOut.end * 1e3);
             }
             continue;
         }
