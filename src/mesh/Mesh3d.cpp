@@ -1050,18 +1050,13 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         ++group;   // index of the NAMED SHAPE this signature came from
         std::string name = ns.name;
         if (auto tp = name.find(" terminal "); tp != std::string::npos) {   // a port cap face, not a volume
-            // Collected here, decided below: MVB++ caps BOTH path ends of every conductor path it emits, and a foil
-            // parallel is three paths -- the sheet and its entrance / exit leads -- so it carries six caps, of which
-            // only the two lead TIPS are free ends. The others sit in the solder joints (two_switch_forward: 16 sheet-
-            // end caps of 12.12 mm were tagged as ports, ABT #1400).
+            // Collected here, decided below: MVB++ caps both free ends of every conductor body it emits (a foil
+            // parallel's are its two lead tips, ABT #1907); a cap that touches another conductor is a joint.
             TermCand tc;
             tc.name = name;
             tc.winding = name.substr(0, name.find(" parallel "));
             tc.ownBody = name.substr(0, tp);
             tc.side = std::atoi(name.c_str() + tp + 10);
-            static const std::regex leadRe(R"(^.+ parallel \d+ (entrance|exit) lead$)");
-            std::smatch lm;
-            if (std::regex_match(tc.ownBody, lm, leadRe)) tc.side = (lm[1].str() == "entrance") ? 0 : 1;
             tc.shape = ns.shape;
             termCands.push_back(tc);
             continue;
@@ -1134,23 +1129,17 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
             const std::string role = classify(ns.name, w, ix, nctx3d);
             if (role == "winding" || role == "solder" || role == "turn") bodies.push_back({ns.name, &ns.shape});
         }
-        // A parallel that has its own LEAD bodies ("<w> parallel <p> entrance|exit lead", the foil construction) takes its
-        // ports at the lead tips; the sheet's own two caps are its free EDGES -- dead ends the leads are soldered beside,
-        // where no current enters or leaves -- so they are not ports either (two_switch: 12.12 mm caps at the sheet ends).
-        std::set<std::string> parallelsWithLeads;
-        {
-            static const std::regex leadBodyRe(R"(^(.+ parallel \d+) (?:entrance|exit) lead$)");
-            for (const auto& tc : termCands) {
-                std::smatch lm;
-                if (std::regex_match(tc.ownBody, lm, leadBodyRe)) parallelsWithLeads.insert(lm[1].str());
-            }
-        }
+        // A FOIL parallel is ONE body (ABT #1907, Alf 2026-10-19): MVB++ fuses its sheet, its two axial leads and the
+        // weld strips MKF lays between them, and caps only the lead tips (MKF's AxialLead::end), so its two caps are its
+        // ports and the sheet's edges carry none. A separate lead body ("<w> parallel <p> entrance|exit lead") is the old
+        // construction, whose lead touched its sheet along a line only -- no current path, so it cannot be meshed.
         std::map<std::string, std::array<int, 2>> portsPerWinding;
         for (const auto& tc : termCands) {
-            if (parallelsWithLeads.count(tc.ownBody)) {
-                std::fprintf(stderr, "[mesh3d] terminal cap '%s' is a sheet edge of a parallel with lead bodies -> not a port\n", tc.name.c_str());
-                continue;
-            }
+            static const std::regex leadBodyRe(R"(^.+ parallel \d+ (?:entrance|exit) lead$)");
+            if (std::regex_match(tc.ownBody, leadBodyRe))
+                throw std::runtime_error("mesh3d_from_mas: terminal cap '" + tc.name + "' belongs to a separate foil lead body; "
+                                         "a foil lead is fused to its sheet by its weld strip, so its port is a cap of the parallel's "
+                                         "own body (ABT #1907)");
             Bnd_Box bb; BRepBndLib::Add(tc.shape, bb);
             double x0,y0,z0,x1,y1,z1; bb.Get(x0,y0,z0,x1,y1,z1);
             const double rad = 0.5*std::sqrt((x1-x0)*(x1-x0)+(y1-y0)*(y1-y0)+(z1-z0)*(z1-z0));

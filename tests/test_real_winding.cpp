@@ -1683,24 +1683,31 @@ TEST_CASE("Real winding: the drum's connections stay out of the core flange (ABT
     CHECK(inCore == 0);
 }
 
-// A FOIL TERMINAL IS MKF'S AXIAL LEAD (ABT #1907, Alf 2026-10-18: "lead touches the foil").
+// A FOIL TERMINAL IS MKF'S AXIAL LEAD, WELDED TO ITS SHEET (ABT #1907, Alf 2026-10-18/19).
 //
 // The example states each foil end's lead: connections[].exit "axial" with the round
 // connections[].leadConductor "Round 0.5 - Grade 1". MKF plans it (ConnectionRoute::axialLead):
-// tangent to the sheet's outer face along the sheet's height, copper on copper, then straight
-// along the column axis through the end face to one lead diameter past the flange's outer face.
-// MVB++ draws exactly that. This holds every lead of every parallel to it: drawn on the stated
-// conductor's copper diameter, TOUCHING its own sheet (distance 0) without overlapping it
-// (common volume 0), running from MKF's attach to MKF's end, which lies past the flange, and no
-// solder body anywhere. The former solder film (a 0.05 mm gap under the wire, bridged by a
-// solder body) is gone: a lead that does not touch the sheet fails the distance check.
-TEST_CASE("Real winding: a foil terminal is MKF's axial lead, touching its sheet and leaving "
-          "through the end face",
+// tangent to the sheet's outer face along the sheet's height, then straight along the column axis
+// through the end face to one lead diameter past the flange's outer face -- and the WELD STRIP that
+// joins it to the sheet (AxialLead::weld), because tangent copper touches along a line only and
+// carries no current. MVB++ draws exactly that and fuses sheet, strips and leads into the
+// parallel's ONE body, whose only port caps are the lead tips. This holds every parallel to it:
+// one valid solid, no lead body of its own and no solder anywhere; the lead drawn on the stated
+// conductor's copper from MKF's attach to MKF's end, past the flange; a cap at each tip and none
+// on the sheet's edges; and the strip at MKF's numbers, measured as the copper in the slab around
+// the lead: the sheet's, the lead's and the wedge the strip fills between them, which is set by
+// MKF's width (a strip of another width, or none, changes it).
+TEST_CASE("Real winding: a foil terminal is MKF's axial lead, welded to its sheet into one body and "
+          "leaving through the end face",
           "[realwinding][foil]") {
     auto magneticJson = loadFixture("two_switch_forward_transformer_complete.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
     const auto routes = enriched.get_mutable_coil().get_connection_layout().routes;
     const double wall = enriched.get_mutable_coil().resolve_bobbin().get_processed_description().value().get_wall_thickness();
+    auto sheetWire = enriched.get_mutable_coil().resolve_wire(1);
+    REQUIRE(sheetWire.get_type() == MAS::WireType::FOIL);
+    const double sheetThickness = sheetWire.get_maximum_conducting_width();
+    const double sheetHeight = sheetWire.get_maximum_conducting_height();
 
     mvb::MagneticBuilder builder;
     auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
@@ -1713,23 +1720,14 @@ TEST_CASE("Real winding: a foil terminal is MKF's axial lead, touching its sheet
         INFO("solid '" << ns.name << "'");
         CHECK(ns.role != mvb::Role::Solder);
         CHECK(ns.name.find("solder") == std::string::npos);
+        CHECK(ns.name.find(" entrance lead") == std::string::npos);
+        CHECK(ns.name.find(" exit lead") == std::string::npos);
     }
     auto find = [&](const std::string& n) {
         for (const auto& ns : named)
             if (ns.name == n) return ns.shape;
-        FAIL("no solid named '" << n << "' in the build");
+        FAIL("no shape named '" << n << "' in the build");
         return TopoDS_Shape{};
-    };
-    auto whereClosest = [](const TopoDS_Shape& a, const TopoDS_Shape& b) {
-        BRepExtrema_DistShapeShape d(a, b);
-        std::ostringstream o;
-        o.precision(6);
-        if (d.IsDone() && d.NbSolution() > 0) {
-            const gp_Pnt p1 = d.PointOnShape1(1), p2 = d.PointOnShape2(1);
-            o << "(" << p1.X() * 1e3 << ", " << p1.Y() * 1e3 << ", " << p1.Z() * 1e3 << ") mm"
-              << " <-> (" << p2.X() * 1e3 << ", " << p2.Y() * 1e3 << ", " << p2.Z() * 1e3 << ") mm";
-        }
-        return o.str();
     };
 
     int leads = 0;
@@ -1738,44 +1736,70 @@ TEST_CASE("Real winding: a foil terminal is MKF's axial lead, touching its sheet
         const bool entrance = route.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE;
         if (!entrance && route.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT) continue;
         const std::string sheetName = "Secondary parallel " + std::to_string(route.parallel);
-        const std::string lead = sheetName + (entrance ? " entrance lead" : " exit lead");
-        INFO(lead);
+        INFO(sheetName << (entrance ? " entrance" : " exit"));
         REQUIRE(route.axialLead);
         const auto& axial = route.axialLead.value();
-        // MKF's plan is the stated conductor, through the flange.
+        const auto& weld = axial.weld;
+        // MKF's plan is the stated conductor, through the flange, with its weld strip.
         CHECK(axial.outerDiameter > axial.conductingDiameter);
         CHECK(std::abs(axial.flangeOuterFace - axial.windowEdge) == Catch::Approx(wall).margin(1e-12));
         CHECK(std::abs(axial.end - axial.flangeOuterFace) == Catch::Approx(axial.outerDiameter).margin(1e-12));
         REQUIRE(wall > 0.0);
+        REQUIRE(weld.width > 0.0);
+        REQUIRE(weld.layerTo > weld.layerFrom);
 
-        const TopoDS_Shape sheet = find(sheetName);
-        const TopoDS_Shape wire = find(lead);
-        Bnd_Box wb;
-        BRepBndLib::AddOptimal(wire, wb, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
-        double xlo, ylo, zlo, xhi, yhi, zhi;
-        wb.Get(xlo, ylo, zlo, xhi, yhi, zhi);
-        // Drawn on the stated conductor's copper, one straight run along the column axis.
-        CHECK((xhi - xlo) == Catch::Approx(axial.conductingDiameter).margin(1e-7));
-        CHECK((zhi - zlo) == Catch::Approx(axial.conductingDiameter).margin(1e-7));
-        CHECK(std::abs(0.5 * (xlo + xhi)) == Catch::Approx(axial.alongFace).margin(1e-9));
-        // From MKF's attach to MKF's end, past the flange's outer face.
-        CHECK(std::min(ylo, yhi) == Catch::Approx(std::min(axial.attachFrom, axial.end)).margin(1e-9));
-        CHECK(std::max(ylo, yhi) == Catch::Approx(std::max(axial.attachFrom, axial.end)).margin(1e-9));
-        // TOUCHING its own sheet...
-        BRepExtrema_DistShapeShape d(sheet, wire);
-        REQUIRE(d.IsDone());
-        INFO("distance " << d.Value() * 1e3 << " mm, closest " << whereClosest(sheet, wire));
-        CHECK(d.Value() < 1e-9);
-        // ...without overlapping it.
-        BRepAlgoAPI_Common common(sheet, wire);
-        REQUIRE(common.IsDone());
-        GProp_GProps props;
-        BRepGProp::VolumeProperties(common.Shape(), props);
-        const double leadVolume = 0.25 * std::numbers::pi * axial.conductingDiameter * axial.conductingDiameter * axial.length;
-        CHECK(std::abs(props.Mass()) < 1e-9 * leadVolume);
+        // ONE body: sheet, both leads and both strips.
+        const TopoDS_Shape body = find(sheetName);
+        int solids = 0;
+        for (TopExp_Explorer e(body, TopAbs_SOLID); e.More(); e.Next()) ++solids;
+        REQUIRE(solids == 1);
+        CHECK(BRepCheck_Analyzer(body).IsValid());
+        // The lead is in it, out to MKF's end past the flange.
+        Bnd_Box bb;
+        BRepBndLib::AddOptimal(body, bb, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+        double bx0, by0, bz0, bx1, by1, bz1;
+        bb.Get(bx0, by0, bz0, bx1, by1, bz1);
+        CHECK((axial.end > 0 ? by1 : -by0) == Catch::Approx(std::abs(axial.end)).margin(1e-9));
+
+        // Its port cap at this end: the lead's copper disc at MKF's end, at the lead's slot.
+        const TopoDS_Shape cap = find(sheetName + " terminal " + std::to_string(entrance ? 0 : 1));
+        GProp_GProps cp;
+        BRepGProp::SurfaceProperties(cap, cp);
+        const double r = 0.5 * axial.conductingDiameter;
+        CHECK(cp.Mass() == Catch::Approx(std::numbers::pi * r * r).epsilon(1e-6));
+        CHECK(cp.CentreOfMass().Y() == Catch::Approx(axial.end).margin(1e-9));
+        CHECK(std::abs(cp.CentreOfMass().X()) == Catch::Approx(axial.alongFace).margin(1e-9));
+        const double zLead = cp.CentreOfMass().Z();
+
+        // The copper in the slab around the lead -- one lead outer diameter along the face, the
+        // attach along the turn axis, from the sheet's inner face to the lead's top on the layer
+        // axis: the sheet's, the lead's, and the strip's wedge at MKF's width, nothing else.
+        const double zs = zLead > 0 ? 1.0 : -1.0;
+        const double zSheetMid = zLead - zs * (axial.layerAxis - weld.layerFrom);
+        const double zA = zSheetMid - zs * 0.5 * sheetThickness, zB = zLead + zs * r;
+        const double xC = cp.CentreOfMass().X();
+        const gp_Pnt lo(xC - 0.5 * axial.outerDiameter, std::min(weld.from, weld.to), std::min(zA, zB));
+        const gp_Pnt hi(xC + 0.5 * axial.outerDiameter, std::max(weld.from, weld.to), std::max(zA, zB));
+        BRepAlgoAPI_Common inSlab(body, BRepPrimAPI_MakeBox(lo, hi).Shape());
+        REQUIRE(inSlab.IsDone());
+        GProp_GProps sp;
+        BRepGProp::VolumeProperties(inSlab.Shape(), sp);
+        const double a = 0.5 * weld.width;
+        const double wedge = weld.width * r - (a * std::sqrt(r * r - a * a) + r * r * std::asin(a / r));
+        const double attach = std::abs(weld.to - weld.from);
+        CHECK(attach == Catch::Approx(sheetHeight).margin(1e-9));
+        const double expected = attach * (axial.outerDiameter * sheetThickness + std::numbers::pi * r * r + wedge);
+        INFO("slab copper " << sp.Mass() * 1e9 << " mm^3, expected " << expected * 1e9 << " mm^3 (wedge "
+                            << wedge * attach * 1e9 << " mm^3, weld width " << weld.width * 1e3 << " mm)");
+        CHECK(sp.Mass() == Catch::Approx(expected).epsilon(1e-6));
         ++leads;
     }
     REQUIRE(leads == 16);   // 8 parallels, two ends each
+    // No cap on a sheet's edge: two per parallel, the lead tips.
+    size_t caps = 0;
+    for (const auto& ns : named)
+        if (ns.name.rfind("Secondary parallel ", 0) == 0 && ns.name.find(" terminal ") != std::string::npos) ++caps;
+    CHECK(caps == 16);
 }
 
 // ABT #1111 (2026-09-06). The FEM product's periodic-face -> B-spline pass used to run in
@@ -2430,7 +2454,7 @@ TEST_CASE("Real winding: every port plane clears the copper it does not cut -- t
         }
     }
     REQUIRE(conductors.size() > 2);
-    size_t capsChecked = 0, jointsSkipped = 0, sheetEndsSkipped = 0;
+    size_t capsChecked = 0, jointsSkipped = 0;
     double worstMargin = std::numeric_limits<double>::max();
     for (const auto& ns : built) {
         const auto at = ns.name.find(" terminal ");
@@ -2447,15 +2471,14 @@ TEST_CASE("Real winding: every port plane clears the copper it does not cut -- t
             if (d.Value() <= 1e-3 * h) { joint = true; break; }
         }
         if (joint) { ++jointsSkipped; continue; }
-        // A FOIL SHEET's two ends are joints too -- the current reaches the sheet through its
-        // soldered lead wires, which are conductors of their own ("<sheet> entrance lead" /
-        // "<sheet> exit lead") and carry the ports. Its end caps (a 12 mm half-diagonal on this
-        // design) are not ports; OMFEM classifies them on its side (a separate issue from this
-        // one), so they are skipped here BY NAME and counted.
-        bool sheet = false;
-        for (const auto& b : conductors)
-            if (b.name == owner + " entrance lead" || b.name == owner + " exit lead") { sheet = true; break; }
-        if (sheet) { ++sheetEndsSkipped; continue; }
+        // A FOIL parallel is ONE body (ABT #1907): its sheet, its axial leads and the weld strips
+        // between them are fused, and its only caps are the lead tips -- the sheet's edges carry
+        // none, and no lead is a body of its own.
+        for (const auto& b : conductors) {
+            INFO("conductor '" << b.name << "'");
+            CHECK(b.name != owner + " entrance lead");
+            CHECK(b.name != owner + " exit lead");
+        }
         // The cap's plane normal and the side it faces: the axis is the normal's dominant
         // component; outward is away from its own conductor's bulk.
         TopExp_Explorer fx(ns.shape, TopAbs_FACE);
@@ -2492,8 +2515,8 @@ TEST_CASE("Real winding: every port plane clears the copper it does not cut -- t
             CHECK(margin >= 0.0);
         }
     }
-    std::fprintf(stderr, "[port-test] caps checked %zu, joints skipped %zu, foil sheet ends skipped %zu, "
-                         "worst margin %.6f mm\n", capsChecked, jointsSkipped, sheetEndsSkipped,
+    std::fprintf(stderr, "[port-test] caps checked %zu, joints skipped %zu, "
+                         "worst margin %.6f mm\n", capsChecked, jointsSkipped,
                  worstMargin * 1e3);
     REQUIRE(capsChecked > 0);
 }

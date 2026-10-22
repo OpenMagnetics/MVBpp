@@ -609,10 +609,17 @@ struct ConductorPath {
     // primitive is built as its own rect solid -- straights as prisms, corners as REVOLVED rect
     // (annular wedges, clean at any corner radius) -- and the solids fused (useRectSolids).
     bool isRectangular = false;
-    // ABT #1265 / #1907: a FOIL sheet and its round lead wires are separate conductors that touch
-    // -- the lead lies tangent to the sheet along the attach MKF plans (ConnectionRoute::axialLead)
-    // -- so the one-body close skips foil: it would fuse two bodies across a tangent contact.
+    // ABT #1265 / #1907: a FOIL sheet and its round lead wires are separate PATHS that touch -- the
+    // lead lies tangent to the sheet along the attach MKF plans (ConnectionRoute::axialLead) -- so
+    // the generic one-body close skips foil; the output step joins them through MKF's weld strips
+    // instead (fuseFoilParallel), never across the bare tangent contact.
     bool isFoil = false;
+    // ABT #1907 (Alf, 2026-10-19): a foil lead's WELD STRIP, MKF's AxialLead::weld, as the two
+    // opposite corners of its box in the builder's frame. The strip is the copper that joins the
+    // lead to its sheet (tangent copper touches along a line only, which carries no current); the
+    // output step fuses sheet, strips and leads into the parallel's ONE body (fuseFoilParallel).
+    bool hasWeldStrip = false;
+    gp_Pnt weldCornerA, weldCornerB;
     bool useRectSolids = false;
     // ROUND wire on a toroid / rect column also goes through the per-primitive analytic path (SEG ->
     // cylinder, ARC3 -> torus segment), because unioning the swept BSpline pipes of the per-run
@@ -8086,6 +8093,10 @@ static void checkPortPlanes(std::vector<ConductorPath>& paths,
 
 // ABT #1265: defined below, beside the other assembly-closing helpers.
 static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::string& name);
+// ABT #1907: a foil parallel's sheet, its leads and their weld strips, fused into one body.
+static TopoDS_Shape fuseFoilParallel(const TopoDS_Shape& sheet,
+                                     const std::vector<std::pair<TopoDS_Shape, const ConductorPath*>>& leads,
+                                     const std::string& name);
 
 // THE PIN GATE (ABT #1172). The copper gate knows only copper; a wrap and its run also live among
 // the pins, the core and each other's pins. Every centreline sample of every conductor keeps its
@@ -15368,6 +15379,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                          turns.back()->get_name() + "' (ABT #1907)");
             const double tangencyIn = axIn.layerAxis - station(turns.front()).x;
             const double tangencyOut = axOut.layerAxis - station(turns.back()).x;
+            // The sheet's run on the connection face that each lead lies on: the entrance sheet from
+            // its start to the +x corner, the exit sheet from the -x corner to its end.
+            const double faceInLo = axIn.alongFace - 0.5 * axIn.outerDiameter, faceInHi = rs0ForLeads.segX;
+            const double faceOutLo = -rs0ForLeads.segX,
+                         faceOutHi = -(axOut.alongFace - 0.5 * axOut.outerDiameter + seamGapForLeads);
             auto makeLead = [&](bool entrance, const OpenMagnetics::AxialLead& ax, double zWire, double slotX,
                                 const std::string& nm) {
                 ConductorPath L;
@@ -15389,6 +15405,32 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 L.roundProfile = rectColumnAnalytic;
                 const gp_Pnt attached = P3(slotX, ax.attachFrom, zWire);
                 const gp_Pnt tip      = P3(slotX, ax.end, zWire);
+                // THE WELD STRIP (AxialLead::weld): MKF's box, mapped like the lead -- the layer
+                // axis onto the connection face's depth (zWire IS the lead's layerAxis there), the
+                // turn axis onto y, the face onto x about the lead's own slot. Nothing is sized
+                // here; it is refused if it would leave the sheet run the lead lies on.
+                {
+                    const auto& wd = ax.weld;
+                    const double xLo = slotX - 0.5 * wd.width, xHi = slotX + 0.5 * wd.width;
+                    const double runLo = entrance ? faceInLo : faceOutLo, runHi = entrance ? faceInHi : faceOutHi;
+                    if (!(wd.width > 0) || !(wd.layerTo > wd.layerFrom) || !(std::abs(wd.to - wd.from) > 0) ||
+                        xLo < runLo - 1e-12 || xHi > runHi + 1e-12 ||
+                        std::abs(std::min(wd.from, wd.to) - sheetBot) > 1e-9 ||
+                        std::abs(std::max(wd.from, wd.to) - sheetTop) > 1e-9) {
+                        std::ostringstream w;
+                        w.precision(6);
+                        w << "ConductorBuilder: foil conductor '" << path.name << "': MKF's weld strip for its "
+                          << (entrance ? "start" : "finish") << " lead (" << wd.width * 1e3 << " mm wide at "
+                          << slotX * 1e3 << " mm, layer " << wd.layerFrom * 1e3 << " .. " << wd.layerTo * 1e3
+                          << " mm, turn axis " << wd.from * 1e3 << " .. " << wd.to * 1e3
+                          << " mm) does not lie on the sheet run " << runLo * 1e3 << " .. " << runHi * 1e3
+                          << " mm, height " << sheetBot * 1e3 << " .. " << sheetTop * 1e3 << " mm (ABT #1907)";
+                        throw std::runtime_error(w.str());
+                    }
+                    L.hasWeldStrip = true;
+                    L.weldCornerA = P3(xLo, wd.from, zWire + (wd.layerFrom - ax.layerAxis));
+                    L.weldCornerB = P3(xHi, wd.to, zWire + (wd.layerTo - ax.layerAxis));
+                }
                 if (entrance)
                     pushSegF(L, tip, attached, "entrance lead seg 0 (axial, through the end face and along the sheet)", 0, true);
                 else
@@ -17025,7 +17067,27 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
 
     std::vector<NamedShape> out;
     out.reserve(paths.size());
+    // ABT #1907 (Alf, 2026-10-19): a foil parallel is ONE conductor -- its sheet, its two axial
+    // leads and the weld strips MKF lays between them -- so its lead paths are not bodies of their
+    // own: they are emitted and fused into their sheet's body below, and only their tips (MKF's
+    // AxialLead::end) are its ports. The bobbin's cutter build keeps them apart (coated envelopes
+    // that cut the flange; no FEM body is made from it).
+    const bool foilFuse = !opts.cutterOnly;
+    std::map<std::pair<std::string, size_t>, std::array<const ConductorPath*, 2>> foilLeadsOf;
+    if (foilFuse)
+        for (const auto& lp : paths)
+            if (lp.isFoil && lp.leadOnlyTerminal >= 0) {
+                auto& slotPair = foilLeadsOf[{lp.winding, lp.parallel}];
+                if (slotPair[lp.leadOnlyTerminal])
+                    throw std::runtime_error("ConductorBuilder: foil parallel '" + lp.name + "' carries two " +
+                                             std::string(lp.leadOnlyTerminal == 0 ? "entrance" : "exit") + " leads (ABT #1907)");
+                if (!lp.hasWeldStrip)
+                    throw std::runtime_error("ConductorBuilder: foil lead '" + lp.name + "' has no weld strip: MKF's "
+                                             "AxialLead::weld was not drawn (ABT #1907)");
+                slotPair[lp.leadOnlyTerminal] = &lp;
+            }
     for (const auto& p0 : paths) {
+        if (foilFuse && p0.isFoil && p0.leadOnlyTerminal >= 0) continue;   // fused into its sheet
         // The terminal fillets (TerminalFillet) are already on p0: they are applied before the
         // collision gate, in place on the path the solids are NAMED from, so the per-solid
         // primitive indices the assembler returns stay one-to-one (filleting a copy inside the
@@ -17038,6 +17100,21 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         TopoDS_Shape cond =
             emitConductor(p, opts.wirePolygonSegments, &primIndexPerSolid, opts.cutterOnly,
                           opts.weld);
+        // ABT #1907: the foil sheet takes its leads and weld strips into its one body.
+        std::array<const ConductorPath*, 2> foilLeads{nullptr, nullptr};
+        const bool foilSheet = foilFuse && p.isFoil && p.leadOnlyTerminal < 0;
+        if (foilSheet) {
+            const auto it = foilLeadsOf.find({p.winding, p.parallel});
+            if (it == foilLeadsOf.end() || !it->second[0] || !it->second[1])
+                throw std::runtime_error("ConductorBuilder: foil sheet '" + p.name + "' has no entrance and exit "
+                                         "lead to fuse with: a foil parallel is drawn with both of MKF's axial leads (ABT #1907)");
+            foilLeads = it->second;
+            std::vector<std::pair<TopoDS_Shape, const ConductorPath*>> leadBodies;
+            for (const ConductorPath* lp : foilLeads)
+                leadBodies.emplace_back(emitConductor(*lp, opts.wirePolygonSegments, nullptr, opts.cutterOnly, opts.weld), lp);
+            cond = fuseFoilParallel(cond, leadBodies, p.name);
+            primIndexPerSolid.clear();   // one body: the per-primitive mapping no longer applies
+        }
         // ABT #1265: one object per wire for the FEM product -- leads included.
         static const bool noOneBody = std::getenv("MVB_NO_ONE_BODY") != nullptr;
         if (opts.femReady && opts.oneBodyPerConductor && opts.weld != WeldMode::Off &&
@@ -17167,14 +17244,22 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // FEM then reports |I_net| ~ 3e-7 A and a meaningless R_ac/R_dc, which reads as a solver
         // bug. Match each free end to the planar face centred on it, and demand a full wire
         // cross-section so a junction sliver can never be picked. (ABT #332)
-        const gp_Pnt freeEnds[2] = {primEndpoints(p.prims.front()).first,
-                                    primEndpoints(p.prims.back()).second};
-        const double wantArea = p.isRectangular ? (p.wireWidth * p.wireHeight)
-                                                : (kPi * p.wireRadius * p.wireRadius);
+        // A fused foil parallel's free ends are its LEAD TIPS (MKF's AxialLead::end): the entrance
+        // lead is drawn tip -> attach, the exit lead attach -> tip. Its sheet's edges are not ends.
+        const gp_Pnt freeEnds[2] = {foilSheet ? primEndpoints(foilLeads[0]->prims.front()).first
+                                              : primEndpoints(p.prims.front()).first,
+                                    foilSheet ? primEndpoints(foilLeads[1]->prims.back()).second
+                                              : primEndpoints(p.prims.back()).second};
+        const ConductorPath& capOf = foilSheet ? *foilLeads[0] : p;
+        if (foilSheet && std::abs(foilLeads[1]->wireRadius - capOf.wireRadius) > 1e-12)
+            throw std::runtime_error("ConductorBuilder: foil sheet '" + p.name + "' has leads of two diameters; its "
+                                     "port caps are matched on one (ABT #1907)");
+        const double wantArea = capOf.isRectangular ? (capOf.wireWidth * capOf.wireHeight)
+                                                    : (kPi * capOf.wireRadius * capOf.wireRadius);
         // characteristic radius for the centroid-match tolerance: the round radius, or half the
         // rectangle's diagonal (its own bounding radius) so a wide flat cap is never missed.
-        const double rChar = p.isRectangular
-                           ? 0.5 * std::hypot(p.wireWidth, p.wireHeight) : p.wireRadius;
+        const double rChar = capOf.isRectangular
+                           ? 0.5 * std::hypot(capOf.wireWidth, capOf.wireHeight) : capOf.wireRadius;
         for (int k = 0; k < 2; ++k) {
             TopoDS_Face bestFace;
             double bestD = 0.75 * rChar;
@@ -17200,6 +17285,106 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     return out;
 }
 
+
+// ABT #1907 (Alf, 2026-10-19): ONE BODY PER FOIL PARALLEL. The sheet, its entrance and exit leads
+// and the weld strip under each (MKF's AxialLead::weld) are fused by the GENERAL boolean: each strip
+// really intersects both coppers (it runs from the sheet's centre to the lead's centreline), which
+// is what makes the tangent lead and its sheet one conductor. Glue is not an option here -- it is
+// specified for coincident contacts only.
+// NOT AN OFFER, unlike fuseConductorToOneBody: a foil parallel whose leads stay separate bodies
+// is a conductor with no current path from its terminals to its sheet, so a failed fuse THROWS.
+// Accepted only as ONE valid solid whose copper is the sheet's plus the leads' (they do not
+// overlap: tangent) plus part of the strips -- each strip adds the wedge between the lead and the
+// sheet face, never more than its own volume and, at MKF's sizing, a quarter of the lead radius
+// squared per unit length (asserted at half of that, which leaves room for faceting).
+static TopoDS_Shape fuseFoilParallel(const TopoDS_Shape& sheet,
+                                     const std::vector<std::pair<TopoDS_Shape, const ConductorPath*>>& leads,
+                                     const std::string& name) {
+    auto volumeOf = [](const TopoDS_Shape& sh) {
+        double v = 0.0;
+        for (TopExp_Explorer e(sh, TopAbs_SOLID); e.More(); e.Next()) {
+            GProp_GProps g;
+            BRepGProp::VolumeProperties(e.Current(), g);
+            v += g.Mass();
+        }
+        return v;
+    };
+    // In millimetres, for the reason fuseConductorToOneBody gives (OCCT's tolerances).
+    auto generalFuse = [&](const std::vector<TopoDS_Shape>& parts, const std::string& what) {
+        gp_Trsf up, down;
+        up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+        down.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
+        BRepAlgoAPI_Fuse fu;
+        TopTools_ListOfShape args, tools;
+        args.Append(BRepBuilderAPI_Transform(parts.front(), up, Standard_True).Shape());
+        for (size_t i = 1; i < parts.size(); ++i)
+            tools.Append(BRepBuilderAPI_Transform(parts[i], up, Standard_True).Shape());
+        fu.SetArguments(args);
+        fu.SetTools(tools);
+        fu.SetRunParallel(true);
+        fu.Build();
+        if (!fu.IsDone() || fu.Shape().IsNull())
+            throw std::runtime_error("ConductorBuilder: foil parallel '" + name + "': the fuse of " + what + " (" +
+                                     std::to_string(parts.size()) + " solids) did not complete (ABT #1907)");
+        return BRepBuilderAPI_Transform(fu.Shape(), down, Standard_True).Shape();
+    };
+    // TWO STEPS, so no boolean ever meets a tangency: each lead first takes its strip (which cuts
+    // the lead's surface at 30 degrees), and the result no longer carries the line the bare lead
+    // touched the sheet along -- it is inside the strip -- so the sheet then meets only the strip's
+    // faces crossing it.
+    std::vector<TopoDS_Shape> operands;
+    for (TopExp_Explorer e(sheet, TopAbs_SOLID); e.More(); e.Next()) operands.push_back(e.Current());
+    if (operands.empty())
+        throw std::runtime_error("ConductorBuilder: foil sheet '" + name + "' emitted no solid (ABT #1907)");
+    const double sheetVolume = volumeOf(sheet);
+    double leadVolume = 0.0, stripVolume = 0.0, wedgeFloor = 0.0;
+    for (const auto& [body, lp] : leads) {
+        std::vector<TopoDS_Shape> leadParts;
+        for (TopExp_Explorer e(body, TopAbs_SOLID); e.More(); e.Next()) leadParts.push_back(e.Current());
+        const size_t n = leadParts.size();
+        if (n == 0)
+            throw std::runtime_error("ConductorBuilder: foil lead '" + lp->name + "' emitted no solid (ABT #1907)");
+        leadVolume += volumeOf(body);
+        const gp_Pnt& a = lp->weldCornerA;
+        const gp_Pnt& b = lp->weldCornerB;
+        const gp_Pnt lo(std::min(a.X(), b.X()), std::min(a.Y(), b.Y()), std::min(a.Z(), b.Z()));
+        const gp_Pnt hi(std::max(a.X(), b.X()), std::max(a.Y(), b.Y()), std::max(a.Z(), b.Z()));
+        BRepPrimAPI_MakeBox strip(lo, hi);
+        strip.Build();
+        if (!strip.IsDone())
+            throw std::runtime_error("ConductorBuilder: the weld strip of foil lead '" + lp->name + "' could not be built (ABT #1907)");
+        leadParts.push_back(strip.Shape());
+        stripVolume += volumeOf(strip.Shape());
+        const TopoDS_Shape welded = generalFuse(leadParts, "lead '" + lp->name + "' and its weld strip");
+        for (TopExp_Explorer e(welded, TopAbs_SOLID); e.More(); e.Next()) operands.push_back(e.Current());
+        // The wedge the strip fills outside both coppers, per unit length: r^2 (3 sqrt(3)/4 - pi/3)
+        // for MKF's sizing (strip as wide as the lead's chord at half a radius, as deep as the lead's
+        // centreline); its length is the attach, the strip's extent along the turn axis.
+        const double r = lp->condRadius;
+        wedgeFloor += 0.5 * r * r * (3.0 * std::sqrt(3.0) / 4.0 - kPi / 3.0) * (hi.Y() - lo.Y());
+    }
+    const TopoDS_Shape fused = generalFuse(operands, "its sheet and its welded leads");
+    int ns = 0;
+    for (TopExp_Explorer e(fused, TopAbs_SOLID); e.More(); e.Next()) ++ns;
+    const double v = volumeOf(fused);
+    const double base = sheetVolume + leadVolume;
+    std::ostringstream why;
+    why.precision(9);
+    if (ns != 1) why << ns << " solids";
+    else if (!BRepCheck_Analyzer(fused).IsValid()) why << "an invalid solid";
+    else if (v < base + wedgeFloor || v > base + stripVolume)
+        why << v * 1e9 << " mm^3 of copper, outside [" << (base + wedgeFloor) * 1e9 << ", " << (base + stripVolume) * 1e9
+            << "] mm^3 (sheet " << sheetVolume * 1e9 << ", leads " << leadVolume * 1e9 << ", strips " << stripVolume * 1e9 << ")";
+    if (!why.str().empty())
+        throw std::runtime_error("ConductorBuilder: foil parallel '" + name + "': fusing its sheet, leads and weld strips "
+                                 "into one conductor gave " + why.str() + " (ABT #1907)");
+    if (std::getenv("MVB_FOIL_DIAG"))
+        std::fprintf(stderr, "[foil] %s: one body, %.6f mm^3 (sheet %.6f + leads %.6f + weld %.6f)\n", name.c_str(),
+                     v * 1e9, sheetVolume * 1e9, leadVolume * 1e9, (v - base) * 1e9);
+    TopoDS_Shape one;
+    for (TopExp_Explorer e(fused, TopAbs_SOLID); e.More(); e.Next()) one = e.Current();
+    return one;
+}
 
 // ABT #1265: close a conductor into ONE body. The conformal assembly ends as several solids that
 // ABUT on exactly coincident faces -- the lead/wrap mitres by construction, the chain wherever a
