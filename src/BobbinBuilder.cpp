@@ -227,34 +227,31 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         // column — rounding the bore would push bobbin material into the column
         // corners and overlap it.
         //
-        // ABT #959: that radius is now the SAME one the winding is routed around
-        // (MKF Bobbin::get_column_corner_radius — the MAS datum, else the moulding
-        // rule), instead of the locally invented 1/4 of the smaller yoke dimension.
-        // Two different corner radii for one surface is how the copper came to be
-        // routed around a mathematically sharp column while the plastic under it was
-        // drawn with a 1.8 mm radius. IRREGULAR columns are included: their wrap path
-        // uses the bounding rectangle, and it must round the same way its former does.
+        // THE CORNER IS MKF'S, and it is the one the copper wraps (ABT #959, #1295). MKF charges
+        // every rect-column turn for a corner of radius frame.cornerRadius + standoff, where
+        // frame.cornerRadius is Bobbin::get_column_corner_radius (the MAS datum; MKF's quick
+        // bobbin states it), and ConductorBuilder draws exactly that wrap. The plastic under the
+        // copper is drawn on the same radius, concentric with every turn: a sharper former pokes
+        // its corner into the innermost turn (02_flyback_efd25_3c95: the square IRREGULAR former's
+        // corner 0.47 mm into the copper of a 1.388 mm wrap), a blunter one (the old 1/4 of the
+        // smaller side) leaves the copper floating. IRREGULAR columns are included: their wrap
+        // path uses the bounding rectangle, and it rounds the same way its former does.
         const bool roundCorners = (bobbin.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
         const bool corneredColumn = roundCorners ||
                                     bobbin.get_column_shape() == MAS::ColumnShape::IRREGULAR;
         // OBLONG columns get a true STADIUM tube and bore (full rounding on the short
-        // axis), matching the stadium core column; rectangular keeps the moulding
-        // radius on the outside and a square bore.
+        // axis), matching the stadium core column; rectangular keeps MKF's corner on the
+        // outside and a square bore.
         const bool oblong = (bobbin.get_column_shape() == MAS::ColumnShape::OBLONG);
         double rOuter = 0.0;
         if (oblong) {
             rOuter = 0.5 * std::min(outerWidth, outerDepth);
         }
-        else if (roundCorners && !std::getenv("MVB_FORMER_CORNER")) {
-            rOuter = 0.25 * std::min(outerWidth, outerDepth);  // the pre-#959 invented radius
-        }
-        else if (corneredColumn && std::getenv("MVB_FORMER_CORNER")) {
-            // Paired with ConductorBuilder's switch: the plastic and the copper must always agree
-            // on the corner they share, so they are gated together, never one without the other.
+        else if (corneredColumn) {
             OpenMagnetics::Bobbin bobbinForCorner;
             bobbinForCorner.set_processed_description(bobbin);
             rOuter = bobbinForCorner.get_column_corner_radius();
-            if (rOuter > 0.5 * std::min(outerWidth, outerDepth)) {
+            if (!(rOuter >= 0.0) || rOuter > 0.5 * std::min(outerWidth, outerDepth)) {
                 throw std::invalid_argument(
                     "BobbinBuilder: column corner radius " + std::to_string(rOuter) +
                     " m does not fit a " + std::to_string(outerWidth) + " x " +
