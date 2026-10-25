@@ -33,8 +33,9 @@ enum class EnamelGateVerdict {
     Certified,        // every distinct-conductor pair proven at/beyond its coated envelope
     SampledOnly,      // clear except BLEND-involved pairs, which are sampled, not proven
     ReportedAllowed,  // certified intrusions found and let through by MVB_ALLOW_ENAMEL
-    Skipped,          // checks disabled (diagnosticSkipCollisionCheck, MVB_SKIP_COLLISION_CHECK,
-                      // MVB_LEAD_NO_VALIDATE)
+    Skipped,          // collision debug switch on (diagnosticSkipCollisionCheck,
+                      // MVB_SKIP_COLLISION_CHECK: the gates run but REPORT, so nothing is
+                      // certified) or the gate skipped (MVB_LEAD_NO_VALIDATE)
 };
 
 // Real-winding geometry: ONE continuous copper body per (winding, parallel), replacing
@@ -198,8 +199,13 @@ public:
         // narrow slots); classifying the actual solids around the lead-tip radius finds the
         // genuine free arc. Empty -> no aiming beyond leadExitAzimuth.
         std::vector<TopoDS_Shape> coreObstacles;
-        // DIAGNOSTIC ONLY. Build the conductors even though two of them overlap, so the
-        // overlap can be LOOKED AT in CAD instead of only read about in an exception. A
+        // DIAGNOSTIC ONLY -- THE ONE "allow overlapping copper" switch (also
+        // MVB_SKIP_COLLISION_CHECK; mvbpp_step_generator --skip-collision-check). Every
+        // copper-collision refusal of the conductor build (copper/enamel gate, terminal-fillet
+        // proof, lead-fan clearances, toroid tilt certification, pin, port-plane and flange
+        // gates) is printed to stderr as a FINDING with its usual message instead of thrown,
+        // and the copper is left as drawn (nothing squished or moved). So the overlap can be
+        // LOOKED AT in CAD, with the list of what collides, instead of only read about in an exception. A
         // collision means two pieces of copper occupy the same space: the result is not a
         // manufacturable part and must never be exported as one, meshed, or handed to a
         // solver. Nothing in the library sets this — only the tools and tests that exist to

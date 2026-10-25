@@ -120,6 +120,37 @@ static bool diagnosticLRouteAsDrawn(size_t waypointCount, const std::string& lea
     return true;
 }
 
+// THE ONE "ALLOW OVERLAPPING COPPER" DEBUG SWITCH (Options::diagnosticSkipCollisionCheck, or
+// MVB_SKIP_COLLISION_CHECK from outside; mvbpp_step_generator --skip-collision-check sets it).
+// Alf, 2026-10-25: "The flag that we have to allow overlapping for debugging should allow building
+// those 2" -- and MKF's "make sure the MAS we put to contiguous at least can make STEP even if it
+// collides". With it on, every copper-collision refusal of the conductor build is REPORTED instead
+// of thrown: the same message, on stderr, tagged as a finding, and the copper is left exactly as
+// the build drew it (nothing is squished, moved or re-routed to make it fit). The STEP that comes
+// out interpenetrates: a picture of the collision, never a part. Off, every site throws as before.
+// Set for the duration of one buildAllImpl (CollisionDiagnosticScope), so helpers that have no
+// Options in reach read the same switch.
+static thread_local bool tlsCollisionDiagnostic = false;
+
+static bool collisionDiagnostic() { return tlsCollisionDiagnostic; }
+
+struct CollisionDiagnosticScope {
+    bool previous;
+    explicit CollisionDiagnosticScope(bool on) : previous(tlsCollisionDiagnostic) {
+        tlsCollisionDiagnostic = on || std::getenv("MVB_SKIP_COLLISION_CHECK") != nullptr;
+    }
+    ~CollisionDiagnosticScope() { tlsCollisionDiagnostic = previous; }
+};
+
+// A copper-collision refusal: thrown, or with the debug switch on, printed as a finding and the
+// build carries on with the copper as drawn.
+static void refuseCollision(const std::string& message) {
+    if (!collisionDiagnostic()) throw std::runtime_error(message);
+    std::cerr << "[ConductorBuilder] FINDING (collision allowed by --skip-collision-check / "
+                 "MVB_SKIP_COLLISION_CHECK; copper left as drawn, not a part): "
+              << message << std::endl;
+}
+
 bool leadRectIsAxial(double width, double height, const LeadRectReading& reading) {
     if (reading.foilRadial > 0.0) return width <= 1.5 * reading.foilRadial;
     // A stub carries the section plus a bend allowance; a run carries it along the column
@@ -865,8 +896,8 @@ void checkWindowContainment(const std::vector<ConductorPath>& paths,
         }
     }
     if (worst > 0.0) {
-        throw std::runtime_error("ConductorBuilder: copper inside the bobbin flange -- " + where +
-                                 ". The winding window is the bobbin's; turns and leads stay in it.");
+        refuseCollision("ConductorBuilder: copper inside the bobbin flange -- " + where +
+                        ". The winding window is the bobbin's; turns and leads stay in it.");
     }
 }
 
@@ -1285,7 +1316,7 @@ EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
                           << (A.condRadius + B.condRadius)
                           << " m (copper envelopes overlap). Turn positions are never moved; "
                              "fix the winding data or the MKF blocking (see MKF ABT #187).";
-                        throw std::runtime_error(s.str());
+                        refuseCollision(s.str());
                     }
                 }
             }
@@ -1307,7 +1338,8 @@ EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
                       << std::endl;
             return EnamelGateVerdict::ReportedAllowed;
         }
-        throw std::runtime_error(m.str());
+        refuseCollision(m.str());   // throws unless the collision debug switch is on
+        return EnamelGateVerdict::ReportedAllowed;
     }
     else if (coatedUncertifiable > 0) {
         // BLEND-involved pairs have no rigorous sag bound yet, so they can be neither proven nor
@@ -8077,7 +8109,7 @@ static void checkPortPlanes(std::vector<ConductorPath>& paths,
                   << " mm inside its port plane, against the " << guard * 1e3
                   << " mm the port needs (tip to copper " << (tipDepth(t) - hi) * 1e3 << " mm of "
                   << portPlaneClearance(t.capHalfDiag) * 1e3 << " mm; PortPlane.h, ABT #1400)";
-                throw std::runtime_error(m.str());
+                refuseCollision(m.str());
             }
     }
 }
@@ -8131,13 +8163,13 @@ void checkPinLeadClearance(const std::vector<ConductorPath>& paths,
             if (pinRun || wrap) {
                 auto hits = coreHits(coreObstacles, pts, copperEnvelopeOf(p), p.name + " '" + pr.label + "'", 1);
                 if (!hits.empty())
-                    throw std::runtime_error("ConductorBuilder: a lead to its pin runs through the core -- " +
-                                             hits.front());
+                    refuseCollision("ConductorBuilder: a lead to its pin runs through the core -- " +
+                                    hits.front());
             }
         }
     }
     if (worst > 0.0)
-        throw std::runtime_error("ConductorBuilder: copper inside a pin -- " + where);
+        refuseCollision("ConductorBuilder: copper inside a pin -- " + where);
 }
 
 // WHAT COUNTS AS TERMINAL-LEAD COPPER (ABT #1215): flags only, no label matching. Lead: every
@@ -8169,6 +8201,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     // Every build starts unproven: only the gate's own outcome below may overwrite this, so a
     // throw anywhere in the build leaves NotRun, never a previous build's Certified.
     if (opts.enamelGateVerdictOut) *opts.enamelGateVerdictOut = EnamelGateVerdict::NotRun;
+    // The one collision debug switch, for every refusal of this build (see collisionDiagnostic).
+    const CollisionDiagnosticScope collisionDiagnosticScope(opts.diagnosticSkipCollisionCheck);
     // ABT #685 (Alf, 2026-08-17): WHAT a connection IS comes from MKF, not from a threshold here.
     // isZReturn() used to answer it from turn coordinates -- a median pitch, a filar-count bound,
     // a sign-of-advance rule -- and every one of those had a comment naming the design it had been
@@ -12533,7 +12567,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 std::cerr << "[ConductorBuilder] MVB_LEAD_NO_VALIDATE set: emitting the leads THROUGH "
                              "each other. " << m.str() << "\n";
             } else {
-                throw std::runtime_error(m.str());
+                refuseCollision(m.str());   // the collision debug switch emits them as planned
             }
         }
         // CONSECUTIVE dragback transitions of one conductor (a single-turn layer) chain end to
@@ -14260,7 +14294,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         // refused geometry anyway with the NATURAL tilt so the crossing chords can
                         // be SEEN in a STEP. The exported copper interpenetrates — review only,
                         // never mesh. Same house pattern as MVB_LEAD_NO_VALIDATE.
-                        if (std::getenv("MVB_ALLOW_TILT_DEFICIT")) {
+                        if (std::getenv("MVB_ALLOW_TILT_DEFICIT") || collisionDiagnostic()) {
                             std::cerr << "[DIAGNOSTIC MVB_ALLOW_TILT_DEFICIT] proceeding past a "
                                          "REFUSED tilt certification with the natural tilt — the "
                                          "exported copper interpenetrates; review only:\n  "
@@ -14452,7 +14486,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                     // current_transformer). Keep the corner at its stage-1
                                     // heading and carry on; the exported copper interpenetrates,
                                     // review only, never mesh.
-                                    if (std::getenv("MVB_ALLOW_TILT_DEFICIT")) {
+                                    if (std::getenv("MVB_ALLOW_TILT_DEFICIT") || collisionDiagnostic()) {
                                         std::cerr << "[DIAGNOSTIC MVB_ALLOW_TILT_DEFICIT] "
                                                      "proceeding past a REFUSED twist decay — the "
                                                      "exported copper interpenetrates; review "
@@ -14515,7 +14549,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                              "interpenetrate.";
                         // Same diagnostic bypass as the tilt certification above (ABT #865
                         // review): keep the wavefront's best heading and continue.
-                        if (std::getenv("MVB_ALLOW_TILT_DEFICIT")) {
+                        if (std::getenv("MVB_ALLOW_TILT_DEFICIT") || collisionDiagnostic()) {
                             std::cerr << "[DIAGNOSTIC MVB_ALLOW_TILT_DEFICIT] proceeding past a "
                                          "REFUSED corner relaxation — the exported copper "
                                          "interpenetrates; review only:\n  "
@@ -16504,7 +16538,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               << " (exporting anyway for inspection)\n";
                 }
                 else {
-                    throw std::runtime_error(fanMsg);
+                    refuseCollision(fanMsg);
                 }
             }
             if (!std::isnan(frozenExitAz)) seamAngle += frozenExitAz - kPlaneAz;
@@ -16636,7 +16670,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               << " (exporting anyway for inspection)\n";
                 }
                 else {
-                    throw std::runtime_error(fanMsg);
+                    refuseCollision(fanMsg);
                 }
             }
             if (!std::isnan(exitAz)) seamAngle += exitAz - kPlaneAz;
@@ -16872,6 +16906,8 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // Every drawn corner is proven here, against the other conductors as they finally are;
             // one that does not clear is re-searched with each candidate proven before it is taken.
             if (arcsClear(pi)) continue;
+            const std::string firstWhy = arcsWhy;
+            const std::vector<Primitive> drawnPrims = p.prims;   // the corners as first drawn
             // Re-searched with every candidate proven: each corner keeps the fan's roll when a fit
             // along it clears, and otherwise walks the default snap and 24 even rolls
             // (filletTerminalCorners with `clears`), taking the first proven fit.
@@ -16892,10 +16928,16 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (!fixed) {
                 // No roll and no fillet along the corner clears every other conductor: the corner
                 // cannot be drawn, and a fillet picked blind would only move the refusal to the gate.
-                throw std::runtime_error(
+                refuseCollision(
                     "ConductorBuilder: no terminal fillet of " + p.name + " clears the other conductors "
                     "at any roll or along its corner. " + (unclearedFillet.count(pi) ? unclearedFillet.at(pi)
                                                                 : "Witness: " + arcsWhy));
+                // Only reached with the collision debug switch on: the corners stay as they were
+                // first drawn (the colliding fillet, not a re-searched compromise), so the STEP
+                // shows the collision the first proof found.
+                p.prims = drawnPrims;
+                std::cerr << "[ConductorBuilder] FINDING: '" << p.name << "' keeps its first-drawn "
+                             "terminal corners; their first collision witness: " << firstWhy << std::endl;
             }
         }
     }
@@ -16976,27 +17018,27 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             stitchPinLead(p.prims, pl, p.wireRadius, drawnBend);
         }
     }
-    // MVB_SKIP_COLLISION_CHECK reaches the same diagnostic gate from the outside, for callers
-    // (the CLI step generator) that have no parameter to thread it through. Diagnosis only:
-    // the result is interpenetrating copper, a picture and never a part.
-    const bool skipChecks =
-        opts.diagnosticSkipCollisionCheck || std::getenv("MVB_SKIP_COLLISION_CHECK") != nullptr;
-    if (!pendingPinLeads.empty() && !skipChecks)
+    // The collision debug switch (see collisionDiagnostic) does not skip the gates: they run, and
+    // each refusal is printed as a finding instead of thrown, so the diagnostic STEP comes with the
+    // list of what collides. Diagnosis only: the result is interpenetrating copper, never a part.
+    const bool skipChecks = collisionDiagnostic();
+    if (skipChecks)
+        // Loud on purpose: a build that let a collision through must not be mistaken for a valid
+        // part further downstream.
+        std::cerr << "[ConductorBuilder] DIAGNOSTIC: collisions are REPORTED, not refused (--skip-"
+                     "collision-check / MVB_SKIP_COLLISION_CHECK) -- the geometry below may contain "
+                     "overlapping conductors and is not a valid part.\n";
+    if (!pendingPinLeads.empty())
         checkPinLeadClearance(paths, bobbinPd, opts.coreObstacles);
-    if (skipChecks) {
-        // Loud on purpose: a build that skipped this gate produces overlapping copper and
-        // must not be mistaken for a valid part further downstream.
-        std::cerr << "[ConductorBuilder] DIAGNOSTIC: collision check SKIPPED — the geometry "
-                     "below may contain overlapping conductors and is not a valid part.\n";
-        if (opts.enamelGateVerdictOut) *opts.enamelGateVerdictOut = EnamelGateVerdict::Skipped;
-    }
-    else {
+    {
         const EnamelGateVerdict verdict = checkCollisions(paths);
         // The port-plane gate (ABT #1400) throws, so a refused port leaves the verdict at NotRun.
         checkPortPlanes(paths, pinEnds);
         checkWindowContainment(paths, windowBoundsPerPath);
-        // Published only once containment has also passed (it throws otherwise).
-        if (opts.enamelGateVerdictOut) *opts.enamelGateVerdictOut = verdict;
+        // Published only once containment has also passed (it throws otherwise). A diagnostic
+        // build's gates certify nothing, whatever they found: its verdict is Skipped.
+        if (opts.enamelGateVerdictOut)
+            *opts.enamelGateVerdictOut = skipChecks ? EnamelGateVerdict::Skipped : verdict;
     }
 
     // Centreline capture mode (ABT #1215): the same finished paths, handed back whole.

@@ -289,7 +289,8 @@ public:
     // window opening; see buildRealWindingConductorsNamed.
     //
     // diagnosticSkipCollisionCheck builds the conductors even when two of them overlap, so
-    // the overlap can be LOOKED AT instead of only read about in an exception. The result is
+    // the overlap can be LOOKED AT instead of only read about in an exception; every collision
+    // refusal is printed to stderr as a finding (see ConductorBuilder::Options). The result is
     // interpenetrating copper: a picture, never a part. Tools and tests investigating a
     // specific refusal only — nothing in the library sets it.
     std::vector<NamedShape> buildRealWindingTurnsNamed(
