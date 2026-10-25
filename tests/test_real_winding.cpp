@@ -1404,6 +1404,32 @@ TEST_CASE("Real winding: export the ABT #646 design",
     WARN("ABT #646 real-winding geometry written to " << path);
 }
 
+TEST_CASE("Real winding: a DRAWN toroid (no femReady) is the conformal mitre compound, no copper in copper",
+          "[realwinding][toroid][drawn]") {
+    // The corpus design 05_pfc_inductor_t4020_hf60 exactly as the gate takes it: the MAS example,
+    // MKF autocomplete, `mvbpp_step_generator --real` (drawing, femReady=false). A drawn toroid used
+    // to be routed around the conformal assembler to the legacy per-run compound: per-turn pipes
+    // and per-primitive cylinders joined by wire-radius spheres, each sphere half inside both of
+    // its neighbours (0.134 of its 0.268 mm^3), so `mvbpp_stepcheck --audit` found 257 copper
+    // self-overlaps and 48 overlaps in this one conductor. Drawn, it must be what FEM gets: abutting
+    // pieces, no point strictly inside two of them.
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/05_pfc_inductor_t4020_hf60.json");
+    REQUIRE(f.good());
+    json j = json::parse(f);
+    auto enriched = mvb::magnetic_autocomplete_safe(j.contains("magnetic") ? j.at("magnetic") : j,
+                                                    /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/false,
+                                       /*emitCoatingShells=*/false, /*includeInsulation=*/false,
+                                       /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/false);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+    REQUIRE(conductor != nullptr);
+    requireConformalConductor(conductor->shape);
+}
+
 TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre compound",
           "[realwinding]") {
     // A 60-turn toroid is too dense for the single-solid MakePipe sweep to close on its packed hole

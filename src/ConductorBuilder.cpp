@@ -3496,10 +3496,15 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
     // 16_coupled refused outright; 06/10/13/14/23 built with 1-6 invalid shapes). It costs
     // essentially nothing next to the geometry itself (24_margin: 23.1 s femReady vs 22.1 s
     // without), so it now runs for drawing too. femReady keeps only the FEM-specific extras.
-    // (Toroids excluded when drawing — see the toroid note further down: their cheap per-run
-    // compound is already valid, and the conformal assembler cannot close their tight-bore
-    // poloidal corner at exact surfaces, ABT #619.)
-    if (!path.isRectangular && (!path.toroidal || path.femReady)) {
+    // TOROIDS INCLUDED. They were excluded when drawing because the assembler could not close
+    // the tight-bore poloidal corner at exact surfaces (ABT #619, fixed 2026-08-23), so a drawn
+    // toroid fell to the legacy per-run compound below: per-turn pipes and per-primitive
+    // cylinders joined by wire-radius SPHERES, each sphere half inside both neighbours (0.134 of
+    // its 0.268 mm^3 on 05_pfc's 0.8 mm wire), some spheres emitted twice at one point. That is
+    // copper inside copper, and the STEP audit refused every drawn toroid of the corpus for it
+    // (05_pfc: 257 self-overlaps + 48 overlaps). The assembler's abutting mitre joints carry
+    // none, and the toroid builds faster through it (05_pfc: 29 s).
+    if (!path.isRectangular) {
         std::vector<const Primitive*> cptrs;
         cptrs.reserve(path.prims.size());
         for (const auto& pr : path.prims) cptrs.push_back(&pr);
@@ -3899,21 +3904,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
             "a round-profile compound");
     }
 
-    // FEM: a conformal (mitre-jointed) toroid compound -- a valid, non-overlapping, mesh-shareable
-    // assembly for the dense toroids where the single-solid sweep can't close. Drawing (femReady
-    // false) skips it and keeps the fast overlapping per-run compound below.
-    // TOROIDS ARE THE EXCEPTION to the "assembly is not an FEM extra" rule above. The
-    // conformal mitre exists to give the MESHER non-overlapping shared faces; a VIEWER only
-    // needs valid closed solids, and the cheap per-run compound below already delivers those
-    // for toroids (verified: 07_cmc and 12_boost, zero bad shapes). Forcing the conformal
-    // assembler on them for drawing buys nothing and walks straight into ABT #619, where it
-    // cannot build a valid solid for the tight-bore poloidal corner at exact surfaces.
-    if (path.toroidal && path.femReady) {
-        return assembleWire(ptrs, path.wireRadius, wirePolygonSegments,
-                        CornerStyle::BisectionMitre, primIndexPerSolid, cutterOnly, path.name,
-                            weld);
-    }
-
+    // (A round toroid, drawn or FEM, never reaches here: the conformal assembler above takes it.)
     BRep_Builder builder;
     TopoDS_Compound compound;
     builder.MakeCompound(compound);
@@ -16826,7 +16817,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
     std::map<size_t, std::string> unclearedFillet;   // path -> witness of a corner none of whose fillets cleared
     for (size_t pi = 0; pi < paths.size(); ++pi) {
         auto& p = paths[pi];
-        if (p.isRectangular || (p.toroidal && !p.femReady)) continue;
+        if (p.isRectangular) continue;
         // WHICH fillet at each terminal corner is the fan's decision (it is the only model that
         // can see the neighbouring parallel); 0 where it had nothing to say.
         // THE LINK IS SMOOTHED WITH THE NEIGHBOURS IN VIEW. Every path exists by now, so the
@@ -16877,7 +16868,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         for (size_t pi = 0; pi < paths.size(); ++pi) {
             auto& p = paths[pi];
             if (std::getenv("MVB_NO_CORNER_REPAIR")) break;   // bisect switch
-            if (p.isRectangular || (p.toroidal && !p.femReady)) continue;
+            if (p.isRectangular) continue;
             // Every drawn corner is proven here, against the other conductors as they finally are;
             // one that does not clear is re-searched with each candidate proven before it is taken.
             if (arcsClear(pi)) continue;
@@ -17755,10 +17746,10 @@ ConductorBuilder::measureTerminalLeadLengths(const OpenMagnetics::Coil& coil,
                                      "to an end");
         // The emitters that do NOT sweep the centreline as measured: the rectangular-wire
         // strategies (the whole-spine sweep fillets every sharp junction, the per-primitive
-        // emitter inserts elbows between two straight lead legs) and the drawing-mode toroid
-        // compound. On those a sharp junction touching a lead is re-shaped after this point, so
-        // the length reported here would not be the length of the copper.
-        const bool conformalEmission = !p.isRectangular && (!p.toroidal || p.femReady);
+        // emitter inserts elbows between two straight lead legs). On those a sharp junction
+        // touching a lead is re-shaped after this point, so the length reported here would not be
+        // the length of the copper. A round toroid is conformal, drawn or FEM.
+        const bool conformalEmission = !p.isRectangular;
         if (!conformalEmission) {
             for (size_t i = 0; i + 1 < n; ++i) {
                 const Primitive& a = p.prims[i];
@@ -17769,8 +17760,8 @@ ConductorBuilder::measureTerminalLeadLengths(const OpenMagnetics::Coil& coil,
                 throw std::runtime_error(
                     "measureTerminalLeadLengths: '" + p.name + "' is emitted by a strategy that "
                     "re-shapes the sharp lead junction between '" + a.label + "' and '" + b.label +
-                    "' after the centreline is final (rectangular wire, or a toroid drawn without "
-                    "femReady); its lead copper length is not the centreline's -- not measured");
+                    "' after the centreline is final (rectangular wire); its lead copper length is "
+                    "not the centreline's -- not measured");
             }
         }
         for (size_t i = 0; i < n; ++i) {
