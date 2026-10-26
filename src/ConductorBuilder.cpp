@@ -12851,11 +12851,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // a GUARD, not a radius: a corner whose centreline radius does not exceed the section's
         // radial half-extent sweeps a self-intersecting tube, and rectStation refuses it.
         const double minBend = (foilWire || rectWire) ? 0.5 * wireW : wireRadius;
-        // The terminal lead corners (rectLeadCorner) are LEADS, not turns, and keep their own
-        // bend rule for now: 1.02 x the envelope radius, unchanged by ABT #1295 (a lead's MKF
-        // radius, plannedBendRadius, takes the larger of a rectangular wire's flatwise and
-        // edgewise IEC radii because a lead turns in 3-D -- 12.5 mm on the rectangular-wire
-        // fixture, which no lead corner on its face can hold).
+        // The round-column terminal lead corners (rectLeadCorner) are LEADS, not turns, and keep
+        // their own bend rule for now: 1.02 x the envelope radius, unchanged by ABT #1295. The
+        // rect-column ones are MKF's (rectLeadCornerRadius below).
         const double leadCornerBend = opts.effectiveBend(wireRadius * 1.02);
         // This conductor's own former corner, from MKF's frame for its section (a lateral leg has
         // its own), shadowing the main column's for everything below.
@@ -12866,6 +12864,30 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (!rectColumnHere) return 0.0;
             return mkfFrameOfSection(sectionOfTurn(ct.turns.front())).cornerRadius;
         }();
+        // THE RECT-COLUMN TERMINAL LEAD CORNER IS MKF'S (spec H8): the in-plane quarter that turns
+        // a rect wire's connection-face straight into its radial lead is bent at the radius MKF
+        // planned for that lead (ConnectionRoute::plannedBendRadius, Coil::lead_bend_radius) --
+        // the same radius MKF judged against the face's half straight when it chose a radial lead
+        // over a tangent departure (Coil::plan_tangent_departure). It used to be drawn at the
+        // TURN's corner, so a lead MKF had fitted on the face (18_stacked: 2.68 mm against a
+        // 5.42 mm half straight) was drawn at the 12.54 mm turn corner and overran the face.
+        // Asked only where such a corner is drawn; a missing or folding radius throws.
+        auto rectLeadCornerRadius = [&]() {
+            const double planned = plannedWireBendRadius(ct.winding, ct.parallel);
+            if (std::isnan(planned))
+                throw std::runtime_error("ConductorBuilder: MKF planned no terminal lead bend radius for " +
+                                         ct.winding + " parallel " + std::to_string(ct.parallel) +
+                                         ", so its rect-column lead corner has no radius to be drawn at");
+            if (!(planned > minBend)) {
+                std::ostringstream m;
+                m.precision(9);
+                m << "ConductorBuilder: the terminal lead bend MKF planned for " << ct.winding << " parallel "
+                  << ct.parallel << " (" << planned * 1e3 << " mm) does not exceed the wire's radial "
+                  << "half-extent (" << minBend * 1e3 << " mm): the lead corner would fold onto itself";
+                throw std::runtime_error(m.str());
+            }
+            return planned;
+        };
         // Every turn's drawn corner must be the one MKF charged it for, to the bit.
         if (rectColumnHere) {
             if constexpr (std::is_same_v<CoilT, OpenMagnetics::Coil>) {
@@ -15693,7 +15715,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // turns it into the lead, conformal to both end planes.
             auto rectLeadCornerPrim = [&](const RectStation& rsA, double rideA,
                                           double rowY, bool isExit, size_t ord) {
-                const double cR = rsA.cornerR;
+                const double cR = rectLeadCornerRadius();
                 const double zA = rsA.zPos + rideA;
                 Primitive cnr;
                 cnr.kind = Primitive::ARC3;
@@ -15797,11 +15819,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                                          path.name);
                     const int sideE = windingFace.at(ct.winding);
                     const double leadSlotE = leadSlotOf.count(ci) ? leadSlotOf.at(ci) : 0.0;
-                    const double begX0 = (rectWire ? rsE.cornerR : 0.0) + leadSlotE;
+                    const double begX0 = (rectWire ? rectLeadCornerRadius() : 0.0) + leadSlotE;
                     const double stopX0 =
                         nextRet0 ? nextRet0->xSlot
                                  : (rectWire && turns.size() == 2
-                                        ? rsE1.cornerR
+                                        ? rectLeadCornerRadius()
                                         : std::numeric_limits<double>::quiet_NaN());
                     if (begX0 > 1e-12) {
                         const double endCut0 = rectRisingEndCut(rsE, stopX0);
@@ -15884,7 +15906,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         // which is why it was never affected.
                         entranceCorner = rsF;
                         entranceCornerRide = rideF;
-                        fLead.x += rsF.cornerR;
+                        fLead.x += rectLeadCornerRadius();
                     }
                 }
                 if (!std::isnan(rectEntranceAttachY)) {
@@ -16160,7 +16182,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                                                  label + ", which is a return, not a revolution");
                     const double stopX = nextRet ? nextRet->xSlot
                                        : (i + 2 == nEmit && !ret && !tangentEndHere && (rw || hasExitSlot)
-                                              ? (rw ? rs1.cornerR : 0.0) + exitSlot
+                                              ? (rw ? rectLeadCornerRadius() : 0.0) + exitSlot
                                               : kNaN);
                     // ABT #849: a wrap fed by a RETURN whose slot sits on the departure side
                     // (local -X) begins AT that slot -- the chain ends there (see appendRectWrap's
@@ -16175,7 +16197,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         for (const auto& r : rectReturns)
                             if (r.ci == ci && i > 0 && r.trans == i - 1) prevRetForStart = &r;
                     const double startX = (i == 0 && !ret && !tangentStartHere)
-                                              ? (rw ? rs0.cornerR : 0.0) + leadSlot
+                                              ? (rw ? rectLeadCornerRadius() : 0.0) + leadSlot
                                               : (i == 0 && tangentStartHere) ? kNaN
                                               : (prevRetForStart && !ret && prevRetForStart->xSlot < -1e-12
                                                      ? -prevRetForStart->xSlot
@@ -16230,7 +16252,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                         for (const auto& r : rectReturns)
                             if (r.ci == ci && r.trans == i + 2) stopXN = r.xSlot;
                         const bool rwN = path.isRectangular;
-                        if (std::isnan(stopXN) && rwN && i + 3 == nEmit) stopXN = rsN.cornerR;
+                        if (std::isnan(stopXN) && rwN && i + 3 == nEmit) stopXN = rectLeadCornerRadius();
                         const double endCutN = rectRisingEndCut(rs1, stopXN);
                         const double LN = rectRisingLength(rs1, rectRideFor(rs1.zPos, side),
                                                            rectRideFor(rs1.zPos, 1 - side),
@@ -16415,7 +16437,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                             exitRowY = reIt->second;   // rect pitch-true end (see above)
                         }
                         rectLeadCornerPrim(rsL, rideL, exitRowY, /*isExit=*/true, nEmit - 1);
-                        lLead.x += rsL.cornerR;
+                        lLead.x += rectLeadCornerRadius();
                     }
                 }
                 wp = terminalWaypoints(exitGroup, lLead, path.name + " exit", foilRadial,
