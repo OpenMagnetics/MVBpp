@@ -1966,13 +1966,17 @@ static TopoDS_Shape loftRuledPrismRoundEnds(const std::vector<gp_Pnt>& start,
     };
     const double chord = 2.0 * r * std::sin(kPi / double(n));
     const double span = gp_Vec(start.front(), end.front()).Dot(gp_Vec(dir));
-    const double need = chord * ((roundStart || startWire ? 1.0 : 0.0) +
-                                 (roundEnd || (endWire && endWireOverChord) ? 1.0 : 0.0));
-    if (!(span > need))
-        throw std::runtime_error("round-ended prism: " + std::to_string(span * 1e6) +
-                                 " um straight is shorter than its round transition(s), " +
-                                 std::to_string(need * 1e6) + " um");
-    std::vector<TopoDS_Wire> sections;
+    const int transitions = (roundStart || startWire ? 1 : 0) + (roundEnd || (endWire && endWireOverChord) ? 1 : 0);
+    if (!(span > 0.0))
+        throw std::runtime_error("round-ended prism: " + std::to_string(span * 1e6) + " um straight");
+    // A straight shorter than its transitions (two round lead corners close together; Alf, 2026-10-31: "transitions
+    // share it") gives each its share: the transitions meet at the polygon, every ruling still joins the circle to
+    // its chord inside the wire, and only there are the ruled faces wider than they are long.
+    const double along = transitions > 0 && !(span > chord * transitions) ? span / transitions : chord;
+    // Each section at its place along the axis; a polygon on the plane of another section is not a section of its
+    // own (the two transitions meet, or one reaches the far cap).
+    struct Section { double t; TopoDS_Wire w; bool polygon; };
+    std::vector<Section> placed;
     auto up = [](const TopoDS_Wire& w) {
         return TopoDS::Wire(BRepBuilderAPI_Transform(w, mitreUpTrsf(), Standard_True).Shape());
     };
@@ -1985,28 +1989,36 @@ static TopoDS_Shape loftRuledPrismRoundEnds(const std::vector<gp_Pnt>& start,
     };
     if (roundStart) {
         requirePerpendicular(start, "start");
-        sections.push_back(up(roundSectionThrough(start, centreOf(start), dir, r)));
-        sections.push_back(polyUp(shifted(start, chord)));
+        placed.push_back({0.0, up(roundSectionThrough(start, centreOf(start), dir, r)), false});
+        placed.push_back({along, polyUp(shifted(start, along)), true});
     } else if (startWire) {
         // The cut face's curves turn into this prism's own regular polygon (laid on the start
         // plane, see mitredFacetPrism) over ONE facet chord; beyond it the prism is exact.
-        sections.push_back(up(*startWire));
-        sections.push_back(polyUp(shifted(start, chord)));
+        placed.push_back({0.0, up(*startWire), false});
+        placed.push_back({along, polyUp(shifted(start, along)), true});
     } else {
-        sections.push_back(polyUp(start));
+        placed.push_back({0.0, polyUp(start), true});
     }
     if (roundEnd) {
         requirePerpendicular(end, "end");
-        sections.push_back(polyUp(shifted(end, -chord)));
-        sections.push_back(up(roundSectionThrough(end, centreOf(end), dir, r)));
+        placed.push_back({span - along, polyUp(shifted(end, -along)), true});
+        placed.push_back({span, up(roundSectionThrough(end, centreOf(end), dir, r)), false});
     } else if (endWire) {
         // Over the last chord when this prism's own polygon was turned to the cut's phase (a free
         // start, see mitredFacetPrism); over the whole prism when its start is pinned by the
         // previous piece, so the turn to the cut's phase is spread and never a twist.
-        if (endWireOverChord) sections.push_back(polyUp(shifted(end, -chord)));
-        sections.push_back(up(*endWire));
+        if (endWireOverChord) placed.push_back({span - along, polyUp(shifted(end, -along)), true});
+        placed.push_back({span, up(*endWire), false});
     } else {
-        sections.push_back(polyUp(end));
+        placed.push_back({span, polyUp(end), true});
+    }
+    const double samePlane = 1e-9 * span;
+    std::vector<TopoDS_Wire> sections;
+    for (size_t k = 0; k < placed.size(); ++k) {
+        const bool onPrevious = k > 0 && std::abs(placed[k].t - placed[k - 1].t) < samePlane;
+        const bool onNext = k + 1 < placed.size() && std::abs(placed[k + 1].t - placed[k].t) < samePlane;
+        if (placed[k].polygon && (onPrevious || (onNext && !placed[k + 1].polygon))) continue;
+        sections.push_back(placed[k].w);
     }
     BRepOffsetAPI_ThruSections loft(Standard_True /*solid*/, Standard_True /*ruled*/);
     for (const auto& w : sections) loft.AddWire(w);

@@ -127,16 +127,19 @@ public:
         // MKF lays turns at a pitch of one OD. At the conducting footprint the enamel that
         // pitch reserves becomes real air between the solids.
         bool paintCoating = false;
-        // ABT #685 (Alf, 2026-08-15): the TWO standard corner constructions for lead/connection
-        // polylines, selected here. false (DEFAULT) -> BISECTION MITRE: plain segments meeting at
-        // the waypoint, the conformal assembler slicing both sides on the angle-bisector plane —
-        // the same joint as the wrap elbows, identical for every parallel regardless of stub
-        // height. true -> ROUNDED: exact tangent fillet arcs where a leg has room (a corner whose
-        // leg is too short for a valid fillet radius still falls back to the mitre — a fillet at
-        // the wire radius is a horn torus OCC cannot build). The conditional fallback is exactly
-        // what made 06_llc's three parallels show three different exit joints, which is why the
-        // deterministic mitre is the default.
-        bool roundedLeadCorners = false;
+        // ONE corner style for every corner of a terminal lead (Alf, 2026-10-28: "make them all either
+        // round or rectangular ... a setting that we can configure"): the joints of the lead polyline
+        // (lead/connection segments) AND the terminal corner where the lead leaves its turn (the
+        // TerminalFillet biarc). 14_dab mixed the two -- mitred 'exit lead seg 0'/'seg 1' against a
+        // filleted '(terminal stub) fillet arc' -- and they collided.
+        //   true (DEFAULT, round) -> every such corner is an exact tangent fillet arc. A corner whose
+        //        legs cannot hold its fillet THROWS (it used to fall back to a mitre, which is how
+        //        06_llc's three parallels showed three different exit joints, ABT #685).
+        //   false (sharp)         -> every such corner is a bisection mitre: plain segments meeting at
+        //        the waypoint, and the lead meets its turn with no terminal fillet.
+        // Rectangular / planar wire is always round whatever this says: its single fixed-binormal
+        // sweep cannot close a sharp spine (Alf, 2026-10-28). DrawConfig::roundedLeadCorners sets it.
+        bool roundedLeadCorners = true;
         // TOROID turn corners: false (default) = the round tangent fillets (today's certified
         // construction); true = sharp MITRE corners -- five straight runs per turn joined on
         // 45-degree bisector planes (Alf, 2026-08-27). Mitres trade the fillets' osculating

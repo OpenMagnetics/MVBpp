@@ -1,6 +1,8 @@
 #include <mvb/TerminalFillet.h>
 
 #include <gp_Ax1.hxx>
+#include <gp_Dir.hxx>
+#include <gp_Lin.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 
@@ -11,6 +13,9 @@
 #include <cstdio>
 #include <limits>
 #include <optional>
+#include <iostream>
+#include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -477,16 +482,242 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
     return done;
 }
 
+bool filletSegCorner(std::vector<Primitive>& prims, size_t i, double radius, const Primitive& flags,
+                     const std::string& label) {
+    Primitive& a = prims[i];
+    Primitive& b = prims[i + 1];
+    const gp_XYZ va = a.seg.b.XYZ() - a.seg.a.XYZ();
+    const gp_XYZ vb = b.seg.b.XYZ() - b.seg.a.XYZ();
+    const double lenA = va.Modulus();
+    const double lenB = vb.Modulus();
+    if (lenA < 1e-12 || lenB < 1e-12) return false;
+    const gp_XYZ da = va / lenA;
+    const gp_XYZ db = vb / lenB;
+    const double cosT = std::max(-1.0, std::min(1.0, da.Dot(db)));
+    if (cosT > 1.0 - 1e-12) return true;   // collinear: nothing to round
+    const double tanLen = radius * std::sqrt((1.0 - cosT) / (1.0 + cosT));
+    if (tanLen >= lenA || tanLen >= lenB) return false;
+    const gp_Pnt vertex = a.seg.b;
+    const gp_Pnt tA(vertex.XYZ() - da * tanLen);
+    const gp_Pnt tB(vertex.XYZ() + db * tanLen);
+    gp_XYZ normal = db - da * cosT;
+    normal /= normal.Modulus();
+    gp_XYZ axis = da.Crossed(db);
+    axis /= axis.Modulus();
+    Primitive arc;
+    arc.kind = Primitive::ARC3;
+    arc.arc.c = gp_Pnt(tA.XYZ() + normal * radius);
+    arc.arc.axis = axis;
+    arc.arc.v0 = tA.XYZ() - arc.arc.c.XYZ();
+    arc.arc.sweep = std::acos(cosT);
+    arc.label = label;
+    arc.turnOrdinal = flags.turnOrdinal;
+    arc.isLead = flags.isLead;
+    arc.isConnection = flags.isConnection;
+    arc.terminal = flags.terminal;
+    a.seg.b = tA;
+    b.seg.a = tB;
+    prims.insert(prims.begin() + static_cast<std::ptrdiff_t>(i) + 1, arc);
+    return true;
+}
+
+std::optional<SlantedStep> slantOneOdStep(std::vector<Primitive>& prims, size_t s0, bool longAfter,
+                                          const gp_Vec& away, double junctionBend, double junctionShare,
+                                          double kinkBend) {
+    const long k = longAfter ? static_cast<long>(s0) + 1 : static_cast<long>(s0) - 1;
+    const long s1 = longAfter ? static_cast<long>(s0) + 2 : static_cast<long>(s0) - 2;
+    if (k < 0 || s1 < 0 || s1 >= static_cast<long>(prims.size())) return std::nullopt;
+    if (prims[s0].kind != Primitive::SEG || prims[static_cast<size_t>(k)].kind != Primitive::ARC3 ||
+        prims[static_cast<size_t>(s1)].kind != Primitive::SEG)
+        return std::nullopt;
+    const Primitive& sh = prims[s0];
+    const Primitive& lg = prims[static_cast<size_t>(s1)];
+    const gp_Pnt V = longAfter ? sh.seg.a : sh.seg.b;
+    // The long leg, oriented away from the step, and the step's own line, oriented from V to its corner.
+    const gp_Pnt nearEnd = longAfter ? lg.seg.a : lg.seg.b;
+    const gp_Pnt farEnd = longAfter ? lg.seg.b : lg.seg.a;
+    gp_Vec dir1(nearEnd, farEnd);
+    const double lenLong = dir1.Magnitude();
+    gp_Vec dir0 = longAfter ? gp_Vec(sh.seg.a, sh.seg.b) : gp_Vec(sh.seg.b, sh.seg.a);
+    if (lenLong < 1e-12 || dir0.Magnitude() < 1e-12 || away.Magnitude() < 1e-12) return std::nullopt;
+    dir1.Normalize();
+    dir0.Normalize();
+    gp_Vec awayDir = away;
+    awayDir.Normalize();
+    // The step's corner: where the long leg's line passes nearest the step's line.
+    const gp_Vec w(nearEnd, V);
+    const double bb = dir0.Dot(dir1);
+    const double den = 1.0 - bb * bb;
+    if (den < 1e-12) return std::nullopt;   // the step runs along the long leg: no step
+    const double tC = (dir1.Dot(w) - bb * dir0.Dot(w)) / den;
+    const gp_Pnt C = nearEnd.Translated(dir1 * tC);
+    const double reach = lenLong - tC;       // from the corner to the long leg's far end
+    if (reach < 1e-12) return std::nullopt;
+    // Along the slant from V to Q = C + d dir1: the junction bend's share and the kink's tangent
+    // length must both fit; the long leg must keep the kink's tangent length beyond Q.
+    auto slack = [&](double d, double& kinkTan) {
+        const gp_Pnt Q = C.Translated(dir1 * d);
+        gp_Vec u(V, Q);
+        const double len = u.Magnitude();
+        u.Normalize();
+        const double thetaJ = M_PI - awayDir.Angle(u);
+        const double thetaQ = u.Angle(dir1);
+        kinkTan = kinkBend * std::tan(0.5 * thetaQ);
+        return len - junctionBend * std::tan(0.5 * thetaJ) / junctionShare - kinkTan;
+    };
+    double kinkTan = 0.0;
+    if (slack(reach, kinkTan) <= 0.0) return std::nullopt;
+    double lo = 0.0, hi = reach;
+    for (int it = 0; it < 80; ++it) {
+        const double mid = 0.5 * (lo + hi);
+        double kt = 0.0;
+        (slack(mid, kt) > 0.0 ? hi : lo) = mid;
+    }
+    slack(hi, kinkTan);
+    if (hi + kinkTan >= reach) return std::nullopt;
+    const gp_Pnt Q = C.Translated(dir1 * hi);
+    SlantedStep out;
+    out.slant = hi;
+    out.departure = gp_Lin(V, gp_Dir(gp_Vec(V, Q))).Distance(C);
+    Primitive slant = sh;
+    slant.seg.a = longAfter ? V : Q;
+    slant.seg.b = longAfter ? Q : V;
+    slant.label = sh.label + " (slanted step)";
+    Primitive longFlags = lg;
+    if (longAfter) prims[static_cast<size_t>(s1)].seg.a = Q;
+    else           prims[static_cast<size_t>(s1)].seg.b = Q;
+    prims[s0] = slant;
+    prims.erase(prims.begin() + k);
+    // [slant][long] or [long][slant]: the kink between them, at kinkBend.
+    const size_t kinkAt = longAfter ? s0 : static_cast<size_t>(s1);
+    if (!filletSegCorner(prims, kinkAt, kinkBend, longFlags, longFlags.label + " step kink"))
+        throw std::logic_error("slantOneOdStep: the kink solved to fit does not fit");
+    return out;
+}
+
+namespace {
+// A Z dragback's own straight (Alf, 2026-10-28: a dragback's ends are round when its corners are).
+bool isDragbackSeg(const Primitive& p) {
+    return p.kind == Primitive::SEG && p.isConnection && p.label.find("(dragback) seg") != std::string::npos;
+}
+// Undo the round corner at prims[k] (an arc between two straights): both straights run on to the corner's
+// vertex again, where the assembler mitres them. False when prims[k] is no such corner.
+bool sharpenSegCorner(std::vector<Primitive>& prims, size_t k) {
+    if (k == 0 || k + 1 >= prims.size() || prims[k].kind != Primitive::ARC3 || prims[k - 1].kind != Primitive::SEG ||
+        prims[k + 1].kind != Primitive::SEG)
+        return false;
+    gp_Vec da(prims[k - 1].seg.a, prims[k - 1].seg.b);
+    if (da.Magnitude() < 1e-12) return false;
+    da.Normalize();
+    const double tanLen = prims[k].arc.v0.Modulus() * std::tan(0.5 * std::abs(prims[k].arc.sweep));
+    const gp_Pnt vertex = prims[k - 1].seg.b.Translated(da * tanLen);
+    prims[k - 1].seg.b = vertex;
+    prims[k + 1].seg.a = vertex;
+    prims.erase(prims.begin() + static_cast<std::ptrdiff_t>(k));
+    return true;
+}
+}  // namespace
+
+static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
+                                 const std::string& who, double entranceRoll, double exitRoll,
+                                 const FilletClears& clears, size_t* uncleared, std::string* witness,
+                                 bool dragbackEnds, bool allowSlant);
+
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
                              const std::string& who, double entranceRoll, double exitRoll,
                              const FilletClears& clears, size_t* uncleared, std::string* witness) {
+    return filletHelixCorners(prims, minBend, wireRadius, who, entranceRoll, exitRoll, clears, uncleared, witness,
+                              /*dragbackEnds=*/false, /*allowSlant=*/true);
+}
+
+namespace {
+// The unit travel direction at a primitive's start (atEnd false) or end.
+gp_Vec travelDirection(const Primitive& pr, bool atEnd) {
+    switch (pr.kind) {
+        case Primitive::SEG: return gp_Vec(pr.seg.a, pr.seg.b).Normalized();
+        case Primitive::ARC3: {
+            gp_Vec v(pr.arc.v0);
+            if (atEnd) v.Rotate(gp_Ax1(gp::Origin(), gp_Dir(pr.arc.axis)), pr.arc.sweep);
+            return gp_Vec(pr.arc.axis).Crossed(v).Normalized();
+        }
+        case Primitive::SPIRAL: {
+            return evalSpiral(pr.spiral, atEnd ? pr.spiral.az1 : pr.spiral.az0).t;   // already the travel tangent
+        }
+        default: throw std::runtime_error("TerminalFillet: no travel direction for primitive '" + pr.label + "'");
+    }
+}
+}  // namespace
+
+size_t filletDragbackEnds(std::vector<Primitive>& prims, double minBend, double wireRadius, const std::string& who,
+                          const FilletClears& clears, size_t* uncleared, std::string* witness, bool allowSlant) {
+    const size_t done = filletHelixCorners(prims, minBend, wireRadius, who, std::numeric_limits<double>::quiet_NaN(),
+                                           std::numeric_limits<double>::quiet_NaN(), clears, uncleared, witness,
+                                           /*dragbackEnds=*/true, allowSlant);
+    // A dragback end left a mitre (a level wrap arc, or no round bend clear) grows wireRadius x tan(turn/2) into its
+    // first or last straight; where the dragback's own round corner left less, that corner is sharp too (Alf,
+    // 2026-10-30, "Fully sharp there"; flyback: 0.530 mm left of a 1.1155 mm step for a 0.558 mm mitre).
+    for (size_t i = 0; i < prims.size(); ++i) {
+        if (!isDragbackSeg(prims[i])) continue;
+        for (const bool wrapBefore : {true, false}) {
+            const size_t w = wrapBefore ? i - 1 : i + 1;
+            const size_t corner = wrapBefore ? i + 1 : i - 1;
+            if ((wrapBefore && i == 0) || (!wrapBefore && i + 1 >= prims.size())) continue;
+            if (prims[w].isConnection || prims[w].isLead) continue;   // not a wrap
+            if (corner >= prims.size() || prims[corner].kind != Primitive::ARC3 || !prims[corner].isConnection) continue;
+            const gp_Vec tIn = travelDirection(wrapBefore ? prims[w] : prims[i], true);
+            const gp_Vec tOut = travelDirection(wrapBefore ? prims[i] : prims[w], false);
+            const double turn = tIn.Angle(tOut);
+            if (turn < 1e-9) continue;   // tangent: no mitre
+            const double mitre = wireRadius * std::tan(0.5 * turn);
+            const double leg = prims[i].seg.a.Distance(prims[i].seg.b);
+            if (leg >= mitre) continue;
+            const std::string cornerLabel = prims[corner].label;
+            if (!sharpenSegCorner(prims, corner)) continue;
+            if (!wrapBefore) --i;
+            std::cerr << "[TerminalFillet] FINDING: '" << prims[i].label << "' of " << who << " meets its wrap in a mitre "
+                      << "that needs " << mitre * 1e3 << " mm of it, and its round corner '" << cornerLabel << "' left "
+                      << leg * 1e3 << " mm; that corner is drawn sharp (bisection mitre).\n";
+        }
+    }
+    return done;
+}
+
+static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
+                                 const std::string& who, double entranceRoll, double exitRoll,
+                                 const FilletClears& clears, size_t* uncleared, std::string* witness,
+                                 bool dragbackEnds, bool allowSlant) {
+    // The corners this pass owns: a terminal stub and its lead, or (dragbackEnds) a wrap and the Z
+    // dragback straight it meets -- the wrap it leaves (exit order) or the wrap it lands on (entrance).
+    auto cornerOf = [&](const Primitive& helixSide, const Primitive& straightSide) {
+        return dragbackEnds ? isWrapSpiral(helixSide) && isDragbackSeg(straightSide)
+                            : filletable(helixSide, straightSide);
+    };
     size_t done = 0;
+    // THE SLANTED STEP (Alf, 2026-10-28): a corner whose lead leg is a one-OD step between the lead's own
+    // rounded corner and the helix, with no biarc fitting, is retried on a slanted step (slantOneOdStep)
+    // whose slant gives the terminal bend 1, 1.2, 1.44, ... times its plain tangent length -- the biarc
+    // leaves a helix, so it needs more than a straight corner would, by the same 1.2 steps the biarc
+    // search itself takes. Per corner, by its stub's label: the attempt, and the corner as it stood.
+    std::map<std::string, size_t> slantAttempt;
+    std::map<std::string, std::vector<Primitive>> beforeSlant;
+    constexpr size_t kSlantAttempts = 12;
     for (size_t i = 0; i + 1 < prims.size(); ++i) {
-        const bool exitCorner = filletable(prims[i], prims[i + 1]);
-        const bool entranceCorner = filletable(prims[i + 1], prims[i]);
+        const bool exitCorner = cornerOf(prims[i], prims[i + 1]);
+        const bool entranceCorner = cornerOf(prims[i + 1], prims[i]);
         if (!exitCorner && !entranceCorner) continue;
         const size_t stubIdx = exitCorner ? i : i + 1;
         size_t leadIdx = exitCorner ? i + 1 : i;
+        const std::string stubLabel = prims[stubIdx].label;
+        std::optional<SlantedStep> slanted;
+        if (const size_t attempt = slantAttempt[stubLabel]; attempt > 0) {
+            const Spiral& st = prims[stubIdx].spiral;
+            const gp_Vec t = evalSpiral(st, exitCorner ? st.az1 : st.az0).t;
+            slanted = slantOneOdStep(prims, leadIdx, exitCorner, exitCorner ? t.Reversed() : t, minBend,
+                                     0.9 / std::pow(1.2, static_cast<double>(attempt - 1)), minBend);
+        }
+        else {
+            beforeSlant[stubLabel] = prims;
+        }
         Primitive& sp = prims[stubIdx];
         const double sgn = sp.spiral.az1 >= sp.spiral.az0 ? 1.0 : -1.0;
         const double azJoint = exitCorner ? sp.spiral.az1 : sp.spiral.az0;
@@ -559,7 +790,8 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
         const gp_Vec tOut2 = exitCorner ? tSeg : atJoint.t;
         const double theta2 = tIn2.Angle(tOut2);
         double L = std::max(minBend * std::tan(0.5 * theta2), 1e-9);
-        const bool neighbourOk = exitCorner ? (i > 0 && sameHelix(prims[i - 1], prims[i]))
+        // A dragback's wrap is a whole turn, not a stub: the corner never reaches past it into another.
+        const bool neighbourOk = dragbackEnds ? false : exitCorner ? (i > 0 && sameHelix(prims[i - 1], prims[i]))
                                             : (i + 2 < prims.size() && sameHelix(prims[i + 1], prims[i + 2]));
         const size_t nbIdx = exitCorner ? (i > 0 ? i - 1 : 0) : i + 2;
         const double spanAbs = std::abs(sp.spiral.az1 - sp.spiral.az0);
@@ -745,7 +977,10 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                 // Proven before it is taken: a fit that does not clear the other conductors is
                 // not a candidate, whatever its radius.
                 std::vector<Primitive> candidate;
-                for (const auto& ao : best->arcs) candidate.push_back(ao.pr);
+                for (const auto& ao : best->arcs) {
+                    candidate.push_back(ao.pr);
+                    candidate.back().terminal = prims[leadIdx].terminal;   // as taken (see Apply)
+                }
                 std::string why;
                 if (!clears(candidate, &why)) {
                     ++rejected;
@@ -787,12 +1022,52 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
             m << "TerminalFillet: every fitting fillet of the terminal corner of " << who << " at '"
               << sp.label << "' (" << rejected << " candidate(s)) comes closer to another conductor than "
               << "their coated envelopes allow; last: " << lastWitness;
+            if (uncleared && dragbackEnds) {
+                // Alf, 2026-10-30 ("Fully sharp there"): a dragback end with no round bend clear of its
+                // neighbours (boost: the slanted step runs into the touching sibling parallel) is drawn sharp,
+                // and so is its step's other corner, which a mitre at the end would run into.
+                prims = beforeSlant.at(stubLabel);
+                const size_t stepCorner = exitCorner ? i + 2 : i - 1;
+                const bool stepSharpened = (exitCorner || i > 0) && sharpenSegCorner(prims, stepCorner);
+                if (stepSharpened && !exitCorner) --i;
+                std::cerr << "[TerminalFillet] FINDING: the dragback end of " << who << " at '" << stubLabel
+                          << "' has no round bend clear of the other conductors (" << lastWitness << "); it"
+                          << (stepSharpened ? " and its step's other corner are" : " is")
+                          << " drawn sharp (bisection mitre).\n";
+                continue;
+            }
             if (uncleared) {
                 ++*uncleared;
                 if (witness) *witness = m.str();
                 continue;   // left as it was: the caller re-rolls or throws with this witness
             }
             throw std::runtime_error(m.str());
+        }
+        const size_t attemptNow = slantAttempt[stubLabel];
+        if (allowSlant && !best && (attemptNow == 0 || slanted) && attemptNow < kSlantAttempts) {
+            // The corner as it stood, then the next slant. A step that cannot be slanted at all (no
+            // rounded lead corner beyond it, no room on the run) ends the retries with the plain error.
+            std::vector<Primitive> trial = beforeSlant.at(stubLabel);
+            const Spiral& st = trial[stubIdx].spiral;
+            const gp_Vec t = evalSpiral(st, exitCorner ? st.az1 : st.az0).t;
+            if (slantOneOdStep(trial, exitCorner ? i + 1 : i, exitCorner, exitCorner ? t.Reversed() : t, minBend,
+                               0.9 / std::pow(1.2, static_cast<double>(attemptNow)), minBend)) {
+                prims = beforeSlant.at(stubLabel);
+                slantAttempt[stubLabel] = attemptNow + 1;
+                --i;   // this corner again, on the slant
+                continue;
+            }
+        }
+        if (!best && dragbackEnds) {
+            // Alf, 2026-10-30: a dragback end no round bend fits is sharp, and so is its step's other corner.
+            prims = beforeSlant.at(stubLabel);
+            const size_t stepCorner = exitCorner ? i + 2 : i - 1;
+            const bool stepSharpened = (exitCorner || i > 0) && sharpenSegCorner(prims, stepCorner);
+            if (stepSharpened && !exitCorner) --i;
+            std::cerr << "[TerminalFillet] FINDING: the dragback end of " << who << " at '" << stubLabel
+                      << "' holds no round bend of at least " << minBend * 1e3 << " mm; it"
+                      << (stepSharpened ? " and its step's other corner are" : " is") << " drawn sharp (bisection mitre).\n";
+            continue;
         }
         if (!best) {
             std::ostringstream m;
@@ -822,6 +1097,8 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
             Primitive q = ao.pr;
             q.isConnection = false;
             q.terminalFillet = terminalCorner;
+            // The lead's terminal, so the corner is proven against the same conductor's other terminal.
+            q.terminal = prims[leadIdx].terminal;
             arcs.push_back(q);
         }
         // Apply. Order of operations keeps indices valid: shorten pieces in place first, then
@@ -842,6 +1119,14 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
         prims.insert(prims.begin() + static_cast<long>(insertAt), arcs.begin(), arcs.end());
         i = insertAt + arcs.size() - 1;
         ++done;
+        if (slanted) {
+            static thread_local std::set<std::string> reported;
+            if (reported.insert(who + "|" + stubLabel + "|" + std::to_string(minBend)).second)
+                std::cerr << "[TerminalFillet] FINDING: the terminal corner of " << who << " at '" << stubLabel
+                          << "' has no room for its bend on MKF's one-OD lead step; it is drawn as a slanted step "
+                             "meeting the lead's run " << slanted->slant * 1e3 << " mm on, "
+                          << slanted->departure * 1e3 << " mm off MKF's corner, bend " << minBend * 1e3 << " mm\n";
+        }
     }
     return done;
 }

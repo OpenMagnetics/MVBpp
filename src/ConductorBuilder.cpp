@@ -66,6 +66,7 @@
 #include <TopoDS_Wire.hxx>
 #include <TopoDS_Edge.hxx>
 #include <gp_Circ.hxx>
+#include <gp_Lin.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Ax3.hxx>
@@ -3515,10 +3516,20 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
         for (size_t i = 0; i < path.prims.size(); ++i) {
             auto [pa, pb] = primEndpoints(path.prims[i]);
             static const char* kn[] = {"SEG", "ARC3", "SPIRAL", "BLEND"};
-            std::fprintf(stderr, "[prim] %s %3zu %-6s a=(%8.3f,%8.3f,%8.3f) b=(%8.3f,%8.3f,%8.3f) '%s'\n",
-                         path.name.c_str(), i, kn[path.prims[i].kind],
+            const auto& pr = path.prims[i];
+            double kinkDeg = 0.0;
+            if (i + 1 < path.prims.size()) {
+                const auto& nx = path.prims[i + 1];
+                const gp_Vec tOut(cert::evalPrim(pr, 1.0 - 1e-7), cert::evalPrim(pr, 1.0));
+                const gp_Vec tIn(cert::evalPrim(nx, 0.0), cert::evalPrim(nx, 1e-7));
+                if (tOut.Magnitude() > 1e-15 && tIn.Magnitude() > 1e-15) kinkDeg = tOut.Angle(tIn) * 180.0 / kPi;
+            }
+            std::fprintf(stderr, "[prim] %s %3zu %-6s a=(%8.3f,%8.3f,%8.3f) b=(%8.3f,%8.3f,%8.3f) '%s' len=%.4f R=%.4f "
+                                 "sweep=%.2f kinkToNext=%.4f deg\n",
+                         path.name.c_str(), i, kn[pr.kind],
                          pa.X()*1e3, pa.Y()*1e3, pa.Z()*1e3, pb.X()*1e3, pb.Y()*1e3, pb.Z()*1e3,
-                         path.prims[i].label.c_str());
+                         pr.label.c_str(), pa.Distance(pb) * 1e3, pr.kind == Primitive::ARC3 ? pr.arc.v0.Modulus() * 1e3 : 0.0,
+                         pr.kind == Primitive::ARC3 ? pr.arc.sweep * 180.0 / kPi : 0.0, kinkDeg);
         }
     }
     // ASSEMBLY STRATEGY IS NOT A FEM EXTRA (Alf, 2026-08-10). ConductorBuilder only ever runs
@@ -5702,7 +5713,45 @@ void appendRoundWrap(ConductorPath& path, const PlanePt& s, const PlanePt& n,
 // ABT #685 (Alf, 2026-08-15): the corner style chosen by Options::roundedLeadCorners, stashed at
 // buildAll entry so the free-function emitters below read it as their default argument (the
 // builder runs single-threaded; evaluated per call, so each build honours its own Options).
-static bool g_roundedLeadCorners = false;
+// Alf, 2026-10-28: it also decides the terminal corner (TerminalFillet), so a lead is all round or
+// all sharp.
+static bool g_roundedLeadCorners = true;
+// The leads (winding, parallel) whose round corners take the smallest buildable bend because at MKF's the fan
+// finds no layout clear of the window's other verticals (06_llc, 23_interleaved_llc; Alf, 2026-10-28: "1.05r
+// where R won't fit"). Filled by the fan's retry (FanBendRetry), for one build.
+static thread_local std::set<std::pair<std::string, size_t>> tlsLeadsAtMinimumBend;
+// The leads the fan finds no clear layout for even at the smallest buildable bend: their corners are drawn sharp
+// (Alf, 2026-10-30, 23_interleaved_llc: "Sharp for that group").
+static thread_local std::set<std::pair<std::string, size_t>> tlsLeadsSharp;
+struct FanBendRetry : std::runtime_error {
+    std::vector<std::pair<std::string, size_t>> leads;
+    bool sharp;   // false: the leads take the smallest buildable bend; true: they are drawn sharp
+    FanBendRetry(const std::string& why, std::vector<std::pair<std::string, size_t>> l, bool s)
+        : std::runtime_error(why), leads(std::move(l)), sharp(s) {}
+};
+// The exact bits of a chain, so a pure fillet of the same chain is computed once (the fan's slot search asks
+// for the same terminal corner thousands of times: 06_llc ran > 1 h).
+static std::string primChainKey(const std::vector<Primitive>& chain) {
+    std::string k;
+    const auto num = [&k](double v) { k.append(reinterpret_cast<const char*>(&v), sizeof v); };
+    const auto pnt = [&](const gp_Pnt& p) { num(p.X()); num(p.Y()); num(p.Z()); };
+    const auto xyz = [&](const gp_XYZ& p) { num(p.X()); num(p.Y()); num(p.Z()); };
+    for (const auto& pr : chain) {
+        k += static_cast<char>(pr.kind);
+        pnt(pr.seg.a); pnt(pr.seg.b);
+        pnt(pr.arc.c); xyz(pr.arc.axis); xyz(pr.arc.v0); num(pr.arc.sweep);
+        const auto& s = pr.spiral;
+        for (double v : {s.cx, s.cz, s.r0, s.y0, s.az0, s.r1, s.y1, s.az1, s.easeIn}) num(v);
+        pnt(pr.blendc.a); pnt(pr.blendc.b); xyz(pr.blendc.u);
+        k += static_cast<char>(pr.arc.exactRound | s.blend << 1 | s.levelOut << 2 | pr.isLead << 3 |
+                               pr.isConnection << 4 | pr.terminalFillet << 5);
+        num(static_cast<double>(pr.turnOrdinal));
+        num(static_cast<double>(pr.terminal));
+        k += pr.label;
+        k += '\0';
+    }
+    return k;
+}
 
 // ABT #685 (Alf, 2026-08-15): two STANDARD corners, one flag. `rounded == false` (the default,
 // Options::roundedLeadCorners) emits the polyline as plain segments — every joint becomes the
@@ -5712,7 +5761,8 @@ static bool g_roundedLeadCorners = false;
 void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pnt>& raw,
                             double wireRadius, const std::string& labelPrefix, size_t ordinal,
                             bool isLead, bool isConnection,
-                            bool rounded = g_roundedLeadCorners) {
+                            bool rounded = g_roundedLeadCorners,
+                            std::optional<double> bendRadius = std::nullopt) {
     std::vector<gp_Pnt> p;
     for (const auto& q : raw)
         if (p.empty() || p.back().Distance(q) > 1e-12) p.push_back(q);
@@ -5750,8 +5800,9 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
     // kRoundCornerBendFactor: the smallest buildable bend (> wireRadius: never a horn torus), the
     // corner rule everywhere else -- target and floor are the same number (Alf, 2026-09-19: no
     // magic numbers; the old 1.5 target was a bare literal).
-    const double bTarget = kRoundCornerBendFactor * wireRadius;
-    const double bFloor = kRoundCornerBendFactor * wireRadius;
+    // A terminal lead passes the bend MKF planned for it (ConnectionRoute::plannedBendRadius; Alf,
+    // 2026-10-28: round lead corners are bent at MKF's radius); a connection keeps the corner rule.
+    const double bTarget = bendRadius ? *bendRadius : kRoundCornerBendFactor * wireRadius;
 
     std::vector<gp_XYZ> dir(n - 1);
     std::vector<double> len(n - 1);
@@ -5760,31 +5811,48 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
         len[i] = d.Modulus();
         dir[i] = d / len[i];
     }
-    // Per-corner bend radius and its tangent length, then a pass that shrinks any pair sharing
-    // a leg until both fit; a corner whose radius falls under the floor is dropped (kept sharp).
     std::vector<double> radius(n, 0.0), tanLen(n, 0.0), halfTan(n, 0.0);
     for (size_t i = 1; i + 1 < n; ++i) {
         const double cosT = std::max(-1.0, std::min(1.0, dir[i - 1].Dot(dir[i])));
         if (cosT > 1.0 - 1e-9) continue;                       // collinear: no corner
         halfTan[i] = std::sqrt((1.0 - cosT) / (1.0 + cosT));   // tan(turn/2)
-        radius[i] = bTarget;
-        tanLen[i] = bTarget * halfTan[i];
     }
-    // A fillet may never consume most of a leg: the straight stub that survives is what carries
-    // the run into its endpoint, and a MKF turn crossing sits exactly at a lead's end -- eat the
-    // leg and the arc curves away from the crossing, leaving it outside the copper (measured on
-    // the E-core zigzag and EP oblong leads). Each corner takes at most 40% of its shorter
-    // neighbouring leg, so every leg keeps at least 20% of its length straight.
+    // Each corner is bent at bTarget where it takes at most 40% of its shorter leg: the straight that
+    // survives carries the run into its endpoint, and a MKF turn crossing sits exactly at a lead's end
+    // (eat the leg and the arc curves away from the crossing, measured on the E-core zigzag and EP
+    // oblong leads), so every leg keeps at least 20% of its length straight.
+    // Alf, 2026-10-28: a round lead is round at EVERY corner. A corner whose legs cannot hold bTarget is
+    // bent at the smallest buildable bend, kRoundCornerBendFactor x the wire radius (nearly sharp inside,
+    // round outside), and may then use its legs up to the neighbouring corner's share (half a leg two
+    // corners share, the whole leg otherwise); it is reported. Only a corner that cannot hold even that
+    // is refused.
+    const double bMin = kRoundCornerBendFactor * wireRadius;
+    auto isCorner = [&](size_t k) { return k >= 1 && k + 1 < n && halfTan[k] > 0.0; };
     for (size_t i = 1; i + 1 < n; ++i) {
         if (halfTan[i] <= 0.0) continue;
-        const double cap = 0.4 * std::min(len[i - 1], len[i]);
-        if (tanLen[i] > cap) {
-            tanLen[i] = cap;
-            radius[i] = cap / halfTan[i];
+        if (bTarget * halfTan[i] <= 0.4 * std::min(len[i - 1], len[i])) {
+            radius[i] = bTarget;
+            tanLen[i] = bTarget * halfTan[i];
+            continue;
         }
+        const double room = std::min(isCorner(i - 1) ? len[i - 1] / 2 : len[i - 1],
+                                     isCorner(i + 1) ? len[i] / 2 : len[i]);
+        std::ostringstream m;
+        m.precision(9);
+        m << "corner " << i << " of '" << labelPrefix << "' (at " << p[i].X() << ", " << p[i].Y() << ", " << p[i].Z()
+          << " m), legs " << len[i - 1] << " and " << len[i] << " m, cannot hold its round fillet of " << bTarget
+          << " m (a fillet may take at most 40% of a leg)";
+        if (bMin * halfTan[i] <= room) {
+            radius[i] = bMin;
+            tanLen[i] = bMin * halfTan[i];
+            std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; it is bent at the smallest buildable bend, "
+                      << bMin << " m (kRoundCornerBendFactor x the wire radius)\n";
+            continue;
+        }
+        m << " nor the smallest buildable bend of " << bMin << " m within " << room << " m of its legs";
+        // Alf, 2026-10-30: below the smallest buildable bend the corner is sharp (bisection mitre).
+        std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; it is drawn sharp (bisection mitre)\n";
     }
-    for (size_t i = 1; i + 1 < n; ++i)
-        if (radius[i] < bFloor) { radius[i] = 0.0; tanLen[i] = 0.0; }
 
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, size_t idx) {
         if (a.Distance(b) < 1e-12) return;
@@ -5818,12 +5886,183 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
         pr.arc.axis = axis / am;
         pr.arc.v0 = tA.XYZ() - pr.arc.c.XYZ();
         pr.arc.sweep = std::acos(cosT);
-        pr.label = labelPrefix + " corner " + std::to_string(c);
+        // A connection's joint is a bend of its own run, not a corner of the wrap it leaves: " corner "
+        // names the wrap's corners on the former (02_flyback's concentricity test reads them so).
+        pr.label = labelPrefix + (isConnection ? " bend " : " corner ") + std::to_string(c);
         pr.turnOrdinal = ordinal;
         pr.isLead = isLead;
         pr.isConnection = isConnection;
         out.push_back(std::move(pr));
     }
+}
+
+// Alf, 2026-10-28 ("Secondary parallel 2 / turn 6 -> turn 6_ending face -Z in and Secondary parallel 2 /
+// exit lead seg 0 is a rectangular corner, not round!!"): on a column with straight faces the lead meets
+// its wrap's face straight at a corner nothing else rounds -- TerminalFillet rounds a helix stub only,
+// appendFilletedPolyline the lead's own joints. Every corner between a wrap SEG and a terminal lead SEG
+// is filleted at `leadBend` (none: those corners are left alone) and every corner between a wrap SEG and a
+// Z dragback's SEG (Alf, 2026-10-28: "why are ... (dragback) seg 0 and ... seg 2 still rectangular
+// corner??") at the bend its own corners take, the smallest buildable one (kRoundCornerBendFactor x the
+// wire radius). The legs are what is left once the neighbouring corners took theirs, so a corner takes
+// what it really needs of them (Alf, 2026-10-28, "split the leg by real cost"); a lead corner that cannot
+// hold `leadBend` falls back to the smallest buildable bend, reported, and one that cannot hold even that
+// throws (drawn sharp and reported under --skip-collision-check). Returns the corners filleted.
+// OMFEM applies the 0.5-cap inset only to a cap whose normal is along an axis (|n_axis| > 0.99); see
+// requireAxisAlignedPort.
+static bool capAlongAnAxis(const gp_XYZ& u) {
+    return std::max({std::abs(u.X()), std::abs(u.Y()), std::abs(u.Z())}) > 0.99;
+}
+
+// `allowSlant` false: a one-OD step with no room for a bend is sharp at once, never slanted; `allowMerge`
+// false: a lead piece too short for its bend is never redrawn as one straight to the lead's end (either
+// reached copper it must clear).
+size_t filletLeadJunctions(std::vector<Primitive>& prims, std::optional<double> leadBend, double wireRadius,
+                           const std::string& who, bool allowSlant = true, bool allowMerge = true) {
+    size_t filleted = 0;
+    const double bMin = kRoundCornerBendFactor * wireRadius;
+    auto isDragback = [](const Primitive& pr) {
+        return pr.isConnection && pr.label.find("(dragback) seg") != std::string::npos;
+    };
+    for (size_t i = 0; i + 1 < prims.size(); ++i) {
+        Primitive& a = prims[i];
+        Primitive& b = prims[i + 1];
+        if (a.kind != Primitive::SEG || b.kind != Primitive::SEG || a.seg.b.Distance(b.seg.a) > 1e-9) continue;
+        const bool wrapA = !a.isLead && !a.isConnection;
+        const bool wrapB = !b.isLead && !b.isConnection;
+        const bool leadJunction = (wrapA && b.isLead && !b.isConnection) || (wrapB && a.isLead && !a.isConnection);
+        const bool dragJunction = (wrapA && isDragback(b)) || (wrapB && isDragback(a));
+        if (!(leadJunction && leadBend) && !dragJunction) continue;
+        const double bend = dragJunction ? bMin : *leadBend;
+        const gp_XYZ va = a.seg.b.XYZ() - a.seg.a.XYZ();
+        const gp_XYZ vb = b.seg.b.XYZ() - b.seg.a.XYZ();
+        const double lenA = va.Modulus();
+        const double lenB = vb.Modulus();
+        if (lenA < 1e-12 || lenB < 1e-12) continue;
+        const gp_XYZ da = va / lenA;
+        const gp_XYZ db = vb / lenB;
+        const double cosT = std::max(-1.0, std::min(1.0, da.Dot(db)));
+        if (cosT > 1.0 - 1e-9) continue;   // collinear: no corner
+        const double halfTan = std::sqrt((1.0 - cosT) / (1.0 + cosT));
+        // Alf, 2026-10-28 ("can you just add two straight parts and one round corner?"): a lead whose first piece
+        // off the wrap is too short for the bend (02_flyback's Secondary exits: 0.48 mm slanted onto the lane, then
+        // a 2.7 deg kink into the straight run) is drawn as ONE straight from the junction to the lead's end, so the
+        // corner is wrap straight -> one round bend -> lead straight. Only where that piece and one more straight
+        // are the whole lead; the shift off MKF's kink is reported.
+        const bool leadIsB = !wrapB;
+        const double leadLen = leadIsB ? lenB : lenA;
+        if (leadJunction && bend * halfTan >= leadLen) {
+            const size_t s0 = leadIsB ? i + 1 : i;                  // the short lead piece at the junction
+            const bool fits = leadIsB ? s0 + 2 < prims.size() : s0 >= 2;
+            const size_t kink = leadIsB ? s0 + 1 : s0 - 1;
+            const size_t s1 = leadIsB ? s0 + 2 : s0 - 2;
+            const bool endsLead = fits && (leadIsB ? (s1 + 1 == prims.size() || !prims[s1 + 1].isLead)
+                                                   : (s1 == 0 || !prims[s1 - 1].isLead));
+            const bool mergeable = allowMerge && endsLead && prims[kink].kind == Primitive::ARC3 && prims[kink].isLead &&
+                                   prims[s1].kind == Primitive::SEG && prims[s1].isLead && !prims[s1].isConnection;
+            // The lead's end is its port, and a port faces along an axis (PortPlane.h): a straight that would tilt it
+            // off one is not drawn, and the corner takes its bend as any other (PSPS E16's Primary 1: 8.7 deg).
+            const bool keepsPortOnAxis =
+                mergeable && capAlongAnAxis(gp_Vec(leadIsB ? prims[s0].seg.a : prims[s1].seg.a,
+                                                   leadIsB ? prims[s1].seg.b : prims[s0].seg.b).Normalized().XYZ());
+            if (mergeable && !keepsPortOnAxis)
+                std::cerr << "[ConductorBuilder] FINDING: the lead of '" << who << "' leaves '"
+                          << (leadIsB ? a.label : b.label) << "' on a piece of " << leadLen
+                          << " m, too short for its bend of " << bend << " m; one straight to its end would turn its "
+                          << "port off an axis, so the corner is bent where it is\n";
+            if (keepsPortOnAxis) {
+                const gp_Pnt from = leadIsB ? prims[s0].seg.a : prims[s1].seg.a;
+                const gp_Pnt to = leadIsB ? prims[s1].seg.b : prims[s0].seg.b;
+                const gp_Lin line(from, gp_Dir(gp_Vec(from, to)));
+                const double shift = std::max(line.Distance(prims[s0].seg.b), line.Distance(prims[s1].seg.a));
+                std::cerr << "[ConductorBuilder] FINDING: the lead of '" << who << "' leaves '"
+                          << (leadIsB ? a.label : b.label) << "' on a piece of " << leadLen
+                          << " m, too short for its bend of " << bend << " m; it is drawn as one straight to its end ("
+                          << prims[s1].label << "), " << shift << " m off MKF's kink, so the corner is one round bend\n";
+                Primitive merged = prims[s0];
+                merged.seg.a = from;
+                merged.seg.b = to;
+                const size_t first = std::min(s0, s1);
+                prims.erase(prims.begin() + static_cast<std::ptrdiff_t>(first),
+                            prims.begin() + static_cast<std::ptrdiff_t>(first) + 3);
+                prims.insert(prims.begin() + static_cast<std::ptrdiff_t>(first), merged);
+                i = (leadIsB ? i : first) - 1;   // the same junction again, with the straight lead
+                continue;
+            }
+        }
+        double radius = bend;
+        // A slanted step is solved so its junction bend takes the slant exactly: equal is a fit, and the
+        // straight left between the two arcs (none) is dropped below.
+        constexpr double kExact = 1e-12;
+        if (bend * halfTan > std::min(lenA, lenB) + kExact) {
+            std::ostringstream m;
+            m.precision(9);
+            m << "the corner of '" << who << "' between '" << a.label << "' and '" << b.label << "' (at " << a.seg.b.X()
+              << ", " << a.seg.b.Y() << ", " << a.seg.b.Z() << " m), legs " << lenA << " and " << lenB
+              << " m (what the neighbouring corners left), cannot hold its round fillet of " << bend << " m";
+            if (bMin * halfTan > std::min(lenA, lenB) + kExact) {
+                m << " nor the smallest buildable bend of " << bMin << " m";
+                // A one-OD step (a dragback's radial drop, a lead's first run): the slanted step (Alf,
+                // 2026-10-28), at `bend` where it fits, else at the smallest buildable bend.
+                const size_t s0 = leadIsB ? i + 1 : i;
+                const Primitive& wrap = leadIsB ? a : b;
+                const gp_Vec away = leadIsB ? gp_Vec(wrap.seg.b, wrap.seg.a) : gp_Vec(wrap.seg.a, wrap.seg.b);
+                const std::string stepLabel = prims[s0].label;
+                std::optional<SlantedStep> step;
+                double stepBend = bend;
+                for (double tryBend : {bend, bMin}) {
+                    if (!allowSlant) break;
+                    stepBend = tryBend;
+                    if ((step = slantOneOdStep(prims, s0, leadIsB, away, tryBend, 1.0, tryBend))) break;
+                }
+                if (step) {
+                    std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; '" << stepLabel
+                              << "' is drawn as a slanted step at " << stepBend << " m, meeting its next run "
+                              << step->slant << " m on, " << step->departure << " m off MKF's corner\n";
+                    i -= 1;   // the same junction again, now on the slant
+                    continue;
+                }
+                // Alf, 2026-10-30: below the smallest buildable bend the corner is sharp (bisection mitre).
+                std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; it is drawn sharp (bisection mitre)\n";
+                continue;
+            }
+            radius = bMin;
+            std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; it is bent at the smallest buildable bend, " << bMin
+                      << " m (kRoundCornerBendFactor x the wire radius)\n";
+        }
+        const double tanLen = radius * halfTan;
+        const gp_Pnt vertex = a.seg.b;
+        const gp_Pnt tA(vertex.XYZ() - da * tanLen);
+        const gp_Pnt tB(vertex.XYZ() + db * tanLen);
+        gp_XYZ normal = db - da * cosT;
+        normal /= normal.Modulus();
+        gp_XYZ axis = da.Crossed(db);
+        axis /= axis.Modulus();
+        const Primitive& lead = leadIsB ? b : a;
+        Primitive arc;
+        arc.kind = Primitive::ARC3;
+        arc.arc.c = gp_Pnt(tA.XYZ() + normal * radius);
+        arc.arc.axis = axis;
+        arc.arc.v0 = tA.XYZ() - arc.arc.c.XYZ();
+        arc.arc.sweep = std::acos(cosT);
+        arc.label = lead.label + " junction fillet";
+        arc.turnOrdinal = lead.turnOrdinal;
+        arc.isLead = lead.isLead;
+        arc.isConnection = lead.isConnection;
+        arc.terminal = lead.terminal;
+        a.seg.b = tA;
+        b.seg.a = tB;
+        const bool dropA = a.seg.a.Distance(a.seg.b) < 1e-9;
+        const bool dropB = b.seg.a.Distance(b.seg.b) < 1e-9;
+        prims.insert(prims.begin() + static_cast<std::ptrdiff_t>(i) + 1, arc);
+        if (dropB) prims.erase(prims.begin() + static_cast<std::ptrdiff_t>(i) + 2);
+        if (dropA) {
+            prims.erase(prims.begin() + static_cast<std::ptrdiff_t>(i));
+            --i;
+        }
+        ++i;   // past the arc
+        ++filleted;
+    }
+    return filleted;
 }
 
 struct PendingZ {
@@ -7993,8 +8232,7 @@ double tipDepth(const PortTip& t) {
 // rule was never derived for: refuse it rather than certify it under the wrong inset.
 void requireAxisAlignedPort(const PortTip& t) {
     if (t.path->toroidal) return;   // the build frame is not the exported one; drops map to -Y
-    const double m = std::max({std::abs(t.u.X()), std::abs(t.u.Y()), std::abs(t.u.Z())});
-    if (!(m > 0.99)) {
+    if (!capAlongAnAxis(t.u)) {
         std::ostringstream s;
         s.precision(6);
         s << "ConductorBuilder: the port of '" << t.path->name << "' at '"
@@ -8186,7 +8424,7 @@ static bool isTerminalLeadPiece(const Primitive& pr) { return pr.isLead || pr.te
 // connection layout and reserved spaces, not during the enrichment that produced the magnetic.
 
 template <typename CoilT, typename WireT>
-std::vector<NamedShape> buildAllImpl(const CoilT& coil,
+std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                      const MAS::CoreBobbinProcessedDescription& bobbinPd,
                                      bool isToroidal,
                                      std::vector<RSpace> allSpaces,
@@ -8232,6 +8470,114 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             radius = r.plannedBendRadius;
         }
         return radius;
+    };
+    // Alf, 2026-10-28: a ROUND terminal-lead corner -- a joint of the lead and the corner where it
+    // leaves its turn -- is bent at the radius MKF planned for the lead, never at a radius chosen here.
+    auto leadBendRadius = [&](const std::string& winding, size_t parallel) {
+        const double planned = plannedWireBendRadius(winding, static_cast<int64_t>(parallel));
+        if (std::isnan(planned))
+            throw std::runtime_error("ConductorBuilder: MKF planned no terminal lead bend radius for " + winding +
+                                     " parallel " + std::to_string(parallel) +
+                                     " (its terminal routes carry no plannedBendRadius), so its round lead "
+                                     "corners have no radius");
+        return planned;
+    };
+    // The bend a round lead corner of this conductor takes: MKF's, or the smallest buildable one where the
+    // fan's retry found MKF's leaves no clear layout (tlsLeadsAtMinimumBend).
+    auto leadBendFor = [&](const std::string& winding, size_t parallel, double wireR) {
+        return tlsLeadsAtMinimumBend.count({winding, parallel}) ? kRoundCornerBendFactor * wireR
+                                                               : leadBendRadius(winding, parallel);
+    };
+    // Alf, 2026-10-28: round lead corners need MKF's bend; a conductor whose terminal routes carry none
+    // is drawn with SHARP lead corners (reported once), never at a radius chosen here.
+    std::set<std::string> sharpForMissingBend;
+    auto leadCornersRound = [&](const std::string& winding, size_t parallel) {
+        if (!g_roundedLeadCorners || tlsLeadsSharp.count({winding, parallel})) return false;
+        if (!std::isnan(plannedWireBendRadius(winding, static_cast<int64_t>(parallel)))) return true;
+        const std::string who = winding + " parallel " + std::to_string(parallel);
+        if (sharpForMissingBend.insert(who).second)
+            std::cerr << "[ConductorBuilder] FINDING: MKF planned no terminal lead bend radius for " << who
+                      << " (its terminal routes carry no plannedBendRadius), so its lead corners are drawn sharp\n";
+        return false;
+    };
+    // The terminal corner (helix -> lead) at MKF's bend; where no biarc of that radius fits, at the
+    // smallest buildable bend, kRoundCornerBendFactor x the wire radius (Alf, 2026-10-28), reported
+    // when `report` (the fan asks this many times while it searches, and does not report).
+    auto filletTerminalAtPlannedBendUncached = [&](std::vector<Primitive>& chain, const std::string& winding, size_t parallel,
+                                           double wireR, const std::string& who, double rollIn, double rollOut, bool report,
+                                           const FilletClears& clears = {}, size_t* uncleared = nullptr,
+                                           std::string* witness = nullptr) -> size_t {
+        const std::vector<Primitive> before = chain;
+        const size_t unclearedBefore = uncleared ? *uncleared : 0;
+        try {
+            const size_t n = filletTerminalCorners(chain, leadBendFor(winding, parallel, wireR), wireR, who, rollIn,
+                                                   rollOut, clears, uncleared, witness);
+            if (!uncleared || *uncleared == unclearedBefore) return n;
+            // MKF's bend fits but clears no neighbour at any roll (11_pushpull: Secondary 1 p0's exit at
+            // 1.031 mm against Secondary 2): the smallest buildable bend, as where it does not fit.
+            std::cerr << "[ConductorBuilder] FINDING: " << (witness ? *witness : std::string("a terminal corner of ") + who)
+                      << " At MKF's bend " << leadBendRadius(winding, parallel) << " m no fillet clears; it is bent at "
+                      << "the smallest buildable bend, " << kRoundCornerBendFactor * wireR << " m.\n";
+            chain = before;
+            *uncleared = unclearedBefore;
+            return filletTerminalCorners(chain, kRoundCornerBendFactor * wireR, wireR, who, rollIn, rollOut, clears,
+                                         uncleared, witness);
+        }
+        catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("no tangent biarc with radius") == std::string::npos) throw;
+            chain = before;
+            const double bMin = kRoundCornerBendFactor * wireR;
+            if (report)
+                std::cerr << "[ConductorBuilder] FINDING: " << e.what() << " It is bent at the smallest buildable bend, "
+                          << bMin << " m (kRoundCornerBendFactor x the wire radius).\n";
+            try {
+                return filletTerminalCorners(chain, bMin, wireR, who, rollIn, rollOut, clears, uncleared, witness);
+            }
+            catch (const std::runtime_error& e2) {
+                if (std::string(e2.what()).find("no tangent biarc with radius") == std::string::npos) throw;
+                // Alf, 2026-10-30: below the smallest buildable bend the corner is sharp -- the crossing
+                // vertex, a bisection mitre.
+                chain = before;
+                if (report)
+                    std::cerr << "[ConductorBuilder] FINDING: " << e2.what() << " It is drawn sharp (bisection mitre).\n";
+                return 0;
+            }
+        }
+    };
+    struct PureFillet { std::vector<Primitive> chain; size_t filleted = 0; std::string error; };
+    std::map<std::string, PureFillet> pureFilletCache;
+    auto filletTerminalAtPlannedBend = [&](std::vector<Primitive>& chain, const std::string& winding, size_t parallel,
+                                           double wireR, const std::string& who, double rollIn, double rollOut, bool report,
+                                           const FilletClears& clears = {}, size_t* uncleared = nullptr,
+                                           std::string* witness = nullptr) -> size_t {
+        // Without a clearance proof the fillet is a pure function of its inputs: computed once per build.
+        const bool pure = !clears && !uncleared && !witness && !report;
+        std::string key;
+        if (pure) {
+            key = primChainKey(chain) + '\x01' + winding + '\x01' + who + '\x01';
+            for (double v : {static_cast<double>(parallel), wireR, rollIn, rollOut}) key.append(reinterpret_cast<const char*>(&v), sizeof v);
+            const auto hit = pureFilletCache.find(key);
+            if (hit != pureFilletCache.end()) {
+                if (!hit->second.error.empty()) throw std::runtime_error(hit->second.error);
+                chain = hit->second.chain;
+                return hit->second.filleted;
+            }
+            PureFillet result;
+            try {
+                result.filleted = filletTerminalAtPlannedBendUncached(chain, winding, parallel, wireR, who, rollIn,
+                                                                      rollOut, report, clears, uncleared, witness);
+                result.chain = chain;
+            }
+            catch (const std::runtime_error& e) {
+                result.error = e.what();
+                pureFilletCache.emplace(std::move(key), std::move(result));
+                throw;
+            }
+            pureFilletCache.emplace(std::move(key), result);
+            return result.filleted;
+        }
+        return filletTerminalAtPlannedBendUncached(chain, winding, parallel, wireR, who, rollIn, rollOut, report,
+                                                   clears, uncleared, witness);
     };
     std::map<std::pair<std::string, std::string>, OpenMagnetics::ConnectionKind> connectionKindOf;
     for (const auto& route : connectionLayout.routes) {
@@ -10401,6 +10747,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         struct AttachLeg { double dr, dy; };
         auto attachLegFor = [&](const Vert& L, double c, const PlanePt& att, double dir) {
             AttachLeg leg{2.0 * L.absorbTol, 0.0};
+            if (!leadCornersRound(conductors[L.ci].winding, conductors[L.ci].parallel)) return leg;   // sharp: no terminal fillet
             const auto helix = ownHelixOf(L, c);
             if (!helix) return leg;
             const double azL = kPlaneAz + c;
@@ -10423,8 +10770,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 if (L.entrance) { chain.push_back(sg); chain.push_back(*helix); }
                 else            { chain.push_back(*helix); chain.push_back(sg); }
                 try {
-                    filletTerminalCorners(chain, kRoundCornerBendFactor * L.rwEmit, L.rwEmit,
-                                          conductors[L.ci].winding + " (fan, attach leg)");
+                    if (filletTerminalAtPlannedBend(chain, conductors[L.ci].winding, conductors[L.ci].parallel, L.rwEmit,
+                                                    conductors[L.ci].winding + " (fan, attach leg)",
+                                                    std::numeric_limits<double>::quiet_NaN(),
+                                                    std::numeric_limits<double>::quiet_NaN(), /*report=*/false) == 0)
+                        return leg;   // drawn sharp: the sharp attach
                 }
                 catch (const std::runtime_error&) {
                     return leg;
@@ -10582,6 +10932,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             if (L.rectWire || L.kind != 0 || segs.empty()) return segs;
             const auto helix = ownHelixOf(L, c);
             if (!helix) return segs;
+            if (!leadCornersRound(conductors[L.ci].winding, conductors[L.ci].parallel)) {
+                // Sharp lead corners: the lead meets its wrap at the crossing slot, uncut.
+                if (cutHelixOut != nullptr) *cutHelixOut = *helix;
+                return segs;
+            }
             std::vector<Primitive> chain;
             if (L.entrance) {
                 // Travel order: tip -> attach -> helix (the lead's last SEG ends at the attach).
@@ -10597,10 +10952,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 for (const auto& pr : segs) chain.push_back(pr);
             }
             try {
-                filletTerminalCorners(chain, kRoundCornerBendFactor * L.rwEmit, L.rwEmit,
-                                      conductors[L.ci].winding + " (fan)",
-                                      L.entrance ? filletRoll : std::numeric_limits<double>::quiet_NaN(),
-                                      L.entrance ? std::numeric_limits<double>::quiet_NaN() : filletRoll);
+                filletTerminalAtPlannedBend(chain, conductors[L.ci].winding, conductors[L.ci].parallel, L.rwEmit,
+                                            conductors[L.ci].winding + " (fan)",
+                                            L.entrance ? filletRoll : std::numeric_limits<double>::quiet_NaN(),
+                                            L.entrance ? std::numeric_limits<double>::quiet_NaN() : filletRoll,
+                                            /*report=*/false);
             }
             catch (const std::runtime_error& e) {
                 if (std::getenv("MVB_LEAD_DIAG")) {
@@ -10754,6 +11110,9 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             }
             return kept;
         };
+        // The conductor the last refusal written to a `why` names (empty when it names none): the fan's retry eases
+        // that conductor's corners too (Alf, 2026-10-31, 23_interleaved_llc: "Sharp for both windings at once").
+        std::optional<size_t> whyCi;
         // Lead L (its emitted segments at slot c) against the wrap leaving row R, PROVEN at
         // clearance clr by the certified engine -- the very object the gate measures.
         auto leadWrapClear = [&](const WireRow& R, const Vert& L, double c, double clr,
@@ -10798,6 +11157,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                       << R.station << " on bare section boxes (axial " << axialSep * 1e3
                       << " mm, in-plane " << inPlaneSep * 1e3 << " mm)";
                     *why = w.str();
+                    whyCi = R.ci;
                 }
                 if (overlap) return false;
                 continue;
@@ -10840,6 +11200,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                       << qa.Y() * 1e3 << "," << qa.Z() * 1e3 << ") mm vs wrap point ("
                       << qb.X() * 1e3 << "," << qb.Y() * 1e3 << "," << qb.Z() * 1e3 << ") mm";
                     *why = w.str();
+                    whyCi = R.ci;
                 }
                 return false;
             }
@@ -10878,7 +11239,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             // OWN conductor keeps the soft, station-exempt check (leadOwnRowsSoft).
             const auto prims = leadPrims3D(L, c, filletRoll);
             if (!prims) {
-                if (why != nullptr) *why = "no terminal fillet fits the corner at this slot";
+                if (why != nullptr) { *why = "no terminal fillet fits the corner at this slot"; whyCi.reset(); }
                 return false;
             }
             // THE FLANGES (boost_inductor_complete, 2026-09-02): the lead's emitted primitives
@@ -10906,6 +11267,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               << depth * 1e6 << " um (flange face at y = "
                               << (below > above ? wb->lo : wb->hi) * 1e3 << " mm)";
                             *why = w.str();
+                            whyCi.reset();
                         }
                         return false;
                     }
@@ -10962,6 +11324,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               << pB.X() * 1e3 << "," << pB.Y() * 1e3 << "," << pB.Z() * 1e3
                               << ") mm]";
                             *why = w.str();
+                            whyCi = R.ci;
                         }
                         return false;
                     }
@@ -12043,12 +12406,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 // slot can change. Ask the block why, at the plane, and quote it (2026-09-03).
                 setBlockCand(cMax);
                 std::string bindingWhy;
+                std::optional<size_t> bindingCi;
                 bool planeFitsRadius = true;
                 for (size_t g = 0; g < group.size() && bindingWhy.empty(); ++g) {
                     const double cg = azMember(g, cMax);
                     if (std::isnan(cg)) { bindingWhy = "does not fit on its radius"; planeFitsRadius = false; break; }
                     std::string w;
-                    if (!leadRowsClearAnyFillet(verts[group[g]], cg, &w)) bindingWhy = w;
+                    whyCi.reset();
+                    if (!leadRowsClearAnyFillet(verts[group[g]], cg, &w)) { bindingWhy = w; bindingCi = whyCi; }
                 }
                 clearBlockCand();
                 // MVB_LEAD_NO_VALIDATE: diagnostic export mode (see emitToroLead) -- the block is
@@ -12059,6 +12424,33 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                               << bindingWhy << "\n";
                     best = cMax;
                     have = true;
+                }
+                if (!have && g_roundedLeadCorners) {
+                    // Round corners at MKF's bend leave no clear layout: once, the same leads at the smallest
+                    // buildable bend (the whole build again, FanBendRetry), as where the bend does not fit; and
+                    // where that leaves none either, the same leads sharp (Alf, 2026-10-30).
+                    std::vector<std::pair<std::string, size_t>> atMinimum, sharp;
+                    for (size_t g = 0; g < group.size(); ++g) {
+                        const auto key = std::make_pair(conductors[verts[group[g]].ci].winding, conductors[verts[group[g]].ci].parallel);
+                        if (!tlsLeadsAtMinimumBend.count(key)) atMinimum.push_back(key);
+                        else if (!tlsLeadsSharp.count(key)) sharp.push_back(key);
+                    }
+                    // Sharp for both windings at once (Alf, 2026-10-31): where the group goes sharp -- or already is
+                    // and still has no layout -- every parallel of the winding its binding constraint names goes sharp
+                    // with it. 23_interleaved_llc: Primary's leads have no layout against Secondary's round corners.
+                    if (atMinimum.empty() && bindingCi && conductors[*bindingCi].winding != conductors[verts[group[0]].ci].winding) {
+                        for (const auto& cd : conductors) {
+                            if (cd.winding != conductors[*bindingCi].winding) continue;
+                            const auto key = std::make_pair(cd.winding, cd.parallel);
+                            if (!tlsLeadsSharp.count(key) && std::find(sharp.begin(), sharp.end(), key) == sharp.end())
+                                sharp.push_back(key);
+                        }
+                    }
+                    const std::string why = "the terminal leads of '" + verts[group[0]].wname + "' " +
+                                            (atMinimum.empty() ? "at the smallest buildable bend" : "at MKF's bend") + ": " +
+                                            (bindingWhy.empty() ? std::string("(none reported)") : bindingWhy);
+                    if (!atMinimum.empty()) throw FanBendRetry(why, std::move(atMinimum), /*sharp=*/false);
+                    if (!sharp.empty()) throw FanBendRetry(why, std::move(sharp), /*sharp=*/true);
                 }
                 if (!have) throw std::runtime_error(
                     "ConductorBuilder: the terminal leads of '" + verts[group[0]].wname +
@@ -15048,8 +15440,11 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
                 const size_t before = path.prims.size();
                 appendFilletedPolyline(path.prims, leadPts, wireRadius, what, ordinal,
                                        /*isLead=*/true, /*isConnection=*/false,
-                                       /*rounded=*/g_roundedLeadCorners ||
-                                           path.isRectangular);
+                                       /*rounded=*/leadCornersRound(path.winding, path.parallel) ||
+                                           path.isRectangular,
+                                       leadCornersRound(path.winding, path.parallel)
+                                           ? std::optional<double>(leadBendFor(path.winding, path.parallel, wireRadius))
+                                           : std::nullopt);
                 for (size_t k = before; k < path.prims.size(); ++k) path.prims[k].terminal = leadTerminal;
             }
             else {
@@ -16832,6 +17227,95 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             return true;
         };
     };
+    // A slanted step moves copper along its run, toward the conductor's own other turns (13_current_sense: 1.7 um into
+    // turn 18; active_clamp: 36.6 um into the next wrap) and toward its neighbours: each slanted piece -- the slant, its
+    // bends, and the kink it leaves in the run it meets -- is proven against the path's own copper, exempt as the gate
+    // exempts it (adjacent turn ordinals, consecutive pieces), and against the other conductors as they stand.
+    auto piecesClear = [&](const ConductorPath& p, const std::function<bool(const Primitive&)>& proven,
+                           std::string* why) {
+        const auto& prims = p.prims;
+        for (size_t i = 0; i < prims.size(); ++i) {
+            const auto& pr = prims[i];
+            if (!proven(pr)) continue;
+            const auto a = primEndpoints(pr);
+            const double envelope = 2.0 * p.wireRadius;
+            for (size_t j = 0; j < prims.size(); ++j) {
+                const auto& other = prims[j];
+                if (j + 1 >= i && j <= i + 1) continue;   // itself and its neighbours
+                const size_t dOrd = pr.turnOrdinal > other.turnOrdinal ? pr.turnOrdinal - other.turnOrdinal
+                                                                       : other.turnOrdinal - pr.turnOrdinal;
+                if (dOrd <= 1) continue;
+                const auto b = primEndpoints(other);
+                const double reach = 4.0 * envelope + a.first.Distance(a.second) + b.first.Distance(b.second);
+                if (a.first.Distance(b.first) > reach && a.first.Distance(b.second) > reach &&
+                    a.second.Distance(b.first) > reach && a.second.Distance(b.second) > reach)
+                    continue;
+                if (!cert::provePairClears(pr, other, envelope - cert::kCoordinateGridHalf).clears) {
+                    if (why) *why = "'" + pr.label + "' vs '" + other.label + "'";
+                    return false;
+                }
+            }
+            // And the other conductors as they stand: on 23_interleaved_llc a slanted step of Primary parallel 0
+            // came 0.477 mm from parallel 1's over-dragback, inside their 0.5 mm envelope; on cm37 a slant off a
+            // straight face came 0.152 mm from the sibling's entrance lead.
+            for (const auto& q : paths) {
+                if (&q == &p || q.isRectangular) continue;
+                const double qEnvelope = p.wireRadius + q.wireRadius;
+                for (const auto& other : q.prims) {
+                    const auto b = primEndpoints(other);
+                    const double reach = 4.0 * qEnvelope + a.first.Distance(a.second) + b.first.Distance(b.second);
+                    if (a.first.Distance(b.first) > reach && a.first.Distance(b.second) > reach &&
+                        a.second.Distance(b.first) > reach && a.second.Distance(b.second) > reach)
+                        continue;
+                    if (!cert::provePairClears(pr, other, qEnvelope - cert::kCoordinateGridHalf).clears) {
+                        if (why) *why = "'" + pr.label + "' vs " + q.name + " '" + other.label + "'";
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+    auto slantsClear = [&](const ConductorPath& p, std::string* why) {
+        return piecesClear(p, [](const Primitive& pr) {
+            return pr.label.find("slanted step") != std::string::npos || pr.label.find("step kink") != std::string::npos;
+        }, why);
+    };
+    // Round lead corners: the lead's junction with a straight wrap face (filletLeadJunctions), before
+    // the terminal fillets and the copy the corner repair restarts from.
+    auto junctionBendFor = [&](const ConductorPath& p) {
+        return leadCornersRound(p.winding, p.parallel) ? std::optional<double>(leadBendFor(p.winding, p.parallel, p.wireRadius))
+                                                       : std::nullopt;
+    };
+    std::vector<std::vector<Primitive>> preJunctionPrims(paths.size());
+    for (size_t pi = 0; pi < paths.size(); ++pi) {
+        auto& p = paths[pi];
+        if (p.isRectangular || !opts.roundedLeadCorners) continue;
+        preJunctionPrims[pi] = p.prims;
+        filletLeadJunctions(p.prims, junctionBendFor(p), p.wireRadius, p.name);
+    }
+    // Every path has its junctions: what they drew -- the bends, a slanted step, a lead redrawn as one straight -- is
+    // proven against the copper it must clear. Where it does not clear, the junctions are drawn again without slants
+    // or merged straights, and where even their bends do not clear they are sharp (Alf, 2026-10-30: where rounding
+    // cannot be used the corner is sharp). cm37: a slant came 0.152 mm, then a merged lead 37 um, from the sibling.
+    for (size_t pi = 0; pi < paths.size(); ++pi) {
+        auto& p = paths[pi];
+        if (p.isRectangular || !opts.roundedLeadCorners) continue;
+        std::set<std::string> before;
+        for (const auto& pr : preJunctionPrims[pi]) before.insert(primChainKey({pr}));
+        const auto drawnHere = [&before](const Primitive& pr) { return !before.count(primChainKey({pr})); };
+        std::string why;
+        if (piecesClear(p, drawnHere, &why)) continue;
+        std::cerr << "[ConductorBuilder] FINDING: a lead junction of " << p.name << " on a straight face reaches copper it "
+                  << "must clear (" << why << "); its junctions are drawn without slanted steps or merged straights.\n";
+        p.prims = preJunctionPrims[pi];
+        filletLeadJunctions(p.prims, junctionBendFor(p), p.wireRadius, p.name, /*allowSlant=*/false, /*allowMerge=*/false);
+        why.clear();
+        if (piecesClear(p, drawnHere, &why)) continue;
+        std::cerr << "[ConductorBuilder] FINDING: a round lead junction of " << p.name << " still reaches copper it must "
+                  << "clear (" << why << "); its junctions on straight faces are drawn sharp (bisection mitre).\n";
+        p.prims = preJunctionPrims[pi];
+    }
     std::vector<std::vector<Primitive>> preFilletPrims(paths.size());
     for (size_t pi = 0; pi < paths.size(); ++pi) preFilletPrims[pi] = paths[pi].prims;
     // Every candidate terminal fillet is PROVEN against the other conductors before it is taken
@@ -16841,9 +17325,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         for (const auto& pr : pieces) {
             const auto a = primEndpoints(pr);
             for (size_t qi = 0; qi < paths.size(); ++qi) {
-                if (qi == pi) continue;
+                // The conductor's own copper too, as the gate judges it: its other terminal (14_dab: Primary p3's
+                // entrance fillet touched its own exit lead) and every piece two or more turns away (13_current_sense:
+                // the entrance fillet 1.6 nm into the same conductor's dragback).
                 const double envelope = paths[pi].wireRadius + paths[qi].wireRadius;
                 for (const auto& other : paths[qi].prims) {
+                    if (qi == pi) {
+                        const bool crossTerminal = pr.terminal >= 0 && other.terminal >= 0 && pr.terminal != other.terminal;
+                        const size_t dOrd = pr.turnOrdinal > other.turnOrdinal ? pr.turnOrdinal - other.turnOrdinal
+                                                                               : other.turnOrdinal - pr.turnOrdinal;
+                        if (!crossTerminal && dOrd <= 1) continue;
+                    }
                     const auto b = primEndpoints(other);
                     const double reach = 4.0 * envelope + a.first.Distance(a.second);
                     if (a.first.Distance(b.first) > reach && a.first.Distance(b.second) > reach &&
@@ -16871,9 +17363,34 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         };
     };
     std::map<size_t, std::string> unclearedFillet;   // path -> witness of a corner none of whose fillets cleared
+    // A round Z dragback has round ends where it meets a helical wrap (Alf, 2026-10-28), at the bend its own corners
+    // take (pushPlaneSegs: kRoundCornerBendFactor x the wire radius). On a straight face the junction is
+    // filletLeadJunctions'.
+    auto roundDragbackEnds = [&](ConductorPath& p, const FilletClears& clears, size_t* uncleared, std::string* why) {
+        if (!opts.roundedLeadCorners || p.isRectangular) return;
+        const std::vector<Primitive> before = p.prims;
+        const size_t unclearedBefore = uncleared ? *uncleared : 0;
+        filletDragbackEnds(p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius, p.name, clears, uncleared, why);
+        std::string slantWhy;
+        if (slantsClear(p, &slantWhy)) return;
+        // Alf, 2026-10-30: where rounding cannot be used the corner is sharp -- no slant, the end a mitre.
+        std::cerr << "[ConductorBuilder] FINDING: a slanted dragback step of " << p.name << " reaches copper it must clear ("
+                  << slantWhy << "); its dragback ends are drawn without slants, sharp where no round bend fits.\n";
+        p.prims = before;
+        if (uncleared) *uncleared = unclearedBefore;
+        filletDragbackEnds(p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius, p.name, clears, uncleared, why,
+                           /*allowSlant=*/false);
+    };
     for (size_t pi = 0; pi < paths.size(); ++pi) {
         auto& p = paths[pi];
         if (p.isRectangular) continue;
+        if (!leadCornersRound(p.winding, p.parallel)) {
+            // Sharp lead corners (Options::roundedLeadCorners, or no bend from MKF): no terminal fillet, so the layer
+            // links are smoothed as before and the terminal corners stay the crossing vertex.
+            smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name, linkVetoFor(pi));
+            roundDragbackEnds(p, {}, nullptr, nullptr);
+            continue;
+        }
         // WHICH fillet at each terminal corner is the fan's decision (it is the only model that
         // can see the neighbouring parallel); 0 where it had nothing to say.
         // THE LINK IS SMOOTHED WITH THE NEIGHBOURS IN VIEW. Every path exists by now, so the
@@ -16883,14 +17400,17 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         // certified gate below has the last word (no silent acceptance).
         smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
                          linkVetoFor(pi));
+        // The dragback ends before the terminal corner: whether they end sharp moves the dragback's straights, and
+        // the terminal fillet is proven against the copper as it finally is (13_current_sense).
+        roundDragbackEnds(p, {}, nullptr, nullptr);
         // The fan's corner first, for every path: a candidate can only be proven against the
         // neighbours' FINAL copper, and a neighbour's own fillet trims its stub and wrap end (06_llc:
         // proven against Secondary p2's still-unfilleted exit wrap, every candidate of p1's exit
         // corner read as a collision). The repair pass below proves and replaces.
-        const size_t filleted = filletTerminalCorners(
-            p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
+        const size_t filleted = filletTerminalAtPlannedBend(
+            p.prims, p.winding, p.parallel, p.wireRadius, p.name,
             leadFilletIn.count(pi) ? leadFilletIn.at(pi) : std::numeric_limits<double>::quiet_NaN(),
-            leadFilletOut.count(pi) ? leadFilletOut.at(pi) : std::numeric_limits<double>::quiet_NaN());
+            leadFilletOut.count(pi) ? leadFilletOut.at(pi) : std::numeric_limits<double>::quiet_NaN(), /*report=*/true);
         if (std::getenv("MVB_DIAG") && filleted)
             std::cerr << "[buildAll] '" << p.name << "' filleted " << filleted
                       << " terminal corner(s)\n";
@@ -16924,7 +17444,7 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         for (size_t pi = 0; pi < paths.size(); ++pi) {
             auto& p = paths[pi];
             if (std::getenv("MVB_NO_CORNER_REPAIR")) break;   // bisect switch
-            if (p.isRectangular) continue;
+            if (p.isRectangular || !leadCornersRound(p.winding, p.parallel)) continue;
             // Every drawn corner is proven here, against the other conductors as they finally are;
             // one that does not clear is re-searched with each candidate proven before it is taken.
             if (arcsClear(pi)) continue;
@@ -16937,23 +17457,28 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
             smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name, linkVetoFor(pi));
             size_t uncleared = 0;
             std::string unclearedWhy;
-            filletTerminalCorners(
-                p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius, p.name,
+            roundDragbackEnds(p, filletClearsFor(pi), &uncleared, &unclearedWhy);   // first: see the first pass
+            filletTerminalAtPlannedBend(
+                p.prims, p.winding, p.parallel, p.wireRadius, p.name,
                 leadFilletIn.count(pi) ? leadFilletIn.at(pi) : std::numeric_limits<double>::quiet_NaN(),
                 leadFilletOut.count(pi) ? leadFilletOut.at(pi) : std::numeric_limits<double>::quiet_NaN(),
-                filletClearsFor(pi), &uncleared, &unclearedWhy);
-            if (uncleared > 0) unclearedFillet[pi] = unclearedWhy;
+                /*report=*/false, filletClearsFor(pi), &uncleared, &unclearedWhy);
+            // A corner none of whose fillets clears is left sharp by the re-search (Alf, 2026-10-30: below the
+            // smallest buildable bend, or where no bend clears, the corner is a bisection mitre).
+            if (uncleared > 0) {
+                unclearedFillet[pi] = unclearedWhy;
+                std::cerr << "[ConductorBuilder] FINDING: " << unclearedWhy << " -- " << uncleared
+                          << " corner(s) of " << p.name << " are drawn sharp (bisection mitre).\n";
+            }
             // The pieces the fillets trimmed are proven too (the corner is not only its arcs).
-            const bool fixed = uncleared == 0 && arcsClear(pi);
+            const bool fixed = arcsClear(pi);
             if (fixed && std::getenv("MVB_DIAG"))
                 std::cerr << "[buildAll] '" << p.name << "' terminal corners re-searched with proven fillets\n";
             if (!fixed) {
-                // No roll and no fillet along the corner clears every other conductor: the corner
-                // cannot be drawn, and a fillet picked blind would only move the refusal to the gate.
-                refuseCollision(
-                    "ConductorBuilder: no terminal fillet of " + p.name + " clears the other conductors "
-                    "at any roll or along its corner. " + (unclearedFillet.count(pi) ? unclearedFillet.at(pi)
-                                                                : "Witness: " + arcsWhy));
+                // The re-searched corners (round where a fillet clears, sharp where none does) still reach
+                // another conductor: a collision, not a corner choice.
+                refuseCollision("ConductorBuilder: the re-searched terminal corners of " + p.name +
+                                " do not clear the other conductors. Witness: " + arcsWhy);
                 // Only reached with the collision debug switch on: the corners stay as they were
                 // first drawn (the colliding fillet, not a re-searched compromise), so the STEP
                 // shows the collision the first proof found.
@@ -17723,6 +18248,57 @@ static TopoDS_Shape fuseConductorToOneBody(const TopoDS_Shape& cond, const std::
     }
     }
     return {};
+}
+
+// One build; again with the leads the fan names at the smallest buildable bend (FanBendRetry), until it needs no
+// more. Each retry adds leads, so it ends.
+template <typename CoilT, typename WireT>
+std::vector<NamedShape> buildAllImpl(const CoilT& coil, const MAS::CoreBobbinProcessedDescription& bobbinPd,
+                                     bool isToroidal, std::vector<RSpace> allSpaces,
+                                     const OpenMagnetics::ConnectionLayout& connectionLayout,
+                                     const ConductorBuilder::Options& opts,
+                                     std::vector<ConductorBuilder::PathPolyline>* polyOut = nullptr,
+                                     std::vector<ConductorPath>* centrelineOut = nullptr) {
+    tlsLeadsAtMinimumBend.clear();
+    tlsLeadsSharp.clear();
+    // MVB_LEADS_SHARP="<winding>:<parallel>,...": diagnostic bisect switch (house pattern, like
+    // MVB_NO_CHAIN_END_SLOT) -- those leads start the build sharp, as the fan's retry would leave them.
+    if (const char* env = std::getenv("MVB_LEADS_SHARP")) {
+        std::stringstream list(env);
+        std::string item;
+        while (std::getline(list, item, ',')) {
+            const auto colon = item.rfind(':');
+            if (colon == std::string::npos)
+                throw std::runtime_error("MVB_LEADS_SHARP: '" + item + "' is not <winding>:<parallel>");
+            tlsLeadsSharp.insert({item.substr(0, colon), std::stoul(item.substr(colon + 1))});
+        }
+    }
+    for (;;) {
+        try {
+            auto shapes = buildAllImplOnce<CoilT, WireT>(coil, bobbinPd, isToroidal, allSpaces, connectionLayout, opts,
+                                                         polyOut, centrelineOut);
+            tlsLeadsAtMinimumBend.clear();
+            tlsLeadsSharp.clear();
+            return shapes;
+        }
+        catch (const FanBendRetry& retry) {
+            for (const auto& lead : retry.leads) {
+                std::cerr << "[ConductorBuilder] FINDING: " << retry.what() << "; " << lead.first << " parallel "
+                          << lead.second
+                          << (retry.sharp ? " is drawn with sharp lead corners (bisection mitre)"
+                                          : " takes the smallest buildable bend at its lead corners")
+                          << "\n";
+                (retry.sharp ? tlsLeadsSharp : tlsLeadsAtMinimumBend).insert(lead);
+            }
+            if (polyOut) polyOut->clear();
+            if (centrelineOut) centrelineOut->clear();
+        }
+        catch (...) {
+            tlsLeadsAtMinimumBend.clear();
+            tlsLeadsSharp.clear();
+            throw;
+        }
+    }
 }
 
 std::vector<NamedShape> ConductorBuilder::buildAll(

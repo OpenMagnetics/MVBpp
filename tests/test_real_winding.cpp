@@ -49,6 +49,8 @@
 #include <BRep_Tool.hxx>
 #include <Precision.hxx>
 #include <Geom_Surface.hxx>
+#include <GeomAPI_ExtremaCurveCurve.hxx>
+#include <Geom_Line.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
@@ -793,15 +795,64 @@ TEST_CASE("Real winding: rectangular-column E core zigzag racetrack conductor",
     auto bobbinPd = bobbinPdOf(enriched);
     REQUIRE(bobbinPd.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
     double zoff = bobbinPd.get_column_depth() - bobbinPd.get_column_width().value();
+    // Where a terminal lead leaves its wrap AT a crossing with a round corner (Alf, 2026-11-01: round lead
+    // corners are the default), the crossing is the corner's vertex: no round bend passes through its own
+    // vertex, so there the contract is that the bend's two straights -- the wrap's and the lead's -- meet
+    // exactly at the crossing (MKF's vertex, rounded). Every other crossing stays on the centreline.
+    std::vector<gp_Pnt> leadVertices;
+    {
+        const auto paths = builder.buildRealWindingPaths(enriched);
+        const mvb::ConductorBuilder::PathPolyline* path = nullptr;
+        for (const auto& pl : paths)
+            if (pl.name == "Primary parallel 0") path = &pl;
+        REQUIRE(path != nullptr);
+        auto pnt = [](const std::array<double, 3>& a) { return gp_Pnt(a[0], a[1], a[2]); };
+        auto straight = [&](size_t k) { return path->prims[k].size() == 2; };
+        for (size_t k = 0; k + 1 < path->prims.size(); ++k) {
+            if (path->primIsLead[k] == path->primIsLead[k + 1]) continue;
+            const bool leadAfter = path->primIsLead[k + 1];
+            const size_t wrap = leadAfter ? k : k + 1;
+            const size_t bend = leadAfter ? k + 1 : k;
+            if (!straight(wrap) || straight(bend)) continue;   // a sharp junction: its vertex is on the copper
+            REQUIRE((leadAfter ? bend + 1 < path->prims.size() : bend >= 1));
+            const size_t run = leadAfter ? bend + 1 : bend - 1;
+            REQUIRE(path->primIsLead[run]);
+            REQUIRE(straight(run));
+            const gp_Pnt w0 = pnt(path->prims[wrap].front()), w1 = pnt(path->prims[wrap].back());
+            const gp_Pnt r0 = pnt(path->prims[run].front()), r1 = pnt(path->prims[run].back());
+            GeomAPI_ExtremaCurveCurve meet(new Geom_Line(gp_Lin(w0, gp_Dir(gp_Vec(w0, w1)))),
+                                           new Geom_Line(gp_Lin(r0, gp_Dir(gp_Vec(r0, r1)))));
+            REQUIRE(meet.NbExtrema() > 0);
+            gp_Pnt onWrap, onRun;
+            meet.NearestPoints(onWrap, onRun);
+            INFO("the round lead corner's straights pass " << onWrap.Distance(onRun) * 1e9 << " nm apart");
+            REQUIRE(onWrap.Distance(onRun) < 1e-9);
+            leadVertices.push_back(gp_Pnt((onWrap.XYZ() + onRun.XYZ()) / 2.0));
+        }
+    }
     auto turnsOpt = enriched.get_coil().get_turns_description();
     REQUIRE(turnsOpt.has_value());
+    size_t atLeadCorners = 0;
     for (const auto& turn : *turnsOpt) {
         const auto& c = turn.get_coordinates();
         REQUIRE(c.size() >= 2);
-        requireCrossingOnCenterline(conductor->shape, gp_Pnt(0.0, c[1], -(c[0] + zoff)),
-                                    turnWireRadius(turn), gp_Dir(0, 1, 0), gp_Dir(0, 0, 1),
+        const gp_Pnt crossing(0.0, c[1], -(c[0] + zoff));
+        const double r = turnWireRadius(turn);
+        const gp_Pnt* vertex = nullptr;
+        for (const auto& v : leadVertices)
+            if (v.Distance(crossing) < r) vertex = &v;
+        if (vertex) {
+            INFO("crossing " << turn.get_name() << " is a round lead corner whose vertex stands "
+                             << vertex->Distance(crossing) * 1e9 << " nm from it");
+            CHECK(vertex->Distance(crossing) < 1e-9);
+            ++atLeadCorners;
+            continue;
+        }
+        requireCrossingOnCenterline(conductor->shape, crossing, r, gp_Dir(0, 1, 0), gp_Dir(0, 0, 1),
                                     "crossing " + turn.get_name());
     }
+    // Non-vacuous: the entrance leaves turn 0 at its crossing, round.
+    CHECK(atLeadCorners >= 1);
 
     // E-core window walls are planar (no facet sag): tangent contact only.
     requireNoPairwiseOverlap(named, 1e-10);
@@ -2281,6 +2332,9 @@ TEST_CASE("Real winding: inter-section lanes follow the parallel order along the
     ScopedSkipCollisionCheck diagnostic;
     auto enriched = enrichPsps();
     mvb::MagneticBuilder builder;
+    // The probe reads MKF's routing, so it draws sharp corners: a round dragback end puts a 1.05r arc between the
+    // radial step and the face it is probed against (Alf, 2026-11-01).
+    builder.setRoundedLeadCorners(false);
     const auto paths = builder.buildRealWindingPaths(enriched);
     REQUIRE(paths.size() == 6);   // Primary x 2, Secondary x 4
 
@@ -2313,6 +2367,9 @@ TEST_CASE("Real winding: an inter-section return is pitch-true at both ends -- t
     ScopedSkipCollisionCheck diagnostic;
     auto enriched = enrichPsps();
     mvb::MagneticBuilder builder;
+    // The probe reads MKF's routing, so it draws sharp corners: a round dragback end puts a 1.05r arc between the
+    // radial step and the face it is probed against (Alf, 2026-11-01).
+    builder.setRoundedLeadCorners(false);
     const auto paths = builder.buildRealWindingPaths(enriched);
     REQUIRE(paths.size() == 6);
 

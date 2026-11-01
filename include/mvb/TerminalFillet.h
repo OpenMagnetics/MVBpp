@@ -11,7 +11,10 @@
 // tangent, so nothing is mitred and nothing is bridged.
 #include <mvb/WireAssembler.h>
 
+#include <gp_Vec.hxx>
+
 #include <functional>
+#include <optional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -39,6 +42,29 @@ namespace mvb {
 // when it does not clear. When NO candidate of a corner clears: with `uncleared` given the corner is
 // left as it was and `*uncleared` counts it (the caller re-rolls and, failing that, throws with
 // `*witness`); without it, it throws with the witness here.
+// Fillets the corner between the SEGs prims[i] and prims[i + 1], which share a vertex, with an arc of
+// `radius` tangent to both (flags -- lead, connection, terminal, turn -- from `flags`). False, nothing
+// changed, when either leg is too short for its tangent length.
+bool filletSegCorner(std::vector<Primitive>& prims, size_t i, double radius, const Primitive& flags,
+                     const std::string& label);
+
+// THE SLANTED STEP (Alf, 2026-10-28, "Slanted step"). A step of about one wire OD between two
+// parallel straights holds two 90 deg bends only when it is at least 2.1 wire radii long, and MKF's
+// steps (a Z dragback's radial drop, a lead's axial run to its turn's row) are one OD. The step
+// [short SEG prims[s0]][its corner ARC3][long SEG] (or the mirror, longAfter = false) is redrawn as
+// one straight from the step's junction end V to a point Q on the long leg, with a round kink at Q:
+// V keeps its junction (a wrap face, a helix), whose corner the caller rounds; `away` points from V
+// into that junction's piece, and the junction bend takes junctionBend * tan(theta / 2) /
+// junctionShare of the slant. Q is the nearest point that holds both bends, so the copper leaves
+// MKF's step by as little as possible. nullopt, nothing changed, when no Q on the long leg does.
+struct SlantedStep {
+    double slant = 0.0;       // how far along the long leg Q stands from the step's corner (m)
+    double departure = 0.0;   // the step's corner's distance from the slant (m)
+};
+std::optional<SlantedStep> slantOneOdStep(std::vector<Primitive>& prims, size_t s0, bool longAfter,
+                                          const gp_Vec& away, double junctionBend, double junctionShare,
+                                          double kinkBend);
+
 using FilletClears = std::function<bool(const std::vector<Primitive>& arcs, std::string* witness)>;
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
                              const std::string& who,
@@ -46,6 +72,13 @@ size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, doub
                              double exitRoll = std::numeric_limits<double>::quiet_NaN(),
                              const FilletClears& clears = {}, size_t* uncleared = nullptr,
                              std::string* witness = nullptr);
+
+// The same corner where a wrap meets a Z dragback's straight (its "(dragback) seg"), in either order: a
+// round dragback has round ends (Alf, 2026-10-28), bent at `minBend` -- the radius its own corners take.
+// `allowSlant` false: an end with no room on its one-OD step is sharp at once, never slanted.
+size_t filletDragbackEnds(std::vector<Primitive>& prims, double minBend, double wireRadius, const std::string& who,
+                          const FilletClears& clears = {}, size_t* uncleared = nullptr,
+                          std::string* witness = nullptr, bool allowSlant = true);
 
 // Replaces each straight radial LAYER LINK by a biarc tangent to the two wraps it joins, taking
 // the azimuth it needs from each (ABT #969, Alf's option 2). `clears` decides between the

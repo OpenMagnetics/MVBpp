@@ -44,6 +44,10 @@ struct DrawConfig {
     // Real-winding only: how each conductor's pieces are welded (WeldMode, WireAssembler.h).
     // Unset = the builder's own mode (MagneticBuilder::setWeldMode), else the environment's.
     std::optional<WeldMode> weld;
+    // Real-winding only: the style of every terminal-lead corner (ConductorBuilder::Options::
+    // roundedLeadCorners): true round fillets, false sharp mitres. Unset = the builder's own
+    // (MagneticBuilder::setRoundedLeadCorners), else round.
+    std::optional<bool> roundedLeadCorners;
 };
 
 class MagneticBuilder {
@@ -345,9 +349,15 @@ public:
     // ConductorBuilder::Options' own default, which follows MVB_WELD_ALL.
     void setWeldMode(WeldMode mode) { weldMode_ = mode; }
     std::optional<WeldMode> weldMode() const { return weldMode_; }
+    // Whether every terminal-lead corner of a real-winding conductor is a round fillet (true) or a
+    // sharp mitre (false); see ConductorBuilder::Options::roundedLeadCorners. Unset (the default)
+    // leaves the Options' own default, round.
+    void setRoundedLeadCorners(bool rounded) { roundedLeadCorners_ = rounded; }
+    std::optional<bool> roundedLeadCorners() const { return roundedLeadCorners_; }
 
   private:
     std::optional<WeldMode> weldMode_;
+    std::optional<bool> roundedLeadCorners_;
     // Shared by buildRealWindingConductorsNamed and measureTerminalLeadLengths.
     ConductorBuilder::Options realWindingConductorOptions(
         const OpenMagnetics::Magnetic& magnetic, const std::vector<NamedShape>& coreShapes,
