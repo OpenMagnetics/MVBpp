@@ -2113,6 +2113,19 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                 mvb::mesh::SizeFieldBuilder sizer(3, opt.air_target);
                 sizer.add_ceiling(opt.air_target);
                 double cmin = opt.core_target;
+                // THE CORE TARGET SIZES THE CORE. It used to be only a floor on cmin, so the core was meshed at
+                // the AIR ceiling: on 07_cmc_t2515_w800 (core.target 3 mm, air 10 mm) the toroid got 3736 tets
+                // and its bore faces stayed coarse 17 um from 0.125 mm copper, which left 68k air tets below
+                // gamma 0.01 and 236-343 slivers; setting core.target to 1 mm changed nothing. The 2D mesher
+                // has always applied it to the ferrite region (Mesh2d.cpp, add_region_size).
+                if (opt.core_target > 0.0) {
+                    const auto core = groups.find("core");
+                    if (core != groups.end() && !core->second.empty()) {
+                        sizer.add_region_size(std::vector<double>(core->second.begin(), core->second.end()), opt.core_target);
+                        std::fprintf(stderr, "[mesh3d] core refinement: %zu volume(s) at target=%.4gmm\n",
+                                     core->second.size(), opt.core_target * 1e3);
+                    }
+                }
                 if (cond_t > 0.0) {
                     std::vector<double> cond_faces;
                     // PER-WINDING TARGETS (OMFEM_COND_TARGET_WINDINGS "winding_<name>=<m>;..."): each
