@@ -5,6 +5,7 @@
 #include "mvb/Symmetry.h"
 #include "mvb/Utils.h"
 #include "mvb/shapes/ShapeBuilder.h"
+#include "mvb/shapes/ShapeSlab.h"   // ShapeRs (ABT #1443)
 #include "mvb/TurnBuilder.h"
 #include "mvb/ConductorBuilder.h"
 #include "mvb/BobbinBuilder.h"
@@ -394,6 +395,34 @@ std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
         auto rotOpt = piece.get_rotation();
         if (rotOpt && rotOpt->size() >= 3) {
             shape = rotate_shape(shape, (*rotOpt)[0], (*rotOpt)[1], (*rotOpt)[2]);
+        }
+
+        // RS (ABT #1443): MKF emits both halves with the RS shape. The one MKF places above the
+        // parting plane is the slab, the one below is the plain pot round (MKF's thermal model
+        // books the cut plate on the top yoke and the round plate on the bottom yoke; see
+        // ShapeSlab.h). Which side a half is on is read from the placed solid itself, after MKF's
+        // rotation and before its translation: a half straddling the plane is a geometry this
+        // rule cannot place, so it throws.
+        if (const auto* rs = dynamic_cast<const shapes::ShapeRs*>(builder.get())) {
+            Bnd_Box box;
+            BRepBndLib::AddOptimal(shape, box, false, false);
+            double x0, y0, z0, x1, y1, z1;
+            box.Get(x0, y0, z0, x1, y1, z1);
+            const double tolerance = 1e-9 * std::max(1.0, y1 - y0) + 1e-9;
+            const bool above = y0 > -tolerance;
+            const bool below = y1 < tolerance;
+            if (above == below)
+                throw std::runtime_error("buildCoreShapes: RS half of '" +
+                                         shapeData->get_name().value_or(std::string("?")) +
+                                         "' does not lie on one side of the parting plane (y from " +
+                                         std::to_string(y0 * 1e3) + " to " + std::to_string(y1 * 1e3) +
+                                         " mm), so it is neither the slab nor the round half");
+            if (below) {
+                shape = rs->buildRoundHalf(*shapeData);
+                if (rotOpt && rotOpt->size() >= 3) {
+                    shape = rotate_shape(shape, (*rotOpt)[0], (*rotOpt)[1], (*rotOpt)[2]);
+                }
+            }
         }
 
         // Apply machining after rotation. EVERY cut must remove material. This used to say the
