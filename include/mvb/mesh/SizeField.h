@@ -31,6 +31,12 @@ struct SizingPolicy {
     int    N_curv   = 16;    // elements per 2*pi on round wires/posts (2D only; 3D uses hausd)
     double dist_band = 4.0;  // refinement extends to dist_band * size_min away from the feature
     double grade    = 1.3;   // max neighbour element-size ratio (informational / MMG -hgrad)
+    // 3D conductor band: the size grows away from the copper at (cond_grade_3d - 1) per unit distance, up to the
+    // air ceiling. Chosen by Alf (2026-11-02) from measurements on 07_cmc / 04_forward / 02_flyback (fast fidelity,
+    // core fix in): an abrupt band (old) gave 31.8k / 398 / 397 tets below gamma 0.01 at 2.42M / 2.78M / 3.47M tets;
+    // 3.0 gave 14 / 137 / 9 at 3.01M / 3.13M / 3.81M with mesh generation 3x faster; 2.0 gave 0 / 219 / 0 at
+    // 3.64M / 3.58M / 4.17M; 1.3 (grade above) gave 4 at 5.38M on 07, over the corpus size limit.
+    double cond_grade_3d = 3.0;
 };
 
 // Skin depth [m]: delta = 1 / sqrt(pi * f * mu0 * mur * sigma). Copper ~ 66.1/sqrt(f[Hz]) mm.

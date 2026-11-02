@@ -2206,11 +2206,24 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                                      "= %.4g mm (target-independent)\n", std::atof(hw), rw*1e3,
                                      fine_radius*1e3);
                     }
-                    std::fprintf(stderr, "[mesh3d] conductor refinement: %zu faces target=%.4gmm fine_r=%.4gmm\n",
-                                 cond_faces.size(), cond_t*1e3, fine_radius*1e3);
+                    // GRADED, NOT CLIFFED. The band used to end at 2 x fine_r with the full air ceiling: the size
+                    // went from the conductor target to 10 mm within 25 um of the copper (fast, halo 0.2), and
+                    // past 50 um nothing sized the mesh at all. A core face a few tenths of a millimetre under a
+                    // wire then took millimetre triangles, and the thin air layer between them could only be
+                    // filled with flat tets: on 07_cmc_t2515_w800, 31.8k of 2.42M tets below gamma 0.01, 99 %
+                    // in air touching the core and a winding, longest edges 0.2 to over 1 mm. The size now grows
+                    // from the band edge at a fixed neighbour ratio (SizingPolicy::cond_grade_3d, where the measurements are), so
+                    // anything near the copper -- a core face, a bobbin, another winding -- is meshed at a size
+                    // its distance allows.
+                    const double growth = mvb::mesh::SizingPolicy{}.cond_grade_3d - 1.0;
+                    if (!(growth > 0.0)) throw std::runtime_error("mesh3d: SizingPolicy::cond_grade_3d must exceed 1");
+                    auto graded_max = [&](double t, double fr) { return fr + (opt.air_target - t) / growth; };
+                    std::fprintf(stderr, "[mesh3d] conductor refinement: %zu faces target=%.4gmm fine_r=%.4gmm, graded "
+                                 "at %.2f per unit distance (cond_grade_3d %.2f) to the %.4gmm ceiling\n",
+                                 cond_faces.size(), cond_t*1e3, fine_radius*1e3, growth, growth + 1.0, opt.air_target*1e3);
                     if (!cond_faces.empty()) {
                         sizer.add_distance_refinement(cond_faces, cond_t, fine_radius,
-                                                      2.0 * fine_radius, 100);
+                                                      graded_max(cond_t, fine_radius), 100);
                         cmin = std::min(cmin, cond_t);
                     }
                     for (const auto& [t, faces] : faces_by_target) {
@@ -2219,7 +2232,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                         const double fr = std::getenv("OMFEM_COND_HALO_WIRE") ? fine_radius : halo * t;
                         std::fprintf(stderr, "[mesh3d]   per-winding refinement: %zu faces target=%.4gmm fine_r=%.4gmm\n",
                                      faces.size(), t * 1e3, fr * 1e3);
-                        sizer.add_distance_refinement(faces, t, fr, 2.0 * fr, 100);
+                        sizer.add_distance_refinement(faces, t, fr, graded_max(t, fr), 100);
                         cmin = std::min(cmin, t);
                     }
                     // ---- LOCAL CHORD-BOUND REFINEMENT --------------------------------------
