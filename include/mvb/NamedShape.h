@@ -83,6 +83,11 @@ struct NamedShape {
     // ABT #1169: what this solid is. Set by every producer; carried through cuts, symmetry and
     // sectioning. NOT exported to STEP (names are the only channel that survives that).
     Role role = Role::Core;
+    // Set on a bobbin CUTTER that MKF routes THROUGH a bobbin solid rather than against it --
+    // a foil's axial lead leaving through the end face (ConnectionRoute::axialLead). cut_bobbin
+    // cuts such a tool without the glue option, which only holds for tools that merely touch.
+    // Never exported; meaningless outside the cutter build.
+    bool piercesBobbin = false;
 
     NamedShape() = default;
     NamedShape(TopoDS_Shape s, std::string n)

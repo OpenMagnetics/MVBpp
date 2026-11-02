@@ -1072,12 +1072,14 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                     checkPinRailCollisions(getPinRails(coil), bobbin.name, obstacles);
                 }
                 // ABT #1171: a pin owns the flange volume it passes through (see PinBuilder.h).
+                // Pins and shunts PIERCE the bobbin: cut without glue (see cut_bobbin).
+                std::vector<TopoDS_Shape> piercing;
                 for (auto& pinShape : PinBuilder::buildPins(getBobbinProcessed(coil)))
-                    cutters.push_back(std::move(pinShape));
+                    piercing.push_back(std::move(pinShape));
                 // ABT #1176: a magnetic shunt owns the former volume it passes through.
                 for (auto& shunt : ShuntBuilder::buildShuntsNamed(magnetic))
-                    cutters.push_back(std::move(shunt.shape));
-                bobbin.shape = cut_bobbin(bobbin.shape, cutters);
+                    piercing.push_back(std::move(shunt.shape));
+                bobbin.shape = cut_bobbin(bobbin.shape, cutters, piercing);
                 if (!bobbin.shape.IsNull()) all.push_back(bobbin);
             }
         }
@@ -1222,24 +1224,27 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
             // (ro - rc), never zero and never a made-up margin. The cutter build runs in
             // DRAWING mode (femReady=false): a cutting tool needs no welds, no mitre
             // certification and may overlap itself, so the cheap per-run compound is enough.
+            // Tools that PIERCE the bobbin (pins, shunts, MKF's axial foil leads) are cut
+            // without glue; everything else only touches it (see cut_bobbin).
+            std::vector<TopoDS_Shape> piercing;
             if (!paintCoating && useRealWindingGeometry) {
                 for (auto& ns : buildRealWindingConductorsNamed(
                          magnetic, all, wirePolygonSegments,
                          /*paintCoating=*/true, /*emitCoatingShells=*/false,
                          /*femReady=*/false, /*diagnosticSkipCollisionCheck=*/false,
                          /*cutterOnly=*/true)) {
-                    cutters.push_back(ns.shape);
+                    (ns.piercesBobbin ? piercing : cutters).push_back(ns.shape);
                 }
             } else {
                 cutters.insert(cutters.end(), turnShapes.begin(), turnShapes.end());
             }
             // ABT #1171: a pin owns the flange volume it passes through (see PinBuilder.h).
             for (auto& pinShape : PinBuilder::buildPins(getBobbinProcessed(magnetic.get_coil())))
-                cutters.push_back(std::move(pinShape));
+                piercing.push_back(std::move(pinShape));
             // ABT #1176: a magnetic shunt owns the former volume it passes through.
             for (auto& shunt : ShuntBuilder::buildShuntsNamed(magnetic))
-                cutters.push_back(std::move(shunt.shape));
-            bobbin.shape = cut_bobbin(bobbin.shape, cutters);
+                piercing.push_back(std::move(shunt.shape));
+            bobbin.shape = cut_bobbin(bobbin.shape, cutters, piercing);
             if (!bobbin.shape.IsNull()) all.push_back(bobbin);
         }
     }
@@ -1630,6 +1635,7 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
             const bool shellPass = !suffix.empty();
             const Role r = (shellPass && ns.role == Role::Turn) ? Role::TurnCoating : ns.role;
             out.push_back({ns.shape, ns.name + suffix, std::move(ns.partNames), r});
+            out.back().piercesBobbin = ns.piercesBobbin;
         }
     };
     if (emitCoatingShells) {

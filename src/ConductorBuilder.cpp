@@ -17805,6 +17805,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             }
         }
         out.push_back({cond, p.name, std::move(partNames), Role::Turn});   // ABT #1169
+        // A foil lead in the bobbin's cutter build is MKF's axial lead: it leaves THROUGH the
+        // flange (AxialLead::end lies past the end face), so it pierces the bobbin.
+        if (opts.cutterOnly && p.isFoil && p.leadOnlyTerminal >= 0) out.back().piercesBobbin = true;
         // PORT SURFACES for full-wave / FEM: the two free ends of a continuous round conductor are
         // its only PLANAR faces (the swept lateral surface is a cylinder/torus/BSpline, the elbows
         // are spheres/tori) -- MVB++ caps them flat precisely so a solver can put a port BC there.

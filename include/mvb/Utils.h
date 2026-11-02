@@ -129,6 +129,11 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
 
 // Helpers for cutting bobbin with cores/turns to match Python MVB behavior
 bool is_shape_usable(const TopoDS_Shape& shape);
-TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Shape>& cutters);
+// `touching`: tools that only rest against the bobbin (core, wound turns) -- cut with OCCT's
+// glue option, fast on their many coincident/tangent contacts. `piercing`: tools that pass
+// THROUGH a bobbin solid (pins, shunts, a foil's axial lead) -- cut without glue, because glue
+// skips face/face intersections and a glued cut leaves the pierced solid untouched.
+TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Shape>& touching,
+                        const std::vector<TopoDS_Shape>& piercing = {});
 
 } // namespace mvb

@@ -1,8 +1,13 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include "mvb/MagneticBuilder.h"
 #include "mvb/BobbinBuilder.h"
 #include "mvb/Utils.h"
 #include "MAS.hpp"
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
+#include <gp_Ax2.hxx>
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
 #include <GProp_GProps.hxx>
@@ -173,4 +178,36 @@ TEST_CASE("BobbinBuilder polygonSegments controls round bobbin tessellation", "[
     // NURBS path (segments=0) collapses each cylindrical wall to a single
     // surface, so it has the smallest face count.
     REQUIRE(f0 < f8);
+}
+
+// A lead that passes THROUGH a flange owns the flange volume it crosses. On
+// two_switch_forward_transformer_complete the foil's axial leads (round 0.5 mm wire,
+// 0.534 mm enamelled) leave through the top flange; the glued cut (BOPAlgo_GlueShift, which
+// skips face/face intersections) returned the flange untouched and the overlap audit found 8
+// copper/bobbin overlaps. Piercing tools are therefore cut unglued. The flange and leads here are that design's: a 30.1 x 1.5 x 33.1 mm
+// plate with the 15.3 x 18.3 mm column opening, leads along +y from inside the window to past
+// the flange, one of them against the window's edge like the foil stack's outermost lead.
+TEST_CASE("cut_bobbin removes the flange volume a lead passes through", "[bobbin][cut]") {
+    const double mm = 1e-3;
+    BRepAlgoAPI_Cut plate(BRepPrimAPI_MakeBox(gp_Pnt(-15.05 * mm, 13.65 * mm, -16.55 * mm),
+                                              gp_Pnt(15.05 * mm, 15.15 * mm, 16.55 * mm)).Shape(),
+                          BRepPrimAPI_MakeBox(gp_Pnt(-7.65 * mm, 13.0 * mm, -9.15 * mm),
+                                              gp_Pnt(7.65 * mm, 16.0 * mm, 9.15 * mm)).Shape());
+    REQUIRE(plate.IsDone());
+    const TopoDS_Shape flange = plate.Shape();
+    auto volume = [](const TopoDS_Shape& s) {
+        GProp_GProps g;
+        BRepGProp::VolumeProperties(s, g);
+        return g.Mass();
+    };
+    const double r = 0.267 * mm, len = 27.806 * mm;
+    std::vector<TopoDS_Shape> leads;
+    for (const double x : {0.267, -0.267, 0.801, 3.471})
+        for (const double z : {12.1, 16.2})
+            leads.push_back(BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x * mm, -12.122 * mm, z * mm), gp_Dir(0, 1, 0)), r, len).Shape());
+    const double before = volume(flange);
+    const double after = volume(mvb::cut_bobbin(flange, /*touching=*/{}, /*piercing=*/leads));
+    const double expected = leads.size() * std::numbers::pi * r * r * 1.5 * mm;
+    // Each lead crosses the full 1.5 mm plate outside the opening: the cut removes all of it.
+    CHECK(before - after == Catch::Approx(expected).epsilon(1e-3));
 }

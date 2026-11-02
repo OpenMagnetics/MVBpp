@@ -480,7 +480,8 @@ bool is_shape_usable(const TopoDS_Shape& shape) {
     return !bb.IsVoid();
 }
 
-TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Shape>& cutters) {
+TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Shape>& touching,
+                        const std::vector<TopoDS_Shape>& piercing) {
     if (std::getenv("MVB_NO_BOBBIN_CUT")) return bobbin;
     if (bobbin.IsNull()) return bobbin;
 
@@ -491,17 +492,29 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
     gp_Trsf down; down.SetScale(gp_Pnt(0, 0, 0), 1.0 / S);
 
     // Pre-scale tools once; reuse for every per-solid cut.
-    struct ScaledTool { TopoDS_Shape shape; Bnd_Box box; };
+    // `glue`: the tool only TOUCHES the bobbin (coincident or tangent faces), so OCCT's
+    // BOPAlgo_GlueShift holds and keeps the many contacts of a wound coil fast. A tool that
+    // PIERCES a solid (a pin, a shunt, a foil's axial lead through the flange) breaks glue's
+    // premise -- glue skips face/face intersections, and the glued cut returned the pierced
+    // flange untouched (two_switch_forward_transformer_complete: 1153.574471 mm^3 in and out,
+    // 8 copper/bobbin overlaps in the audit) -- so it is cut without glue. Unglued for every
+    // tool is correct but slow on the tangent contacts (14_dab: past the hour, in OCCT's
+    // micro-edge pass; 23_interleaved_llc 558 s -> 1842 s).
+    struct ScaledTool { TopoDS_Shape shape; Bnd_Box box; bool glue; };
     std::vector<ScaledTool> scaledTools;
-    scaledTools.reserve(cutters.size());
-    for (const auto& tool : cutters) {
-        if (tool.IsNull()) continue;
-        TopoDS_Shape s = BRepBuilderAPI_Transform(tool, up).Shape();
-        Bnd_Box tb;
-        BRepBndLib::Add(s, tb);
-        if (tb.IsVoid()) continue;
-        scaledTools.push_back({s, tb});
-    }
+    scaledTools.reserve(touching.size() + piercing.size());
+    auto addTools = [&](const std::vector<TopoDS_Shape>& tools, bool glue) {
+        for (const auto& tool : tools) {
+            if (tool.IsNull()) continue;
+            TopoDS_Shape s = BRepBuilderAPI_Transform(tool, up).Shape();
+            Bnd_Box tb;
+            BRepBndLib::Add(s, tb);
+            if (tb.IsVoid()) continue;
+            scaledTools.push_back({s, tb, glue});
+        }
+    };
+    addTools(touching, true);
+    addTools(piercing, false);
     if (scaledTools.empty()) return bobbin;
 
     // Iterate solids in the bobbin. BobbinBuilder returns a compound of
@@ -539,12 +552,14 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
         Bnd_Box solidBox;
         BRepBndLib::Add(solidScaled, solidBox);
 
-        std::vector<TopoDS_Shape> relevant;
+        // Glued tools first, then the piercing ones; a batch never mixes the two.
+        std::vector<std::pair<TopoDS_Shape, bool>> relevant;
         relevant.reserve(scaledTools.size());
-        for (const auto& st : scaledTools) {
-            if (solidBox.IsOut(st.box)) continue;
-            relevant.push_back(st.shape);
-        }
+        for (const bool glue : {true, false})
+            for (const auto& st : scaledTools) {
+                if (st.glue != glue || solidBox.IsOut(st.box)) continue;
+                relevant.emplace_back(st.shape, st.glue);
+            }
         if (relevant.empty()) {
             cbld.Add(resultComp, solid);
             continue;
@@ -552,20 +567,23 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
 
         TopoDS_Shape current = solidScaled;
         bool ok = true;
-        for (std::size_t i = 0; i < relevant.size(); i += BOP_TOOL_CHUNK) {
+        for (std::size_t i = 0; i < relevant.size();) {
             TopTools_ListOfShape args, batchTools;
             args.Append(current);
-            const std::size_t end = std::min(i + BOP_TOOL_CHUNK, relevant.size());
-            for (std::size_t j = i; j < end; ++j) {
-                batchTools.Append(relevant[j]);
+            const bool glue = relevant[i].second;
+            std::size_t end = i;
+            while (end < relevant.size() && end - i < BOP_TOOL_CHUNK && relevant[end].second == glue) {
+                batchTools.Append(relevant[end].first);
+                ++end;
             }
+            i = end;
 
             BRepAlgoAPI_Cut cutter;
             cutter.SetArguments(args);
             cutter.SetTools(batchTools);
             cutter.SetUseOBB(true);
             cutter.SetRunParallel(true);
-            cutter.SetGlue(BOPAlgo_GlueShift);
+            if (glue) cutter.SetGlue(BOPAlgo_GlueShift);
             cutter.SetCheckInverted(false);
             cutter.SetNonDestructive(false);
             cutter.Build();
