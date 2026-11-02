@@ -529,24 +529,32 @@ inline Bounds boundedMinDist(const Primitive& A, const Primitive& B, double tol,
     const double ddA = maxSecondDerivative(A), ddB = maxSecondDerivative(B);
     struct Box {
         double a0, a1, b0, b1, lb;
+        size_t seq;   // insertion order: breaks lb ties so the search order is deterministic
     };
+    size_t nextSeq = 0;
     auto boxOf = [&](double a0, double a1, double b0, double b1) {
         const double sagA = ddA * (a1 - a0) * (a1 - a0) / 8.0;
         const double sagB = ddB * (b1 - b0) * (b1 - b0) / 8.0;
         return Box{a0, a1, b0, b1,
                    segSegDistance(evalPrim(A, a0), evalPrim(A, a1), evalPrim(B, b0),
                                   evalPrim(B, b1)) -
-                       sagA - sagB};
+                       sagA - sagB,
+                   nextSeq++};
+    };
+    // Best-first on the box lower bound, from a binary heap. The old engine found the lowest
+    // box by scanning the whole list on every split and then scanned it again for the running
+    // bound: O(budget^2) per call. With tol a quarter of kCertEpsilon the budget is nearly
+    // always spent, so one call walked ~4e8 boxes, and the lead-roll search (one call per
+    // neighbour piece) held 06_llc in the STEP stage past its hour. Same boxes, same splits.
+    auto worse = [](const Box& x, const Box& y) {
+        return x.lb > y.lb || (x.lb == y.lb && x.seq > y.seq);
     };
     std::vector<Box> boxes{boxOf(0.0, 1.0, 0.0, 1.0)};
     Bounds out;
     out.ub = evalPrim(A, 0.0).Distance(evalPrim(B, 0.0));
     for (size_t n = 0; n < budget && !boxes.empty(); ++n) {
-        size_t best = 0;
-        for (size_t k = 1; k < boxes.size(); ++k)
-            if (boxes[k].lb < boxes[best].lb) best = k;
-        const Box bx = boxes[best];
-        boxes[best] = boxes.back();
+        std::pop_heap(boxes.begin(), boxes.end(), worse);
+        const Box bx = boxes.back();
         boxes.pop_back();
         out.lb = bx.lb;
         const double am = 0.5 * (bx.a0 + bx.a1), bm = 0.5 * (bx.b0 + bx.b1);
@@ -574,22 +582,23 @@ inline Bounds boundedMinDist(const Primitive& A, const Primitive& B, double tol,
         if (out.ub - bx.lb < tol) break;
         const double sagA = ddA * (bx.a1 - bx.a0) * (bx.a1 - bx.a0) / 8.0;
         const double sagB = ddB * (bx.b1 - bx.b0) * (bx.b1 - bx.b0) / 8.0;
+        Box c1, c2;
         if (sagA >= sagB) {
-            boxes.push_back(boxOf(bx.a0, am, bx.b0, bx.b1));
-            boxes.push_back(boxOf(am, bx.a1, bx.b0, bx.b1));
+            c1 = boxOf(bx.a0, am, bx.b0, bx.b1);
+            c2 = boxOf(am, bx.a1, bx.b0, bx.b1);
         }
         else {
-            boxes.push_back(boxOf(bx.a0, bx.a1, bx.b0, bm));
-            boxes.push_back(boxOf(bx.a0, bx.a1, bm, bx.b1));
+            c1 = boxOf(bx.a0, bx.a1, bx.b0, bm);
+            c2 = boxOf(bx.a0, bx.a1, bm, bx.b1);
         }
-        for (const auto& b2 : boxes)
-            if (b2.lb < out.lb) out.lb = b2.lb;
+        // bx was the lowest box, so only its children can sit below it.
+        out.lb = std::min({out.lb, c1.lb, c2.lb});
+        boxes.push_back(c1);
+        std::push_heap(boxes.begin(), boxes.end(), worse);
+        boxes.push_back(c2);
+        std::push_heap(boxes.begin(), boxes.end(), worse);
     }
-    if (!boxes.empty()) {
-        double m = std::numeric_limits<double>::max();
-        for (const auto& b2 : boxes) m = std::min(m, b2.lb);
-        out.lb = m;
-    }
+    if (!boxes.empty()) out.lb = boxes.front().lb;   // the heap's top is the lowest bound
     return out;
 }
 
