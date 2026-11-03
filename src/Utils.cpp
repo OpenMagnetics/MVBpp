@@ -1,6 +1,7 @@
 #include "mvb/Utils.h"
 #include "mvb/ConductorBuilder.h"   // the bend policy MKF is told about (ABT #1172)
 #include "mvb/WireAssembler.h"
+#include "constructive_models/MasMigration.h"   // MKF's reader of older MAS files
 #include <algorithm>
 #include <vector>
 #include <BRepBuilderAPI_MakeEdge.hxx>
@@ -230,6 +231,11 @@ void patch_dimension_nominals(nlohmann::json& j) {
             patch_dimension_nominals(elem);
         }
     }
+}
+
+MAS::Magnetic magnetic_from_json(nlohmann::json j) {
+    OpenMagnetics::compat::migrate_pre_1_0(j);
+    return j.contains("magnetic") ? j.at("magnetic").get<MAS::Magnetic>() : j.get<MAS::Magnetic>();
 }
 
 std::string core_shape_family_to_string(MAS::CoreShapeFamily family) {

@@ -136,12 +136,7 @@ static bool processFile(const fs::path& inputPath, const fs::path& outputPath, b
         mvb::patch_dimension_nominals(j);
         
         // Get magnetic data
-        MAS::Magnetic magnetic;
-        if (j.contains("magnetic")) {
-            magnetic = j.at("magnetic").get<MAS::Magnetic>();
-        } else {
-            magnetic = j.get<MAS::Magnetic>();
-        }
+        MAS::Magnetic magnetic = mvb::magnetic_from_json(j);
         
         // Generate STEP
         mvb::MagneticBuilder builder;

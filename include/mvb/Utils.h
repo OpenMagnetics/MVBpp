@@ -113,6 +113,14 @@ std::vector<std::string> get_supported_families();
 // (MVB test data often has only min/max)
 void patch_dimension_nominals(nlohmann::json& j);
 
+// A MAS magnetic from JSON, read the way MKF reads it: MKF's compat::migrate_pre_1_0 first brings
+// an older MAS file up to the current schema (pre-1.0 enum spellings such as "half set" ->
+// "halfSet", a core material's single "application" string -> the list MAS now holds), then the
+// generated MAS types parse it. Every MVB++ entry point that takes MAS JSON goes through here, so a
+// file MKF accepts is never refused by MVB++ alone. `j` may be a whole MAS document (its "magnetic"
+// is taken) or a bare magnetic.
+MAS::Magnetic magnetic_from_json(nlohmann::json j);
+
 // Safely enrich a raw MAS::Magnetic using MKF's magnetic_autocomplete.
 // This avoids object-slicing and Coil::wind() crashes for raw MAS files
 // (e.g. with "Basic" bobbins) by constructing OpenMagnetics::Coil with

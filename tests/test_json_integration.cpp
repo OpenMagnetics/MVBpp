@@ -9,6 +9,7 @@
 #include "constructive_models/Magnetic.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <functional>
 #include <GProp_GProps.hxx>
 #include <BRepGProp.hxx>
 #include <TopExp_Explorer.hxx>
@@ -224,4 +225,49 @@ TEST_CASE("U core: origin in the winding column, equal legs", "[3d][ucore][cente
     REQUIRE(nearEdge == Catch::Approx(wcw / 2.0).margin(0.5));   // ≈ 14.6 mm
     // The far (return) leg's outer face is A - wcw/2 away → equal legs.
     REQUIRE(farEdge == Catch::Approx(A - wcw / 2.0).margin(0.5)); // ≈ 78.4 mm
+}
+
+// An older MAS file (pre-1.0 enum spellings, a core material's single "application" string) is
+// read the way MKF reads it: mvb::magnetic_from_json runs MKF's compat::migrate_pre_1_0 before the
+// generated MAS types parse it. Without that, MVB++ refused files MKF accepts (750372438rA, a
+// customer design exported before MAS 1.0, failed with "Input JSON does not conform to schema!").
+TEST_CASE("An older MAS file loads through MKF's migration", "[json][migration]") {
+    std::ifstream f("tests/realwinding_fixtures/realwinding_interleaved_full_section_e16.json");
+    REQUIRE(f.is_open());
+    const json current = json::parse(f);
+
+    // Write the current file back in the older spellings MKF's migration reads.
+    json legacy = current;
+    int rewritten = 0;
+    std::function<void(json&)> toLegacy = [&](json& j) {
+        if (j.is_object()) {
+            for (auto it = j.begin(); it != j.end(); ++it) {
+                auto& v = it.value();
+                if (it.key() == "type" && v == "twoPieceSet") { v = "two-piece set"; ++rewritten; }
+                else if (v == "innerOrTop") { v = "inner or top"; ++rewritten; }
+                else toLegacy(v);
+            }
+            if (j.contains("permeability") && j.contains("application") && j["application"].is_array()) {
+                j["application"] = j["application"].at(0);
+                ++rewritten;
+            }
+        } else if (j.is_array()) {
+            for (auto& e : j) toLegacy(e);
+        }
+    };
+    toLegacy(legacy);
+    // The fixture must carry every older spelling this test is about, or it proves nothing.
+    REQUIRE(rewritten >= 3);
+    REQUIRE(legacy.dump().find("\"application\":\"power\"") != std::string::npos);
+
+    // The generated MAS types alone refuse the older file ...
+    CHECK_THROWS(json(legacy).at("magnetic").get<MAS::Magnetic>());
+    // ... while MVB++'s reader takes it, and reads the same magnetic as the current file.
+    MAS::Magnetic fromLegacy;
+    REQUIRE_NOTHROW(fromLegacy = mvb::magnetic_from_json(legacy));
+    const MAS::Magnetic fromCurrent = mvb::magnetic_from_json(current);
+    json a, b;
+    MAS::to_json(a, fromLegacy);
+    MAS::to_json(b, fromCurrent);
+    CHECK(a == b);
 }

@@ -626,7 +626,7 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
                                femReady,
                                g_skipGeometryChecks);   // a picture, not a part -- see drawTurns
     }
-    auto magnetic = j.get<MAS::Magnetic>();
+    auto magnetic = mvb::magnetic_from_json(j);
     std::size_t numTurns = 0;
     auto turnsOpt = magnetic.get_coil().value().get_turns_description();
     if (turnsOpt.has_value()) numTurns = turnsOpt->size();

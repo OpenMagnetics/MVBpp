@@ -234,7 +234,7 @@ std::vector<mvb::NamedShape> build_spacer(const std::string& json_str, int /*pol
 // be processed (columns and gap coordinates) because MKF's shunt model reads them.
 std::vector<mvb::NamedShape> build_shunt(const std::string& json_str, int /*polygonSegments*/) {
     auto j = json::parse(json_str);
-    OpenMagnetics::Magnetic magnetic(j.get<MAS::Magnetic>());
+    OpenMagnetics::Magnetic magnetic(mvb::magnetic_from_json(j));
     auto out = mvb::ShuntBuilder::buildShuntsNamed(magnetic);
     if (out.empty()) {
         throw std::runtime_error("drawShunt: this magnetic has no shunts (magnetic.shunts is absent or empty).");
@@ -329,7 +329,7 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
                                /*useRealWindingGeometry=*/true,
                                femReady);
     }
-    auto magnetic = j.get<MAS::Magnetic>();
+    auto magnetic = mvb::magnetic_from_json(j);
     return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
                             polygonSegments, polygonSegments, paintCoating);
 }
