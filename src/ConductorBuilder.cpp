@@ -18599,6 +18599,8 @@ ConductorBuilder::LeadBendPolicy::LeadBendPolicy(double minBendRadius) {
     auto& settings = OpenMagnetics::Settings::GetInstance();
     _previousFactor = settings.get_coil_lead_bend_radius_factor();
     _previousMinimum = settings.get_coil_lead_minimum_bend_radius();
+    _previousRealWinding = settings.get_coil_use_real_winding_geometry();
+    settings.set_coil_use_real_winding_geometry(true);
     settings.set_coil_lead_bend_radius_factor(std::optional<double>(kRoundCornerBendFactor));
     settings.set_coil_lead_minimum_bend_radius(minBendRadius > 0 ? std::optional<double>(minBendRadius)
                                                                  : std::nullopt);
@@ -18608,6 +18610,7 @@ ConductorBuilder::LeadBendPolicy::~LeadBendPolicy() {
     auto& settings = OpenMagnetics::Settings::GetInstance();
     settings.set_coil_lead_bend_radius_factor(_previousFactor);
     settings.set_coil_lead_minimum_bend_radius(_previousMinimum);
+    settings.set_coil_use_real_winding_geometry(_previousRealWinding);
 }
 
 } // namespace mvb

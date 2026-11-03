@@ -229,8 +229,8 @@ TEST_CASE("U core: origin in the winding column, equal legs", "[3d][ucore][cente
 
 // An older MAS file (pre-1.0 enum spellings, a core material's single "application" string) is
 // read the way MKF reads it: mvb::magnetic_from_json runs MKF's compat::migrate_pre_1_0 before the
-// generated MAS types parse it. Without that, MVB++ refused files MKF accepts (750372438rA, a
-// customer design exported before MAS 1.0, failed with "Input JSON does not conform to schema!").
+// generated MAS types parse it. Without that, MVB++ refused files MKF accepts (a design
+// exported before MAS 1.0 failed with "Input JSON does not conform to schema!").
 TEST_CASE("An older MAS file loads through MKF's migration", "[json][migration]") {
     std::ifstream f("tests/realwinding_fixtures/realwinding_interleaved_full_section_e16.json");
     REQUIRE(f.is_open());

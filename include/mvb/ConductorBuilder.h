@@ -69,6 +69,13 @@ public:
     // A caller that reads MKF's routes ITSELF (to compare against what was drawn) must hold one of
     // these over that read, or it will read sharp-planned routes and disagree with the drawing by
     // the leg offset. RAII; restores the previous settings on every path out.
+    //
+    // It also declares the coil REAL-WOUND (Settings coil_use_real_winding_geometry), as the
+    // enrichment did when MKF wound it. MKF's lead rules for real winding are gated on that setting
+    // -- among them the section-local terminal (a lead leaves at its own section's height on
+    // axially stacked sections) -- so a layout read with it off is planned by the ideal-wind rules:
+    // on a coil whose secondary and primary sections are stacked axially, the secondary leads
+    // then ran axially through the primary sections the wind had kept them out of.
     class LeadBendPolicy {
     public:
         explicit LeadBendPolicy(double minBendRadius = Options_minBendRadiusDefault());
@@ -78,6 +85,7 @@ public:
     private:
         std::optional<double> _previousFactor;
         std::optional<double> _previousMinimum;
+        bool _previousRealWinding = false;
     };
     // The MVB_MIN_BEND_RADIUS floor Options() would pick up, without constructing one (Options is
     // declared below).

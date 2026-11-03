@@ -4,6 +4,7 @@
 #include <catch2/catch_approx.hpp>
 #include <filesystem>
 #include <set>
+#include <optional>
 #include <functional>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "mvb/MagneticBuilder.h"
@@ -2631,4 +2632,51 @@ TEST_CASE("Real winding: parallels that cannot all end on the FEM terminal plane
     unsetenv("MVB_FAN_TERMINALS_ON_PLANE");
     INFO(error);
     CHECK(error.find("cannot all end on the terminal plane") != std::string::npos);
+}
+
+// A coil MKF wound with real-winding geometry is drawn with MKF's real-winding lead plan.
+// MKF plans connection routes lazily, at the query, and several of its lead rules are gated on
+// Settings coil_use_real_winding_geometry -- among them the section-local terminal (ABT #1487: on
+// axially stacked sections a lead leaves at its own section's height). magnetic_autocomplete_safe
+// holds that setting only for the enrichment, so every draw-time route query used to see it off
+// and got the ideal-wind plan, in which a lead runs axially through the neighbouring sections to
+// the window edge. LeadBendPolicy (held by every ConductorBuilder entry) now declares the coil
+// real-wound for the whole draw. Fixture: MKF's own abt1487_pq65_sp_contiguous.json, unchanged.
+TEST_CASE("Draw-time lead routes are MKF's real-winding plan", "[realwinding][leadroute]") {
+    const std::filesystem::path fixture =
+        std::filesystem::path(MKF_TEST_DATA_DIR) / "abt1487_pq65_sp_contiguous.json";
+    std::ifstream f(fixture);
+    REQUIRE(f.good());
+    nlohmann::json j = nlohmann::json::parse(f);
+    mvb::patch_dimension_nominals(j);
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    // The ambient state a draw runs in after enrichment: real-winding geometry off.
+    OpenMagnetics::SettingsGuard<bool> ambient(settings,
+        &OpenMagnetics::Settings::get_coil_use_real_winding_geometry,
+        &OpenMagnetics::Settings::set_coil_use_real_winding_geometry, false);
+    const auto enriched = mvb::magnetic_autocomplete_safe(mvb::magnetic_from_json(j), true);
+    REQUIRE_FALSE(settings.get_coil_use_real_winding_geometry());
+
+    using Routes = std::vector<std::vector<std::vector<double>>>;
+    auto routesUnder = [&](std::optional<bool> real) {
+        mvb::ConductorBuilder::LeadBendPolicy policy;
+        std::optional<OpenMagnetics::SettingsGuard<bool>> g;
+        if (real) g.emplace(settings,
+            &OpenMagnetics::Settings::get_coil_use_real_winding_geometry,
+            &OpenMagnetics::Settings::set_coil_use_real_winding_geometry, *real);
+        OpenMagnetics::Coil coil = enriched.get_coil();
+        Routes w;
+        for (const auto& r : coil.get_connection_layout().routes) w.push_back(r.waypoints);
+        return w;
+    };
+    const Routes realPlan = routesUnder(true);
+    const Routes idealPlan = routesUnder(false);
+    REQUIRE_FALSE(realPlan.empty());
+    // Premise: on this design the two rule sets plan different leads. If MKF ever plans them
+    // alike, this test no longer guards anything -- report it, do not change the fixture.
+    REQUIRE(realPlan != idealPlan);
+
+    CHECK(routesUnder(std::nullopt) == realPlan);
+    // The policy restores the caller's setting when it ends.
+    CHECK_FALSE(settings.get_coil_use_real_winding_geometry());
 }

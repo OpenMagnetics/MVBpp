@@ -343,6 +343,7 @@ target_compile_definitions(mvb_tests PRIVATE
     REFERENCE_STEPS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/reference_steps"
     MAS_EXAMPLES_DIR="${CMAKE_BINARY_DIR}/_deps/mas-src/examples"
     MAS_DATA_DIR="${CMAKE_BINARY_DIR}/_deps/mas-src/data"
+    MKF_TEST_DATA_DIR="${_MKF_SRC}/tests/testData"
     # Locally-patched copies of MAS/examples/complete with stale wire/shape
     # refs corrected to valid DB entries (see tools/fix-mas-complete-examples.py).
     MAS_COMPLETE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/mas_complete_fixtures"
