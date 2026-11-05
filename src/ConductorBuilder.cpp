@@ -4282,6 +4282,9 @@ struct PinLead {
     int wrapTurns = 0;   // dfm_rules.json R4.wrapTurns, read through MKF
 };
 
+// ABT #2268: false parks the drawing of terminal leads to their pins (see terminalPinLeadFor).
+constexpr bool kDrawTerminalPinRuns = false;
+
 // The pin the connections[] of this conductor's END name, and MKF's route to it. nullopt when the
 // end has no pin (a bobbin without pins[], a legacy pinName without `end`, a tap). A pin named on
 // connections[] whose route carries no pin run THROWS: drawing the free-air terminal instead would
@@ -4292,6 +4295,11 @@ std::optional<PinLead> terminalPinLeadFor(const CoilT& coil,
                                           const MAS::CoreBobbinProcessedDescription& bobbinPd,
                                           const std::string& winding, int64_t parallel,
                                           bool entrance, const std::string& who) {
+    // ABT #2268 (Alf, 2026-11-04): the 3D run of a terminal lead to its pin is PARKED, here and in
+    // MKF (which plans no pin run any more). Every terminal is the free-air lead on the common tip
+    // plane, whatever connections[] assigns; the pin bodies are drawn either way. The pin-run and wrap
+    // drawing below is kept, unused and untested, until the lead-to-pin connection is designed.
+    if (!kDrawTerminalPinRuns) return std::nullopt;
     // Settings coil_connect_leads_to_pins (MKF, off by default, ABT #1237): when off, every
     // terminal stays the free-air lead on the common tip plane, exactly as before WP3, whatever
     // connections[] or the routes say. The pin bodies are drawn either way.
