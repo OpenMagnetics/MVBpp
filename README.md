@@ -31,12 +31,25 @@ LD_LIBRARY_PATH=build/occt-install/lib ./build/mvb_tests "[step]"
 
 ### Python bindings
 
+The one Python package of MVB++ is published on PyPI as **OpenMagneticsVirtualBuilder**
+(from 1.0.0; earlier versions of that name were the old Python/FreeCAD MVB). Wheels are built
+for Linux (x86_64), Windows (AMD64) and macOS (arm64), CPython 3.10–3.14:
+
+```bash
+pip install OpenMagneticsVirtualBuilder
+python -c "import mvbpp"
+```
+
+From source:
+
 ```bash
 pip install -e .                     # scikit-build-core + pybind11
 pytest bindings/python/tests/ -v
 ```
 
-The wheel exposes a `mvbpp` module.
+Releasing: bump `version` in `pyproject.toml`, then push a tag `vX.Y.Z` with the same version;
+`.github/workflows/publish.yml` builds every wheel and the sdist and uploads them to PyPI.
+A manual run of the workflow uploads to TestPyPI instead.
 
 ### WebAssembly bindings
 

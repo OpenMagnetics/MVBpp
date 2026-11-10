@@ -2,19 +2,41 @@
 requires = ["scikit-build-core>=0.9", "pybind11>=2.13"]
 build-backend = "scikit_build_core.build"
 
+# The one Python package of MVB++. It takes over the PyPI name of the old Python/FreeCAD MVB
+# (OpenMagnetics/MVB, last release 0.6.12) from 1.0.0 on; the module it installs is `mvbpp`.
 [project]
-name            = "mvbpp"
-version         = "0.1.0"
-description     = "MVB++ Python bindings — OpenMagnetics 3-D geometry builder"
-requires-python = ">=3.9"
+name            = "OpenMagneticsVirtualBuilder"
+version         = "1.0.0"
+description     = "MVB++ Python bindings — OpenMagnetics 3-D geometry builder (STEP/STL and drawings from MAS)"
+readme          = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage   = "https://openmagnetics.com"
+Repository = "https://github.com/OpenMagnetics/MVBpp"
 
 [tool.scikit-build]
+cmake.version = ">=3.18"
 cmake.build-type = "Release"
 cmake.source-dir = "."
-build-dir        = "build_python"
+build-dir        = "build_python/{wheel_tag}"
 cmake.args       = ["-GNinja"]
 build.targets         = ["mvbpp"]
 install.components    = ["PythonModule"]
+wheel.packages        = []
+# Only what the CMake build reads goes into the sdist: the C++ sources, headers, CMake files and
+# the binding. Reference STEPs, fixtures and local work trees stay out.
+sdist.exclude = ["tests/**", "testData", "build*/**", "output/**", ".mvbpp*/**", ".playwright-mcp/**",
+                 "bindings/python/dist/**", "*.json", "*.step", "*.stl"]
+sdist.include = ["bindings/python/tests/**"]
 
 [tool.scikit-build.cmake.define]
 BUILD_PYTHON_BINDINGS = "ON"
@@ -22,3 +44,43 @@ INCLUDE_MKF_TESTS     = "OFF"
 INCLUDE_PYMKF         = "OFF"
 ENABLE_MATPLOTPP      = "OFF"
 ENABLE_NGSPICE        = "OFF"
+
+# Windows builds with the default Visual Studio generator (as PyOpenMagnetics does): Ninja would
+# need an activated MSVC developer shell, which cibuildwheel does not provide.
+[[tool.scikit-build.overrides]]
+if.platform-system = "^win32"
+cmake.args = []
+
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip  = ["pp*", "*-win32", "*musllinux*", "*i686"]
+manylinux-x86_64-image = "manylinux_2_28"
+build-verbosity = 1
+test-requires = ["pytest"]
+test-command  = "pytest {project}/bindings/python/tests -q"
+
+[tool.cibuildwheel.linux]
+# OCCT needs the X11/OpenGL headers (TKService, TKV3d, TKOpenGl); MKF generates MAS.hpp with quicktype.
+before-all = [
+  "dnf -y install libX11-devel libXext-devel libXmu-devel libXi-devel mesa-libGL-devel mesa-libEGL-devel fontconfig-devel",
+  "dnf -y module reset nodejs",
+  "dnf -y module enable nodejs:20",
+  "dnf -y install nodejs npm",
+  "npm install -g quicktype@23.2.6",
+  "git config --global url.\"https://github.com/\".insteadOf \"git@github.com:\"",
+]
+# One build tree per wheel is several GB (MKF + MVB++); drop the previous one so a job that builds
+# every Python version fits on the runner's disk. The OCCT install lives outside it and is reused.
+before-build = "rm -rf build_python"
+environment = { CMAKE_BUILD_PARALLEL_LEVEL = "2" }
+
+[tool.cibuildwheel.macos]
+before-all   = "npm install -g quicktype@23.2.6"
+before-build = "rm -rf build_python"
+environment = { MACOSX_DEPLOYMENT_TARGET = "14.0", CMAKE_BUILD_PARALLEL_LEVEL = "3" }
+
+[tool.cibuildwheel.windows]
+archs        = ["AMD64"]
+before-all   = "npm install -g quicktype@23.2.6"
+before-build = "if exist build_python rmdir /S /Q build_python"
+environment = { CMAKE_BUILD_PARALLEL_LEVEL = "2" }

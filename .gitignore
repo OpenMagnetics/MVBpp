@@ -33,3 +33,8 @@ __pycache__/
 # Generated geometry galleries / demo renders (STEP+PNG+SVG, ~100 MB) -- outputs, not sources.
 mas_step_gallery/
 real_winding_demo/
+
+# Python wheel build trees (pyproject build-dir)
+build_python/
+.occt-install/
+wheelhouse/
