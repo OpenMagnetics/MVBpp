@@ -63,6 +63,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      # MKF fetches Kirchhoff, whose PSMA submodules (RAS, SAS, TAS, AAS, ...) have SSH URLs; the
+      # runners have no SSH key, so clone them over HTTPS. (The Linux container sets the same
+      # rewrite in its before-all, since it does not see the runner's git config.)
+      - name: Clone GitHub submodules over HTTPS
+        shell: bash
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
