@@ -16,6 +16,12 @@ on:
         required: false
         default: false
         type: boolean
+      os:
+        description: 'Build wheels only on this runner (to re-test one platform without paying for the others)'
+        required: false
+        default: 'all'
+        type: choice
+        options: [all, ubuntu-22.04, windows-2022, macos-15]
 
 env:
   GIT_LFS_SKIP_SMUDGE: 1
@@ -51,7 +57,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15]
+        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.os != 'all') && format('["{0}"]', inputs.os) || '["ubuntu-22.04","windows-2022","macos-15"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -119,7 +125,8 @@ jobs:
     name: Publish
     needs: [check_version, build_wheels, build_sdist]
     # check_version is skipped on workflow_dispatch; a skipped need still lets this run.
-    if: always() && needs.build_wheels.result == 'success' && needs.build_sdist.result == 'success' && needs.check_version.result != 'failure'
+    # A single-platform manual run never publishes: the release must carry every wheel.
+    if: always() && needs.build_wheels.result == 'success' && needs.build_sdist.result == 'success' && needs.check_version.result != 'failure' && (github.event_name != 'workflow_dispatch' || inputs.os == 'all')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
