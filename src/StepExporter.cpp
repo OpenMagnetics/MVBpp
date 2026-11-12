@@ -677,11 +677,19 @@ std::string exportSTLToBytes(const std::vector<TopoDS_Shape>& shapes,
     writer.ASCIIMode() = !binary;
     if (!writer.Write(compound, tmpPath.string().c_str())) return {};
 
-    std::ifstream f(tmpPath, std::ios::binary);
-    if (!f) { std::filesystem::remove(tmpPath); return {}; }
-    std::string data((std::istreambuf_iterator<char>(f)),
-                      std::istreambuf_iterator<char>());
+    // Read and CLOSE the file before removing it: Windows refuses to delete a file that is still open
+    // ("The process cannot access the file because it is being used by another process").
+    std::string data;
+    bool opened = false;
+    {
+        std::ifstream f(tmpPath, std::ios::binary);
+        if (f) {
+            opened = true;
+            data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+    }
     std::filesystem::remove(tmpPath);
+    if (!opened) return {};
     return data;
 }
 
