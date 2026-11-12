@@ -44,6 +44,9 @@ INCLUDE_MKF_TESTS     = "OFF"
 INCLUDE_PYMKF         = "OFF"
 ENABLE_MATPLOTPP      = "OFF"
 ENABLE_NGSPICE        = "OFF"
+# The module does not use the FEM mesher (gmsh + MMG + GMP + OpenMP, for OMFEM); building it would
+# need those on every wheel runner.
+MVBPP_BUILD_MESH      = "OFF"
 
 # Windows builds with the default Visual Studio generator (as PyOpenMagnetics does): Ninja would
 # need an activated MSVC developer shell, which cibuildwheel does not provide.
