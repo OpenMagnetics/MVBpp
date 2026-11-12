@@ -47,6 +47,9 @@ ENABLE_NGSPICE        = "OFF"
 # The module does not use the FEM mesher (gmsh + MMG + GMP + OpenMP, for OMFEM); building it would
 # need those on every wheel runner.
 MVBPP_BUILD_MESH      = "OFF"
+# Nor MKF's converter models: MKF_USE_KIRCHHOFF=OFF drops KirchhoffBridge (as webMKF does), so the wheel does
+# not build Kirchhoff (whose tests need glibc >= 2.33, newer than manylinux_2_28) or ship libKirchhoffApi.
+MKF_USE_KIRCHHOFF     = "OFF"
 
 # Windows builds with the default Visual Studio generator (as PyOpenMagnetics does): Ninja would
 # need an activated MSVC developer shell, which cibuildwheel does not provide.
