@@ -309,6 +309,12 @@ target_include_directories(mvb++ PUBLIC
     ${CMAKE_BINARY_DIR}/_deps/svg-src/src
 )
 
+# MSVC: <windows.h> defines `near` and `far` as empty macros, which MVB++ uses as identifiers;
+# cmake/msvc_windows_macros.h includes it first and drops them.
+if(MSVC)
+    target_compile_options(mvb++ PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_windows_macros.h")
+endif()
+
 target_link_libraries(mvb++ PUBLIC
     occt
     MKF
@@ -417,6 +423,9 @@ if(BUILD_PYTHON_BINDINGS)
     )
     FetchContent_MakeAvailable(pybind11)
     pybind11_add_module(mvbpp bindings/python/mvbpp_python.cpp)
+    if(MSVC)
+        target_compile_options(mvbpp PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_windows_macros.h")
+    endif()
     install(TARGETS mvbpp
             LIBRARY DESTINATION .
             COMPONENT PythonModule
