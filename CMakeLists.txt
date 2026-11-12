@@ -456,9 +456,9 @@ if(BUILD_PYTHON_BINDINGS)
         target_link_options(mvbpp PRIVATE "LINKER:-force_load,$<TARGET_FILE:mvb++>")
         target_link_libraries(mvbpp PRIVATE mvb++)
     elseif(MSVC)
-        foreach(_a ${OCCT_STATIC_LIB_FILES})
-            target_link_options(mvbpp PRIVATE "/WHOLEARCHIVE:${_a}")
-        endforeach()
+        # OCCT is NOT whole-archived here: every OCCT .lib carries its own version resource (.res), and
+        # /WHOLEARCHIVE pulls them all in, which link.exe refuses (LNK1241 "resource file already
+        # specified"). link.exe resolves the OCCT objects mvb++ needs from the plain list on `occt`.
         target_link_options(mvbpp PRIVATE "/WHOLEARCHIVE:$<TARGET_FILE:mvb++>")
         target_link_libraries(mvbpp PRIVATE mvb++)
     else()
