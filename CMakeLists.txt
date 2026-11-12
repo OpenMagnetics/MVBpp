@@ -127,8 +127,10 @@ endif()
 
 # MSVC: large TUs (MKF, ConductorBuilder.cpp) need /bigobj, as PyOpenMagnetics' Windows build of
 # MKF does; the sources are UTF-8 (µ, ×, — in literals and comments), hence /utf-8.
+# /MP: compile a project's files in parallel. MSBuild otherwise builds one file at a time inside each
+# project, and MKF is one large project (a Windows wheel spent ~65 min per Python version in it).
 if(MSVC)
-    add_compile_options(/bigobj /utf-8)
+    add_compile_options(/bigobj /utf-8 /MP)
 endif()
 
 # ============================================================================

@@ -89,4 +89,6 @@ environment = { MACOSX_DEPLOYMENT_TARGET = "14.0", CMAKE_BUILD_PARALLEL_LEVEL = 
 archs        = ["AMD64"]
 before-all   = "npm install -g quicktype@23.2.6"
 before-build = "if exist build_python rmdir /S /Q build_python"
-environment = { CMAKE_BUILD_PARALLEL_LEVEL = "2" }
+# One MSBuild project at a time: /MP (CMakeLists.txt) already uses every core inside a project, and two
+# heavy MKF projects at once would put 2 x cores compilers on the runner's 16 GB.
+environment = { CMAKE_BUILD_PARALLEL_LEVEL = "1" }
