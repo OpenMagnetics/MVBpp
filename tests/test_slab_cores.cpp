@@ -53,10 +53,10 @@ double clipped_disc(double r, double c) {
     return std::numbers::pi * r * r - 2.0 * (r * r * std::acos(c / r) - c * std::sqrt(r * r - c * c));
 }
 
-OpenMagnetics::Core gapped_core(const json& shape) {
+OpenMagnetics::Core gapped_core(const json& shape, const std::string& type = "two-piece set") {
     json coreJson;
     coreJson["functionalDescription"] = {
-        {"name", "slab"}, {"type", "two-piece set"}, {"material", "N97"}, {"shape", shape},
+        {"name", "slab"}, {"type", type}, {"material", "N97"}, {"shape", shape},
         {"gapping", json::array({ json{{"length", 0.0001}, {"type", "subtractive"}} })},
         {"numberStacks", 1},
     };
@@ -115,7 +115,7 @@ TEST_CASE("A gapped DS core as MKF lays it out draws both halves", "[shapes][sla
 TEST_CASE("A core family with no 3D builder is refused by name, not drawn empty", "[shapes][slab]") {
     // This case used RS 14/08 until RS gained its builder (ABT #1443). UI is the one MAS family
     // still without a 3D builder, so it carries the same assertion now.
-    auto core = gapped_core(slab_shape("UI 93/76/16"));
+    auto core = gapped_core(slab_shape("UI 93/76/16"), "piece and plate");
     mvb::MagneticBuilder builder;
     REQUIRE_THROWS_WITH(builder.buildCoreNamed(core),
                         Catch::Matchers::ContainsSubstring("no 3D geometry builder")
