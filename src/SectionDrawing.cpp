@@ -143,7 +143,7 @@ double getMm(const std::map<std::string, double>& d, const char* k, double dflt 
 // ==========================================================================
 // FrontView dimensions — core-shape B/D (or C for toroidal).
 // ==========================================================================
-std::vector<Dim> buildCoreShapeFrontDims(const MAS::CoreShape& shape) {
+std::vector<Dim> buildCoreShapeFrontDims(const MAS::CoreShape& shape, double matingPlaneMm = 0.0) {
     std::vector<Dim> dims;
     auto flat = flattenMm(shape);
     if (flat.empty()) return dims;
@@ -169,6 +169,34 @@ std::vector<Dim> buildCoreShapeFrontDims(const MAS::CoreShape& shape) {
             dims.push_back({l.str(), -A / 2.0, 0.0, +A / 2.0, 0.0, true, off + sh});
         }
         (void)C;
+        return dims;
+    }
+
+    // Piece-and-plate (EI, UI, PQI; ABT #2372): ONE shaped piece below the mating plane, at
+    // Y ∈ [m - B, m] with its legs ending at the plane y = m, closed by the flat plate at
+    // Y ∈ [m, m + B2]. MKF places the plane at the leg tip of its processed frame (m = +D/2, where
+    // the coil is wound), given here as matingPlaneMm. B and D
+    // belong to the piece, below the plane; B2 is the plate's thickness, above it. This used to
+    // fall through to the two-half-set layout, which anchored B and D on an upper half that does
+    // not exist and left B2 off the drawing altogether.
+    const auto family = shape.get_family();
+    if (family == MAS::CoreShapeFamily::EI || family == MAS::CoreShapeFamily::UI ||
+        family == MAS::CoreShapeFamily::PQI) {
+        const double B2 = getMm(flat, "B2");
+        if (!(A > 0 && B > 0 && D > 0 && B2 > 0))
+            throw std::runtime_error("buildCoreShapeFrontDims: piece-and-plate shape '" +
+                                     shape.get_name().value_or(std::string("?")) +
+                                     "' needs positive A, B, D and B2 to be dimensioned");
+        // D is drawn on the window's outer edge (x = E/2); a UI given without E has its single
+        // window centred on x = 0, so the arrow goes there.
+        const double windowHalf = E > 0 ? E / 2.0 : 0.0;
+        std::ostringstream lB; lB << std::fixed << std::setprecision(2) << "B = " << B;
+        const double m = matingPlaneMm;
+        dims.push_back({lB.str(), A / 2.0, m - B, A / 2.0, m, false, A * 0.12});
+        std::ostringstream lD; lD << std::fixed << std::setprecision(2) << "D = " << D;
+        dims.push_back({lD.str(), windowHalf, m - D, windowHalf, m, false, A * 0.05});
+        std::ostringstream lB2; lB2 << std::fixed << std::setprecision(2) << "B2 = " << B2;
+        dims.push_back({lB2.str(), A / 2.0, m, A / 2.0, m + B2, false, A * 0.12});
         return dims;
     }
 
@@ -865,14 +893,23 @@ static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnet
         // For a symmetric core both pieces give the same projection; we pick the
         // piece whose Y centroid is closest to +B/2 (the outer face of the assembly).
         // A simple heuristic: choose the piece with the largest positive Y bound.
+        // A piece-and-plate core (ABT #2372) has ONE shaped piece, below the mating plane, and a
+        // flat plate above it whose top view is a bare A x C rectangle with none of the legs the
+        // top dimensions (E, F) point at. There the shaped piece is the one to project: the
+        // piece reaching lowest in Y.
+        const bool pieceAndPlate =
+            magnetic.get_core().get_functional_description().get_type() == MAS::CoreType::PIECE_AND_PLATE;
         TopoDS_Shape topPiece = pieces[0].shape;
-        double bestYhi = -1e30;
+        double bestYhi = -1e30, bestYlo = 1e30;
         for (const auto& p : pieces) {
             Bnd_Box pb;
             BRepBndLib::Add(p.shape, pb);
             double xlo, ylo, zlo, xhi, yhi, zhi;
             pb.Get(xlo, ylo, zlo, xhi, yhi, zhi);
-            if (yhi > bestYhi) { bestYhi = yhi; topPiece = p.shape; }
+            if (pieceAndPlate) {
+                if (ylo < bestYlo) { bestYlo = ylo; topPiece = p.shape; }
+            }
+            else if (yhi > bestYhi) { bestYhi = yhi; topPiece = p.shape; }
         }
         // Heal the fused solid: merge co-planar adjacent faces and remove the
         // redundant seam edges left by BRepAlgoAPI_Fuse (unifyEdges + unifyFaces).
@@ -896,8 +933,27 @@ static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnet
 
     std::vector<Dim> dims;
     if (showCoreDims && shapeOpt) {
+        // A piece-and-plate's mating plane is where MKF placed its shaped piece (ABT #2372).
+        double matingPlaneMm = 0.0;
+        if (magnetic.get_core().get_functional_description().get_type() == MAS::CoreType::PIECE_AND_PLATE) {
+            const auto geometricalDescription = magnetic.get_core().get_geometrical_description();
+            bool found = false;
+            if (geometricalDescription) {
+                for (const auto& element : *geometricalDescription) {
+                    if (element.get_type() == MAS::CoreGeometricalDescriptionElementType::HALF_SET &&
+                        element.get_coordinates().size() >= 2) {
+                        matingPlaneMm = element.get_coordinates()[1] * 1000.0;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found)
+                throw std::runtime_error("SectionDrawing: the piece-and-plate core has no placed HALF_SET piece "
+                                         "in its geometrical description to dimension from");
+        }
         auto core_dims = (view == ViewKind::FRONT)
-            ? buildCoreShapeFrontDims(*shapeOpt)
+            ? buildCoreShapeFrontDims(*shapeOpt, matingPlaneMm)
             : buildCoreShapeTopDims(*shapeOpt);
         dims.insert(dims.end(), core_dims.begin(), core_dims.end());
     }

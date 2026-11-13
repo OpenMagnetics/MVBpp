@@ -365,6 +365,7 @@ add_executable(mvb_tests
     tests/test_sleeves.cpp
     tests/test_slab_cores.cpp
     tests/test_bobbin_corner.cpp
+    tests/test_piece_and_plate.cpp
 )
 if(MVBPP_BUILD_MESH)
     target_sources(mvb_tests PRIVATE tests/test_mesh_io.cpp)

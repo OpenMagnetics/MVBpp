@@ -345,6 +345,51 @@ namespace {
 // for emitting core shapes is buildCoreNamed(). Callers that don't need the
 // piece names use this directly; callers that need names go through
 // MagneticBuilder::buildCoreNamed.
+// The PLATE element of a piece-and-plate core (ABT #2372). EI, UI and PQI close their shaped piece
+// with a flat bar of the piece's footprint, A wide and C deep, and B2 thick (MKF CorePieceEi/Ui/Pqi
+// count B2 as the plate's yoke). MKF places the plate at the piece's leg tips: its coordinates are
+// the face that meets the legs, and the plate extends B2 away from the piece, towards +Y.
+// Returns a null shape for the closers a family builder already draws as part of its piece (the
+// drum ring's shield and the semi-shielded drum's shell come from their applyExtras; ShapeUt builds
+// the U and its T bar as one closed solid). Any other family's plate has no builder: that throws,
+// rather than drawing a core with its closer missing.
+TopoDS_Shape buildPlate(const MAS::CoreGeometricalDescriptionElement& piece) {
+    auto shapeOpt = piece.get_shape();
+    if (!shapeOpt) throw std::runtime_error("buildPlate: a PLATE element carries no shape");
+    const MAS::CoreShape* shapeData = std::get_if<MAS::CoreShape>(&*shapeOpt);
+    if (!shapeData) throw std::runtime_error("buildPlate: a PLATE element's shape is a name, not resolved shape data");
+    const auto family = shapeData->get_family();
+    const std::string shapeName = shapeData->get_name().value_or(std::string("?"));
+    if (family == MAS::CoreShapeFamily::DRUM_RING || family == MAS::CoreShapeFamily::DRUM_SEMISHIELDED ||
+        family == MAS::CoreShapeFamily::UT) {
+        return TopoDS_Shape();
+    }
+    if (family != MAS::CoreShapeFamily::EI && family != MAS::CoreShapeFamily::UI && family != MAS::CoreShapeFamily::PQI) {
+        throw std::runtime_error("buildPlate: no 3D geometry builder for the plate of core family '" +
+                                 nlohmann::json(family).get<std::string>() + "' (shape '" + shapeName + "')");
+    }
+    if (!shapeData->get_dimensions())
+        throw std::runtime_error("buildPlate: shape '" + shapeName + "' has no dimensions");
+    const auto dims = flatten_dimensions(*shapeData->get_dimensions());
+    for (const char* key : {"A", "B2", "C"}) {
+        auto it = dims.find(key);
+        if (it == dims.end() || !(it->second > 0))
+            throw std::runtime_error(std::string("buildPlate: shape '") + shapeName + "' has no positive dimension " + key +
+                                     ", which the plate of a piece-and-plate core is built from");
+    }
+    const double a = dims.at("A"), b2 = dims.at("B2"), c = dims.at("C");
+    TopoDS_Shape plate = BRepPrimAPI_MakeBox(gp_Pnt(-a / 2.0, 0.0, -c / 2.0), a, b2, c).Shape();
+    auto rotOpt = piece.get_rotation();
+    if (rotOpt && rotOpt->size() >= 3) {
+        plate = rotate_shape(plate, (*rotOpt)[0], (*rotOpt)[1], (*rotOpt)[2]);
+    }
+    if (piece.get_machining() && !piece.get_machining()->empty())
+        throw std::runtime_error("buildPlate: the plate of '" + shapeName + "' carries machining; a plate is flat and is not machined");
+    const auto& coords = piece.get_coordinates();
+    if (coords.size() < 3) throw std::runtime_error("buildPlate: the plate of '" + shapeName + "' has no coordinates");
+    return translate_shape(plate, coords[0], coords[1], coords[2]);
+}
+
 std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
                                                int corePolygonSegments) {
     std::vector<TopoDS_Shape> result;
@@ -352,10 +397,15 @@ std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
     if (!geoOpt) return result;
 
     for (const auto& piece : *geoOpt) {
+        // PLATE: the closer of a piece-and-plate core (ABT #264, ABT #2372).
+        if (piece.get_type() == MAS::CoreGeometricalDescriptionElementType::PLATE) {
+            auto plate = buildPlate(piece);
+            if (!plate.IsNull()) result.push_back(plate);
+            continue;
+        }
         // CLOSED covers single-solid cores (UT, and DRUM per ABT #331): their family
         // builders emit the complete piece, so they go through the same path as
-        // HALF_SET. PLATE (piece-and-plate closers, ABT #264) still needs a
-        // plate-dimension build and is not handled yet.
+        // HALF_SET.
         if (piece.get_type() != MAS::CoreGeometricalDescriptionElementType::HALF_SET
             && piece.get_type() != MAS::CoreGeometricalDescriptionElementType::TOROIDAL
             && piece.get_type() != MAS::CoreGeometricalDescriptionElementType::CLOSED) {
