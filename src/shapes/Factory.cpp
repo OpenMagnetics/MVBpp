@@ -3,6 +3,7 @@
 #include "mvb/shapes/ShapeDrum.h"
 #include "mvb/shapes/ShapeDrumRing.h"
 #include "mvb/shapes/ShapeMolded.h"
+#include "mvb/shapes/ShapeRod.h"
 #include "mvb/shapes/ShapeDrumSemishielded.h"
 #include "mvb/shapes/ShapeE.h"
 #include "mvb/shapes/ShapeEp.h"
@@ -54,6 +55,9 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
             builder = std::make_unique<ShapeT>(); break;
         case MAS::CoreShapeFamily::DRUM:
             builder = std::make_unique<ShapeDrum>();
+            break;
+        case MAS::CoreShapeFamily::ROD:  // a bare cylinder (MKF CorePieceRod)
+            builder = std::make_unique<ShapeRod>();
             break;
         case MAS::CoreShapeFamily::DRUM_RING:  // ABT #366/#367: drum + concentric shield ring
             builder = std::make_unique<ShapeDrumRing>();

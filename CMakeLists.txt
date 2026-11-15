@@ -280,6 +280,7 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/shapes/ShapeDrum.cpp
     src/shapes/ShapeDrumRing.cpp
     src/shapes/ShapeMolded.cpp
+    src/shapes/ShapeRod.cpp
     src/shapes/ShapeDrumSemishielded.cpp
     src/shapes/ShapeE.cpp
     src/shapes/ShapeEp.cpp
