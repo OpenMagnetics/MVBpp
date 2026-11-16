@@ -202,8 +202,33 @@ std::pair<double, double> conducting_dimensions(const MAS::Wire& wire) {
 // Resolve the wire cross-section used to build a turn solid.
 //   paintCoating == true  → OUTER (insulation) footprint  [default, unchanged]
 //   paintCoating == false → CONDUCTING (copper) footprint  [FEM winding-loss]
+// A litz bundle MKF wound into a RECTANGULAR CELL (MKF Coil::wind, Alf 2026-11-03: the bundle
+// deforms to occupy its whole rectangular cell): its turns carry crossSectionalShape rectangular
+// and the cell as their dimensions.
+static bool is_litz_in_rectangular_cell(const MAS::Wire& wire, const MAS::Turn& turn) {
+    return wire.get_type() == MAS::WireType::LITZ && turn.get_cross_sectional_shape() &&
+           *turn.get_cross_sectional_shape() == MAS::TurnCrossSectionalShape::RECTANGULAR;
+}
+
 static std::pair<double, double> get_wire_dimensions(const MAS::Wire& wire, const MAS::Turn& turn,
                                                      bool paintCoating) {
+    if (!paintCoating && is_litz_in_rectangular_cell(wire, turn)) {
+        // The strands fill the cell inside the serving, which is as thick as on the round
+        // bundle: the cell less the round bundle's outer-to-bare difference on each axis.
+        auto td = turn.get_dimensions();
+        if (!td || td->size() < 2) {
+            throw std::runtime_error("get_wire_dimensions: litz turn '" + turn.get_name() +
+                                     "' is rectangular but carries no dimensions");
+        }
+        const double bare = get_conducting_dimensions(wire).first;
+        const double outer = OpenMagnetics::Wire::calculate_outer_diameter(OpenMagnetics::Wire(wire));
+        const double serving = outer - bare;
+        if (!(serving >= 0) || !((*td)[0] > serving) || !((*td)[1] > serving)) {
+            throw std::runtime_error("get_wire_dimensions: litz turn '" + turn.get_name() +
+                                     "' has a cell no larger than its serving");
+        }
+        return {(*td)[0] - serving, (*td)[1] - serving};
+    }
     if (!paintCoating) {
         return get_conducting_dimensions(wire);
     }
@@ -1041,6 +1066,35 @@ static TopoDS_Shape build_concentric_oblong_turn(double radial_pos, double wire_
     if (!torus_pz.IsNull()) cb.Add(comp, torus_pz);
     if (!torus_nz.IsNull()) cb.Add(comp, torus_nz);
     return comp;
+}
+
+double TurnBuilder::sectionCornerRadius(const MAS::Wire& wire, const MAS::Turn& turn, bool paintCoating) {
+    if (!is_litz_in_rectangular_cell(wire, turn)) {
+        return 0.0;
+    }
+    // Compressed litz is the rounded rectangle MKF wound it as: the cell's corner radius is MKF's
+    // (Wire::compressed_litz_corner_radius keeps the round bundle's area in the cell). The copper is
+    // that outline taken in by the serving on every side, so its corners are the serving less round;
+    // a serving at least as thick as the corner radius leaves the copper's corners sharp.
+    const auto td = turn.get_dimensions();
+    if (!td || td->size() < 2) {
+        throw std::runtime_error("sectionCornerRadius: litz turn '" + turn.get_name() +
+                                 "' is rectangular but carries no dimensions");
+    }
+    const OpenMagnetics::Wire mkfWire(wire);
+    const double cellRadius = OpenMagnetics::Wire::compressed_litz_corner_radius(
+        OpenMagnetics::Wire::round_litz_outer_diameter(mkfWire), (*td)[0], (*td)[1]);
+    if (paintCoating) {
+        return cellRadius;
+    }
+    const double servingPerSide =
+        (OpenMagnetics::Wire::calculate_outer_diameter(mkfWire) - get_conducting_dimensions(wire).first) / 2;
+    return cellRadius > servingPerSide ? cellRadius - servingPerSide : 0.0;
+}
+
+bool TurnBuilder::rectangularSection(const MAS::Wire& wire, const MAS::Turn& turn) {
+    return wire.get_type() == MAS::WireType::RECTANGULAR || wire.get_type() == MAS::WireType::PLANAR ||
+           is_litz_in_rectangular_cell(wire, turn);
 }
 
 std::pair<double, double> TurnBuilder::wireDimensions(const MAS::Wire& wire, bool paintCoating) {

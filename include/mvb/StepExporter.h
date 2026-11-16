@@ -29,6 +29,12 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
                 const std::string& filepath,
                 const StepExportOptions& options);
 
+// Re-parametrise every B-spline surface of a MILLIMETRE-frame shape so one parameter unit spans about one
+// millimetre (ABT #1111): a metre-built sweep scaled x1000 keeps its metre knots under millimetre poles, and
+// OCCT's booleans map 3D tolerances to UV through that 1000x ratio. EXACT (an affine change of the knots and
+// pcurves; no point moves). Throws when the result is invalid although the input was valid.
+TopoDS_Shape unitParametrised(const TopoDS_Shape& shapeMm, const std::string& name);
+
 // Legacy overload — pairs shapes and names positionally, delegates to the
 // NamedShape overload. Kept so existing callers compile; new code should
 // use NamedShape directly.

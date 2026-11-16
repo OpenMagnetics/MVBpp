@@ -4,6 +4,7 @@
 #include <mvb/TerminalFillet.h>
 #include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
+#include "mvb/StepExporter.h"   // unitParametrised: the weld fuses in the STEP export's millimetre parametrisation (ABT #2262)
 #include <array>
 #include <functional>
 #include <deque>
@@ -38,6 +39,9 @@
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
+#include <BRepPrimAPI_MakeHalfSpace.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Trsf.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
@@ -133,7 +137,17 @@ static bool diagnosticLRouteAsDrawn(size_t waypointCount, const std::string& lea
 // Options in reach read the same switch.
 static thread_local bool tlsCollisionDiagnostic = false;
 
-static bool collisionDiagnostic() { return tlsCollisionDiagnostic; }
+// DISPLAY ONLY (Alf, 2026-11-15: "Outer diameter are just for display for now, on the web, so no welding and no
+// checking"). A build that draws the wire at its OUTER (coated) envelope (paintCoating) is a picture of the winding,
+// not copper: its tubes are a coating thicker than the conductor the layout and the bends are planned for, so nothing
+// about it is judged -- no enamel gate, no collision refusal -- and its pieces are not welded.
+static thread_local bool tlsDisplayOnly = false;
+struct DisplayOnlyScope {
+    bool previous;
+    explicit DisplayOnlyScope(bool on) : previous(tlsDisplayOnly) { tlsDisplayOnly = on; }
+    ~DisplayOnlyScope() { tlsDisplayOnly = previous; }
+};
+static bool collisionDiagnostic() { return tlsCollisionDiagnostic || tlsDisplayOnly; }
 
 struct CollisionDiagnosticScope {
     bool previous;
@@ -146,6 +160,7 @@ struct CollisionDiagnosticScope {
 // A copper-collision refusal: thrown, or with the debug switch on, printed as a finding and the
 // build carries on with the copper as drawn.
 static void refuseCollision(const std::string& message) {
+    if (tlsDisplayOnly) return;   // a display drawing is not judged
     if (!collisionDiagnostic()) throw std::runtime_error(message);
     std::cerr << "[ConductorBuilder] FINDING (collision allowed by --skip-collision-check / "
                  "MVB_SKIP_COLLISION_CHECK; copper left as drawn, not a part): "
@@ -233,6 +248,15 @@ inline gp_Pnt evalPrim(const Primitive& pr, double t) {
             const double y =
                 pr.spiral.y0 + (pr.spiral.y1 - pr.spiral.y0) * spiralHeightFrac(pr.spiral, t);
             return gp_Pnt(pr.spiral.cx + r * std::cos(az), y, pr.spiral.cz - r * std::sin(az));
+        }
+        case Primitive::BLEND: {
+            // The cosine S the assembler draws (WireAssembler samplePrim/primEdge): with
+            // d = b - a, L = d.u and perp = d - L u, p(t) = a + L u t + perp (1 - cos(pi t)) / 2.
+            const gp_XYZ d = pr.blendc.b.XYZ() - pr.blendc.a.XYZ();
+            const double L = d.Dot(pr.blendc.u);
+            const gp_XYZ perp = d - pr.blendc.u * L;
+            return gp_Pnt(pr.blendc.a.XYZ() + pr.blendc.u * (L * t) +
+                          perp * (0.5 * (1.0 - std::cos(kPi * t))));
         }
         default:
             throw std::runtime_error("cert::evalPrim: unsupported primitive kind");
@@ -352,6 +376,14 @@ inline double maxSecondDerivative(const Primitive& pr) {
                 return std::hypot(rMax * S * S, 2.0 * dy);
             }
             return std::sqrt(4.0 * dr * dr * S * S + rMax * rMax * S * S * S * S);
+        }
+        case Primitive::BLEND: {
+            // p(t) = a + L u t + perp (1 - cos(pi t)) / 2  =>  p''(t) = perp (pi^2 / 2) cos(pi t):
+            // max |p''| = pi^2 |perp| / 2 at the ends (t in [0,1]; per unit length along u this
+            // is the peak curvature pi^2 |perp| / (2 L^2) WireAssembler samples on).
+            const gp_XYZ d = pr.blendc.b.XYZ() - pr.blendc.a.XYZ();
+            const gp_XYZ perp = d - pr.blendc.u * d.Dot(pr.blendc.u);
+            return 0.5 * kPi * kPi * perp.Modulus();
         }
         default:
             throw std::runtime_error("cert::maxSecondDerivative: unsupported primitive kind");
@@ -512,7 +544,14 @@ inline Verdict provePairClears(const Primitive& A, const Primitive& B, double th
           << A.label << "' (" << kinds[A.kind] << ") vs '" << B.label << "' (" << kinds[B.kind]
           << "): threshold " << threshold * 1e6 << " um, " << work.size()
           << " boxes unresolved, lowest box bound " << lowest * 1e6 << " um";
-        throw std::runtime_error(m.str());
+        // Debug (--skip-collision-check): NOT proven clear is reported and answered as not clear, so the caller
+        // treats the pair as the collision it may be and the design can still be drawn and looked at.
+        if (!collisionDiagnostic()) throw std::runtime_error(m.str());
+        std::cerr << "[ConductorBuilder] FINDING (debug build, --skip-collision-check; not a part): " << m.str()
+                  << "; answered as NOT clear" << std::endl;
+        v.clears = false;
+        v.violationUB = std::numeric_limits<double>::quiet_NaN();   // no distance was achieved: none is quoted
+        return v;
     }
     v.clears = true;
     return v;
@@ -602,6 +641,230 @@ inline Bounds boundedMinDist(const Primitive& A, const Primitive& B, double tol,
     return out;
 }
 
+
+// THE MITRED CORNER, EXACTLY (ABT #2274, 2026-11-14). A corner the assembler mitres grows each leg's tube on to the
+// mitre plane; the grown part of a leg is a solid cylinder (the leg's axis, radius r) cut by that plane -- a convex
+// body. The gate first judges a corner by a capsule that contains it (checkCollisions), which overshoots the true
+// corner by up to 0.29 r along the legs at 90 degrees; a pair that fails that capsule is judged here against the
+// corner itself. Distance from a point to a grown leg is a convex problem in the slice position s along the leg
+// (each slice is a disc cut by the mitre line, its distance closed-form), and distance from a straight chord to it
+// is convex in the chord parameter: both are minimised by golden-section search with an explicit Lipschitz bound,
+// inside the same chord-and-sag branch-and-bound as provePairClears. Bounds, not samples.
+struct MitreCorner {
+    gp_XYZ V;      // the corner's vertex
+    gp_XYZ a, b;   // unit travel directions: into the vertex (leg a), out of it (leg b)
+    // A CURVED LEG GROWS ALONG ITS OWN CURVE (2026-11-14). The assembler grows an ARC3 or a SPIRAL end analytically,
+    // on the arc, so its grown copper is the tube of the curve's own continuation -- not of the tangent line, which
+    // drifts off the curve by s^2/2R (06_llc: the over-dragback wrap, R 9.75 mm, put the straight model 0.25 um
+    // inside a layer that touches it exactly, and missed copper on the inner side). Set for a curved leg: that leg is
+    // judged as the capsule of this continuation (a superset of its grown part) by the pair prover; unset legs are
+    // straight and keep the exact slice model.
+    std::optional<Primitive> extA, extB;
+};
+
+// Lower bound on the distance from p to one grown leg: growth direction g (unit), the body on the side
+// (x - V) . side <= 0 of the mitre plane, radius r. Also returns an achieved distance (a point of the body).
+inline void distToGrownLeg(const gp_XYZ& p, const gp_XYZ& V, const gp_XYZ& g, const gp_XYZ& side, double r,
+                           double& lower, double& achieved) {
+    const double gs = g.Dot(side);
+    gp_XYZ w = side - g * gs;
+    const double wl = w.Modulus();
+    if (!(gs > 0.0) || wl < 1e-15) {   // no growth (a straight joint): nothing beyond the leg's own capsule
+        lower = achieved = std::numeric_limits<double>::infinity();
+        return;
+    }
+    const gp_XYZ wh = w / wl;
+    gp_XYZ l = g.Crossed(wh);
+    l /= l.Modulus();
+    const gp_XYZ rel = p - V;
+    const double ps = rel.Dot(g);
+    const gp_XYZ q = rel - g * ps;            // the point's position in every slice's plane
+    const double qn = q.Dot(wh), qq = q.Modulus();
+    const double sMax = r * wl / gs;          // the last slice the mitre line leaves non-empty
+    auto sliceDist = [&](double s) {          // distance from p to slice s (disc radius r, y.wh <= cp)
+        const double cp = -s * gs / wl;
+        double best = std::numeric_limits<double>::infinity();
+        auto cand = [&](const gp_XYZ& y) { best = std::min(best, (q - y).Modulus()); };
+        if (qq <= r && qn <= cp) best = 0.0;
+        else {
+            const gp_XYZ y1 = qq > r ? q * (r / qq) : q;
+            if (y1.Dot(wh) <= cp) cand(y1);
+            const gp_XYZ y2 = q - wh * (qn - cp);
+            if (y2.Modulus() <= r) cand(y2);
+            if (std::abs(cp) <= r) {
+                const double h = std::sqrt(std::max(0.0, r * r - cp * cp));
+                cand(wh * cp + l * h);
+                cand(wh * cp - l * h);
+            }
+        }
+        return std::sqrt(best * best + (ps - s) * (ps - s));
+    };
+    double lo = 0.0, hi = sMax;
+    const double gr = 0.5 * (std::sqrt(5.0) - 1.0);
+    double x1 = hi - gr * (hi - lo), x2 = lo + gr * (hi - lo), f1 = sliceDist(x1), f2 = sliceDist(x2);
+    for (int it = 0; it < 120 && hi - lo > 1e-16; ++it) {
+        if (f1 <= f2) { hi = x2; x2 = x1; f2 = f1; x1 = hi - gr * (hi - lo); f1 = sliceDist(x1); }
+        else          { lo = x1; x1 = x2; f1 = f2; x2 = lo + gr * (hi - lo); f2 = sliceDist(x2); }
+    }
+    achieved = std::min({sliceDist(0.0), sliceDist(sMax), f1, f2});
+    const double lip = 1.0 + gs / wl;         // |dF/ds|: the slice moves 1, its mitre line gs/wl per unit s
+    lower = achieved - lip * (hi - lo);
+}
+
+// Lower bound (and an achieved value) of the distance from the chord c0->c1 to the corner's grown legs.
+inline void chordToCorner(const gp_XYZ& c0, const gp_XYZ& c1, const MitreCorner& k, double r, double& lower,
+                          double& achieved) {
+    gp_XYZ nm = k.a + k.b;
+    nm /= nm.Modulus();
+    lower = achieved = std::numeric_limits<double>::infinity();
+    const double len = (c1 - c0).Modulus();
+    for (int leg = 0; leg < 2; ++leg) {
+        if ((leg == 0 ? k.extA : k.extB).has_value()) continue;   // a curved leg is judged by its continuation
+        const gp_XYZ g = leg == 0 ? k.a : k.b * -1.0;
+        const gp_XYZ side = leg == 0 ? nm : nm * -1.0;
+        auto f = [&](double t, double& lb) {
+            double ach = 0.0;
+            distToGrownLeg(c0 + (c1 - c0) * t, k.V, g, side, r, lb, ach);
+            return ach;
+        };
+        double lo = 0.0, hi = 1.0, lbMin = std::numeric_limits<double>::infinity(), lb = 0.0;
+        const double gr = 0.5 * (std::sqrt(5.0) - 1.0);
+        double x1 = hi - gr * (hi - lo), x2 = lo + gr * (hi - lo);
+        double f1 = f(x1, lb); lbMin = std::min(lbMin, lb);
+        double f2 = f(x2, lb); lbMin = std::min(lbMin, lb);
+        for (int it = 0; it < 120 && hi - lo > 1e-16; ++it) {
+            if (f1 <= f2) { hi = x2; x2 = x1; f2 = f1; x1 = hi - gr * (hi - lo); f1 = f(x1, lb); }
+            else          { lo = x1; x1 = x2; f1 = f2; x2 = lo + gr * (hi - lo); f2 = f(x2, lb); }
+            lbMin = std::min(lbMin, lb);
+        }
+        double lb0 = 0.0, lb1 = 0.0;
+        const double e0 = f(0.0, lb0), e1 = f(1.0, lb1);
+        const double ach = std::min({e0, e1, f1, f2});
+        if (!std::isfinite(ach)) continue;
+        // the convex minimum lies in the final bracket: its value is at least the bracket's best lower bound
+        // less the chord's Lipschitz travel across the bracket
+        const double lbLeg = std::min({lb0, lb1, lbMin - len * (hi - lo)});
+        lower = std::min(lower, lbLeg);
+        achieved = std::min(achieved, ach);
+    }
+}
+
+// Prove that every point of B's centreline lies at least `threshold` from the corner's grown legs (radius r), or
+// exhibit a point of B closer than that.
+inline Verdict proveCornerClears(const MitreCorner& k, double r, const Primitive& B, double threshold) {
+    for (const auto* ext : {&k.extA, &k.extB}) {
+        if (!ext->has_value()) continue;
+        // the continuation's capsule (radius r) against B's centreline: centrelines at least threshold + r apart
+        const Verdict cv = provePairClears(**ext, B, threshold + r);
+        if (!cv.clears) {
+            Verdict v;
+            v.violationUB = cv.violationUB - r;
+            v.tB = cv.tB;
+            return v;
+        }
+    }
+    if (k.extA.has_value() && k.extB.has_value()) { Verdict v; v.clears = true; return v; }
+    const double ddB = maxSecondDerivative(B);
+    std::vector<std::pair<double, double>> work{{0.0, 1.0}};
+    Verdict v;
+    for (size_t guard = 0; !work.empty() && guard < 400000; ++guard) {
+        const auto [b0, b1] = work.back();
+        work.pop_back();
+        const double h = b1 - b0, sag = ddB * h * h / 8.0;
+        double lower = 0.0, ach = 0.0;
+        chordToCorner(evalPrim(B, b0).XYZ(), evalPrim(B, b1).XYZ(), k, r, lower, ach);
+        if (lower - sag >= threshold - kCertEpsilon) continue;
+        double lm = 0.0, am = 0.0;
+        const double bm = 0.5 * (b0 + b1);
+        const gp_XYZ pm = evalPrim(B, bm).XYZ();
+        chordToCorner(pm, pm, k, r, lm, am);
+        if (am < threshold - kCertEpsilon) {
+            v.clears = false;
+            v.violationUB = am;
+            v.tB = bm;
+            return v;
+        }
+        if (sag <= kCertEpsilon) {
+            if (ach + sag < threshold - kCertEpsilon) {
+                v.clears = false;
+                v.violationUB = ach + sag;
+                v.tB = bm;
+                return v;
+            }
+            continue;
+        }
+        work.push_back({b0, bm});
+        work.push_back({bm, b1});
+    }
+    if (!work.empty()) {
+        const std::string m = "cert::proveCornerClears: box budget exhausted on '" + B.label +
+                              "' -- the mitred corner cannot be certified";
+        // Debug (--skip-collision-check): reported and answered as NOT clear (see provePairClears).
+        if (!collisionDiagnostic()) throw std::runtime_error(m);
+        std::cerr << "[ConductorBuilder] FINDING (debug build, --skip-collision-check; not a part): " << m
+                  << "; answered as NOT clear" << std::endl;
+        v.clears = false;
+        v.violationUB = std::numeric_limits<double>::quiet_NaN();
+        return v;
+    }
+    v.clears = true;
+    return v;
+}
+
+// TWO MITRED CORNERS AGAINST EACH OTHER (ABT #2274). Each corner's extra copper (both legs grown to the mitre
+// plane) lies in the convex hull of three planar sections centred on its vertex V: the leg discs normal to a and
+// to b (radius r) and the mitre-plane ellipse (semi-axes r along a x nm and r / |a.nm| across it). The hull adds
+// nothing outside the wire: every point within r of V is copper of one leg or the other. For two convex sets and
+// ANY unit direction q, min_B q.y - max_A q.x is a lower bound on their distance (a separating slab), so whatever
+// q the search below settles on, the bound it returns is proven; the search only decides how tight it is.
+inline double cornerSupport(const MitreCorner& k, double r, const gp_XYZ& q) {
+    auto disc = [&](const gp_XYZ& d) {
+        const double qd = q.Dot(d);
+        return r * std::sqrt(std::max(0.0, q.SquareModulus() - qd * qd));
+    };
+    gp_XYZ nm = k.a + k.b;
+    nm /= nm.Modulus();
+    gp_XYZ e1 = k.a.Crossed(nm);
+    const double e1l = e1.Modulus();
+    double ell = 0.0;
+    if (e1l > 1e-15) {
+        e1 /= e1l;
+        const gp_XYZ e2 = nm.Crossed(e1);
+        const double an = std::abs(k.a.Dot(nm));
+        if (!(an > 0.0))
+            throw std::runtime_error("cert::cornerSupport: a mitre plane containing its leg (a 180-degree fold)");
+        const double u = r * q.Dot(e1), w = r / an * q.Dot(e2);
+        ell = std::sqrt(u * u + w * w);
+    }
+    // only the STRAIGHT legs' grown parts (a curved leg is its continuation, judged by the pair prover)
+    double best = ell;
+    if (!k.extA) best = std::max(best, disc(k.a));
+    if (!k.extB) best = std::max(best, disc(k.b));
+    return q.Dot(k.V) + best;
+}
+
+// A proven lower bound on the distance between corner A (radius rA) and corner B (radius rB).
+inline double cornersLowerBound(const MitreCorner& A, double rA, const MitreCorner& B, double rB) {
+    auto gap = [&](const gp_XYZ& q) { return -cornerSupport(B, rB, q * -1.0) - cornerSupport(A, rA, q); };
+    gp_XYZ q = B.V - A.V;
+    q = q.Modulus() < 1e-15 ? gp_XYZ(1.0, 0.0, 0.0) : q / q.Modulus();   // coincident vertices: any start
+    double best = gap(q);
+    // Pattern search on the sphere: rotate q about two axes normal to it, halving the step when nothing improves.
+    for (double step = 0.5; step > 1e-10;) {
+        gp_XYZ t1 = q.Crossed(std::abs(q.X()) < 0.9 ? gp_XYZ(1, 0, 0) : gp_XYZ(0, 1, 0));
+        t1 /= t1.Modulus();
+        const gp_XYZ t2 = q.Crossed(t1);
+        bool moved = false;
+        for (const gp_XYZ& t : {t1, t1 * -1.0, t2, t2 * -1.0}) {
+            gp_XYZ c = q * std::cos(step) + t * std::sin(step);
+            c /= c.Modulus();
+            const double g = gap(c);
+            if (g > best) { best = g; q = c; moved = true; break; }
+        }
+        if (!moved) step *= 0.5;
+    }
+    return best;
+}
 }  // namespace cert
 
 constexpr double gateMinSeparation(double bareA, double bareB) {
@@ -630,6 +893,10 @@ struct ConductorPath {
     // physically valid and mesh fine at the conducting radius, but overlapping COPPER is a real short /
     // an un-meshable solid and is always rejected. For a rect wire these are the copper half-extents.
     double condRadius = 0.0, condWidth = 0.0, condHeight = 0.0;
+    // The COATED (insulation) envelope radius, whatever paintCoating draws. The enamel rule is judged at THIS
+    // radius: on a bare-copper drawing wireRadius is the copper's, and judging the enamel there certified
+    // 32 um of copper gap against 34 um of enamel (ABT #2274, 06_llc: Primary p2's entrance bend in p1's dragback).
+    double coatedRadius = 0.0;
     // Seam rotation this path was rigidly rotated by about the column axis (windings/parallels are
     // staggered so leads don't collide) — deferred Z end-run planning attaches at this azimuth.
     double seamRot = 0.0;
@@ -671,6 +938,10 @@ struct ConductorPath {
                               // AZIMUTHAL direction (tangent to the big ring), not the column Y.
     double wireWidth = 0.0;   // radial extent [m]
     double wireHeight = 0.0;  // axial extent [m]
+    double wireCornerRadius = 0.0;  // rounded corners of the section (compressed litz, MKF's radius); 0 = sharp
+    // ABT #2274: the terminal-lead bend MKF planned for this conductor (ConnectionRoute::plannedBendRadius); empty when
+    // MKF planned none or its lead corners are drawn sharp. emitRectColumn's lead elbows are bent at it or not at all.
+    std::optional<double> leadBendRadius;
     bool femReady = false;    // true -> pay for the one-piece/conformal FEM geometry; false -> fast
                               // per-run compound for drawing (see ConductorBuilder::Options::femReady)
 };
@@ -911,7 +1182,170 @@ void checkWindowContainment(const std::vector<ConductorPath>& paths,
     }
 }
 
+// The enamel envelope of a path (ConductorPath::coatedRadius); a path built without one is refused, never
+// judged at its drawn radius.
+double coatedRadiusOf(const ConductorPath& p) {
+    if (!(p.coatedRadius > 0.0))
+        throw std::runtime_error("ConductorBuilder: " + p.name + " has no coated radius, so its enamel cannot be judged");
+    return p.coatedRadius;
+}
+
+EnamelGateVerdict checkCollisionsOfCapsules(const std::vector<ConductorPath>& paths);
+// The mitred corners behind the corner capsules checkCollisions adds, by capsule (valid during one gate call).
+static thread_local std::map<const Primitive*, cert::MitreCorner> tlsMitreCornerOf;
+// A pair that failed with a corner capsule in it, judged against the corner itself: true when the corner (at
+// radius rCorner) is proven at least `threshold` from the other piece's centreline.
+static bool mitreCornerClears(const Primitive& pa, double ra, const Primitive& pb, double rb, double envelope) {
+    const auto ia = tlsMitreCornerOf.find(&pa), ib = tlsMitreCornerOf.find(&pb);
+    if (ia == tlsMitreCornerOf.end() && ib == tlsMitreCornerOf.end()) return false;
+    if (ia != tlsMitreCornerOf.end() && ib != tlsMitreCornerOf.end()) {   // corner against corner
+        const cert::MitreCorner& kA = ia->second;
+        const cert::MitreCorner& kB = ib->second;
+        // each corner's curved continuations against the whole other corner
+        for (const auto* ext : {&kB.extA, &kB.extB})
+            if (ext->has_value() &&
+                !cert::proveCornerClears(kA, ra, **ext, envelope - ra - cert::kCoordinateGridHalf).clears)
+                return false;
+        for (const auto* ext : {&kA.extA, &kA.extB})
+            if (ext->has_value() &&
+                !cert::proveCornerClears(kB, rb, **ext, envelope - rb - cert::kCoordinateGridHalf).clears)
+                return false;
+        // straight parts against straight parts (same grid convention as proveCornerClears)
+        const bool straightA = !kA.extA || !kA.extB, straightB = !kB.extA || !kB.extB;
+        return !(straightA && straightB) ||
+               cert::cornersLowerBound(kA, ra, kB, rb) >= envelope - ra - rb - cert::kCoordinateGridHalf;
+    }
+    const bool aIsCorner = ia != tlsMitreCornerOf.end();
+    const cert::MitreCorner& k = aIsCorner ? ia->second : ib->second;
+    const Primitive& other = aIsCorner ? pb : pa;
+    const double rCorner = aIsCorner ? ra : rb;
+    const auto v = cert::proveCornerClears(k, rCorner, other, envelope - rCorner - cert::kCoordinateGridHalf);
+    if (!v.clears && std::getenv("MVB_ENAMEL_LIST")) {
+        const gp_Pnt q = cert::evalPrim(other, v.tB);
+        std::fprintf(stderr, "[corner-refused] corner '%s' V=(%.6f,%.6f,%.6f) a=(%.4f,%.4f,%.4f) b=(%.4f,%.4f,%.4f) r=%.6f "
+                             "vs '%s' at t=%.4f (%.6f,%.6f,%.6f): distance %.7f mm < threshold %.7f mm\n",
+                     (aIsCorner ? pa : pb).label.c_str(), k.V.X() * 1e3, k.V.Y() * 1e3, k.V.Z() * 1e3, k.a.X(), k.a.Y(),
+                     k.a.Z(), k.b.X(), k.b.Y(), k.b.Z(), rCorner * 1e3, other.label.c_str(), v.tB, q.X() * 1e3,
+                     q.Y() * 1e3, q.Z() * 1e3, v.violationUB * 1e3, (envelope - rCorner) * 1e3);
+    }
+    return v.clears;
+}
+
+// The analytic continuation of a curved leg by arc length L: past its END (afterEnd, the leg arriving at a corner)
+// or before its START (the leg leaving it) -- the curve the assembler grows a curved end along. Only the curves whose
+// continuation is that same curve: an ARC3, and a SPIRAL whose radius and height are linear in azimuth. Anything
+// else has no exact continuation here, and the corner cannot be judged exactly: that throws.
+static Primitive curvedLegContinuation(const Primitive& pr, bool afterEnd, double L, const std::string& who) {
+    Primitive e = pr;
+    e.label += afterEnd ? " (grown end)" : " (grown start)";
+    if (pr.kind == Primitive::ARC3) {
+        const double R = pr.arc.v0.Modulus();
+        if (!(R > 0.0)) throw std::runtime_error("ConductorBuilder: '" + pr.label + "' is an arc of no radius");
+        const double dSweep = L / R;
+        gp_Vec v(pr.arc.v0);
+        const gp_Ax1 ax(gp::Origin(), gp_Dir(pr.arc.axis));
+        v.Rotate(ax, afterEnd ? pr.arc.sweep : -dSweep);
+        e.arc.v0 = v.XYZ();
+        e.arc.sweep = dSweep;
+        return e;
+    }
+    if (pr.kind == Primitive::SPIRAL && !pr.spiral.blend && !pr.spiral.levelOut && !(pr.spiral.easeIn > 0.0)) {
+        const Spiral& sp = pr.spiral;
+        const double sweep = sp.az1 - sp.az0;
+        if (!(std::abs(sweep) > 0.0)) throw std::runtime_error("ConductorBuilder: '" + pr.label + "' is a spiral of no sweep");
+        const double drDaz = (sp.r1 - sp.r0) / sweep, dyDaz = (sp.y1 - sp.y0) / sweep;
+        const double R = afterEnd ? sp.r1 : sp.r0;
+        const double dAz = (sweep > 0 ? 1.0 : -1.0) * L / std::sqrt(R * R + drDaz * drDaz + dyDaz * dyDaz);
+        Spiral c = sp;
+        if (afterEnd) { c.az0 = sp.az1; c.r0 = sp.r1; c.y0 = sp.y1; c.az1 = sp.az1 + dAz; }
+        else          { c.az1 = sp.az0; c.r1 = sp.r0; c.y1 = sp.y0; c.az0 = sp.az0 - dAz; }
+        c.r1 = c.r0 + drDaz * (c.az1 - c.az0);
+        c.y1 = c.y0 + dyDaz * (c.az1 - c.az0);
+        e.spiral = c;
+        return e;
+    }
+    throw std::runtime_error("ConductorBuilder: " + who + ": the mitred corner at '" + pr.label + "' grows a curved "
+                             "piece (kind " + std::to_string(int(pr.kind)) + (pr.kind == Primitive::SPIRAL ?
+                             ", eased or blended" : "") + ") that has no exact continuation to judge its corner by");
+}
+
+// THE MITRE'S CORNER IS COPPER TOO (ABT #2274, 2026-11-14). The gate proves every piece as a capsule (its centreline
+// grown by the radius, round ends). A joint the assembler MITRES (junctionVerdict == Mitre: two pieces meeting at a
+// real angle, sliced on the bisector plane) is not round: each leg's tube runs on to the bisector plane, up to
+// r tan(theta/2) past the vertex on the outside of the corner. On 06_llc that square corner of Primary p1's sharp
+// dragback corner came 32.3 um (bare) from p2's entrance bend -- 1.7 um into the enamel -- and the capsule gate
+// certified it. Each mitred joint therefore adds, to the copper the gate judges, the capsule that contains the
+// mitre's outer corner (see below), at the coated radius.
 EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
+    std::vector<ConductorPath> judged = paths;
+    std::vector<std::vector<cert::MitreCorner>> cornersOf(judged.size());
+    for (size_t pi = 0; pi < judged.size(); ++pi) {
+        auto& p = judged[pi];
+        if (p.isRectangular) continue;   // rect pairs are judged on their own sections (rectPair)
+        const double rc = coatedRadiusOf(p);
+        std::vector<Primitive> corners;
+        auto& cornerGeom = cornersOf[pi];
+        for (size_t i = 0; i + 1 < p.prims.size(); ++i) {
+            const Primitive& a = p.prims[i];
+            const Primitive& b = p.prims[i + 1];
+            const auto ea = primEndpoints(a);
+            const auto eb = primEndpoints(b);
+            if (ea.second.Distance(eb.first) > 1e-9) continue;   // not a joint: the next piece starts elsewhere
+            const double angle = junctionAngle(a, b, p.wireRadius);
+            if (junctionVerdict(angle, static_cast<int>(a.kind), static_cast<int>(b.kind), p.wireRadius) !=
+                JunctionVerdict::Mitre)
+                continue;
+            // The mitre's extra copper (each leg run on to the bisector plane) lies on the OUTER side of the corner,
+            // at most rc / cos(theta/2) from the vertex, at the corner's outer bisector u = (fa - fb)/|fa - fb|. It is
+            // contained in the capsule of radius rc on the segment V -> V + u rc (1/cos(theta/2) - 1): the points of
+            // the corner ellipse on the bisector plane lie exactly rc from that segment's end, the rest of each grown
+            // piece within rc of V. Nothing else is added: for a near-tangent joint the segment has no length.
+            const double half = 0.5 * angle;
+            if (!(std::cos(half) > 0.0))
+                throw std::runtime_error("ConductorBuilder: " + p.name + " folds back on itself at '" + a.label +
+                                         "' -> '" + b.label + "'; a 180-degree mitre has no corner to judge");
+            const double reach = rc * (1.0 / std::cos(half) - 1.0);
+            if (!(reach > 0.0)) continue;
+            const gp_Vec fa(primFwdEnd(a, p.wireRadius)), fb(primFwdStart(b, p.wireRadius));
+            gp_Vec u = fa - fb;
+            if (u.Magnitude() < 1e-15) continue;
+            u.Normalize();
+            const gp_Pnt v = ea.second;
+            Primitive corner = a;
+            corner.kind = Primitive::SEG;
+            corner.seg = Seg{v, v.Translated(u * reach)};
+            corner.label += " (mitre corner)";
+            cert::MitreCorner mc{v.XYZ(), gp_XYZ(fa.X(), fa.Y(), fa.Z()) / fa.Magnitude(),
+                                 gp_XYZ(fb.X(), fb.Y(), fb.Z()) / fb.Magnitude(), std::nullopt, std::nullopt};
+            // a curved leg's grown part, as its own continuation: rc tan(theta/2) is how far a leg's tube runs past
+            // the vertex to the mitre plane (coated, so the copper check, at the bare radius, is covered too)
+            const double grow = rc * std::tan(half);
+            if (a.kind != Primitive::SEG) mc.extA = curvedLegContinuation(a, true, grow, p.name);
+            if (b.kind != Primitive::SEG) mc.extB = curvedLegContinuation(b, false, grow, p.name);
+            cornerGeom.push_back(mc);
+            if (std::getenv("MVB_ENAMEL_LIST"))
+                std::fprintf(stderr, "[mitre-corner] %s '%s' (kind %d) -> '%s' (kind %d) angle %.6f deg reach %.6f mm at "
+                                     "(%.6f, %.6f, %.6f) mm\n", p.name.c_str(), a.label.c_str(), int(a.kind), b.label.c_str(),
+                             int(b.kind), angle * 180.0 / std::numbers::pi, reach * 1e3, v.X() * 1e3, v.Y() * 1e3, v.Z() * 1e3);
+            corners.push_back(corner);
+        }
+        p.prims.insert(p.prims.end(), corners.begin(), corners.end());
+    }
+    // The corners behind the capsules, keyed by the capsules' final addresses.
+    tlsMitreCornerOf.clear();
+    for (size_t pi = 0; pi < judged.size(); ++pi) {
+        const size_t n = cornersOf[pi].size(), base = judged[pi].prims.size() - n;   // appended last, in order
+        for (size_t k = 0; k < n; ++k) tlsMitreCornerOf[&judged[pi].prims[base + k]] = cornersOf[pi][k];
+    }
+    struct Clear { ~Clear() { tlsMitreCornerOf.clear(); } } clearAfter;
+    return checkCollisionsOfCapsules(judged);
+}
+
+EnamelGateVerdict checkCollisionsOfCapsules(const std::vector<ConductorPath>& paths) {
+    if (tlsDisplayOnly) {
+        std::cerr << "[gate] enamel rule: NOT RUN -- the wire is drawn at its outer diameter, a display drawing\n";
+        return EnamelGateVerdict::NotRun;
+    }
     if (std::getenv("MVB_PATH_DUMP")) {
         for (size_t ci = 0; ci < paths.size(); ++ci) {
             for (const auto& pr : paths[ci].prims) {
@@ -974,9 +1408,9 @@ EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
     // envelope, the worst 0.6502 mm against 0.6790, which is 15 um of real overlap even after
     // crediting both wires' sampling sag. Counted here and reported unconditionally, so no design
     // can hide it again; whether it should THROW is a corpus-wide decision, not one to slip in.
-    size_t coatedIntrusions = 0, coatedUncertifiable = 0;
+    size_t coatedIntrusions = 0;
     double worstCoatedGap = std::numeric_limits<double>::max();
-    double worstCoatedEnvelope = 0.0, worstUncertifiable = std::numeric_limits<double>::max();
+    double worstCoatedEnvelope = 0.0;
     std::string worstCoatedWhere;
     for (size_t ci = 0; ci < paths.size(); ++ci) {
         for (size_t cj = ci; cj < paths.size(); ++cj) {
@@ -1001,7 +1435,7 @@ EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
                 std::fprintf(stderr,
                              "[closest] %s vs %s (copper envelope %.4f mm, coated %.4f mm)\n",
                              A.name.c_str(), B.name.c_str(), envelope * 1e3,
-                             (A.wireRadius + B.wireRadius) * 1e3);
+                             (coatedRadiusOf(A) + coatedRadiusOf(B)) * 1e3);
                 const size_t topN = std::getenv("MVB_GATE_CLOSEST_ALL") ? near.size() : 6;
                 for (size_t k = 0; k < near.size() && k < topN; ++k) {
                     std::fprintf(stderr,
@@ -1079,21 +1513,15 @@ EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
                         // exact curves are proven clear -- or the violation is exhibited -- by
                         // the branch-and-bound engine above. No credit is ever subtracted from
                         // the envelope itself.
-                        const double coatedEnvelope = A.wireRadius + B.wireRadius;
+                        const double coatedEnvelope = coatedRadiusOf(A) + coatedRadiusOf(B);
                         const double documentedSag =
                             samplingSag(A.wireRadius) + samplingSag(B.wireRadius);
                         const bool vouchedBySampling =
                             d - documentedSag >= coatedEnvelope - kCertEpsilon;
                         if (!vouchedBySampling && !rectPair) {
-                            const bool certifiable =
-                                pa.kind != Primitive::BLEND && pb.kind != Primitive::BLEND;
-                            if (!certifiable) {
-                                ++coatedUncertifiable;
-                                if (d < coatedEnvelope && d < worstUncertifiable) {
-                                    worstUncertifiable = d;
-                                }
-                            }
-                            else {
+                            // Every kind, BLEND included, has an exact evalPrim and an exact
+                            // max |p''| (cert::maxSecondDerivative), so every pair is PROVEN.
+                            {
                                 const auto verdict = cert::provePairClears(
                                     pa, pb, coatedEnvelope - cert::kCoordinateGridHalf);
                                 // ABT #865 (b), Alf 2026-08-24 ("all parts should be CLEAN of
@@ -1116,7 +1544,9 @@ EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
                                 // refusal here is a violation deeper than the resolution -- not a
                                 // first witness that merely grazed the grid while the true minimum
                                 // lay deeper, which the old post-hoc test on the witness let by.)
-                                if (!verdict.clears) {
+                                // A failed corner capsule is judged against the mitred corner itself (cert::proveCornerClears).
+                                if (!verdict.clears && !mitreCornerClears(pa, coatedRadiusOf(A), pb, coatedRadiusOf(B),
+                                                                          coatedEnvelope)) {
                                     ++coatedIntrusions;
                                     if (std::getenv("MVB_ENAMEL_LIST")) {
                                         const gp_Pnt qa = cert::evalPrim(pa, verdict.tA);
@@ -1309,6 +1739,8 @@ EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
                         continue;  // beyond the loosest rectangle reach -> no overlap
                     } else if (d >= minGap) {
                         continue;
+                    } else if (mitreCornerClears(pa, A.condRadius, pb, B.condRadius, A.condRadius + B.condRadius)) {
+                        continue;   // the capsule's overshoot; the mitred corner itself clears the copper
                     }
                     {
                         auto [aa, ab] = primEndpoints(pa);
@@ -1348,19 +1780,13 @@ EnamelGateVerdict checkCollisions(const std::vector<ConductorPath>& paths) {
                       << std::endl;
             return EnamelGateVerdict::ReportedAllowed;
         }
+        // ABT #2274 (agent 22): a debug build that draws the copper still states the gate's verdict on the
+        // "[gate]" line every run summary reads (it printed only the FINDING before).
+        if (collisionDiagnostic())
+            std::cerr << "[gate] enamel rule: REFUSED (debug: drawn, not a part) -- " << coatedIntrusions
+                      << " pairs, " << (worstCoatedEnvelope - worstCoatedGap) * 1e9 << " nm worst interpenetration" << std::endl;
         refuseCollision(m.str());   // throws unless the collision debug switch is on
         return EnamelGateVerdict::ReportedAllowed;
-    }
-    else if (coatedUncertifiable > 0) {
-        // BLEND-involved pairs have no rigorous sag bound yet, so they can be neither proven nor
-        // refuted beyond the sampled figure -- said out loud rather than silently passed.
-        std::cerr << "[gate] enamel rule: certified clear except " << coatedUncertifiable
-                  << " BLEND-involved pair(s), sampled-only (closest sampled "
-                  << (worstUncertifiable == std::numeric_limits<double>::max()
-                          ? 0.0
-                          : worstUncertifiable * 1e3)
-                  << " mm)." << std::endl;
-        return EnamelGateVerdict::SampledOnly;
     }
     std::cerr << "[gate] enamel rule: CERTIFIED -- every pair proven at or beyond its coated "
                  "envelope (0 nm interpenetration)."
@@ -1667,12 +2093,12 @@ TopoDS_Wire buildFilletedWire(const Primitive* const* prims, size_t count, doubl
 //    so exactly one frame is correct -- no fallback ladder.
 TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir& t0,
                        double wireRadius, int profileSegments, bool rectangular = false,
-                       double rectWidth = 0.0, double rectHeight = 0.0,
+                       double rectWidth = 0.0, double rectHeight = 0.0, double rectCorner = 0.0,
                        const gp_Dir& axialAxis = gp_Dir(0, 1, 0),
                        bool preferSimplePipe = false, bool tryFixedBinormal = false) {
     if (rectangular) {
         try {
-            TopoDS_Wire prof = rectProfileWire(p0, t0, axialAxis, rectWidth, rectHeight);
+            TopoDS_Wire prof = rectProfileWire(p0, t0, axialAxis, rectWidth, rectHeight, rectCorner);
             BRepOffsetAPI_MakePipeShell ps(spine);
             ps.SetMode(axialAxis);   // fixed binormal = column axis: section stays axial/radial
             // TIGHT SURFACE TOLERANCE, not OCC's default. The default tol3d is 1e-4 MODEL UNITS
@@ -1705,7 +2131,7 @@ TopoDS_Shape sweepWire(const TopoDS_Wire& spine, const gp_Pnt& p0, const gp_Dir&
                 GProp_GProps lp, vp;
                 BRepGProp::LinearProperties(spine, lp);
                 BRepGProp::VolumeProperties(s, vp);
-                const double expect = lp.Mass() * rectWidth * rectHeight;
+                const double expect = lp.Mass() * rectSectionArea(rectWidth, rectHeight, rectCorner);
                 if (expect > 0 && std::abs(vp.Mass() - expect) > 0.02 * expect) {
                     if (std::getenv("MVB_DIAG"))
                         std::cerr << "[sweepWire] rect sweep volume " << vp.Mass() * 1e9
@@ -1986,7 +2412,7 @@ TopoDS_Shape sweepRun(const Primitive* const* prims, size_t count, double wireRa
 // Squaring the cap to the NEIGHBOUR's tangent instead makes the two caps coplanar and identical,
 // so the union dissolves them. The centreline endpoints stay exactly where MKF put them; only
 // the cap's shear changes, and the true section area changes by cos(angle) = 1 - 6.5e-7 here.
-TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir& axialStart,
+TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, double corner, const gp_Dir& axialStart,
                            const gp_Dir& axialEnd, double extendA = 0.0, double extendB = 0.0,
                            bool round = false, double radius = 0.0,
                            int splitOverride = -1,
@@ -2011,7 +2437,7 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
                           : std::getenv("MVB_SPLIT_PROFILE")
                             ? std::atoi(std::getenv("MVB_SPLIT_PROFILE")) : 0;
     auto profile = [&](const gp_Pnt& c, const gp_Dir& tan, const gp_Dir& ax) {
-        if (!round) return rectProfileWire(c, tan, ax, w, h);
+        if (!round) return rectProfileWire(c, tan, ax, w, h, corner);
         if (splitPieces > 0) {
             // EQUAL-AREA POLYGON, not split arcs: split cylindrical panels are still patches
             // of a periodic basis surface, and after a fragment re-maps their u-range across
@@ -2075,8 +2501,8 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
                     std::fflush(stderr);
                 }
                 BRepOffsetAPI_ThruSections sheared(Standard_True);   // solid
-                sheared.AddWire(rectProfileWire(sa, nA, axialStart, w, h));
-                sheared.AddWire(rectProfileWire(sb, nB, axialEnd, w, h));
+                sheared.AddWire(rectProfileWire(sa, nA, axialStart, w, h, corner));
+                sheared.AddWire(rectProfileWire(sb, nB, axialEnd, w, h, corner));
                 sheared.Build();
                 if (sheared.IsDone() && !sheared.Shape().IsNull()) return sheared.Shape();
                 // Fall through to the plain prism rather than emit nothing.
@@ -2087,8 +2513,8 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
                 return BRepPrimAPI_MakePrism(face, gp_Vec(ext)).Shape();
             }
             BRepOffsetAPI_ThruSections loft(Standard_True);  // solid
-            loft.AddWire(rectProfileWire(sa, t, axialStart, w, h));
-            loft.AddWire(rectProfileWire(sb, t, axialEnd, w, h));
+            loft.AddWire(rectProfileWire(sa, t, axialStart, w, h, corner));
+            loft.AddWire(rectProfileWire(sb, t, axialEnd, w, h, corner));
             loft.Build();
             if (!loft.IsDone()) return TopoDS_Shape();
             return loft.Shape();
@@ -2129,7 +2555,7 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, const gp_Dir
                           sp.y1 - sp.y0,
                           -rr * std::cos(az) * azSpan - (sp.r1 - sp.r0) * std::sin(az));
                 if (tv.Modulus() < 1e-15) return TopoDS_Shape();
-                loft.AddWire(rectProfileWire(c, gp_Dir(tv), axial, w, h));
+                loft.AddWire(rectProfileWire(c, gp_Dir(tv), axial, w, h, corner));
             }
             loft.Build();
             if (loft.IsDone() && !loft.Shape().IsNull()) return loft.Shape();
@@ -2279,10 +2705,25 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         gp_XYZ bendAxis = dA.XYZ().Crossed(dB.XYZ());
         if (bendAxis.Modulus() < 1e-12) continue;
         bendAxis.Normalize();
-        double R = std::min({std::min(path.wireWidth, path.wireHeight), 0.4 * segLen(A),
-                             0.4 * segLen(B)});
-        if (R < 1e-9) continue;
-        double trim = R * std::tan(ang / 2.0);
+        // ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"): a corner the lead was left sharp at is bent here
+        // at MKF's lead radius where its tangent fits the legs' space (the leg behind minus the previous elbow's trim,
+        // the whole leg ahead), else it stays sharp and is reported. No radius of MVB++'s own, no leg share.
+        if (!path.leadBendRadius) continue;
+        const double R = *path.leadBendRadius;
+        const double trim = R * std::tan(ang / 2.0);
+        if (trim > segLen(A) - trimStart[i] || trim > segLen(B)) {
+            std::cerr << "[ConductorBuilder] FINDING: rect lead corner '" << A.label << " -> " << B.label << "' of "
+                      << path.name << " cannot hold MKF's bend of " << R << " m: its tangent length " << trim
+                      << " m against legs " << segLen(A) - trimStart[i] << " and " << segLen(B)
+                      << " m left; it is drawn sharp\n";
+            if (std::getenv("MVB_CORNER_LIST")) {
+                const gp_Pnt at = primEndpoints(A).second;
+                std::fprintf(stderr, "[corner-list]\trect-lead\t%s\t%s\t%.6f,%.6f,%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n",
+                             path.name.c_str(), (A.label + " -> " + B.label).c_str(), at.X() * 1e3, at.Y() * 1e3,
+                             at.Z() * 1e3, R * 1e3, trim * 1e3, (segLen(A) - trimStart[i]) * 1e3, segLen(B) * 1e3);
+            }
+            continue;
+        }
         gp_Pnt P = primEndpoints(A).second;
         gp_XYZ Ap = P.XYZ() - dA.XYZ() * trim;
         gp_XYZ nA = dB.XYZ() - dA.XYZ() * dB.XYZ().Dot(dA.XYZ());  // dB perp to dA -> toward centre
@@ -2304,9 +2745,16 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         elbow.isLead = true;
         elbow.turnOrdinal = A.turnOrdinal;
         elbow.label = A.label + " -> " + B.label + " elbow";
-        TopoDS_Shape es = rectPrimSolid(elbow, path.wireWidth, path.wireHeight, gp_Dir(bendAxis),
+        TopoDS_Shape es = rectPrimSolid(elbow, path.wireWidth, path.wireHeight, path.wireCornerRadius, gp_Dir(bendAxis),
                                         gp_Dir(bendAxis), 0.0, 0.0, round, radius);
-        if (es.IsNull()) continue;
+        if (es.IsNull()) {
+            std::cerr << "[ConductorBuilder] FINDING: rect lead corner '" << elbow.label << "' of " << path.name
+                      << " at MKF's bend of " << R << " m builds no solid; it is drawn sharp\n";
+            if (std::getenv("MVB_CORNER_LIST"))
+                std::fprintf(stderr, "[corner-list]\trect-lead\t%s\t%s\t-\t%.6f\t%.6f\t-\t-\n", path.name.c_str(),
+                             elbow.label.c_str(), R * 1e3, trim * 1e3);
+            continue;
+        }
         leadElbows.push_back(es);
         leadElbowPrims.push_back(elbow);
         leadElbowAxis.push_back(gp_Dir(bendAxis));
@@ -2431,7 +2879,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
                 if (a2 > 1e-9 && a2 < 0.05) { capB = nb; haveCapB = true; }
             }
         }
-        TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, axialA, axialB, extA,
+        TopoDS_Shape s = rectPrimSolid(pr, path.wireWidth, path.wireHeight, path.wireCornerRadius, axialA, axialB, extA,
                                        extB, round, radius, /*splitOverride=*/-1,
                                        haveCapA ? &capA : nullptr, haveCapB ? &capB : nullptr);
         if (std::getenv("MVB_RECT_TRACE")) {
@@ -2515,7 +2963,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         for (size_t k = 1; k < pts.size(); ++k) spineLen += pts[k].Distance(pts[k - 1]);
     }
     const double sectionArea =
-        round ? kPi * path.wireRadius * path.wireRadius : path.wireWidth * path.wireHeight;
+        round ? kPi * path.wireRadius * path.wireRadius : rectSectionArea(path.wireWidth, path.wireHeight, path.wireCornerRadius);
     const double expectedVol = sectionArea * spineLen;
     auto volumeOf = [](const TopoDS_Shape& s) {
         GProp_GProps g; BRepGProp::VolumeProperties(s, g); return g.Mass();
@@ -2877,7 +3325,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
                 for (size_t si = 0; si < solids.size(); ++si) {
                     if (!piece.IsSame(solids[si])) continue;
                     TopoDS_Shape rs = rectPrimSolid(*splitArgs[si].pr, path.wireWidth,
-                                                    path.wireHeight, splitArgs[si].axialA,
+                                                    path.wireHeight, path.wireCornerRadius, splitArgs[si].axialA,
                                                     splitArgs[si].axialB, splitArgs[si].extA,
                                                     splitArgs[si].extB, round, radius,
                                                     /*splitOverride=*/6);
@@ -3027,7 +3475,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
                 std::vector<TopoDS_Shape> rebuilt;
                 for (size_t si : singleIdx) {
                     TopoDS_Shape rs = rectPrimSolid(*splitArgs[si].pr, path.wireWidth,
-                                                    path.wireHeight, splitArgs[si].axialA,
+                                                    path.wireHeight, path.wireCornerRadius, splitArgs[si].axialA,
                                                     splitArgs[si].axialB, splitArgs[si].extA,
                                                     splitArgs[si].extB, round, radius,
                                                     /*splitOverride=*/6);
@@ -3075,7 +3523,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
             for (size_t i2 = 0; i2 < splitArgs.size(); ++i2) {
                 const Primitive& pr2 = *splitArgs[i2].pr;
                 if (pr2.isLead || pr2.isConnection) {
-                    TopoDS_Shape rs = rectPrimSolid(pr2, path.wireWidth, path.wireHeight,
+                    TopoDS_Shape rs = rectPrimSolid(pr2, path.wireWidth, path.wireHeight, path.wireCornerRadius,
                                                     splitArgs[i2].axialA, splitArgs[i2].axialB,
                                                     splitArgs[i2].extA, splitArgs[i2].extB,
                                                     round, radius, /*splitOverride=*/6);
@@ -3135,7 +3583,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
             resplit.reserve(splitArgs.size());
             bool okSplit = true;
             for (const auto& saPack : splitArgs) {
-                TopoDS_Shape rs = rectPrimSolid(*saPack.pr, path.wireWidth, path.wireHeight,
+                TopoDS_Shape rs = rectPrimSolid(*saPack.pr, path.wireWidth, path.wireHeight, path.wireCornerRadius,
                                                 saPack.axialA, saPack.axialB, saPack.extA,
                                                 saPack.extB, round, radius, /*splitOverride=*/6);
                 if (rs.IsNull()) { okSplit = false; break; }
@@ -3403,6 +3851,83 @@ TopoDS_Shape weldSolidsPairwise(const TopoDS_Shape& compound, double fuzzy) {
     return backDown(out);
 }
 
+// The weld of a STADIUM (compressed-litz) per-run compound: ONE N-way fuse in the millimetre frame,
+// with every piece's B-spline surfaces re-parametrised to about one millimetre per unit first
+// (mvb::unitParametrised, the pass the STEP export makes, ABT #1111), then verified piece by piece.
+//
+// Why not weldSolidsPairwise: a metre-built sweep scaled x1000 keeps its metre knots, so one parameter
+// unit spans ~1000 mm, and OCCT's edge/face intersector never converges on a mitre wedge's ellipse edge
+// lying on the stadium sweep. Measured on a three-winding ER 35/20/11 design (19 pieces per parallel):
+// three wedge/sweep pairs did not fuse in 20 s each and the pairwise weld ran for over 15 min per
+// parallel (ABT #2262). Re-parametrised, every touching pair fuses in 0.1-3.7 s, but the pairwise
+// order (biggest first) still tries sweeps that do not touch the accumulated body yet (75 s for one
+// such step) and one pass left 14 of 19 pieces loose, while one N-way fuse of the same 19 pieces gives
+// one valid solid in ~17 s.
+//
+// The N-way fuse can silently drop a piece (see weldSolidsPairwise), so the result is accepted only as
+// ONE valid solid whose volume is the pieces' minus their overlaps and which holds a point proven
+// inside every piece. Anything else throws, naming what failed: no unwelded fallback.
+TopoDS_Shape weldStadiumRunPieces(const TopoDS_Shape& compound, const std::string& what) {
+    std::vector<TopoDS_Shape> pieces;
+    for (TopExp_Explorer e(compound, TopAbs_SOLID); e.More(); e.Next()) pieces.push_back(e.Current());
+    if (pieces.size() <= 1) return compound;
+    gp_Trsf up, down;
+    up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+    down.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
+    auto massOf = [](const TopoDS_Shape& sh) { GProp_GProps gp; BRepGProp::VolumeProperties(sh, gp); return gp.Mass(); };
+    double sum = 0.0, largest = 0.0;
+    for (auto& p : pieces) {
+        p = mvb::unitParametrised(BRepBuilderAPI_Transform(p, up, Standard_True).Shape(), what);
+        const double m = massOf(p);
+        sum += m; largest = std::max(largest, m);
+    }
+    TopTools_ListOfShape args, tools;
+    args.Append(pieces.front());
+    for (size_t i = 1; i < pieces.size(); ++i) tools.Append(pieces[i]);
+    BRepAlgoAPI_Fuse f;
+    f.SetArguments(args);
+    f.SetTools(tools);
+    f.SetRunParallel(true);
+    f.Build();
+    if (!f.IsDone() || f.Shape().IsNull())
+        throw std::runtime_error("ConductorBuilder: the stadium weld of " + what + " (" + std::to_string(pieces.size()) +
+                                 " pieces) did not complete");
+    const TopoDS_Shape out = f.Shape();
+    int nsol = 0;
+    for (TopExp_Explorer e(out, TopAbs_SOLID); e.More(); e.Next()) ++nsol;
+    const double m = massOf(out);
+    std::ostringstream why;
+    if (nsol != 1) why << " " << nsol << " solids, not one;";
+    if (!BRepCheck_Analyzer(out).IsValid()) why << " the fused body is invalid;";
+    // overlaps only take volume away, and they are the joints' lenses: never more than the sum, never
+    // below the largest piece
+    if (!(m <= sum * (1.0 + 1e-6) && m >= largest)) why << " volume " << m << " mm3 outside [" << largest << ", " << sum << "];";
+    BRepClass3d_SolidClassifier inOut(out);
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        std::optional<gp_Pnt> inside;
+        BRepClass3d_SolidClassifier inPiece(pieces[i]);
+        for (TopExp_Explorer fc(pieces[i], TopAbs_FACE); fc.More() && !inside; fc.Next()) {
+            const TopoDS_Face face = TopoDS::Face(fc.Current());
+            BRepAdaptor_Surface s(face);
+            gp_Pnt p; gp_Vec du, dv;
+            s.D1(0.5 * (s.FirstUParameter() + s.LastUParameter()), 0.5 * (s.FirstVParameter() + s.LastVParameter()), p, du, dv);
+            gp_Vec n = du.Crossed(dv);
+            if (n.Magnitude() < 1e-12) continue;
+            n.Normalize();
+            if (face.Orientation() == TopAbs_REVERSED) n.Reverse();
+            const gp_Pnt q(p.XYZ() - n.XYZ() * 1e-3);   // 1 um inside, in this millimetre frame
+            inPiece.Perform(q, 1e-7);
+            if (inPiece.State() == TopAbs_IN) inside = q;
+        }
+        if (!inside) { why << " piece " << i << " has no face-adjacent interior point to prove;"; continue; }
+        inOut.Perform(*inside, 1e-7);
+        if (inOut.State() != TopAbs_IN) why << " piece " << i << " (" << massOf(pieces[i]) << " mm3) is not inside the weld;";
+    }
+    if (!why.str().empty())
+        throw std::runtime_error("ConductorBuilder: the stadium weld of " + what + " was refused:" + why.str());
+    return BRepBuilderAPI_Transform(out, down, Standard_True).Shape();
+}
+
 TopoDS_Shape fuseAllSolids(const TopoDS_Shape& compound, double wireRadius) {
     std::vector<TopoDS_Shape> solids;
     for (TopExp_Explorer exp(compound, TopAbs_SOLID); exp.More(); exp.Next()) {
@@ -3559,12 +4084,62 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
     if (!path.isRectangular) {
         std::vector<const Primitive*> cptrs;
         cptrs.reserve(path.prims.size());
-        for (const auto& pr : path.prims) cptrs.push_back(&pr);
+        // ABT #2274 (Alf, 2026-11-13: the copper bends round the coating -- centreline radius = the coated radius):
+        // the BOBBIN CUTTER is the coated envelope, and a coated tube cannot be swept round a bend at its own radius
+        // (a horn torus). A cutting tool needs no round corner: such a bend is cut as its two tangent straights,
+        // whose coated envelope contains the round bend's (the slot is the corner's, a little wider at the bend).
+        std::vector<Primitive> mitred;
+        std::vector<size_t> mitredFrom;   // mitred piece -> the path piece it came from (solid naming)
+        // The COPPER's bend stays round whatever its hole: the assembler revolves a bend the metre frame cannot hold in
+        // the millimetre frame (WireAssembler, THE REVOLVE'S FRAME).
+        const bool mitreUnsweepable = cutterOnly;
+        if (mitreUnsweepable) {
+            mitred.reserve(path.prims.size() + 8);
+            for (size_t k = 0; k < path.prims.size(); ++k) {
+                const auto& pr = path.prims[k];
+                // "At its own radius" is to the kernel's own point-coincidence tolerance (Precision::Confusion): a torus
+                // whose hole is thinner than that cannot be modelled either. The coated radius drawn here is the turn's
+                // stated section, MKF's bend the wire's stated outer size; on flyback_transformer_complete's litz they
+                // differ by 22 nm (0.319478 against 0.3195 mm) and the bend, kept round, had no valid solid.
+                if (pr.kind == Primitive::ARC3 && pr.arc.v0.Modulus() - path.wireRadius <= Precision::Confusion()) {
+                    const gp_XYZ ax = pr.arc.axis / pr.arc.axis.Modulus();
+                    const double s = pr.arc.sweep;
+                    const double R = pr.arc.v0.Modulus();
+                    const gp_Pnt p0(pr.arc.c.XYZ() + pr.arc.v0);
+                    const gp_Pnt p1 = p0.Rotated(gp_Ax1(pr.arc.c, gp_Dir(ax)), s);
+                    gp_XYZ t0 = ax.Crossed(pr.arc.v0);
+                    t0 /= t0.Modulus();
+                    if (s < 0) t0 = t0 * -1.0;
+                    const gp_Pnt x(p0.XYZ() + t0 * (R * std::tan(0.5 * std::abs(s))));
+                    Primitive a = pr, b = pr;
+                    a.kind = b.kind = Primitive::SEG;
+                    a.seg = Seg{p0, x};
+                    b.seg = Seg{x, p1};
+                    mitred.push_back(a);
+                    mitred.push_back(b);
+                    mitredFrom.insert(mitredFrom.end(), {k, k});
+                    continue;
+                }
+                mitred.push_back(pr);
+                mitredFrom.push_back(k);
+            }
+            for (const auto& pr : mitred) cptrs.push_back(&pr);
+        } else {
+            for (const auto& pr : path.prims) cptrs.push_back(&pr);
+        }
         // NO prune: the conformal assembler runs no booleans, so it cannot make slivers --
         // every solid is a swept primitive, and it throws rather than dropping any.
-        return assembleWire(cptrs, path.wireRadius, wirePolygonSegments,
-                            CornerStyle::BisectionMitre, primIndexPerSolid, cutterOnly, path.name,
-                            weld);
+        TopoDS_Shape assembled = assembleWire(cptrs, path.wireRadius, wirePolygonSegments,
+                                              CornerStyle::BisectionMitre, primIndexPerSolid, cutterOnly, path.name,
+                                              weld);
+        if (mitreUnsweepable && primIndexPerSolid)
+            for (auto& idx : *primIndexPerSolid) {
+                if (idx >= mitredFrom.size())
+                    throw std::runtime_error("ConductorBuilder: the cutter of " + path.name + " maps a solid to piece " +
+                                             std::to_string(idx) + " of " + std::to_string(mitredFrom.size()));
+                idx = mitredFrom[idx];
+            }
+        return assembled;
     }
     // Rect/oblong-column rectangular wire: the flat section can't sweep the racetrack corners, so
     // build every primitive as its own rect solid (prisms + revolved corners) and fuse.
@@ -3672,7 +4247,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
     if (rectWireCompound) {
         const bool diagR = std::getenv("MVB_DIAG") != nullptr;
         BRep_Builder bb; TopoDS_Compound comp; bb.MakeCompound(comp);
-        bool okAll = true;
+        bool okAll = true; std::string rectFailWhy;   // why the compound was refused, for MVB_DIAG
         double total = 0.0;
         auto vol = [](const TopoDS_Shape& sh) {
             GProp_GProps gp; BRepGProp::VolumeProperties(sh, gp); return gp.Mass();
@@ -3726,7 +4301,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
                     gp_Dir t0(pts[1].XYZ() - pts[0].XYZ());
                     TopoDS_Shape whole = sweepWire(wm.Wire(), pts.front(), t0,
                                                    path.wireRadius, 0, /*rectangular=*/true,
-                                                   path.wireWidth, path.wireHeight,
+                                                   path.wireWidth, path.wireHeight, path.wireCornerRadius,
                                                    gp_Dir(0, 1, 0));
                     if (!whole.IsNull()) {
                         double spineLen = 0.0;
@@ -3735,7 +4310,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
                             for (size_t j = 1; j < sp.size(); ++j)
                                 spineLen += sp[j].Distance(sp[j - 1]);
                         }
-                        const double expected = path.wireWidth * path.wireHeight * spineLen;
+                        const double expected = rectSectionArea(path.wireWidth, path.wireHeight, path.wireCornerRadius) * spineLen;
                         const double v = vol(whole);
                         int nsol = 0;
                         for (TopExp_Explorer e2(whole, TopAbs_SOLID); e2.More(); e2.Next())
@@ -3768,11 +4343,130 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
                 // junction ends so consecutive prisms (and the wrap behind) overlap for the weld
                 for (size_t i = b; i < e; ++i) {
                     if (claimed[i]) continue;   // corner helix -> swept with the wrap run
-                    if (ptrs[i]->kind != Primitive::SEG) { okAll = false; break; }
+                    if (ptrs[i]->kind != Primitive::SEG) {
+                        // A round bend MKF put in this lead run (a dragback's fillet): swept with the
+                        // rect profile, as a wrap is, instead of refusing the compound.
+                        try {
+                            BRepBuilderAPI_MakeWire bw;
+                            TopoDS_Edge pe = primEdge(*ptrs[i], path.wireRadius);
+                            if (pe.IsNull()) { okAll = false; rectFailWhy = "lead bend edge null (run " + std::to_string(k) + ")"; break; }
+                            bw.Add(pe);
+                            auto bpts = samplePrim(*ptrs[i], path.wireRadius);
+                            if (!bw.IsDone() || bpts.size() < 2) { okAll = false; rectFailWhy = "lead bend wire (run " + std::to_string(k) + ")"; break; }
+                            // The bend turns in a plane holding the column axis, so the fixed axial
+                            // binormal is degenerate on it: sweep with a corrected-Frenet frame and a
+                            // profile whose height axis is the column axis made normal to the start tangent.
+                            const gp_Dir bt = path.wireCornerRadius > 0.0 ? primFwdStart(*ptrs[i], path.wireRadius)
+                                                                          : gp_Dir(bpts[1].XYZ() - bpts[0].XYZ());
+                            gp_XYZ up = gp_XYZ(0, 1, 0) - bt.XYZ() * bt.XYZ().Dot(gp_XYZ(0, 1, 0));
+                            if (up.Modulus() < 1e-6) up = gp_XYZ(1, 0, 0) - bt.XYZ() * bt.XYZ().Dot(gp_XYZ(1, 0, 0));
+                            BRepOffsetAPI_MakePipeShell bps(bw.Wire());
+                            bps.SetMode(Standard_True);
+                            bps.Add(rectProfileWire(bpts.front(), bt, gp_Dir(up), path.wireWidth, path.wireHeight, path.wireCornerRadius));
+                            bps.Build();
+                            TopoDS_Shape bend;
+                            if (bps.IsDone() && bps.MakeSolid()) bend = bps.Shape();
+                            if (bend.IsNull()) { okAll = false; rectFailWhy = "lead bend sweep null (run " + std::to_string(k) + ", '" + ptrs[i]->label + "', kind " + std::to_string(int(ptrs[i]->kind)) + ")"; break; }
+                            bb.Add(comp, bend); total += vol(bend);
+                        } catch (const Standard_Failure&) { okAll = false; rectFailWhy = "lead bend sweep threw (run " + std::to_string(k) + ")"; break; }
+                        continue;
+                    }
                     gp_XYZ d = ptrs[i]->seg.b.XYZ() - ptrs[i]->seg.a.XYZ();
                     const double len = d.Modulus();
                     if (len < 1e-12) continue;
                     d /= len;
+                    // A ROUNDED SECTION (compressed litz) JOINS ITS NEIGHBOURS EXACTLY (Alf, 2026-11-04: "make
+                    // sure that the rounded corners are done properly with the stadium cross section"). The
+                    // overshot, 10% proud prism below suits a sharp rectangle; on a stadium its square ends
+                    // and taller sides stood out of every joint. Here each end either continues its tangent
+                    // neighbour flush, on the same section, or meets an angled neighbour in a MITRE: this
+                    // prism and the neighbour are both carried past the joint and cut on the bisector plane,
+                    // where their two sections are the same stadium. A neighbour this loop does not build (a
+                    // wrap, or a corner swept with it) gets that part as its own wedge: its end section carried
+                    // straight on and cut by the same plane. The joints of the radial U link (ABT #685: "the
+                    // wire is pushed over one wire and carries on") are such corners; a one-pitch step leaves
+                    // no room for a bend wider than the section, so they are mitred.
+                    if (path.wireCornerRadius > 0.0) {
+                        const gp_Dir dSeg(d);
+                        const double reach = std::max(path.wireWidth, path.wireHeight);
+                        const gp_Dir axialY(0, 1, 0);
+                        auto handledHere = [&](size_t j) {
+                            return ptrs[j]->kind == Primitive::SEG && (ptrs[j]->isLead || ptrs[j]->isConnection) &&
+                                   !claimed[j];
+                        };
+                        // Keep the part of `body` on the side of the plane (P, n) holding `keep`; in the mm frame,
+                        // where OCC's default tolerance is nanometres, as the WireAssembler slice does.
+                        auto keepSide = [&](const TopoDS_Shape& body, const gp_Pnt& P, const gp_Dir& n,
+                                            const gp_Pnt& keep) -> TopoDS_Shape {
+                            gp_Trsf up, down;
+                            up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+                            down.SetScale(gp_Pnt(0, 0, 0), 1e-3);
+                            const TopoDS_Shape bodyMm = BRepBuilderAPI_Transform(body, up, Standard_True).Shape();
+                            const gp_Pnt Pm = P.Transformed(up), keepM = keep.Transformed(up);
+                            TopoDS_Face f = BRepBuilderAPI_MakeFace(gp_Pln(Pm, n)).Face();
+                            const double h = (keepM.XYZ() - Pm.XYZ()).Dot(n.XYZ());
+                            if (std::abs(h) < 1e-9)
+                                throw std::runtime_error("ConductorBuilder: a mitre of " + path.name +
+                                                         " has its kept side on its own plane");
+                            const gp_Pnt away(keepM.XYZ() - n.XYZ() * (2.0 * h));   // MakeHalfSpace keeps this side
+                            BRepAlgoAPI_Cut cut(bodyMm, BRepPrimAPI_MakeHalfSpace(f, away).Solid());
+                            if (!cut.IsDone() || cut.Shape().IsNull())
+                                throw std::runtime_error("ConductorBuilder: the mitre cut of " + path.name + " failed");
+                            return BRepBuilderAPI_Transform(cut.Shape(), down, Standard_True).Shape();
+                        };
+                        auto prismOf = [&](const gp_Pnt& from, const gp_Dir& t, double length) {
+                            TopoDS_Face prof = BRepBuilderAPI_MakeFace(rectProfileWire(
+                                from, t, axialY, path.wireWidth, path.wireHeight, path.wireCornerRadius)).Face();
+                            return BRepPrimAPI_MakePrism(prof, gp_Vec(t.XYZ() * length)).Shape();
+                        };
+                        const gp_Pnt A = ptrs[i]->seg.a, B = ptrs[i]->seg.b;
+                        // The joints: the previous primitive's end tangent into A, the next one's start out of B.
+                        std::optional<gp_Dir> inT, outT;
+                        if (i > 0) {
+                            if (primEndpoints(*ptrs[i - 1]).second.Distance(A) > 1e-9)
+                                throw std::runtime_error("ConductorBuilder: " + ptrs[i]->label + " does not start where " +
+                                                         ptrs[i - 1]->label + " ends");
+                            inT = primFwdEnd(*ptrs[i - 1], path.wireRadius);
+                        }
+                        if (i + 1 < ptrs.size()) {
+                            if (primEndpoints(*ptrs[i + 1]).first.Distance(B) > 1e-9)
+                                throw std::runtime_error("ConductorBuilder: " + ptrs[i]->label + " does not end where " +
+                                                         ptrs[i + 1]->label + " starts");
+                            outT = primFwdStart(*ptrs[i + 1], path.wireRadius);
+                        }
+                        const bool mitreA = inT && inT->Angle(dSeg) > 1e-6;
+                        const bool mitreB = outT && dSeg.Angle(*outT) > 1e-6;
+                        try {
+                            const double eA = mitreA ? reach : 0.0, eB = mitreB ? reach : 0.0;
+                            TopoDS_Shape piece = prismOf(gp_Pnt(A.XYZ() - d * eA), dSeg, len + eA + eB);
+                            if (mitreA) {
+                                const gp_Dir n(inT->XYZ() + d);
+                                piece = keepSide(piece, A, n, gp_Pnt(A.XYZ() + d * (0.5 * len)));
+                                if (!handledHere(i - 1)) {
+                                    TopoDS_Shape wedge = prismOf(A, *inT, reach);
+                                    wedge = keepSide(wedge, A, n, gp_Pnt(A.XYZ() - inT->XYZ() * reach));
+                                    bb.Add(comp, wedge); total += vol(wedge);
+                                }
+                            }
+                            if (mitreB) {
+                                const gp_Dir n(d + outT->XYZ());
+                                piece = keepSide(piece, B, n, gp_Pnt(B.XYZ() - d * (0.5 * len)));
+                                if (!handledHere(i + 1)) {
+                                    TopoDS_Shape wedge = prismOf(gp_Pnt(B.XYZ() - outT->XYZ() * reach), *outT, reach);
+                                    wedge = keepSide(wedge, B, n, gp_Pnt(B.XYZ() + outT->XYZ() * reach));
+                                    bb.Add(comp, wedge); total += vol(wedge);
+                                }
+                            }
+                            if (diagR)
+                                std::cerr << "[rect-wire] stadium seg '" << ptrs[i]->label << "' mitre A="
+                                          << (mitreA ? inT->Angle(dSeg) * 180 / kPi : 0.0) << " deg B="
+                                          << (mitreB ? dSeg.Angle(*outT) * 180 / kPi : 0.0) << " deg\n";
+                            bb.Add(comp, piece); total += vol(piece);
+                        } catch (const Standard_Failure&) {
+                            okAll = false; rectFailWhy = "stadium mitre threw (run " + std::to_string(k) + ")"; break;
+                        }
+                        continue;
+                    }
                     const double ovA = (i > b || b > 0) ? 0.35 * path.wireRadius : 0.0;
                     const double ovB = (i + 1 < e || e < path.prims.size()) ? 0.35 * path.wireRadius : 0.0;
                     gp_Pnt a2(ptrs[i]->seg.a.XYZ() - d * ovA);
@@ -3786,12 +4480,12 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
                         // copper is confined to the short lead runs.
                         TopoDS_Face prof = BRepBuilderAPI_MakeFace(
                             rectProfileWire(a2, gp_Dir(d), gp_Dir(0, 1, 0),
-                                            path.wireWidth, 1.10 * path.wireHeight)).Face();
+                                            path.wireWidth, 1.10 * path.wireHeight, path.wireCornerRadius)).Face();
                         TopoDS_Shape prism =
                             BRepPrimAPI_MakePrism(prof, gp_Vec(d) * (len + ovA + ovB)).Shape();
-                        if (prism.IsNull()) { okAll = false; break; }
+                        if (prism.IsNull()) { okAll = false; rectFailWhy = "lead prism null (run " + std::to_string(k) + ")"; break; }
                         bb.Add(comp, prism); total += vol(prism);
-                    } catch (const Standard_Failure&) { okAll = false; break; }
+                    } catch (const Standard_Failure&) { okAll = false; rectFailWhy = "lead prism threw (run " + std::to_string(k) + ")"; break; }
                 }
             } else {
                 try {
@@ -3808,27 +4502,80 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
                         for (size_t i = runsAll[k + 1].first;
                              i < runsAll[k + 1].second && claimed[i]; ++i)
                             idxs.push_back(i);
+                    // The run's edges in chains that join. A run whose edges do not join (a gap in the
+                    // conductor) is refused -- except in a diagnostic build (--skip-collision-check: no weld,
+                    // collisions not judged; Alf, 2026-11-05: "the debug implies no welding and not caring
+                    // about collisions"), which draws each chain as it is and reports the gap.
+                    std::vector<std::vector<size_t>> chains(1);
+                    bool joined = true;
+                    {
+                        BRepBuilderAPI_MakeWire probe;
+                        for (size_t i : idxs) {
+                            TopoDS_Edge pe = primEdge(*ptrs[i], path.wireRadius);
+                            if (pe.IsNull()) continue;
+                            probe.Add(pe);
+                            if (!probe.IsDone()) {
+                                if (!collisionDiagnostic() || chains.back().empty()) { joined = false; break; }
+                                const gp_Pnt from = primEndpoints(*ptrs[chains.back().back()]).second;
+                                const gp_Pnt to = primEndpoints(*ptrs[i]).first;
+                                std::cerr << "[ConductorBuilder] FINDING (gap drawn by --skip-collision-check; not a part): "
+                                          << path.name << " is not continuous: '" << ptrs[chains.back().back()]->label
+                                          << "' ends " << from.Distance(to) * 1e3 << " mm from where '" << ptrs[i]->label
+                                          << "' starts (" << from.X() << ", " << from.Y() << ", " << from.Z() << ") -> ("
+                                          << to.X() << ", " << to.Y() << ", " << to.Z() << ") m\n";
+                                chains.emplace_back();
+                                probe = BRepBuilderAPI_MakeWire();
+                                probe.Add(pe);
+                            }
+                            chains.back().push_back(i);
+                        }
+                    }
+                    if (!joined) { okAll = false; rectFailWhy = "wrap wire edge rejected (run " + std::to_string(k) + ")"; break; }
+                    for (const auto& chain : chains) {
+                    if (chain.empty()) continue;
                     BRepBuilderAPI_MakeWire wm;
-                    for (size_t i : idxs) {
+                    for (size_t i : chain) {
                         TopoDS_Edge pe = primEdge(*ptrs[i], path.wireRadius);
                         if (!pe.IsNull()) wm.Add(pe);
-                        if (!wm.IsDone()) { okAll = false; break; }
                     }
-                    if (!okAll || !wm.IsDone()) { okAll = false; break; }
-                    auto pts = samplePrim(*ptrs[idxs.front()], path.wireRadius);
-                    if (pts.size() < 2) { okAll = false; break; }
+                    if (!okAll || !wm.IsDone()) { okAll = false; rectFailWhy = "wrap wire not done (run " + std::to_string(k) + ")"; break; }
+                    auto pts = samplePrim(*ptrs[chain.front()], path.wireRadius);
+                    if (pts.size() < 2) { okAll = false; rectFailWhy = "wrap sample <2 points (run " + std::to_string(k) + ")"; break; }
                     gp_Dir t0(pts[1].XYZ() - pts[0].XYZ());
+                    // A rounded section starts on the run's EXACT tangent. The first sample chord sits half a
+                    // sample step off it -- 5.6 deg when the run opens on a lead bend's quarter arc -- and the
+                    // fixed-binormal sweep carries that twist down the whole run, so its end faces met the
+                    // flush lead prisms 5.6 deg askew (a compressed-litz three-winding ER 35/20/11 design). Sharp rectangles keep the chord for now: the
+                    // same twist there sits under the overshooting prism, and correcting it moves every rect
+                    // design's copper (tracked on its own).
+                    if (path.wireCornerRadius > 0.0) t0 = primFwdStart(*ptrs[chain.front()], path.wireRadius);
                     TopoDS_Shape run = sweepWire(wm.Wire(), pts.front(), t0, path.wireRadius, 0,
                                                  /*rectangular=*/true, path.wireWidth,
-                                                 path.wireHeight, gp_Dir(0, 1, 0));
-                    if (run.IsNull()) { okAll = false; break; }
+                                                 path.wireHeight, path.wireCornerRadius, gp_Dir(0, 1, 0));
+                    if (run.IsNull()) { okAll = false; rectFailWhy = "wrap sweep null (run " + std::to_string(k) + ")"; break; }
                     bb.Add(comp, run); total += vol(run);
-                } catch (const Standard_Failure&) { okAll = false; break; }
+                    }
+                    if (!okAll) break;
+                } catch (const Standard_Failure&) { okAll = false; rectFailWhy = "wrap sweep threw (run " + std::to_string(k) + ")"; break; }
             }
             if (!okAll) break;
         }
         if (okAll) {
-            TopoDS_Shape welded = weldSolidsPairwise(comp, 1e-7);
+            // --weld off (Alf, 2026-11-04: "just dont run the union, just the faster way of getting the
+            // step"): the pieces are handed over as they are, unfused.
+            // A CUTTING TOOL is never welded either (ABT #1265, Options::cutterOnly: "a cutting tool
+            // needs no welds"; the round-wire assembler already honours it). This branch ignored the
+            // flag, so the bobbin cutter -- the same conductor at its OUTER envelope -- was welded too.
+            // At the outer envelope a conductor's pieces are TANGENT by construction: MKF packs the
+            // coated sections, so 750372247r01's layers sit exactly one coated depth (0.8018 mm)
+            // apart and a return's chain lies on the wrap beneath it face to face. OCCT's fuse cannot
+            // resolve those tangencies (wrap + its mitred run-out fused to nothing; the 35-piece fuse
+            // kept 3 solids, 9.9 of 503.8 mm3), and the weld's own checks refused the cutter, and with
+            // it the build. The conductor itself (conducting footprint, real clearances) is still
+            // welded and verified below.
+            TopoDS_Shape welded = (weld == WeldMode::Off || cutterOnly)
+                                      ? TopoDS_Shape(comp)
+                                      : weldStadiumRunPieces(comp, "'" + path.name + "'");
             int nsol = 0;
             for (TopExp_Explorer e2(welded, TopAbs_SOLID); e2.More(); e2.Next()) ++nsol;
             if (diagR) std::cerr << "[rect-wire] per-run compound: " << nsol
@@ -3846,7 +4593,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
             }
             return pruneDegenerateSolids(welded, path.wireRadius);
         }
-        if (diagR) std::cerr << "[rect-wire] per-run compound failed -- falling back to the "
+        if (diagR) std::cerr << "[rect-wire] per-run compound failed (" << rectFailWhy << ") -- falling back to the "
                                 "whole-spine single body\n";
     }
     if (!skipSingleBody && !roundFemCompound &&
@@ -3886,7 +4633,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
                             ? gp_Dir(p0pts[1].XYZ() - p0pts[0].XYZ())
                             : gp_Dir(1, 0, 0);
             whole = sweepWire(spine, p0pts.front(), t0, path.wireRadius, /*exact profile*/ 0,
-                              path.isRectangular, path.wireWidth, path.wireHeight,
+                              path.isRectangular, path.wireWidth, path.wireHeight, path.wireCornerRadius,
                               /*axialAxis=*/gp_Dir(0, 1, 0),
                               // Simple MakePipe for toroids AND the rect-column whole sweep: on
                               // both, MakePipeShell's corrected-Frenet framing drifts the section
@@ -3904,8 +4651,8 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
                 auto pts = samplePrim(*ptrs[i], path.wireRadius);
                 for (size_t k = 1; k < pts.size(); ++k) spineLen += pts[k].Distance(pts[k - 1]);
             }
-            // Swept copper cross-section area: rectangle width*height, else circle.
-            double area = path.isRectangular ? path.wireWidth * path.wireHeight
+            // Swept copper cross-section area: the (rounded) rectangle, else circle.
+            double area = path.isRectangular ? rectSectionArea(path.wireWidth, path.wireHeight, path.wireCornerRadius)
                                              : kPi * path.wireRadius * path.wireRadius;
             double expected = area * spineLen;
             GProp_GProps gp;
@@ -4421,7 +5168,7 @@ PinAxis pinAxisOf(const MAS::Pin& pin, const std::string& who) {
 }
 
 // A polyline in travel order with ROUND corners: the toroid terminal lead's construction (an exact
-// ARC3 of bend radius opts.effectiveBend(kRoundCornerBendFactor r) tangent to both legs, each leg giving at most 49%
+// ARC3 of bend radius `bend` (MKF's; 0 = sharp) tangent to both legs, each leg giving at most 49%
 // of itself to a corner; a corner without room stays a sharp joint for the assembler's mitre).
 std::vector<Primitive> roundedLeadChain(const std::vector<gp_Pnt>& pts, double bend,
                                         const std::string& label, size_t ordinal, int terminal) {
@@ -4449,7 +5196,22 @@ std::vector<Primitive> roundedLeadChain(const std::vector<gp_Pnt>& pts, double b
         const gp_XYZ u = inVec.XYZ() / lenIn, w = outVec.XYZ() / lenOut;
         const double cosTurn = u.Dot(w);
         const double tangentLen = bend * std::sqrt(std::max(0.0, (1.0 - cosTurn) / (1.0 + cosTurn)));
-        if (cosTurn > 1.0 - 1e-9 || tangentLen > 0.49 * std::min(lenIn, lenOut)) {
+        // ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"): MKF's bend where its tangent fits the space
+        // the corner has -- the leg behind minus what the previous corner took, the whole leg ahead -- else sharp and
+        // reported. No leg share.
+        const double roomIn = mid.Distance(segStart);
+        const bool fits = bend > 0.0 && cosTurn <= 1.0 - 1e-9 && tangentLen <= roomIn && tangentLen <= lenOut;
+        if (!fits && bend > 0.0 && cosTurn <= 1.0 - 1e-9) {
+            std::cerr << "[ConductorBuilder] FINDING: corner " << v << " of '" << label << "' (at " << mid.X() << ", "
+                      << mid.Y() << ", " << mid.Z() << " m) cannot hold MKF's bend of " << bend << " m: its tangent length "
+                      << tangentLen << " m against legs " << roomIn << " and " << lenOut << " m left; it is drawn sharp "
+                      << "(bisection mitre)\n";
+            if (std::getenv("MVB_CORNER_LIST"))
+                std::fprintf(stderr, "[corner-list]\tpin-run\t%s\tcorner %zu\t%.6f,%.6f,%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n",
+                             label.c_str(), v, mid.X() * 1e3, mid.Y() * 1e3, mid.Z() * 1e3, bend * 1e3, tangentLen * 1e3,
+                             roomIn * 1e3, lenOut * 1e3);
+        }
+        if (!fits) {   // bend 0: sharp
             pushSeg(segStart, mid);
             segStart = mid;
             continue;
@@ -4839,9 +5601,12 @@ struct WrapBump {
     // dragback LEVEL, so lanes must be grouped by where they sit radially -- the K parallels of a
     // winding all return at the same layer boundary and count once between them, not K times.
     double radius = 0.0;
-    // How far the wire is RAISED, as a distance. Not a count of dragbacks: the wire that laid
-    // the dragback sets the clearance needed, and different windings use different wire.
+    // The lane's wire (MKF's ConnectionRideLevel::height): what groups lanes into one level.
     double distance = 0.0;
+    // ABT #2274 (Alf, 2026-11-05: "MKF owns the placement"): how far a turn riding over this lane's
+    // level is translated -- MKF's ConnectionRideLevel::rise, the exact circle reach at the azimuth
+    // MKF laid the lane at. MVB++ draws it; it never re-derives it.
+    double rise = 0.0;
 };
 
 // The tallest azimuth COLUMN in a bump list. Dragbacks SHARING an azimuth stack radially --
@@ -4877,56 +5642,34 @@ std::pair<double, double> tallestBumpColumn(const std::vector<WrapBump>& bumps,
     // wire of each other are the same level -- that is what makes a winding's K parallels, which
     // all return at one layer boundary, count once. Within a level take the DEEPEST wire, since
     // the ride has to clear the thickest thing at that level.
+    // ABT #2274 (Alf, 2026-11-05: "MKF owns the placement"): each level's step is MKF's own rise
+    // (ConnectionRideLevel::rise: the exact circle reach at the azimuth MKF laid the level's lanes at,
+    // ABT #685's formula, now computed where the placement is decided). The grouping is MKF's too
+    // (lanes within half a step are one level); a level whose lanes carry different rises is two
+    // different MKF levels merged here, which cannot happen for lanes MKF grouped -- refuse it.
     struct Level {
-        double radius, height, maxOffPlane;
+        double radius, height, rise;
     };
     std::vector<Level> levels;
     for (const auto& bmp : bumps) {
-        const double offPlane = std::abs(std::remainder(bmp.azimuth - kPlaneAz, kTwoPi));
         bool found = false;
         for (auto& lv : levels) {
             if (std::abs(bmp.radius - lv.radius) <= 0.5 * bmp.distance) {
+                if (std::abs(bmp.rise - lv.rise) > 1e-15) {
+                    throw std::runtime_error(
+                        "ConductorBuilder: two returns MVB++ groups into one ride level at radius " +
+                        std::to_string(lv.radius) + " m carry different MKF rises (" + std::to_string(lv.rise) +
+                        " and " + std::to_string(bmp.rise) + " m)");
+                }
                 lv.height = std::max(lv.height, bmp.distance);
-                lv.maxOffPlane = std::max(lv.maxOffPlane, offPlane);
                 found = true;
                 break;
             }
         }
-        if (!found) levels.push_back({bmp.radius, bmp.distance, offPlane});
+        if (!found) levels.push_back({bmp.radius, bmp.distance, bmp.rise});
     }
-    // ...and SUM the levels: the global bump grows by one step at every dragback level it
-    // passes and never decreases. bumpsForTurn() has already selected the lanes at or inside
-    // this turn.
-    //
-    // EACH LEVEL'S STEP IS THE EXACT CIRCLE-REACH, NOT d/cos(phi) (ABT #685, 2026-08-19). The
-    // binding pair per level is the ride at the lane's own radius: the lane's centre sits at
-    // r*u(phi) - c_lane*z, the ride is the same circle translated c_lane + step, so the lane
-    // lies inside the ride's circle by  r - sqrt(r^2 + step^2 - 2 r step cos(phi)),  and
-    // touching at the coated envelope d needs
-    //     step = r cos(phi) - sqrt((r - d)^2 - r^2 sin^2(phi)).
-    // d/cos(phi) is that formula's first-order Taylor: it drops the curvature term
-    // step^2 sin^2(phi)/2r, which on the boost's 7.91-degree lanes is 1.07 um per level --
-    // the turn-8 ride sat 1.05 um inside its own dragback lane's coated envelope, hidden
-    // until the certified engine's interior-witness fix exposed it. The stack stays rigid:
-    // the schedule is still one shared per-level sum, computed identically from the same
-    // lists by every structure. Riders further out over-clear (their translation is the sum
-    // of every step between), which is the safe direction.
-    // A lane the sqrt cannot reach (r sin(phi) approaching r - d) is a lane a -z translation
-    // cannot clear at all -- refuse it by name, exactly as the old cos(phi) < 0.2 guard did.
     double raise = 0.0;
-    for (const auto& lv : levels) {
-        const double sinPhi = std::sin(lv.maxOffPlane);
-        const double inner = lv.radius - lv.height;
-        const double disc = inner * inner - lv.radius * lv.radius * sinPhi * sinPhi;
-        if (disc <= 0.0) {
-            throw std::runtime_error(
-                "ConductorBuilder: a dragback lane at radius " + std::to_string(lv.radius) +
-                " sits " + std::to_string(lv.maxOffPlane * 180.0 / kPi) +
-                " degrees off the connection plane, where no -z translation can lift a ride "
-                "clear of it. Fix the fan slot or the winding data.");
-        }
-        raise += lv.radius * std::cos(lv.maxOffPlane) - std::sqrt(disc);
-    }
+    for (const auto& lv : levels) raise += lv.rise;
     if (cosTheta > 1e-6) {
         raise /= cosTheta;
     }
@@ -4952,6 +5695,54 @@ std::pair<double, double> tallestBumpColumn(const std::vector<WrapBump>& bumps,
     for (const auto& c : cols)
         if (c.second > deepest) { deepest = c.second; az = c.first; }
     return {raise, az};
+}
+
+// A laid return as the tip plane's COLUMN sees it: its fan azimuth, the radius it lies at, the step
+// a turn riding over it is lifted (its bumpStep), and the axial band its copper occupies -- the band
+// its drawn chain spans, widened by its coated radius on both sides.
+struct StackedReturn {
+    double azimuth = 0.0;
+    double radius = 0.0;
+    double step = 0.0;
+    double yLo = 0.0, yHi = 0.0;
+};
+
+// The tallest REAL stack of returns at one azimuth (Alf, 2026-11-05: "Count real stacks only").
+// Returns sharing an azimuth stack only where their copper meets axially: a return lies in its
+// destination layer's space and lifts what lies over it at its OWN axial band, so returns whose
+// bands are apart (750372247r01: one Primary parallel per section, its 12 returns in three axial
+// bands whose chains are 2.79 mm or more apart, all at the plane) sit side by side and never pile up. Summing every return of
+// the column put r01's tip plane 12 steps out where the copper is 4 deep (6.38 mm further out).
+// At each axial position the stack is one step per radius LEVEL among the returns covering it --
+// the level grouping tallestBumpColumn uses (lanes within half a step are one level, the deepest
+// step counts) -- and the column is the largest such sum over the axial positions. The sum is
+// piecewise constant in y and changes only at band edges, so the band starts are the only
+// positions to test. Bands are half-open: two returns exactly one envelope apart (the separation
+// at which need() stops asking them for distinct angles) do not stack.
+double tallestRealStack(const std::vector<StackedReturn>& rs) {
+    double tallest = 0.0;
+    for (const auto& probe : rs) {
+        const double y = probe.yLo;
+        struct Level { double radius, step; };
+        std::vector<Level> levels;
+        for (const auto& r : rs) {
+            if (std::abs(std::remainder(r.azimuth - probe.azimuth, kTwoPi)) >= 1e-9) continue;
+            if (!(r.yLo <= y && y < r.yHi)) continue;
+            bool found = false;
+            for (auto& lv : levels) {
+                if (std::abs(r.radius - lv.radius) <= 0.5 * r.step) {
+                    lv.step = std::max(lv.step, r.step);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) levels.push_back({r.radius, r.step});
+        }
+        double sum = 0.0;
+        for (const auto& lv : levels) sum += lv.step;
+        tallest = std::max(tallest, sum);
+    }
+    return tallest;
 }
 
 // Emit a helical sweep (r,y linear in azimuth) that RIDES OVER the given dragbacks: plain helix,
@@ -5737,6 +6528,30 @@ static bool g_roundedLeadCorners = true;
 // finds no layout clear of the window's other verticals (06_llc, 23_interleaved_llc; Alf, 2026-10-28: "1.05r
 // where R won't fit"). Filled by the fan's retry (FanBendRetry), for one build.
 static thread_local std::set<std::pair<std::string, size_t>> tlsLeadsAtMinimumBend;
+// ABT #2274 (Alf, 2026-11-07: "MKF exports it and MVB++ draws it"): the bend MKF planned for each conductor's Z
+// dragback corners (ConnectionRoute::dragbackBendRadius), stashed at buildAll entry for the dragback emitters.
+static thread_local std::map<std::pair<std::string, size_t>, double> tlsDragbackBend;
+// The conductors MKF routes a Z dragback for, and each winding's own-wire bend (ConnectionLayout::wireBendRadius, MKF's
+// radius for the corners no route carries one for: U turnarounds, edge continuations). A conductor with no Z dragback
+// whose link the dragback emitters draw (a rect column's level U turnaround or band-row continuation; PSPS E16) bends
+// at its winding's wire bend.
+static thread_local std::set<std::pair<std::string, size_t>> tlsHasZDragback;
+static thread_local std::map<std::string, double> tlsWireBend;
+static double dragbackBendOf(const std::string& winding, size_t parallel) {
+    const auto found = tlsDragbackBend.find({winding, parallel});
+    if (found == tlsDragbackBend.end() && !tlsHasZDragback.count({winding, parallel})) {
+        const auto wire = tlsWireBend.find(winding);
+        if (wire == tlsWireBend.end() || !(wire->second > 0.0))
+            throw std::runtime_error("ConductorBuilder: " + winding + " parallel " + std::to_string(parallel) + " draws a "
+                                     "link with the dragback emitter but MKF exported no wire bend radius for winding '" +
+                                     winding + "' (ConnectionLayout::wireBendRadius)");
+        return wire->second;
+    }
+    if (found == tlsDragbackBend.end())
+        throw std::runtime_error("ConductorBuilder: MKF planned no dragback bend radius (ConnectionRoute::dragbackBendRadius) for " +
+                                 winding + " parallel " + std::to_string(parallel) + ", whose path draws a Z dragback");
+    return found->second;
+}
 // The leads the fan finds no clear layout for even at the smallest buildable bend: their corners are drawn sharp
 // (Alf, 2026-10-30, 23_interleaved_llc: "Sharp for that group").
 static thread_local std::set<std::pair<std::string, size_t>> tlsLeadsSharp;
@@ -5779,10 +6594,24 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
                             double wireRadius, const std::string& labelPrefix, size_t ordinal,
                             bool isLead, bool isConnection,
                             bool rounded = g_roundedLeadCorners,
-                            std::optional<double> bendRadius = std::nullopt) {
+                            std::optional<double> bendRadius = std::nullopt,
+                            // ABT #2274 (Alf, 2026-11-13, "round corners everywhere"): the length of the FIRST /
+                            // LAST leg that a fillet drawn later at that end of the polyline takes (a lead's
+                            // terminal fillet at its attach, from the fan). Required for a rounded LEAD.
+                            std::optional<double> startClaim = std::nullopt,
+                            std::optional<double> endClaim = std::nullopt,
+                            // ABT #2274 (agent 45): a ROUND wire's dragback leaves its interior corners sharp here;
+                            // filletDragbackInteriorCorners bends them once its end fillets have taken their share.
+                            bool deferDragbackCorners = false,
+                            // The conductor the polyline belongs to, for the FINDING / [corner-list] text only.
+                            const std::string& owner = std::string()) {
+    // Points closer than OCCT's confusion tolerance are ONE point to every edge and wire built from
+    // them: a step of a few tens of nanometres (a compressed litz dragback's radial step, 25-61 nm,
+    // where its two layers' cells meet) makes no edge OCCT accepts, and the wire it should join is
+    // rejected. They are merged, exactly as OCCT itself would see them.
     std::vector<gp_Pnt> p;
     for (const auto& q : raw)
-        if (p.empty() || p.back().Distance(q) > 1e-12) p.push_back(q);
+        if (p.empty() || p.back().Distance(q) > Precision::Confusion()) p.push_back(q);
     if (p.size() < 2) return;
     // The mitre default applies to the ROUND conformal assembler, which cuts both sides of a
     // sharp joint on the bisector plane. A RECT single-body sweep has no assembler: its whole
@@ -5814,12 +6643,20 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
         return;
     }
     const size_t n = p.size();
-    // kRoundCornerBendFactor: the smallest buildable bend (> wireRadius: never a horn torus), the
-    // corner rule everywhere else -- target and floor are the same number (Alf, 2026-09-19: no
-    // magic numbers; the old 1.5 target was a bare literal).
-    // A terminal lead passes the bend MKF planned for it (ConnectionRoute::plannedBendRadius; Alf,
-    // 2026-10-28: round lead corners are bent at MKF's radius); a connection keeps the corner rule.
-    const double bTarget = bendRadius ? *bendRadius : kRoundCornerBendFactor * wireRadius;
+    // Every round corner is bent at the radius MKF planned (ConnectionRoute::plannedBendRadius for a lead,
+    // dragbackBendRadius for a dragback; ABT #2274, Alf 2026-11-07: "IEC where it fits, else sharp", no 1.05).
+    // A radius not above the wire's own is MKF's SHARP plan (Settings::resolve_lead_bend_radius): no arc.
+    if (rounded && !bendRadius)
+        throw std::logic_error("appendFilletedPolyline: '" + labelPrefix + "' is to be drawn round but MKF gave it no bend radius");
+    // ABT #2274 (Alf, 2026-11-13: inner radius = the coating, measured on the copper): MKF's real-winding bend IS the
+    // coated radius, and the copper drawn round it is thinner, so a bend EQUAL to the coated radius is round; only one
+    // below it cannot be swept. Round or sharp is the corner setting's choice (Options::roundedLeadCorners), not MKF's.
+    if (rounded && *bendRadius < wireRadius * (1.0 - 1e-12)) {
+        std::cerr << "[ConductorBuilder] FINDING: MKF's bend for '" << labelPrefix << "' is " << *bendRadius
+                  << " m, not above the wire radius " << wireRadius << " m (MKF planned it sharp); its corners are drawn sharp\n";
+        rounded = false;
+    }
+    const double bTarget = rounded ? *bendRadius : 0.0;
 
     std::vector<gp_XYZ> dir(n - 1);
     std::vector<double> len(n - 1);
@@ -5832,43 +6669,92 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
     for (size_t i = 1; i + 1 < n; ++i) {
         const double cosT = std::max(-1.0, std::min(1.0, dir[i - 1].Dot(dir[i])));
         if (cosT > 1.0 - 1e-9) continue;                       // collinear: no corner
-        halfTan[i] = std::sqrt((1.0 - cosT) / (1.0 + cosT));   // tan(turn/2)
+        const double t = std::sqrt((1.0 - cosT) / (1.0 + cosT));   // tan(turn/2)
+        // A kink whose fillet would leave the straight by less than OCCT's confusion tolerance has no arc
+        // OCCT can build or sweep (a few tens of nanometres on a compressed litz dragback): no corner.
+        if (bTarget * t < Precision::Confusion()) continue;
+        halfTan[i] = t;
     }
-    // Each corner is bent at bTarget where it takes at most 40% of its shorter leg: the straight that
-    // survives carries the run into its endpoint, and a MKF turn crossing sits exactly at a lead's end
-    // (eat the leg and the arc curves away from the crossing, measured on the E-core zigzag and EP
-    // oblong leads), so every leg keeps at least 20% of its length straight.
-    // Alf, 2026-10-28: a round lead is round at EVERY corner. A corner whose legs cannot hold bTarget is
-    // bent at the smallest buildable bend, kRoundCornerBendFactor x the wire radius (nearly sharp inside,
-    // round outside), and may then use its legs up to the neighbouring corner's share (half a leg two
-    // corners share, the whole leg otherwise); it is reported. Only a corner that cannot hold even that
-    // is refused.
-    const double bMin = kRoundCornerBendFactor * wireRadius;
+    // ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"; agent 44): THE ALLOTTED-SPACE RULE, no leg
+    // share. Each corner is bent at MKF's radius bTarget, whose tangent length is bTarget tan(turn/2), where that
+    // length fits the space its two legs actually have left: a leg's length minus what the fillet at its other end
+    // takes -- the neighbouring corner's tangent length, or at the polyline's ends the fillet drawn there later
+    // (startClaim / endClaim: a lead's terminal fillet at its attach). A corner whose tangent does not fit is SHARP
+    // (bisection mitre) and reported with the numbers. Where two corners compete for one leg, the one needing less
+    // takes it first (equal needs: the one nearer the attach end), so as many corners as the legs can hold are round
+    // and none takes more than its tangent length. No 40% cap, no smallest-buildable bend.
     auto isCorner = [&](size_t k) { return k >= 1 && k + 1 < n && halfTan[k] > 0.0; };
+    (void) isCorner;
+    // ABT #2274 (Alf, 2026-11-07): a Z dragback's corners are bent at the radius MKF planned for them
+    // (ConnectionRoute::dragbackBendRadius), with no 40% leg rule and no smallest-buildable fallback: a corner
+    // takes its legs up to the neighbouring corner's share, and one whose legs cannot hold MKF's bend is left
+    // sharp here, for the one-OD step slant (slantDragbackSteps) or a reported sharp corner.
+    const bool dragback = isConnection && labelPrefix.find("(dragback)") != std::string::npos;
+    if (dragback && rounded && !bendRadius)
+        throw std::logic_error("appendFilletedPolyline: the dragback '" + labelPrefix + "' was given no MKF bend radius");
+    // A corner's room reads the claim at BOTH ends (corner 1 takes the first leg, corner n-2 the last), so a lead with
+    // any corner must be told what each end's fillet takes; one with no corner reads neither (agent 46: a rect column's
+    // single radial run, whose terminal claim the fan -- round columns only -- never measured).
+    bool anyCorner = false;
+    for (size_t i = 1; i + 1 < n; ++i) anyCorner = anyCorner || halfTan[i] > 0.0;
+    // A rounded lead whose terminal fillet nobody measured (the fan measures that claim, on round columns only):
+    // its corners are DEFERRED, emitted sharp with their straights flagged, and filletDeferredLeadCorners bends them
+    // after the terminal fillet, by the same allotted-space rule, on the legs that fillet really leaves (PSPS E16, a
+    // rect column: the entrance lead's one-OD stub holds its two 90-degree bends exactly).
+    const bool deferLeadCorners = !dragback && rounded && isLead && anyCorner && (!startClaim || !endClaim);
     for (size_t i = 1; i + 1 < n; ++i) {
-        if (halfTan[i] <= 0.0) continue;
-        if (bTarget * halfTan[i] <= 0.4 * std::min(len[i - 1], len[i])) {
+        if (halfTan[i] <= 0.0 || !dragback || deferDragbackCorners) continue;
+        const double room = std::min(isCorner(i - 1) ? len[i - 1] / 2 : len[i - 1], isCorner(i + 1) ? len[i] / 2 : len[i]);
+        if (bTarget * halfTan[i] <= room) {
             radius[i] = bTarget;
             tanLen[i] = bTarget * halfTan[i];
-            continue;
+        } else {
+            std::cerr << "[ConductorBuilder] FINDING: dragback corner " << i << " of '" << labelPrefix << "' (at " << p[i].X()
+                      << ", " << p[i].Y() << ", " << p[i].Z() << " m) needs " << bTarget * halfTan[i] << " m of legs "
+                      << len[i - 1] << " and " << len[i] << " m for MKF's bend of " << bTarget << " m and has " << room
+                      << " m; it is drawn sharp (bisection mitre)\n";
         }
-        const double room = std::min(isCorner(i - 1) ? len[i - 1] / 2 : len[i - 1],
-                                     isCorner(i + 1) ? len[i] / 2 : len[i]);
-        std::ostringstream m;
-        m.precision(9);
-        m << "corner " << i << " of '" << labelPrefix << "' (at " << p[i].X() << ", " << p[i].Y() << ", " << p[i].Z()
-          << " m), legs " << len[i - 1] << " and " << len[i] << " m, cannot hold its round fillet of " << bTarget
-          << " m (a fillet may take at most 40% of a leg)";
-        if (bMin * halfTan[i] <= room) {
-            radius[i] = bMin;
-            tanLen[i] = bMin * halfTan[i];
-            std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; it is bent at the smallest buildable bend, "
-                      << bMin << " m (kRoundCornerBendFactor x the wire radius)\n";
-            continue;
+    }
+    if (!dragback && rounded && !deferLeadCorners) {
+        std::vector<double> takenAtStart(n - 1, 0.0), takenAtEnd(n - 1, 0.0);   // per leg, by the fillet at that end
+        takenAtStart.front() = startClaim.value_or(0.0);
+        takenAtEnd.back() = endClaim.value_or(0.0);
+        std::vector<size_t> order;
+        for (size_t i = 1; i + 1 < n; ++i)
+            if (halfTan[i] > 0.0) order.push_back(i);
+        const bool fromBack = !startClaim && endClaim.has_value();
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            if (halfTan[a] != halfTan[b]) return halfTan[a] < halfTan[b];
+            return fromBack ? a > b : a < b;
+        });
+        for (size_t i : order) {
+            const double need = bTarget * halfTan[i];
+            const double roomBefore = len[i - 1] - takenAtStart[i - 1];
+            const double roomAfter = len[i] - takenAtEnd[i];
+            // Equal is a fit (a leg MKF made exactly one tangent long): compared to a few ulps of round-off, no length.
+            auto fits = [](double nd, double rm) { return nd <= rm + 8.0 * std::numeric_limits<double>::epsilon() * std::max(std::abs(nd), std::abs(rm)); };
+            if (fits(need, roomBefore) && fits(need, roomAfter)) {
+                radius[i] = bTarget;
+                tanLen[i] = need;
+                takenAtEnd[i - 1] = need;
+                takenAtStart[i] = need;
+                continue;
+            }
+            std::ostringstream m;
+            m.precision(9);
+            m << "corner " << i << " of '" << labelPrefix << "' (at " << p[i].X() << ", " << p[i].Y() << ", " << p[i].Z()
+              << " m), legs " << len[i - 1] << " and " << len[i] << " m, cannot hold its round fillet of " << bTarget
+              << " m: its tangent length " << need << " m needs that much of each leg, and the legs have " << roomBefore
+              << " and " << roomAfter << " m left beside the fillets at their other ends ("
+              << (i == 1 ? "terminal fillet " : "corner ") << takenAtStart[i - 1] << " m, "
+              << (i + 2 == n ? "terminal fillet " : "corner ") << takenAtEnd[i] << " m)";
+            std::cerr << "[ConductorBuilder] FINDING: " << (owner.empty() ? std::string() : owner + ": ") << m.str()
+                      << "; it is drawn sharp (bisection mitre)\n";
+            if (std::getenv("MVB_CORNER_LIST"))
+                std::fprintf(stderr, "[corner-list]\tlead\t%s\tcorner %zu\t%.6f,%.6f,%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n",
+                             (owner.empty() ? labelPrefix : owner + " " + labelPrefix).c_str(), i, p[i].X() * 1e3, p[i].Y() * 1e3, p[i].Z() * 1e3, bTarget * 1e3,
+                             need * 1e3, roomBefore * 1e3, roomAfter * 1e3);
         }
-        m << " nor the smallest buildable bend of " << bMin << " m within " << room << " m of its legs";
-        // Alf, 2026-10-30: below the smallest buildable bend the corner is sharp (bisection mitre).
-        std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; it is drawn sharp (bisection mitre)\n";
     }
 
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, size_t idx) {
@@ -5880,6 +6766,7 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
         pr.turnOrdinal = ordinal;
         pr.isLead = isLead;
         pr.isConnection = isConnection;
+        pr.deferredCorners = deferLeadCorners;
         out.push_back(std::move(pr));
     };
     for (size_t i = 0; i + 1 < n; ++i) {
@@ -5919,8 +6806,7 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
 // appendFilletedPolyline the lead's own joints. Every corner between a wrap SEG and a terminal lead SEG
 // is filleted at `leadBend` (none: those corners are left alone) and every corner between a wrap SEG and a
 // Z dragback's SEG (Alf, 2026-10-28: "why are ... (dragback) seg 0 and ... seg 2 still rectangular
-// corner??") at the bend its own corners take, the smallest buildable one (kRoundCornerBendFactor x the
-// wire radius). The legs are what is left once the neighbouring corners took theirs, so a corner takes
+// corner??") at the bend its own corners take, MKF's dragbackBendRadius. The legs are what is left once the neighbouring corners took theirs, so a corner takes
 // what it really needs of them (Alf, 2026-10-28, "split the leg by real cost"); a lead corner that cannot
 // hold `leadBend` falls back to the smallest buildable bend, reported, and one that cannot hold even that
 // throws (drawn sharp and reported under --skip-collision-check). Returns the corners filleted.
@@ -5930,13 +6816,257 @@ static bool capAlongAnAxis(const gp_XYZ& u) {
     return std::max({std::abs(u.X()), std::abs(u.Y()), std::abs(u.Z())}) > 0.99;
 }
 
+// ABT #2274 (Alf, 2026-11-15, PSPS E16: "Ease the 5 deg joint"): where MKF's row start / row end piece -- a turn's first
+// or last piece, re-sloped straight onto its row -- rejoins the turn's uniform climb, the slope changes (PSPS E16's
+// Secondary p0: 5.3 degrees). Left to the assembler that kink is a mitre, whose outer edge stands r (1/cos(a/2) - 1)
+// outside both pieces: 0.29 um into the parallel MKF stacks exactly one wire above. It is ONE ROUND BEND at MKF's wire
+// bend radius instead, like every other corner. prims[i], prims[i+1] are a wrap's corner arc and the face straight it
+// meets, in either order. The arc is cut back one tangent length; the bend is the circle in the plane of the arc's
+// tangent there and the straight, which is re-aimed from its far end to the bend's vertex (a move below a nanometre:
+// the cut point leaves the straight's line by L^2 / 2 rho). False (nothing changed, reported) where the straight is
+// shorter than the bend's tangent.
+static bool roundRowKink(std::vector<Primitive>& prims, size_t i, double bend, const std::string& who) {
+    if (i + 1 >= prims.size()) return false;
+    const bool spFirst = prims[i].kind == Primitive::SPIRAL && prims[i + 1].kind == Primitive::SEG;
+    const bool segFirst = prims[i].kind == Primitive::SEG && prims[i + 1].kind == Primitive::SPIRAL;
+    if (!spFirst && !segFirst) return false;
+    const size_t spIdx = spFirst ? i : i + 1, sgIdx = spFirst ? i + 1 : i;
+    const Spiral sp = prims[spIdx].spiral;
+    const double span = sp.az1 - sp.az0;
+    if (sp.blend || sp.levelOut || sp.easeIn > 0.0 || std::abs(span) < 1e-12 || std::abs(sp.r1 - sp.r0) > 1e-12) return false;
+    const double sgn = span > 0 ? 1.0 : -1.0;
+    const double yp = (sp.y1 - sp.y0) / span;
+    const double dsdaz = std::sqrt(sp.r0 * sp.r0 + yp * yp);
+    auto eval = [&](double az, gp_XYZ& P, gp_XYZ& t) {
+        P = gp_XYZ(sp.cx + sp.r0 * std::cos(az), sp.y0 + yp * (az - sp.az0), sp.cz - sp.r0 * std::sin(az));
+        t = gp_XYZ(-sp.r0 * std::sin(az), yp, -sp.r0 * std::cos(az)) * sgn;
+        t /= t.Modulus();
+    };
+    const gp_XYZ F = spFirst ? prims[sgIdx].seg.b.XYZ() : prims[sgIdx].seg.a.XYZ();   // the straight's far end
+    const gp_XYZ J = spFirst ? prims[sgIdx].seg.a.XYZ() : prims[sgIdx].seg.b.XYZ();
+    {
+        gp_XYZ P, t;
+        eval(spFirst ? sp.az1 : sp.az0, P, t);
+        if ((P - J).Modulus() > 1e-9) return false;   // not a joint
+        gp_XYZ d0 = spFirst ? F - J : J - F;
+        if (d0.Modulus() < 1e-12) return false;
+        d0 /= d0.Modulus();
+        if (gp_Vec(t).Angle(gp_Vec(d0)) < 1e-9) return false;   // already tangent: nothing to round
+    }
+    // The cut is one tangent length back along the arc; the tangent length follows the angle, the angle the re-aimed
+    // straight, so the three are iterated to their fixed point (a few rounds: the straight moves by picometres).
+    double L = 0.0, theta = 0.0;
+    gp_XYZ T, t, V, d;
+    {
+        gp_XYZ P;
+        eval(spFirst ? sp.az1 : sp.az0, P, t);
+        gp_XYZ d0 = spFirst ? F - J : J - F;
+        d0 /= d0.Modulus();
+        theta = gp_Vec(t).Angle(gp_Vec(d0));
+        L = bend * std::tan(0.5 * theta);
+    }
+    for (int it = 0; it < 50; ++it) {
+        const double delta = L / dsdaz;
+        if (!(delta < 0.5 * std::abs(span))) return false;
+        eval(spFirst ? sp.az1 - sgn * delta : sp.az0 + sgn * delta, T, t);
+        V = spFirst ? T + t * L : T - t * L;
+        d = spFirst ? F - V : V - F;
+        const double far = d.Modulus();
+        if (far < 1e-12) return false;
+        d /= far;
+        theta = gp_Vec(t).Angle(gp_Vec(d));
+        const double Lnext = bend * std::tan(0.5 * theta);
+        const bool done = std::abs(Lnext - L) < 1e-16;
+        L = Lnext;
+        if (done) break;
+    }
+    const double delta = L / dsdaz;
+    eval(spFirst ? sp.az1 - sgn * delta : sp.az0 + sgn * delta, T, t);
+    V = spFirst ? T + t * L : T - t * L;
+    d = spFirst ? F - V : V - F;
+    const double far = d.Modulus();
+    d /= far;
+    theta = gp_Vec(t).Angle(gp_Vec(d));
+    if (!(far > L + 1e-9)) {
+        std::cerr << "[ConductorBuilder] FINDING: the slope change of " << theta * 180.0 / kPi << " deg where '" << prims[spIdx].label
+                  << "' of " << who << " meets '" << prims[sgIdx].label << "' cannot hold its round bend of " << bend
+                  << " m (tangent " << L << " m against a straight of " << far << " m); it is drawn sharp (bisection mitre)\n";
+        return false;
+    }
+    const gp_XYZ dIn = spFirst ? t : d, dOut = spFirst ? d : t;
+    const gp_XYZ tA = spFirst ? T : V - d * L;   // the bend's start
+    const gp_XYZ tB = spFirst ? V + d * L : T;   // and its end
+    const double cosT = std::cos(theta);
+    gp_XYZ normal = dOut - dIn * cosT;
+    normal /= normal.Modulus();
+    gp_XYZ axis = dIn.Crossed(dOut);
+    axis /= axis.Modulus();
+    Primitive arc = prims[sgIdx];
+    arc.kind = Primitive::ARC3;
+    arc.arc.c = gp_Pnt(tA + normal * bend);
+    arc.arc.axis = axis;
+    arc.arc.v0 = tA - arc.arc.c.XYZ();
+    arc.arc.sweep = theta;
+    arc.label = prims[spFirst ? spIdx : sgIdx].label + " (row bend)";
+    const double azCut = spFirst ? sp.az1 - sgn * delta : sp.az0 + sgn * delta;
+    const double yCut = sp.y0 + yp * (azCut - sp.az0);
+    if (spFirst) {
+        prims[spIdx].spiral.az1 = azCut;
+        prims[spIdx].spiral.y1 = yCut;
+        prims[sgIdx].seg.a = gp_Pnt(tB);
+    } else {
+        prims[spIdx].spiral.az0 = azCut;
+        prims[spIdx].spiral.y0 = yCut;
+        prims[sgIdx].seg.b = gp_Pnt(tA);
+    }
+    prims.insert(prims.begin() + static_cast<std::ptrdiff_t>(i) + 1, arc);
+    if (std::getenv("MVB_LEAD_DIAG"))
+        std::fprintf(stderr, "[row-bend] %s: '%s' rejoins its climb through a bend of %.6f mm over %.4f deg (tangent %.6f mm)\n",
+                     who.c_str(), arc.label.c_str(), bend * 1e3, theta * 180.0 / kPi, L * 1e3);
+    return true;
+}
+
+// ABT #2274 (Alf, 2026-11-15, PSPS E16: "fix all sharp corners, make them round"): a lead that leaves its wrap's face
+// straight closer to the straight's END than its bend's tangent length (a lane MKF lays near the column's corner; PSPS
+// E16's Secondary p1: 0.139 mm of straight for a 0.267 mm tangent) is bent ONTO THE CORNER ARC that follows the straight.
+// The straight piece between the lead and the arc is consumed; the arc is cut back to the point T whose tangent line
+// reaches the lead's line one tangent length R tan(theta/2) away, and the bend is the circle of radius R in the plane
+// of that tangent and the lead's leg. T's tangent has left the face plane by the arc's turn, so the leg stands that
+// much off the face (the shift, along the lead's run, a few microns to tens of microns): the leg and its own corner
+// move by it and the run, parallel to it, changes length. Only where the lead is leg + corner + a run parallel to the
+// shift; false (nothing changed) anywhere else. `leadIsB`: the junction is wrap then lead (an exit).
+static bool bendOntoArcNo(int why, const std::string& who) {
+    if (std::getenv("MVB_CORNER_LIST")) std::fprintf(stderr, "[bend-onto-arc] %s: precondition %d not met\n", who.c_str(), why);
+    return false;
+}
+static bool bendLeadOntoCornerArc(std::vector<Primitive>& prims, size_t i, bool leadIsB, double bend, double wireRadius,
+                                  const std::string& who) {
+    const size_t wrapIdx = leadIsB ? i : i + 1, legIdx = leadIsB ? i + 1 : i;
+    if (leadIsB ? wrapIdx == 0 : wrapIdx + 1 >= prims.size()) return bendOntoArcNo(1, who);
+    const size_t spIdx = leadIsB ? wrapIdx - 1 : wrapIdx + 1;
+    // The lead beyond the leg: its own round corner and then the run, or the run at once while that corner is still
+    // deferred (sharp; filletDeferredLeadCorners bends it later).
+    if (leadIsB ? legIdx + 1 >= prims.size() : legIdx < 1) return bendOntoArcNo(2, who);
+    const size_t nextIdx = leadIsB ? legIdx + 1 : legIdx - 1;
+    const bool hasCorner = prims[nextIdx].kind == Primitive::ARC3;
+    if (hasCorner && (leadIsB ? legIdx + 2 >= prims.size() : legIdx < 2)) return bendOntoArcNo(2, who);
+    const size_t cornerIdx = nextIdx, runIdx = hasCorner ? (leadIsB ? legIdx + 2 : legIdx - 2) : nextIdx;
+    const Primitive& spPrim = prims[spIdx];
+    const Primitive& wrap = prims[wrapIdx];
+    const Primitive& leg = prims[legIdx];
+    if (spPrim.kind != Primitive::SPIRAL || spPrim.spiral.blend || spPrim.spiral.levelOut || spPrim.isConnection || spPrim.isLead)
+        return bendOntoArcNo(3, who);
+    if ((hasCorner && !prims[cornerIdx].isLead) || prims[runIdx].kind != Primitive::SEG || !prims[runIdx].isLead)
+        return bendOntoArcNo(4, who);
+    const Spiral sp = spPrim.spiral;
+    const double span = sp.az1 - sp.az0;
+    if (std::abs(span) < 1e-12 || std::abs(sp.r1 - sp.r0) > 1e-12) return bendOntoArcNo(5, who);
+    const double sgn = span > 0 ? 1.0 : -1.0;
+    auto eval = [&](double az, gp_XYZ& P, gp_XYZ& t) {
+        const double f = (az - sp.az0) / span;
+        const double r = sp.r0, y = sp.y0 + (sp.y1 - sp.y0) * f, yp = (sp.y1 - sp.y0) / span;
+        P = gp_XYZ(sp.cx + r * std::cos(az), y, sp.cz - r * std::sin(az));
+        t = gp_XYZ(-r * std::sin(az), yp, -r * std::cos(az)) * sgn;
+        t /= t.Modulus();
+    };
+    // the arc must continue the wrap straight (same end point, to a nanometre)
+    {
+        gp_XYZ P, t;
+        eval(leadIsB ? sp.az1 : sp.az0, P, t);
+        if ((P - (leadIsB ? wrap.seg.a.XYZ() : wrap.seg.b.XYZ())).Modulus() > 1e-9) return bendOntoArcNo(6, who);
+    }
+    gp_XYZ dL = leg.seg.b.XYZ() - leg.seg.a.XYZ();
+    const double legLen = dL.Modulus();
+    gp_XYZ dW = wrap.seg.b.XYZ() - wrap.seg.a.XYZ();
+    gp_XYZ dRun = prims[runIdx].seg.b.XYZ() - prims[runIdx].seg.a.XYZ();
+    const double runLen = dRun.Modulus();
+    if (legLen < 1e-12 || dW.Modulus() < 1e-12 || runLen < 1e-12) return bendOntoArcNo(7, who);
+    dL /= legLen; dW /= dW.Modulus(); dRun /= runLen;
+    gp_XYZ n = dL.Crossed(dW);          // the shift's direction: across the face, perpendicular to the leg
+    if (n.Modulus() < 1e-9) return bendOntoArcNo(8, who);
+    n /= n.Modulus();
+    if (std::abs(std::abs(n.Dot(dRun)) - 1.0) > 1e-9) return bendOntoArcNo(9, who);   // the run must absorb the shift
+    const gp_XYZ u = n.Crossed(dL);     // along the face, perpendicular to the leg and to the shift
+    const gp_XYZ J = leadIsB ? leg.seg.a.XYZ() : leg.seg.b.XYZ();   // the junction, on the leg's line
+    // V(delta): the bend's vertex for the arc cut `delta` radians back from its junction end.
+    auto vertex = [&](double delta, gp_XYZ& T, gp_XYZ& t, double& L, double& theta) {
+        eval(leadIsB ? sp.az1 - sgn * delta : sp.az0 + sgn * delta, T, t);
+        theta = leadIsB ? gp_Vec(t).Angle(gp_Vec(dL)) : gp_Vec(dL).Angle(gp_Vec(t));
+        L = bend * std::tan(0.5 * theta);
+        return leadIsB ? T + t * L : T - t * L;
+    };
+    auto miss = [&](double delta) {
+        gp_XYZ T, t; double L, theta;
+        return (vertex(delta, T, t, L, theta) - J).Dot(u);
+    };
+    double lo = 0.0, hi = 0.98 * std::abs(span);
+    double fLo = miss(lo), fHi = miss(hi);
+    if (!(fLo * fHi < 0.0)) return bendOntoArcNo(10, who);   // no cut of this arc puts the vertex on the leg's line
+    for (int it = 0; it < 200 && hi - lo > 1e-15; ++it) {
+        const double mid = 0.5 * (lo + hi), fMid = miss(mid);
+        if (fLo * fMid <= 0.0) { hi = mid; fHi = fMid; } else { lo = mid; fLo = fMid; }
+    }
+    const double delta = 0.5 * (lo + hi);
+    gp_XYZ T, t; double L, theta;
+    const gp_XYZ V = vertex(delta, T, t, L, theta);
+    const double shift = (V - J).Dot(n);
+    // room: the leg keeps a positive length past the bend, the run past the shift
+    const gp_XYZ legFar = (leadIsB ? leg.seg.b.XYZ() : leg.seg.a.XYZ()) + n * shift;
+    const double legLeft = leadIsB ? (legFar - V).Dot(dL) - L : (V - legFar).Dot(dL) - L;
+    const double runGrow = (leadIsB ? -1.0 : 1.0) * shift * n.Dot(dRun);   // the run's end at the corner moves by the shift
+    if (!(legLeft > 1e-9) || !(runLen + runGrow > wireRadius)) return bendOntoArcNo(11, who);
+    // -- apply --
+    const gp_XYZ move = n * shift;
+    Primitive& legM = prims[legIdx];
+    legM.seg.a = gp_Pnt(legM.seg.a.XYZ() + move);
+    legM.seg.b = gp_Pnt(legM.seg.b.XYZ() + move);
+    if (hasCorner) prims[cornerIdx].arc.c = gp_Pnt(prims[cornerIdx].arc.c.XYZ() + move);
+    if (leadIsB) prims[runIdx].seg.a = gp_Pnt(prims[runIdx].seg.a.XYZ() + move);
+    else prims[runIdx].seg.b = gp_Pnt(prims[runIdx].seg.b.XYZ() + move);
+    const gp_XYZ dIn = leadIsB ? t : dL, dOut = leadIsB ? dL : t;
+    const gp_XYZ tA = V - dIn * L, tB = V + dOut * L;
+    if (leadIsB) legM.seg.a = gp_Pnt(tB); else legM.seg.b = gp_Pnt(tA);
+    const double cosT = std::cos(theta);
+    gp_XYZ normal = dOut - dIn * cosT;
+    normal /= normal.Modulus();
+    gp_XYZ axis = dIn.Crossed(dOut);
+    axis /= axis.Modulus();
+    Primitive arc;
+    arc.kind = Primitive::ARC3;
+    arc.arc.c = gp_Pnt(tA + normal * bend);
+    arc.arc.axis = axis;
+    arc.arc.v0 = tA - arc.arc.c.XYZ();
+    arc.arc.sweep = theta;
+    arc.label = legM.label + " junction fillet";
+    arc.turnOrdinal = legM.turnOrdinal;
+    arc.isLead = legM.isLead;
+    arc.isConnection = legM.isConnection;
+    arc.terminal = legM.terminal;
+    Spiral cut = sp;
+    {
+        const double azCut = leadIsB ? sp.az1 - sgn * delta : sp.az0 + sgn * delta;
+        const double yCut = sp.y0 + (sp.y1 - sp.y0) * (azCut - sp.az0) / span;
+        if (leadIsB) { cut.az1 = azCut; cut.y1 = yCut; } else { cut.az0 = azCut; cut.y0 = yCut; }
+    }
+    prims[spIdx].spiral = cut;
+    std::cerr << "[ConductorBuilder] NOTE: the lead of '" << who << "' leaves '" << wrap.label << "' " << wrap.seg.a.Distance(wrap.seg.b)
+              << " m from the face straight's end, less than its bend's tangent length; the bend of " << bend
+              << " m runs on onto the corner arc (cut " << delta * sp.r0 << " m back), its leg standing " << shift
+              << " m off the face\n";
+    prims[wrapIdx] = arc;   // the consumed straight's place: lead leg | bend | arc, in path order
+    return true;
+}
+
 // `allowSlant` false: a one-OD step with no room for a bend is sharp at once, never slanted; `allowMerge`
 // false: a lead piece too short for its bend is never redrawn as one straight to the lead's end (either
 // reached copper it must clear).
+// `dragBend`: MKF's bend for this conductor's dragback corners (ConnectionRoute::dragbackBendRadius; ABT #2274) --
+// a dragback junction is bent at it, slanted at it where its one-OD step cannot hold it, else sharp and reported;
+// never at the smallest buildable bend.
 size_t filletLeadJunctions(std::vector<Primitive>& prims, std::optional<double> leadBend, double wireRadius,
-                           const std::string& who, bool allowSlant = true, bool allowMerge = true) {
+                           const std::string& who, std::optional<double> dragBend, bool allowSlant = true,
+                           bool allowMerge = true) {
     size_t filleted = 0;
-    const double bMin = kRoundCornerBendFactor * wireRadius;
     auto isDragback = [](const Primitive& pr) {
         return pr.isConnection && pr.label.find("(dragback) seg") != std::string::npos;
     };
@@ -5949,7 +7079,15 @@ size_t filletLeadJunctions(std::vector<Primitive>& prims, std::optional<double> 
         const bool leadJunction = (wrapA && b.isLead && !b.isConnection) || (wrapB && a.isLead && !a.isConnection);
         const bool dragJunction = (wrapA && isDragback(b)) || (wrapB && isDragback(a));
         if (!(leadJunction && leadBend) && !dragJunction) continue;
-        const double bend = dragJunction ? bMin : *leadBend;
+        if (dragJunction && !dragBend)
+            throw std::logic_error("filletLeadJunctions: '" + who + "' has a dragback junction but no MKF dragback bend radius");
+        const double bend = dragJunction ? *dragBend : *leadBend;
+        if (bend < wireRadius * (1.0 - 1e-12)) {   // below the coated radius: cannot be swept round (equal is round, ABT #2274)
+            std::cerr << "[ConductorBuilder] FINDING: the junction of '" << who << "' between '" << a.label << "' and '"
+                      << b.label << "' has MKF bend " << bend << " m, not above the wire radius " << wireRadius
+                      << " m; it is drawn sharp (bisection mitre)\n";
+            continue;
+        }
         const gp_XYZ va = a.seg.b.XYZ() - a.seg.a.XYZ();
         const gp_XYZ vb = b.seg.b.XYZ() - b.seg.a.XYZ();
         const double lenA = va.Modulus();
@@ -5976,21 +7114,33 @@ size_t filletLeadJunctions(std::vector<Primitive>& prims, std::optional<double> 
                                                    : (s1 == 0 || !prims[s1 - 1].isLead));
             const bool mergeable = allowMerge && endsLead && prims[kink].kind == Primitive::ARC3 && prims[kink].isLead &&
                                    prims[s1].kind == Primitive::SEG && prims[s1].isLead && !prims[s1].isConnection;
-            // The lead's end is its port, and a port faces along an axis (PortPlane.h): a straight that would tilt it
-            // off one is not drawn, and the corner takes its bend as any other (PSPS E16's Primary 1: 8.7 deg).
-            const bool keepsPortOnAxis =
-                mergeable && capAlongAnAxis(gp_Vec(leadIsB ? prims[s0].seg.a : prims[s1].seg.a,
-                                                   leadIsB ? prims[s1].seg.b : prims[s0].seg.b).Normalized().XYZ());
-            if (mergeable && !keepsPortOnAxis)
+            // ABT #2274 (Alf, 2026-11-06: "MKF plans it, MVB++ obeys"): the straight is drawn only where it IS MKF's
+            // run -- it passes MKF's kink within the coordinate grid, so the run keeps MKF's direction and the port
+            // stays on its axis. A straight through a real kink tilts the whole run (02_flyback's Secondary p0
+            // entrance: a 0.468 mm slant merged into one straight 2.04 deg off the axis, whose port plane then caught
+            // the Primary exit 15.9 mm away); "it still faces within 8.1 deg of an axis" (capAlongAnAxis) is not
+            // MKF's run. Anywhere else the corner is bent where it is, as any other corner.
+            gp_Pnt from, to;
+            double shift = 0.0;
+            if (mergeable) {
+                from = leadIsB ? prims[s0].seg.a : prims[s1].seg.a;
+                to = leadIsB ? prims[s1].seg.b : prims[s0].seg.b;
+                const gp_Lin line(from, gp_Dir(gp_Vec(from, to)));
+                // How far the straight passes from MKF's kink: the kink's own tangent points, the ends of the short
+                // piece and of the run that meet it (an exit's s0.b and s1.a; an entrance, drawn border first, has
+                // its kink at s1.b and s0.a). Measuring `from`/`to` instead reads the line's own ends and prints 0.
+                const gp_Pnt kinkIn = leadIsB ? prims[s0].seg.b : prims[s1].seg.b;
+                const gp_Pnt kinkOut = leadIsB ? prims[s1].seg.a : prims[s0].seg.a;
+                shift = std::max(line.Distance(kinkIn), line.Distance(kinkOut));
+            }
+            const bool keepsMkfRun = mergeable && shift <= cert::kCoordinateGridHalf &&
+                                     capAlongAnAxis(gp_Vec(from, to).Normalized().XYZ());
+            if (mergeable && !keepsMkfRun)
                 std::cerr << "[ConductorBuilder] FINDING: the lead of '" << who << "' leaves '"
                           << (leadIsB ? a.label : b.label) << "' on a piece of " << leadLen
-                          << " m, too short for its bend of " << bend << " m; one straight to its end would turn its "
-                          << "port off an axis, so the corner is bent where it is\n";
-            if (keepsPortOnAxis) {
-                const gp_Pnt from = leadIsB ? prims[s0].seg.a : prims[s1].seg.a;
-                const gp_Pnt to = leadIsB ? prims[s1].seg.b : prims[s0].seg.b;
-                const gp_Lin line(from, gp_Dir(gp_Vec(from, to)));
-                const double shift = std::max(line.Distance(prims[s0].seg.b), line.Distance(prims[s1].seg.a));
+                          << " m, too short for its bend of " << bend << " m; one straight to its end would pass "
+                          << shift << " m off MKF's kink and turn its run off MKF's, so the corner is bent where it is\n";
+            if (keepsMkfRun) {
                 std::cerr << "[ConductorBuilder] FINDING: the lead of '" << who << "' leaves '"
                           << (leadIsB ? a.label : b.label) << "' on a piece of " << leadLen
                           << " m, too short for its bend of " << bend << " m; it is drawn as one straight to its end ("
@@ -6010,27 +7160,53 @@ size_t filletLeadJunctions(std::vector<Primitive>& prims, std::optional<double> 
         // A slanted step is solved so its junction bend takes the slant exactly: equal is a fit, and the
         // straight left between the two arcs (none) is dropped below.
         constexpr double kExact = 1e-12;
-        if (bend * halfTan > std::min(lenA, lenB) + kExact) {
+        // Agent 46 (allotted space): a dragback's straight also has a corner at its FAR end, still sharp here
+        // (filletDragbackInteriorCorners bends it later, if what is left holds MKF's bend). At the least that corner
+        // is a mitre and takes wireRadius tan(turn/2) of the straight, so the junction fillet may not take that part
+        // (02_flyback: the fillet took all but 0.015 mm of the 0.43 mm step and overlapped the next straight).
+        double farTake = 0.0;
+        if (dragJunction) {
+            const bool dragIsB = leadIsB;
+            const Primitive& leg = dragIsB ? b : a;
+            const size_t farIdx = dragIsB ? i + 2 : (i >= 1 ? i - 1 : prims.size());
+            if (farIdx < prims.size() && prims[farIdx].kind == Primitive::SEG && isDragback(prims[farIdx]) &&
+                (dragIsB ? leg.seg.b.Distance(prims[farIdx].seg.a) : prims[farIdx].seg.b.Distance(leg.seg.a)) <= 1e-9) {
+                const gp_XYZ vf = prims[farIdx].seg.b.XYZ() - prims[farIdx].seg.a.XYZ();
+                if (vf.Modulus() >= 1e-12) {
+                    const gp_XYZ dLeg = dragIsB ? db : da;
+                    const double cosF = std::max(-1.0, std::min(1.0, dLeg.Dot(vf / vf.Modulus())));
+                    if (cosF < 1.0 - 1e-9) farTake = wireRadius * std::sqrt((1.0 - cosF) / (1.0 + cosF));
+                }
+            }
+        }
+        const double roomA = (dragJunction && !leadIsB) ? lenA - farTake : lenA;
+        const double roomB = (dragJunction && leadIsB) ? lenB - farTake : lenB;
+        // The WRAP's straight is the short leg and a corner arc follows it: the bend runs on onto the arc.
+        if (leadJunction && !dragJunction && bend * halfTan > (leadIsB ? roomA : roomB) + kExact &&
+            bend * halfTan <= (leadIsB ? roomB : roomA) + kExact &&
+            bendLeadOntoCornerArc(prims, i, leadIsB, bend, wireRadius, who)) {
+            ++filleted;
+            continue;
+        }
+        if (bend * halfTan > std::min(roomA, roomB) + kExact) {
             std::ostringstream m;
             m.precision(9);
             m << "the corner of '" << who << "' between '" << a.label << "' and '" << b.label << "' (at " << a.seg.b.X()
               << ", " << a.seg.b.Y() << ", " << a.seg.b.Z() << " m), legs " << lenA << " and " << lenB
-              << " m (what the neighbouring corners left), cannot hold its round fillet of " << bend << " m";
-            if (bMin * halfTan > std::min(lenA, lenB) + kExact) {
-                m << " nor the smallest buildable bend of " << bMin << " m";
+              << " m (what the neighbouring corners left";
+            if (farTake > 0.0) m << "; the sharp corner at the dragback straight's far end takes " << farTake << " m of it";
+            m << "), cannot hold its round fillet of " << bend << " m";
+            {
                 // A one-OD step (a dragback's radial drop, a lead's first run): the slanted step (Alf,
-                // 2026-10-28), at `bend` where it fits, else at the smallest buildable bend.
+                // 2026-10-28) at MKF's `bend` where it fits, else sharp (ABT #2274: never a smaller bend).
                 const size_t s0 = leadIsB ? i + 1 : i;
                 const Primitive& wrap = leadIsB ? a : b;
                 const gp_Vec away = leadIsB ? gp_Vec(wrap.seg.b, wrap.seg.a) : gp_Vec(wrap.seg.a, wrap.seg.b);
                 const std::string stepLabel = prims[s0].label;
                 std::optional<SlantedStep> step;
                 double stepBend = bend;
-                for (double tryBend : {bend, bMin}) {
-                    if (!allowSlant) break;
-                    stepBend = tryBend;
-                    if ((step = slantOneOdStep(prims, s0, leadIsB, away, tryBend, 1.0, tryBend))) break;
-                }
+                // A dragback junction is never slanted here: MKF publishes no such slant (ABT #2274, see slantDragbackSteps).
+                if (allowSlant && !dragJunction) step = slantOneOdStep(prims, s0, leadIsB, away, bend, 1.0, bend);
                 if (step) {
                     std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; '" << stepLabel
                               << "' is drawn as a slanted step at " << stepBend << " m, meeting its next run "
@@ -6038,13 +7214,9 @@ size_t filletLeadJunctions(std::vector<Primitive>& prims, std::optional<double> 
                     i -= 1;   // the same junction again, now on the slant
                     continue;
                 }
-                // Alf, 2026-10-30: below the smallest buildable bend the corner is sharp (bisection mitre).
                 std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; it is drawn sharp (bisection mitre)\n";
                 continue;
             }
-            radius = bMin;
-            std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; it is bent at the smallest buildable bend, " << bMin
-                      << " m (kRoundCornerBendFactor x the wire radius)\n";
         }
         const double tanLen = radius * halfTan;
         const gp_Pnt vertex = a.seg.b;
@@ -6080,6 +7252,124 @@ size_t filletLeadJunctions(std::vector<Primitive>& prims, std::optional<double> 
         ++filleted;
     }
     return filleted;
+}
+
+// ABT #2274 (Alf, 2026-11-07: "make sure the dragback is bent in a way that the bump it adds is just outer
+// diameter"): a dragback step between two corners its legs cannot bend at MKF's radius (17_cllc's Secondary
+// 13_ending -> 14: a 1.9645 mm = 1 OD step shared by two corners of 1.014 mm) is slanted along its longer
+// neighbour -- the vertex they share moves along that neighbour by the least d that lets both corners hold
+// `bend` -- so the step still reaches exactly that neighbour's line: the excursion stays the step's (one OD),
+// and the corners bend at MKF's radius. A step no slant fits is left sharp and reported. Returns the steps
+// slanted.
+size_t slantDragbackSteps(std::vector<Primitive>& prims, double bend, const std::string& who) {
+    size_t slanted = 0;
+    auto isDragbackSeg = [](const Primitive& pr) {
+        return pr.kind == Primitive::SEG && pr.isConnection && pr.label.find("(dragback) seg") != std::string::npos;
+    };
+    auto corner = [](const Primitive& a, const Primitive& b) {
+        if (a.kind != Primitive::SEG || b.kind != Primitive::SEG || a.seg.b.Distance(b.seg.a) > 1e-9) return false;
+        const gp_Vec va(a.seg.a, a.seg.b), vb(b.seg.a, b.seg.b);
+        if (va.Magnitude() < 1e-12 || vb.Magnitude() < 1e-12) return false;
+        return va.Normalized().Dot(vb.Normalized()) < 1.0 - 1e-9;
+    };
+    for (size_t i = 1; i + 1 < prims.size(); ++i) {
+        if (!isDragbackSeg(prims[i]) || !corner(prims[i - 1], prims[i]) || !corner(prims[i], prims[i + 1])) continue;
+        // Copies: the fillets below insert into `prims`, which would leave references dangling.
+        const Primitive A = prims[i - 1];
+        const Primitive S = prims[i];
+        const Primitive B = prims[i + 1];
+        const std::string beforeA = i >= 2 ? prims[i - 2].label : std::string("(path start)");
+        const std::string afterB = i + 2 < prims.size() ? prims[i + 2].label : std::string("(path end)");
+        const double lenA = A.seg.a.Distance(A.seg.b), lenB = B.seg.a.Distance(B.seg.b), lenS = S.seg.a.Distance(S.seg.b);
+        auto halfTanOf = [](const gp_Vec& u, const gp_Vec& v) {
+            const double c = std::max(-1.0, std::min(1.0, u.Normalized().Dot(v.Normalized())));
+            return std::sqrt((1.0 - c) / (1.0 + c));
+        };
+        if (bend * (halfTanOf(gp_Vec(A.seg.a, A.seg.b), gp_Vec(S.seg.a, S.seg.b)) +
+                    halfTanOf(gp_Vec(S.seg.a, S.seg.b), gp_Vec(B.seg.a, B.seg.b))) <= lenS &&
+            bend * halfTanOf(gp_Vec(A.seg.a, A.seg.b), gp_Vec(S.seg.a, S.seg.b)) <= lenA &&
+            bend * halfTanOf(gp_Vec(S.seg.a, S.seg.b), gp_Vec(B.seg.a, B.seg.b)) <= lenB)
+            continue;   // both fit as drawn: not a step for the slant (appendFilletedPolyline left them for a reason)
+        const bool longAfter = lenB >= lenA;   // lean on the longer neighbour
+        const gp_Pnt VK = longAfter ? S.seg.a : S.seg.b;   // the vertex that stays
+        const gp_Pnt VL = longAfter ? S.seg.b : S.seg.a;   // the vertex that moves along the long leg
+        const gp_Pnt farL = longAfter ? B.seg.b : A.seg.a;
+        const gp_Pnt farK = longAfter ? A.seg.a : B.seg.b;
+        const double lenL = longAfter ? lenB : lenA, lenK = longAfter ? lenA : lenB;
+        const gp_Vec alongL = gp_Vec(VL, farL).Normalized();
+        auto need = [&](double d, double& tK, double& tL, double& lenSlant) {
+            const gp_Pnt Q = VL.Translated(alongL * d);
+            const gp_Vec slant(VK, Q);
+            lenSlant = slant.Magnitude();
+            tK = bend * halfTanOf(gp_Vec(farK, VK), slant);
+            tL = bend * halfTanOf(slant, gp_Vec(Q, farL));
+            return lenSlant - tK - tL;
+        };
+        auto fits = [&](double d) {
+            // Q must stay strictly inside the long leg (its bend needs tL < lenL - d > 0) and off VK: at d = lenL
+            // the leg past Q is a zero vector, which gp_Vec::Normalized refuses (Standard_ConstructionError --
+            // the uncaught crash of 17_cllc and 13_current_sense, agent 16).
+            if (!(d < lenL) || VK.Distance(VL.Translated(alongL * d)) <= 0.0) return false;
+            double tK, tL, ls;
+            return need(d, tK, tL, ls) > 0.0 && tK < lenK && tL < lenL - d;
+        };
+        double hi = lenL;
+        while (hi > 0.0 && !fits(hi)) hi /= 2.0;   // a feasible slant, if the long leg holds one
+        if (!(hi > 0.0) || !fits(hi)) {
+            std::cerr << "[ConductorBuilder] FINDING: the dragback step '" << S.label << "' of " << who << " (" << lenS
+                      << " m, legs " << lenA << " and " << lenB << " m) cannot hold two bends of MKF's " << bend
+                      << " m even slanted along its longer leg; its corners are drawn sharp (bisection mitre)\n";
+            continue;
+        }
+        double lo = 0.0;
+        for (int it = 0; it < 80; ++it) {
+            const double mid = 0.5 * (lo + hi);
+            (fits(mid) ? hi : lo) = mid;
+        }
+        double tK, tL, lenSlant;
+        need(hi, tK, tL, lenSlant);
+        const gp_Pnt Q = VL.Translated(alongL * hi);
+        const Primitive flags = S;
+        if (longAfter) {
+            prims[i].seg = {VK, Q};
+            prims[i + 1].seg.a = Q;
+        } else {
+            prims[i].seg = {Q, VK};
+            prims[i - 1].seg.b = Q;
+        }
+        prims[i].label = S.label + " (slanted step)";
+        // Fillet the corner at Q first (the later index when it is after), then the one at VK.
+        const size_t qAt = longAfter ? i : i - 1;
+        const size_t kAt = longAfter ? i - 1 : i + 1;   // after the arc at Q went in before S
+        const bool okQ = filletSegCorner(prims, qAt, bend, flags, flags.label + " step bend");
+        const bool okK = okQ && filletSegCorner(prims, kAt, bend, flags, flags.label + " step bend");
+        if (!okQ || !okK) throw std::logic_error("slantDragbackSteps: the slant solved to fit does not fit (" + S.label + ")");
+        // The least slant drives the straight left between the two bends (now at i + 1 either way) to the
+        // bisection's residual, a sub-picometre segment whose two ends come from different fillets: its
+        // direction is noise (17_cllc: the welder read the bend -> straight joint as 90 deg and could not mitre
+        // it). Below OCCT's confusion it is not a segment at all: the bends meet tangentially at its ends.
+        if (prims[i + 1].kind == Primitive::SEG && prims[i + 1].seg.a.Distance(prims[i + 1].seg.b) < Precision::Confusion()) {
+            const gp_Pnt mid(0.5 * (prims[i + 1].seg.a.XYZ() + prims[i + 1].seg.b.XYZ()));
+            prims.erase(prims.begin() + static_cast<std::ptrdiff_t>(i) + 1);   // arcs now at i and i + 1
+            // Both arcs keep their centres; the shared end moves by under the confusion distance.
+            prims[i].arc.sweep = std::atan2(prims[i].arc.v0.Crossed(mid.XYZ() - prims[i].arc.c.XYZ()).Dot(prims[i].arc.axis),
+                                            prims[i].arc.v0.Dot(mid.XYZ() - prims[i].arc.c.XYZ()));
+            const gp_XYZ v1 = mid.XYZ() - prims[i + 1].arc.c.XYZ();
+            const gp_XYZ endOld = rotateXYZ(prims[i + 1].arc.v0, prims[i + 1].arc.axis, prims[i + 1].arc.sweep);
+            prims[i + 1].arc.sweep = std::atan2(v1.Crossed(endOld).Dot(prims[i + 1].arc.axis), v1.Dot(endOld));
+            prims[i + 1].arc.v0 = v1;
+            --i;   // keep `i += 2` below landing past the second arc
+        }
+        std::cerr << "[ConductorBuilder] FINDING: the dragback step '" << S.label << "' of " << who << " (" << lenS
+                  << " m) cannot hold two bends of MKF's " << bend << " m square; it is slanted " << hi
+                  << " m along its longer leg, so both corners bend at " << bend << " m and the step still reaches "
+                  << "that leg (its excursion unchanged); tangents " << tK << " of " << lenK << " m (K leg) and " << tL
+                  << " of " << (lenL - hi) << " m (L leg), " << (longAfter ? "L after" : "L before") << ", before A '"
+                  << beforeA << "', after B '" << afterB << "'\n";
+        ++slanted;
+        i += 2;
+    }
+    return slanted;
 }
 
 struct PendingZ {
@@ -6208,7 +7498,7 @@ std::vector<PlanePt> absorbLeadWaypoints(const std::vector<PlanePt>& wp, double 
 void appendZDragback(ConductorPath& path, const PlanePt& s, const PlanePt& n, double wireRadius,
                      double azD, const std::string& label, size_t ordinal,
                      const std::vector<WrapBump>& bumpsOut,
-                     const std::vector<WrapBump>& bumpsIn) {
+                     const std::vector<WrapBump>& bumpsIn, double* landingAz) {
     // The return is CENTRED ON ITS SLOT's axial plane: the wrap arrives at its station on that
     // plane, steps out parallel to the radial direction onto the next layer's radius, drops
     // parallel to Y, and steps out once more onto the first station of the layer that continues.
@@ -6255,14 +7545,43 @@ void appendZDragback(ConductorPath& path, const PlanePt& s, const PlanePt& n, do
     // flyback, the largest 1.1155 mm, every one of them at (bump riser) -> (over dragback). The
     // dragback is one polyline from the source wrap's end to the destination turn's start, and
     // it stays one polyline.
+    //
+    // ABT #2274 (Alf, 2026-11-14: "Radial step"; every corner a 90-degree bend): the ride change ends on the landing
+    // turn's circle -- centred one ride further out, (0, -destRaise) -- along THAT circle's radius through the descent's
+    // foot, not parallel to z. Parallel to z it met the landing wrap at 90 degrees plus the slot's azimuth off the
+    // plane (06_llc: 98.5 degrees, a bend needing 0.31 mm of a 0.54 mm step, which left the descent's own corner
+    // sharp). Along the radius both corners are square and the step is the ride difference projected on that radius.
+    // The landing turn starts where the step lands (*landingAz, its azimuth on that circle), a fraction of a degree
+    // from the slot.
+    const gp_Pnt foot = azPointC(0, -chainRaise, n.x, n.y, azD);
+    const double dx = foot.X(), dz = foot.Z() + destRaise;   // foot relative to the landing circle's centre
+    // The 90-degree bend onto the landing wrap ENDS on the wrap a bend radius R further on (wraps sweep towards +az),
+    // where the wrap has turned delta = R / r more: the step must be radial THERE, or the bend is 90 + delta degrees
+    // (06_llc: 91.7, 4 um more than the one-OD step holds). With the foot at distance rho, azimuth phi from the landing
+    // circle's centre, the step line through the foot is radial at az + delta when
+    //   sin(phi - az - delta) = -(r / rho) sin(delta)   ->   az = phi - delta + asin((r / rho) sin(delta)).
+    // Sharp corners (no bend): delta = 0, the step is radial at the landing point itself.
+    const double rho = std::hypot(dx, dz);
+    if (!(rho > 0.0))
+        throw std::runtime_error("ConductorBuilder: the dragback " + label + " lands on its own circle's centre");
+    const double bend = (g_roundedLeadCorners && !path.isRectangular) ? dragbackBendOf(path.winding, path.parallel) : 0.0;
+    const double delta = bend / n.x;
+    const double sinArg = n.x / rho * std::sin(delta);
+    if (!(std::abs(sinArg) <= 1.0))
+        throw std::runtime_error("ConductorBuilder: the dragback " + label + " cannot land radially to its bend's end");
+    const double phi = std::atan2(-dz, dx);
+    const double landAz = azD + std::remainder(phi - delta + std::asin(sinArg) - azD, kTwoPi);   // next to the slot
+    if (landingAz) *landingAz = landAz;
     std::vector<gp_Pnt> direct{
         pS,
         azPointC(0, -chainRaise, n.x, s.y, azD),
-        azPointC(0, -chainRaise, n.x, n.y, azD),
-        azPointC(0, -destRaise,  n.x, n.y, azD)};
+        foot,
+        azPointC(0, -destRaise,  n.x, n.y, landAz)};
     appendFilletedPolyline(path.prims, direct, wireRadius, label + " (dragback)", ordinal,
                            /*isLead=*/false, /*isConnection=*/true,
-                           /*rounded=*/g_roundedLeadCorners || path.isRectangular);
+                           /*rounded=*/g_roundedLeadCorners || path.isRectangular,
+                           /*bendRadius=*/dragbackBendOf(path.winding, path.parallel),
+                           std::nullopt, std::nullopt, /*deferDragbackCorners=*/g_roundedLeadCorners && !path.isRectangular);
 }
 
 std::vector<Primitive> buildZEndRun(const PlanePt& s, const PlanePt& n, double azA, double azOff,
@@ -6535,13 +7854,26 @@ RectStation rectStation(const PlanePt& p, double halfW, double halfD, double min
 // The end-cut a descent slot takes from a rising turn's path (stadium: the cap arc to the
 // slot azimuth; rect: the straight from the slot to the crossing). Shared by the wrap and by
 // the callers that need the pitch-true attach height before the wrap is emitted.
+// The path length from the crossing (x = 0 on the -Z face) to the turn's point at face coordinate x: the face
+// straight, then the corner arc beyond it -- MKF's Coil::terminal_lane_along. A lane MKF lays past the straight
+// (ABT #2274, Alf 2026-11-15, PSPS E16: "leave from the arc") stands on the corner arc at
+// x = segX + cornerR sin(theta), a path length segX + cornerR theta from the crossing. Signed like x.
+double rectFaceAlong(const RectStation& s0, double x, const std::string& who) {
+    const double reach = std::abs(x);
+    if (reach <= s0.segX) return x;
+    if (reach > s0.segX + s0.cornerR)
+        throw std::runtime_error("ConductorBuilder: the lane x = " + std::to_string(x) + " m of " + who +
+                                 " lies beyond its turn's face and corner (" + std::to_string(s0.segX + s0.cornerR) + " m)");
+    const double along = s0.segX + s0.cornerR * std::asin((reach - s0.segX) / s0.cornerR);
+    return x < 0 ? -along : along;
+}
 double rectRisingEndCut(const RectStation& s0, double stopAtX) {
     if (std::isnan(stopAtX)) return 0.0;
     const bool stadium = s0.segX < 1e-12;
     if (stadium) {
         return s0.cornerR * std::asin(std::min(1.0, std::max(0.0, stopAtX) / s0.cornerR));
     }
-    return stopAtX;
+    return rectFaceAlong(s0, stopAtX, "a descent slot");
 }
 
 // A rising rect turn's travelled path length (straights + corner arcs + ride extensions,
@@ -6594,7 +7926,21 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                     // ENDS there: its +X-Z corner and connection-face half straight are not drawn
                     // (tangentEnd). The climb stays pitch-true over the FULL path, exactly as for
                     // a slot-shortened wrap (startAtX / stopAtX).
-                    bool tangentStart = false, bool tangentEnd = false) {
+                    bool tangentStart = false, bool tangentEnd = false,
+                    // ABT #2274 (Alf, 2026-11-08, after agent 24): MKF's row end (ConnectionRoute::rowEndX..): the last
+                    // piece on the connection face starts at rowEndFromX (the face straight's end, where the climb stands
+                    // at rowEndFromY) and climbs straight to rowEndY at the stop slot. NaN = the pitch-true climb.
+                    double rowEndFromX = std::numeric_limits<double>::quiet_NaN(),
+                    double rowEndFromY = std::numeric_limits<double>::quiet_NaN(),
+                    double rowEndY = std::numeric_limits<double>::quiet_NaN(),
+                    // ABT #2274 (Alf, 2026-11-15): MKF's ROW START of a flat-faced entrance turn (ConnectionRoute::rowEndX on
+                    // a TERMINAL_ENTRANCE), the mirror of the row end: the wrap's first piece starts ON the row rowStartY at
+                    // the start slot and climbs straight to where the turn stands at its uniform climb, the piece's end at
+                    // |x| = |rowStartFromX| (the face straight's end, or the first corner's end for a slot on that corner),
+                    // height rowStartFromY. NaN = the pitch-true climb.
+                    double rowStartFromX = std::numeric_limits<double>::quiet_NaN(),
+                    double rowStartFromY = std::numeric_limits<double>::quiet_NaN(),
+                    double rowStartY = std::numeric_limits<double>::quiet_NaN()) {
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
         Primitive pr;
@@ -6665,21 +8011,28 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
                         std::to_string(s0.cornerR) + " m) for " + label);
                 stadiumTheta = std::asin(std::min(1.0, stopAtX / s0.cornerR));
             }
-            else if (std::abs(stopAtX) > s0.segX) {
-                throw std::runtime_error(
-                    "ConductorBuilder: dragback x-slot " + std::to_string(stopAtX) +
-                    " m lies outside the -Z face straight of " + label);
-            }
+            else if (stopAtX < -s0.segX)
+                throw std::runtime_error("ConductorBuilder: the end slot " + std::to_string(stopAtX) + " m of " + label +
+                                         " lies past the crossing on the -X corner; a wrap ends on its own (+X) side");
         }
-        if (stadium && begX > 1e-12)
+        if (stadium && std::abs(begX) > 1e-12)
             throw std::runtime_error(
                 "ConductorBuilder: entrance corner offsets are not supported on stadium "
                 "columns for " + label);
-        if (begX < 0.0 || (!stadium && begX > s0.segX))
-            throw std::runtime_error(
-                "ConductorBuilder: entrance corner offset " + std::to_string(begX) +
-                " m lies outside the -Z face straight of " + label);
-        const double endCut = stadium ? s0.cornerR * stadiumTheta : endX;
+        // A NEGATIVE begX is an entrance MKF lays UPSTREAM of the crossing (ABT #2274 / #2292, spec S0:
+        // a non-primary winding's entrance at x > 0): the first straight then begins at x = -begX > 0
+        // and the turn is |begX| longer than a revolution, its climb starting that share of the advance
+        // below the station (yAt) -- MKF's Coil::terminal_turn_height_along.
+        if (!stadium && begX < -s0.segX)
+            throw std::runtime_error("ConductorBuilder: the entrance offset " + std::to_string(begX) + " m of " + label +
+                                     " lies upstream of the crossing on the +X corner; a wrap starts on its own (-X) side");
+        // A slot past the face straight stands on the corner arc (rectFaceAlong): the wrap starts / ends there, on
+        // a shortened corner, and the path it travels is cut by the arc length, not by x.
+        const double endCut = stadium ? s0.cornerR * stadiumTheta : rectFaceAlong(s0, endX, label);
+        const double begCut = stadium ? begX : rectFaceAlong(s0, begX, label);
+        const bool startOnArc = !stadium && begX > s0.segX, endOnArc = !stadium && endX > s0.segX;
+        const double begTheta = startOnArc ? std::asin((begX - s0.segX) / s0.cornerR) : 0.0;
+        const double endTheta = endOnArc ? std::asin((endX - s0.segX) / s0.cornerR) : 0.0;
         if (tangentStart || tangentEnd) {
             if (stadium || isReturn)
                 throw std::runtime_error("ConductorBuilder: a tangent departure on " + label +
@@ -6693,7 +8046,7 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         }
         const double tangentBeg = tangentStart ? s0.segX + q : 0.0;
         const double tangentEnd_ = tangentEnd ? q + s0.segX : 0.0;
-        const double L = rectRisingLength(s0, ride0, rideBack0, endCut, begX) - tangentBeg - tangentEnd_;
+        const double L = rectRisingLength(s0, ride0, rideBack0, endCut, begCut) - tangentBeg - tangentEnd_;
         if (L < 1e-12) {
             throw std::runtime_error(
                 "ConductorBuilder: rect turn of " + label +
@@ -6718,9 +8071,9 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         // starts begX-share above its station (where the full-path helix truly is at the slot --
         // the lead attaches there, exactly like the round side's entranceAttachY) and ends
         // endCut-share short of s1.y (the descent chain starts there and covers the rest).
-        const double Lplain = L + begX + endCut + tangentBeg + tangentEnd_;
+        const double Lplain = L + begCut + endCut + tangentBeg + tangentEnd_;
         const double slopeBand = dy / Lplain;
-        auto yAt = [&](double at) { return s0.y + slopeBand * (begX + tangentBeg + at); };
+        auto yAt = [&](double at) { return s0.y + slopeBand * (begCut + tangentBeg + at); };
         if (riseEndYOut) {
             *riseEndYOut = yAt(L);
         }
@@ -6739,9 +8092,52 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             path.prims.push_back(std::move(pr));
             arc += q;
         };
-        if (!tangentStart) {
-            riseSeg(-begX, -zN0, -s0.segX, -zN0, s0.segX - begX, "face -Z out");
-            riseCorner(-s0.segX, -cZ0, kPi / 2.0, "corner -X-Z");
+        // A corner piece from azimuth az0 to az1 (P = centre + cornerR (cos az, -sin az)), climbing pitch-true, or to
+        // endY where MKF states the height it ends at (a row end).
+        auto riseArc = [&](double cxx, double czz, double az0, double az1, const char* what,
+                           double endY = std::numeric_limits<double>::quiet_NaN(),
+                           double startY = std::numeric_limits<double>::quiet_NaN()) {
+            const double len = s0.cornerR * (az1 - az0);
+            Primitive pr;
+            pr.kind = Primitive::SPIRAL;
+            pr.spiral = {cxx, czz, s0.cornerR, std::isnan(startY) ? yAt(arc) : startY, az0, s0.cornerR,
+                         std::isnan(endY) ? yAt(arc + len) : endY, az1};
+            pr.label = label + std::string(" ") + what;
+            pr.turnOrdinal = ordinal;
+            path.prims.push_back(std::move(pr));
+            arc += len;
+        };
+        if (!tangentStart && !std::isnan(rowStartY)) {
+            // MKF's row start: drawn exactly as MKF states it, or refused with both numbers.
+            const double pieceEndX = startOnArc ? s0.segX + s0.cornerR : s0.segX;
+            const double pieceLen = startOnArc ? s0.cornerR * (kPi / 2.0 - begTheta) : s0.segX - begX;
+            if (stadium || isReturn || std::isnan(startAtX) || begX < 0.0 || std::abs(std::abs(rowStartFromX) - pieceEndX) > 1e-9 ||
+                std::abs(yAt(pieceLen) - rowStartFromY) > 1e-9) {
+                std::ostringstream m;
+                m.precision(12);
+                m << "ConductorBuilder: MKF's row start of " << label << " joins the turn's climb at x = " << rowStartFromX
+                  << " m, height " << rowStartFromY << " m; the wrap's first piece ends at |x| = " << pieceEndX << " m, height "
+                  << yAt(pieceLen) << " m";
+                throw std::runtime_error(m.str());
+            }
+            if (std::getenv("MVB_LEAD_DIAG"))
+                std::fprintf(stderr, "[row-start] '%s' first piece from (%.9f, %.9f) to (%.9f, %.9f) mm; pitch-true start %.9f mm\n",
+                             label.c_str(), -begX * 1e3, rowStartY * 1e3, -pieceEndX * 1e3, rowStartFromY * 1e3, yAt(0.0) * 1e3);
+            if (startOnArc) {
+                riseArc(-s0.segX, -cZ0, kPi / 2.0 + begTheta, kPi, "corner -X-Z (from slot) (terminal stub)",
+                        std::numeric_limits<double>::quiet_NaN(), rowStartY);
+            } else {
+                pushSeg(gp_Pnt(-begX, rowStartY, -zN0), gp_Pnt(-s0.segX, yAt(pieceLen), -zN0), "face -Z out");
+                arc += pieceLen;
+                riseCorner(-s0.segX, -cZ0, kPi / 2.0, "corner -X-Z");
+            }
+        } else if (!tangentStart) {
+            if (startOnArc) {
+                riseArc(-s0.segX, -cZ0, kPi / 2.0 + begTheta, kPi, "corner -X-Z (from slot) (terminal stub)");
+            } else {
+                riseSeg(-begX, -zN0, -s0.segX, -zN0, s0.segX - begX, "face -Z out");
+                riseCorner(-s0.segX, -cZ0, kPi / 2.0, "corner -X-Z");
+            }
         }
         riseSeg(-s0.xPos, -cZ0, -s0.xPos, +cP0, 2.0 * s0.segZ + ride0 + rideBack0,
                 "face -X");
@@ -6763,8 +8159,45 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             arc += s0.cornerR * sweep;
             return;
         }
+        if (!tangentEnd && endOnArc) {
+            // The slot stands on the last corner: the wrap ends there, the corner shortened to it.
+            if (!std::isnan(rowEndY)) {
+                // MKF's row end on the arc: the last corner, from its start (the +X face's end) to the slot.
+                if (isReturn || std::abs(s0.segX + s0.cornerR - rowEndFromX) > 1e-9 || std::abs(yAt(arc) - rowEndFromY) > 1e-9) {
+                    std::ostringstream m;
+                    m.precision(12);
+                    m << "ConductorBuilder: MKF's row end of " << label << " starts at x = " << rowEndFromX << " m, height "
+                      << rowEndFromY << " m; the wrap's last corner starts at x = " << s0.segX + s0.cornerR << " m, height "
+                      << yAt(arc) << " m";
+                    throw std::runtime_error(m.str());
+                }
+                riseArc(+s0.segX, -cZ0, 0.0, kPi / 2.0 - endTheta, "corner +X-Z (to slot) (terminal stub)", rowEndY);
+                if (riseEndYOut) *riseEndYOut = rowEndY;
+                return;
+            }
+            riseArc(+s0.segX, -cZ0, 0.0, kPi / 2.0 - endTheta, "corner +X-Z (to slot) (terminal stub)");
+            return;
+        }
         if (!tangentEnd) {
             riseCorner(+s0.segX, -cZ0, 0.0, "corner +X-Z");
+            if (!std::isnan(rowEndY)) {
+                // MKF's row end: drawn exactly as MKF states it, or refused with both numbers.
+                if (stadium || isReturn || std::isnan(stopAtX) || std::abs(s0.segX - rowEndFromX) > 1e-9 ||
+                    std::abs(yAt(arc) - rowEndFromY) > 1e-9) {
+                    std::ostringstream m;
+                    m.precision(12);
+                    m << "ConductorBuilder: MKF's row end of " << label << " starts at x = " << rowEndFromX << " m, height "
+                      << rowEndFromY << " m; the wrap's face straight ends at x = " << s0.segX << " m, height " << yAt(arc) << " m";
+                    throw std::runtime_error(m.str());
+                }
+                if (std::getenv("MVB_LEAD_DIAG"))
+                    std::fprintf(stderr, "[row-end] '%s' face -Z in from (%.9f, %.9f) to (%.9f, %.9f) mm; pitch-true end %.9f mm\n",
+                                 label.c_str(), s0.segX * 1e3, yAt(arc) * 1e3, endX * 1e3, rowEndY * 1e3, yAt(L) * 1e3);
+                pushSeg(gp_Pnt(+s0.segX, yAt(arc), -zN0), gp_Pnt(endX, rowEndY, -zN0), "face -Z in");
+                arc += s0.segX - endX;
+                if (riseEndYOut) *riseEndYOut = rowEndY;
+                return;
+            }
             riseSeg(+s0.segX, -zN0, endX, -zN0, s0.segX - endX, "face -Z in");
         }
         return;
@@ -6817,7 +8250,9 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
             pts.insert(pts.end(), {gp_Pnt(0.0, yChain, -zN0), gp_Pnt(0.0, yEnd, -zDest)});
             appendFilletedPolyline(path.prims, pts, wireRadius, label + " (dragback)", ordinal,
                                    /*isLead=*/false, /*isConnection=*/true,
-                                   /*rounded=*/g_roundedLeadCorners || path.isRectangular);
+                                   /*rounded=*/g_roundedLeadCorners || path.isRectangular,
+                           /*bendRadius=*/dragbackBendOf(path.winding, path.parallel),
+                           std::nullopt, std::nullopt, /*deferDragbackCorners=*/g_roundedLeadCorners && !path.isRectangular);
             return;
         }
         if (!std::isnan(bandY)) {
@@ -6870,7 +8305,9 @@ void appendRectWrap(ConductorPath& path, const RectStation& s0, const RectStatio
         }
         appendFilletedPolyline(path.prims, pts, wireRadius, label + " (dragback)", ordinal,
                                /*isLead=*/false, /*isConnection=*/true,
-                               /*rounded=*/g_roundedLeadCorners || path.isRectangular);
+                               /*rounded=*/g_roundedLeadCorners || path.isRectangular,
+                           /*bendRadius=*/dragbackBendOf(path.winding, path.parallel),
+                           std::nullopt, std::nullopt, /*deferDragbackCorners=*/g_roundedLeadCorners && !path.isRectangular);
     }
 }
 
@@ -7620,7 +9057,10 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     // segment pout -> pout + sign*h*bend, the corner arc's plane being vertical -- and every
     // OTHER rim tube. Negative means interpenetration.
     auto rimCornerSlack = [&](const gp_XY& h, double sign) {
-        const double ownCoated = b / kRoundCornerBendFactor;
+        // The wire's COATED radius, whatever is drawn: path.wireRadius is the conducting radius in the default (copper)
+        // drawing, and judging the corner with it passed headings a coating thickness inside the neighbour's envelope
+        // (realwinding_cmc_3w_2layer: the natural heading "cleared" and the gate certified 22 um of overlap).
+        const double ownCoated = coatedRadiusOf(path);
         const gp_XY u(h.X() * b * sign, h.Y() * b * sign);
         const double len2 = u.Dot(u);
         double worst = std::numeric_limits<double>::max();
@@ -7649,7 +9089,7 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
         const gp_XY poloidal(-sign * c0.pout.X() / poutR, -sign * c0.pout.Y() / poutR);
         double bestSlack = rimCornerSlack(poloidal, sign);
         if (bestSlack >= kRimClear) return poloidal;
-        const double minArc = 2.0 * b / kRoundCornerBendFactor;
+        const double minArc = 2.0 * path.wireRadius;
         for (int n = 1; n <= 1800; ++n) {   // 0.05 deg steps out to +-90 deg from poloidal
             for (const double dir : {1.0, -1.0}) {
                 const double rot = dir * n * 0.05 * kPi / 180.0;
@@ -7694,7 +9134,7 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     if ((dTopChord - dTopEnd).Modulus() > 0.0) {
         // ABT #865 imposed the poloidal rim heading: the chord becomes spiral + bend arc.
         topBend = solveToroChordBend(c0.pin, topHeading, c0.pout, dTopChord, b, /*top=*/true, label,
-                                     2.0 * b / kRoundCornerBendFactor);
+                                     2.0 * path.wireRadius);
         topSp = topBend->spiral;
         dTop = topSp.nearHeading;
     }
@@ -7769,7 +9209,7 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
     std::optional<ToroChordBend> botBend;
     if ((eBotChord - eBotStart).Modulus() > 0.0) {
         botBend = solveToroChordBend(c1.pin, bottomHeading, c0.pout, eBotChord, b, /*top=*/false, label,
-                                     2.0 * b / kRoundCornerBendFactor);
+                                     2.0 * path.wireRadius);
         botSp = botBend->spiral;
         eBot = botSp.nearHeading;
     }
@@ -7809,7 +9249,7 @@ void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c
 // tangent junctions.
 void appendToroTransitionBand(ConductorPath& path, const ToroCross& c0, const ToroCross& c1,
                               double bend, double extraDepth, double rMid,
-                              const std::string& label, size_t ordinal) {
+                              const std::string& label, size_t ordinal, bool mitreCorners) {
     auto P = [](const gp_XY& h, double y) { return gp_Pnt(h.X(), y, h.Y()); };
     auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const char* what) {
         if (a.Distance(b) < 1e-12) return;
@@ -7860,8 +9300,39 @@ void appendToroTransitionBand(ConductorPath& path, const ToroCross& c0, const To
     // centreline radius equals the wire radius sweeps a HORN TORUS -- the tube touches its own
     // axis of revolution, so OCC returns a self-touching (invalid) solid and the conformal
     // assembler drops it, which is exactly the "missing dragback corner" seen in the STEP.
-    // kDragbackFilletBendFactor (WireAssembler.h) says why it is 1.5 rather than the buildable floor.
-    const double bf = kDragbackFilletBendFactor * bend;
+    // ABT #2274 (Alf, 2026-11-13): MKF's radius (ConnectionLayout::wireBendRadius), no factor of MVB++'s own; the
+    // caller only calls here with a radius above the wire's.
+    // MITRE CORNERS (appendToroWrap's own rule, and its caller's: MKF's bend not above the wire radius cannot be swept
+    // round, so the wraps are sharp and reported). The same route, its runs meeting at sharp corner points: up, the top
+    // chord, down to the band depth, then either the dragback -- radially in to the core's central circle, along it,
+    // radially in to the destination's bore crossing -- or the direct return under the core, and up.
+    if (mitreCorners) {
+        const double rh0M = c0.tube + b;
+        const double rhbM = toroWrapDepth(c0, c1, b) + extraDepth + b;
+        const double rOut0M = c0.pout.Modulus(), rIn1M = c1.pin.Modulus();
+        const double az0M = std::atan2(c0.pout.Y(), c0.pout.X());
+        const double az1M = std::atan2(c1.pin.Y(), c1.pin.X());
+        const double dAzM = std::remainder(az1M - az0M, 2.0 * kPi);
+        pushSeg(P(c0.pin, 0), P(c0.pin, rh0M), "inner tube up");
+        pushSeg(P(c0.pin, rh0M), P(c0.pout, rh0M), "top chord");
+        pushSeg(P(c0.pout, rh0M), P(c0.pout, -rhbM), "outer tube down");
+        // The dragback runs on the central circle only where that circle lies between the two crossings and there is
+        // azimuth to travel; otherwise the wire returns straight under the core, as the round route does.
+        if (std::abs(dAzM) > 1e-9 && rOut0M > rMid && rIn1M < rMid) {
+            pushSeg(P(c0.pout, -rhbM), P(pol(rMid, az0M), -rhbM), "dragback out leg");
+            pushArcH(gp_XY(0, 0), -rhbM, pol(rMid, az0M), pol(rMid, az0M + dAzM), "dragback central arc");
+            pushSeg(P(pol(rMid, az0M + dAzM), -rhbM), P(c1.pin, -rhbM), "dragback in leg");
+        }
+        else {
+            pushSeg(P(c0.pout, -rhbM), P(c1.pin, -rhbM), "turnaround return");
+        }
+        pushSeg(P(c1.pin, -rhbM), P(c1.pin, 0), "inner tube up to crossing");
+        return;
+    }
+    if (!(bend > path.wireRadius))
+        throw std::logic_error("appendToroTransitionBand: " + label + " has MKF's bend " + std::to_string(bend) +
+                               " m, not above its wire radius " + std::to_string(path.wireRadius) + " m");
+    const double bf = bend;
 
     // ---- source turn's top half (identical to a normal wrap's) ----
     gp_XY dH = c0.pout - c0.pin;
@@ -8432,6 +9903,187 @@ void checkPinLeadClearance(const std::vector<ConductorPath>& paths,
 // is there). Turn copper, stubs, bumps and isConnection links are not lead.
 static bool isTerminalLeadPiece(const Primitive& pr) { return pr.isLead || pr.terminalFillet; }
 
+// ABT #2274 (Alf, 2026-11-08, after agent 20: "level row at the lane only"): MKF keeps a level lead's reserved
+// section (the 2-D crossing) at the crossing row and publishes the row the lead takes AT ITS LANE on the route
+// (ConnectionRoute::levelRowShift, waypoints = section + shift). `wp` is the lead read from the section,
+// station first, border last; its run (every point past the station) moves to MKF's lane row. The drawn border
+// row is then checked against the route's own border waypoint: a mismatch means this reader drew a row MKF did
+// not plan, and it throws with both numbers. No route with a level row: wp is untouched.
+void applyMkfLevelRow(std::vector<PlanePt>& wp, const OpenMagnetics::ConnectionLayout& layout,
+                      const std::string& winding, size_t parallel, bool entrance, const std::string& who) {
+    const auto kind = entrance ? OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE : OpenMagnetics::ConnectionKind::TERMINAL_EXIT;
+    const OpenMagnetics::ConnectionRoute* level = nullptr;
+    for (const auto& r : layout.routes) {
+        if (r.winding == winding && static_cast<size_t>(r.parallel) == parallel && r.kind == kind && r.levelRowShift) {
+            if (level)
+                throw std::runtime_error("ConductorBuilder: MKF published two level-row routes for " + who);
+            level = &r;
+        }
+    }
+    if (!level || wp.size() < 2)
+        return;
+    if (level->waypoints.empty())
+        throw std::runtime_error("ConductorBuilder: MKF's level-row route for " + who + " has no waypoints");
+    const double shift = *level->levelRowShift;
+    for (size_t i = 1; i < wp.size(); ++i)
+        wp[i].y += shift;
+    // An entrance's MKF route runs border -> attach, an exit's attach -> border.
+    const double mkfBorderY = (entrance ? level->waypoints.front() : level->waypoints.back()).at(1);
+    if (std::getenv("MVB_LEAD_DIAG"))
+        std::cerr << "[level-row] " << who << ": run moved " << shift * 1e3 << " mm to the lane row " << wp.back().y * 1e3
+                  << " mm (MKF border row " << mkfBorderY * 1e3 << " mm)\n";
+    if (std::abs(wp.back().y - mkfBorderY) > 1e-9) {
+        std::ostringstream w;
+        w.precision(9);
+        w << "ConductorBuilder: the level-row lead of " << who << " is drawn at " << wp.back().y * 1e3
+          << " mm at its border, MKF's route row is " << mkfBorderY * 1e3 << " mm (shift " << shift * 1e3 << " mm)";
+        throw std::runtime_error(w.str());
+    }
+}
+
+// ABT #2274 (agent 27; MKF decides, MVB++ draws): MIRROR-HANDED CONDUCTORS. Every wrap here is drawn clockwise (it leaves
+// the crossing towards -x: appendRoundWrap / appendRectWrap). MKF winds a mirrored window's turns counter-clockwise
+// (TurnOrientation, Coil::get_turn_orientation_in_winding_window) and says so on the conductor's terminal routes
+// (ConnectionRoute::wrapDirection +1). Such a conductor is the mirror image (x -> -x in its leg frame) of a clockwise one,
+// so it is BUILT clockwise in the mirrored frame -- from a copy of MKF's layout whose face-x quantities of that conductor
+// are mirrored (exitSlot, laneHalf, wrapDirection) -- and the finished path is mirrored back (mirrorPathX) before it is
+// placed on its leg. A face-x quantity this does not yet mirror (row end, slot ramp, dragback interval, tangent departure,
+// return lanes, pin run) on such a conductor throws. A foil's axial leads keep their own mirror (#2293); a conductor whose
+// terminal routes disagree on the direction throws.
+static OpenMagnetics::ConnectionLayout mirrorHandedLayout(const OpenMagnetics::ConnectionLayout& in,
+                                                          std::set<std::pair<std::string, int64_t>>& mirrored) {
+    std::map<std::pair<std::string, int64_t>, int> direction;
+    for (const auto& r : in.routes) {
+        if (r.kind != OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE && r.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT) continue;
+        if (!r.wrapDirection || r.axialLead) continue;
+        const auto key = std::make_pair(r.winding, r.parallel);
+        auto [it, fresh] = direction.emplace(key, *r.wrapDirection);
+        if (!fresh && it->second != *r.wrapDirection)
+            throw std::runtime_error("ConductorBuilder: MKF's terminal routes of '" + r.winding + " parallel " + std::to_string(r.parallel) +
+                                     "' disagree on the wrap direction, so the handedness of its turns is unknown");
+    }
+    for (const auto& [key, d] : direction) {
+        if (d != 1 && d != -1)
+            throw std::runtime_error("ConductorBuilder: MKF states wrap direction " + std::to_string(d) + " for '" + key.first +
+                                     " parallel " + std::to_string(key.second) + "', neither -1 nor +1");
+        if (d == 1) mirrored.insert(key);
+    }
+    OpenMagnetics::ConnectionLayout out = in;
+    for (auto& r : out.routes) {
+        if (!mirrored.count({r.winding, r.parallel})) continue;
+        const std::string who = "'" + r.winding + " parallel " + std::to_string(r.parallel) + "'";
+        auto refuse = [&](const char* what) {
+            throw std::runtime_error("ConductorBuilder: " + who + " is wound counter-clockwise (MKF wrapDirection +1, a mirrored "
+                                     "window) and MKF gives it " + what + ", which MVB++ does not yet draw mirror-handed");
+        };
+        if (r.rowEndX || r.rowEndFromX) refuse("a row end");
+        if (r.slotRampLength || r.slotRampEndX) refuse("a slot-step ramp");
+        if (r.dragbackAlongFace) refuse("a dragback interval along the face");
+        if (r.tangentDeparture) refuse("a tangent departure");
+        if (r.laneOffset || r.laneAzimuth) refuse("a return lane");
+        if (!r.pinWaypoints.empty()) refuse("a pin run");
+        if (r.axialLead) refuse("an axial lead");
+        if (r.exitSlot) r.exitSlot = -*r.exitSlot;
+        if (r.laneHalf) r.laneHalf = -*r.laneHalf;
+        if (r.wrapDirection) r.wrapDirection = -*r.wrapDirection;
+    }
+    return out;
+}
+
+// The mirror x -> -x of a finished path (leg frame): points and an arc's start vector are polar, an arc's rotation axis
+// is a pseudo-vector ((ax, -ay, -az): the same sweep traces the mirrored arc), a blend's tangent is polar, a spiral
+// keeps r and y and maps cx -> -cx, az -> pi - az.
+static void mirrorPathX(ConductorPath& path) {
+    auto mirror = [](gp_Pnt& q) { q.SetX(-q.X()); };
+    for (auto& pr : path.prims) {
+        switch (pr.kind) {
+            case Primitive::SEG:
+                mirror(pr.seg.a);
+                mirror(pr.seg.b);
+                break;
+            case Primitive::ARC3:
+                mirror(pr.arc.c);
+                pr.arc.v0.SetX(-pr.arc.v0.X());
+                pr.arc.axis = gp_XYZ(pr.arc.axis.X(), -pr.arc.axis.Y(), -pr.arc.axis.Z());
+                break;
+            case Primitive::BLEND:
+                mirror(pr.blendc.a);
+                mirror(pr.blendc.b);
+                pr.blendc.u.SetX(-pr.blendc.u.X());
+                break;
+            case Primitive::SPIRAL:
+                // P(az) = (cx + r cos az, y, cz - r sin az) (azPointC). Its mirror (-cx - r cos az, y, cz - r sin az) is
+                // the same piece about -cx at azimuth pi - az: r, y and every profile fraction in t are unchanged.
+                pr.spiral.cx = -pr.spiral.cx;
+                pr.spiral.az0 = std::numbers::pi - pr.spiral.az0;
+                pr.spiral.az1 = std::numbers::pi - pr.spiral.az1;
+                break;
+        }
+    }
+    if (path.hasWeldStrip) {
+        mirror(path.weldCornerA);
+        mirror(path.weldCornerB);
+    }
+}
+
+// ABT #2274 (Alf, 2026-11-08, after agent 24): the exit route whose turn MKF ends ON its crossing row at its lane
+// (ConnectionRoute::rowEndX / rowEndHeight / rowEndFromX / rowEndFromHeight), or null.
+static const OpenMagnetics::ConnectionRoute* mkfRowEndRoute(const OpenMagnetics::ConnectionLayout& layout,
+                                                            const std::string& winding, size_t parallel) {
+    for (const auto& r : layout.routes)
+        if (r.winding == winding && static_cast<size_t>(r.parallel) == parallel &&
+            r.kind == OpenMagnetics::ConnectionKind::TERMINAL_EXIT && r.rowEndX) {
+            if (!r.rowEndHeight || !r.rowEndFromX || !r.rowEndFromHeight || r.waypoints.size() < 2 || r.levelRowShift)
+                throw std::runtime_error("ConductorBuilder: MKF's row end of " + winding + " is incomplete or carries a level-row shift");
+            return &r;
+        }
+    return nullptr;
+}
+
+// ABT #2274 (Alf, 2026-11-09, decision 2): MKF's ROW START of a round-column entrance -- the mirror of the row end: the
+// first wrap starts ON the crossing row at the lane (rowEndX, rowEndHeight) and climbs uniformly onto its helix, which it
+// joins at the next crossing (rowEndFromX = 0, rowEndFromHeight). Null when MKF gives none.
+const OpenMagnetics::ConnectionRoute* mkfRowStartRoute(const OpenMagnetics::ConnectionLayout& layout,
+                                                       const std::string& winding, size_t parallel) {
+    for (const auto& r : layout.routes)
+        if (r.winding == winding && static_cast<size_t>(r.parallel) == parallel &&
+            r.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE && r.rowEndX) {
+            if (!r.rowEndHeight || !r.rowEndFromX || !r.rowEndFromHeight || r.waypoints.size() < 2 || r.levelRowShift)
+                throw std::runtime_error("ConductorBuilder: MKF's row start of " + winding + " is incomplete or carries a level-row shift");
+            return &r;
+        }
+    return nullptr;
+}
+
+// ABT #2274 (Alf, 2026-11-09, decision 1 "low row"): the lead of a round-column row end / row start is MKF's route, not
+// the 2-D section. MKF keeps the section where the blocking put it (its border row) and publishes the row the lead
+// really takes on the route's waypoints (the crossing row of decision 2, or the low row under the turn that crosses
+// the lane). `wp` is the lead read from the section, station first, border last; it is replaced by MKF's waypoints in
+// that order (an entrance's route runs border -> attach). The attach point stays the one drawn from the turn's own
+// copper (the stub's true end); the row-end / row-start checks after pushPlaneSegs compare it with MKF's row.
+static void drawMkfRowRoute(std::vector<PlanePt>& wp, const OpenMagnetics::ConnectionRoute* route, bool entrance,
+                            const std::string& who) {
+    if (!route || wp.empty())
+        return;
+    std::vector<PlanePt> mkf;
+    for (const auto& q : route->waypoints) {
+        if (q.size() < 2)
+            throw std::runtime_error("ConductorBuilder: MKF's row route of " + who + " has a waypoint without two coordinates");
+        mkf.push_back({q[0], q[1]});
+    }
+    if (entrance)
+        std::reverse(mkf.begin(), mkf.end());
+    if (std::getenv("MVB_LEAD_DIAG")) {
+        std::cerr << "[row-route] " << who << ": section";
+        for (const auto& q : wp) std::cerr << " (" << q.x * 1e3 << "," << q.y * 1e3 << ")";
+        std::cerr << " -> MKF";
+        for (const auto& q : mkf) std::cerr << " (" << q.x * 1e3 << "," << q.y * 1e3 << ")";
+        std::cerr << " mm\n";
+    }
+    mkf.front() = wp.front();
+    wp = std::move(mkf);
+}
+
 // ABT #1172/#1237: MKF plans a pin run's corners for the bend radius THIS consumer will draw --
 // it offsets each leg d >= R - (R - r) sin(theta/2) off the obstacle faces (Settings::
 // lead_leg_clearance) -- and plans SHARP corners (R = r) when nothing declares one, which puts the
@@ -8448,16 +10100,21 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                      // ABT #685: MKF's classification of every connection —
                                      // MVB++ READS which transitions are returns instead of
                                      // re-deriving them from turn coordinates.
-                                     const OpenMagnetics::ConnectionLayout& connectionLayout,
+                                     const OpenMagnetics::ConnectionLayout& connectionLayoutIn,
                                      const ConductorBuilder::Options& opts,
                                      std::vector<ConductorBuilder::PathPolyline>* polyOut = nullptr,
                                      // ABT #1215: finished centrelines, no solids (see polyOut).
                                      std::vector<ConductorPath>* centrelineOut = nullptr) {
+    // ABT #2274 (agent 27): counter-clockwise conductors are built in their mirrored frame (see mirrorHandedLayout).
+    std::set<std::pair<std::string, int64_t>> mirrorHanded;
+    const OpenMagnetics::ConnectionLayout connectionLayout = mirrorHandedLayout(connectionLayoutIn, mirrorHanded);
     // Every build starts unproven: only the gate's own outcome below may overwrite this, so a
     // throw anywhere in the build leaves NotRun, never a previous build's Certified.
     if (opts.enamelGateVerdictOut) *opts.enamelGateVerdictOut = EnamelGateVerdict::NotRun;
     // The one collision debug switch, for every refusal of this build (see collisionDiagnostic).
     const CollisionDiagnosticScope collisionDiagnosticScope(opts.diagnosticSkipCollisionCheck);
+    const DisplayOnlyScope displayOnlyScope(opts.paintCoating);
+    const WeldMode weldMode = opts.paintCoating ? WeldMode::Off : opts.weld;   // a display drawing is not welded
     // ABT #685 (Alf, 2026-08-17): WHAT a connection IS comes from MKF, not from a threshold here.
     // isZReturn() used to answer it from turn coordinates -- a median pitch, a filar-count bound,
     // a sign-of-advance rule -- and every one of those had a comment naming the design it had been
@@ -8488,6 +10145,16 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         }
         return radius;
     };
+    // ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"): the radius MKF exports for a bend of a winding's
+    // own wire where no route carries one (ConnectionLayout::wireBendRadius: layer links, toroid corners and ring
+    // transitions). Missing = MKF did not say, which throws: no radius is chosen here.
+    auto wireBendOf = [&](const std::string& winding) {
+        const auto it = connectionLayout.wireBendRadius.find(winding);
+        if (it == connectionLayout.wireBendRadius.end() || !(it->second > 0.0))
+            throw std::runtime_error("ConductorBuilder: MKF exported no wire bend radius for winding '" + winding +
+                                     "' (ConnectionLayout::wireBendRadius), so its layer links and toroid corners have no radius");
+        return it->second;
+    };
     // Alf, 2026-10-28: a ROUND terminal-lead corner -- a joint of the lead and the corner where it
     // leaves its turn -- is bent at the radius MKF planned for the lead, never at a radius chosen here.
     auto leadBendRadius = [&](const std::string& winding, size_t parallel) {
@@ -8499,11 +10166,31 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                      "corners have no radius");
         return planned;
     };
+    // ABT #2274 item E (agent 48, Alf: "MKF plans what is built"): the terminal corner MKF planned for a ramped
+    // round-column lead (ConnectionRoute::terminalClimbTangentLength / terminalClimbPhiDegrees), drawn exactly and
+    // only validated (TerminalFillet.h PlannedClimb). Half a plan (one field without the other) throws.
+    auto plannedClimbOf = [&](const std::string& winding, size_t parallel, bool entrance) -> std::optional<PlannedClimb> {
+        std::optional<PlannedClimb> out;
+        for (const auto& r : connectionLayout.routes) {
+            if (r.winding != winding || r.parallel != static_cast<int64_t>(parallel)) continue;
+            if (r.kind != (entrance ? OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE : OpenMagnetics::ConnectionKind::TERMINAL_EXIT))
+                continue;
+            if (r.terminalClimbTangentLength.has_value() != r.terminalClimbPhiDegrees.has_value())
+                throw std::runtime_error("ConductorBuilder: MKF published half a terminal climb for " + winding + " parallel " +
+                                         std::to_string(parallel) + (entrance ? " entrance" : " exit"));
+            if (!r.terminalClimbTangentLength) continue;
+            if (out)
+                throw std::runtime_error("ConductorBuilder: MKF published two terminal climbs for " + winding + " parallel " +
+                                         std::to_string(parallel) + (entrance ? " entrance" : " exit"));
+            out = PlannedClimb{r.terminalClimbTangentLength.value(), r.terminalClimbPhiDegrees.value()};
+        }
+        return out;
+    };
     // The bend a round lead corner of this conductor takes: MKF's, or the smallest buildable one where the
     // fan's retry found MKF's leaves no clear layout (tlsLeadsAtMinimumBend).
     auto leadBendFor = [&](const std::string& winding, size_t parallel, double wireR) {
-        return tlsLeadsAtMinimumBend.count({winding, parallel}) ? kRoundCornerBendFactor * wireR
-                                                               : leadBendRadius(winding, parallel);
+        (void) wireR;
+        return leadBendRadius(winding, parallel);
     };
     // Alf, 2026-10-28: round lead corners need MKF's bend; a conductor whose terminal routes carry none
     // is drawn with SHARP lead corners (reported once), never at a radius chosen here.
@@ -8517,48 +10204,41 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                       << " (its terminal routes carry no plannedBendRadius), so its lead corners are drawn sharp\n";
         return false;
     };
-    // The terminal corner (helix -> lead) at MKF's bend; where no biarc of that radius fits, at the
-    // smallest buildable bend, kRoundCornerBendFactor x the wire radius (Alf, 2026-10-28), reported
-    // when `report` (the fan asks this many times while it searches, and does not report).
+    // The terminal corner (helix -> lead) at MKF's bend; where no biarc of that radius fits, sharp
+    // (ABT #2274, Alf 2026-11-13: no smaller bend chosen here), reported when `report` (the fan asks this many times while it searches, and does not report).
     auto filletTerminalAtPlannedBendUncached = [&](std::vector<Primitive>& chain, const std::string& winding, size_t parallel,
                                            double wireR, const std::string& who, double rollIn, double rollOut, bool report,
                                            const FilletClears& clears = {}, size_t* uncleared = nullptr,
                                            std::string* witness = nullptr) -> size_t {
         const std::vector<Primitive> before = chain;
         const size_t unclearedBefore = uncleared ? *uncleared : 0;
+        // ABT #2274 item E (agent 48): the fan's own lead model (who "... (fan...)": an idealised stub on a whole-turn
+        // helix, not the emitted chain -- 06 P1 entrance: 93.5 deg there against 82.9 deg drawn) is not the corner MKF
+        // planned, so MKF's plan is held only to the emitted conductor chains.
+        const bool fanModel = who.find(" (fan") != std::string::npos;
         try {
             const size_t n = filletTerminalCorners(chain, leadBendFor(winding, parallel, wireR), wireR, who, rollIn,
-                                                   rollOut, clears, uncleared, witness);
+                                                   rollOut, clears, uncleared, witness,
+                                                   fanModel ? std::nullopt : plannedClimbOf(winding, parallel, /*entrance=*/true),
+                                                   fanModel ? std::nullopt : plannedClimbOf(winding, parallel, /*entrance=*/false));
             if (!uncleared || *uncleared == unclearedBefore) return n;
             // MKF's bend fits but clears no neighbour at any roll (11_pushpull: Secondary 1 p0's exit at
-            // 1.031 mm against Secondary 2): the smallest buildable bend, as where it does not fit.
+            // 1.031 mm against Secondary 2): the corner is sharp (ABT #2274, Alf 2026-11-07: "IEC where it
+            // fits, else sharp" -- never a smaller bend chosen here).
             std::cerr << "[ConductorBuilder] FINDING: " << (witness ? *witness : std::string("a terminal corner of ") + who)
-                      << " At MKF's bend " << leadBendRadius(winding, parallel) << " m no fillet clears; it is bent at "
-                      << "the smallest buildable bend, " << kRoundCornerBendFactor * wireR << " m.\n";
+                      << " At MKF's bend " << leadBendRadius(winding, parallel) << " m no fillet clears; it is drawn "
+                      << "sharp (bisection mitre).\n";
             chain = before;
             *uncleared = unclearedBefore;
-            return filletTerminalCorners(chain, kRoundCornerBendFactor * wireR, wireR, who, rollIn, rollOut, clears,
-                                         uncleared, witness);
+            return 0;
         }
         catch (const std::runtime_error& e) {
             if (std::string(e.what()).find("no tangent biarc with radius") == std::string::npos) throw;
+            // MKF's bend does not fit: the corner is sharp -- the crossing vertex, a bisection mitre.
             chain = before;
-            const double bMin = kRoundCornerBendFactor * wireR;
             if (report)
-                std::cerr << "[ConductorBuilder] FINDING: " << e.what() << " It is bent at the smallest buildable bend, "
-                          << bMin << " m (kRoundCornerBendFactor x the wire radius).\n";
-            try {
-                return filletTerminalCorners(chain, bMin, wireR, who, rollIn, rollOut, clears, uncleared, witness);
-            }
-            catch (const std::runtime_error& e2) {
-                if (std::string(e2.what()).find("no tangent biarc with radius") == std::string::npos) throw;
-                // Alf, 2026-10-30: below the smallest buildable bend the corner is sharp -- the crossing
-                // vertex, a bisection mitre.
-                chain = before;
-                if (report)
-                    std::cerr << "[ConductorBuilder] FINDING: " << e2.what() << " It is drawn sharp (bisection mitre).\n";
-                return 0;
-            }
+                std::cerr << "[ConductorBuilder] FINDING: " << e.what() << " It is drawn sharp (bisection mitre).\n";
+            return 0;
         }
     };
     struct PureFillet { std::vector<Primitive> chain; size_t filleted = 0; std::string error; };
@@ -8596,11 +10276,87 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         return filletTerminalAtPlannedBendUncached(chain, winding, parallel, wireR, who, rollIn, rollOut, report,
                                                    clears, uncleared, witness);
     };
+    // ABT #2274 (Alf, 2026-11-08, after agent 20): every finding MKF judged on a route is printed with its numbers,
+    // and a level-row clash (LEVEL_ROW_CLASH: a lead's level row at its lane meets other copper) refuses the part --
+    // thrown in production, drawn and reported under --skip-collision-check (refuseCollision).
+    for (const auto& route : connectionLayout.routes) {
+        for (const auto& finding : route.findings) {
+            std::cerr << "[mkf-finding] " << route.winding << " parallel " << route.parallel << " kind "
+                      << static_cast<int>(finding.kind) << ": " << finding.witness << "\n";
+        }
+    }
+    // ABT #2274 (Alf, after agent 29: "a real finding must throw in prod"; no fallbacks): every finding kind that
+    // states copper in copper (or in the core) or copper out of its window refuses the part the same way -- thrown in
+    // production, drawn and reported under --skip-collision-check. Only ROUTE_NOT_MODELLED (MKF states a condition it
+    // does not model, no overlap claimed) stays a printed finding.
+    auto refusedFindingKind = [](OpenMagnetics::LeadFindingKind kind) -> const char* {
+        switch (kind) {
+            case OpenMagnetics::LeadFindingKind::TURN_COLLISION: return "a turn wound across the tangent lead";
+            case OpenMagnetics::LeadFindingKind::CROSSES_FAR_SIDE: return "a tangential lead meets its turn past the turn's far side";
+            case OpenMagnetics::LeadFindingKind::NO_RADIAL_RUN: return "a tangential lead's corner ends past the border its radial run must reach";
+            case OpenMagnetics::LeadFindingKind::MEETS_CORE_LEG: return "a lead meets the core's outer leg";
+            case OpenMagnetics::LeadFindingKind::LEADS_TOO_CLOSE: return "a tangential lead comes closer to another lead than their coated radii";
+            case OpenMagnetics::LeadFindingKind::TIED_LEADS_COLLIDE: return "no order of tied leads keeps every member's turn clear of its siblings' leads";
+            case OpenMagnetics::LeadFindingKind::LANES_COLLIDE: return "two leads stand closer along the face than their extents";
+            case OpenMagnetics::LeadFindingKind::PIN_RUN_COLLIDES: return "every candidate run to the pin shares copper";
+            case OpenMagnetics::LeadFindingKind::LIFT_TOO_SHORT: return "an off-face exit's lift and bend need more axial room than its stub has";
+            case OpenMagnetics::LeadFindingKind::LANES_DO_NOT_FIT: return "a lead does not fit its lane (copper into a lead or out of the window)";
+            case OpenMagnetics::LeadFindingKind::LEVEL_ROW_CLASH: return "the level lead row meets other copper";
+            case OpenMagnetics::LeadFindingKind::NO_CONSISTENT_RAMP: return "no ramp is consistent with the lead's lane and no standoff moves it";
+            case OpenMagnetics::LeadFindingKind::ROUTE_NOT_MODELLED: return nullptr;
+        }
+        throw std::logic_error("ConductorBuilder: MKF reports a lead finding of kind " + std::to_string(static_cast<int>(kind)) +
+                               " that MVB++ does not know");
+    };
+    for (const auto& route : connectionLayout.routes) {
+        for (const auto& finding : route.findings) {
+            if (const char* what = refusedFindingKind(finding.kind))
+                refuseCollision("ConductorBuilder: MKF refuses the terminal lead of " + route.winding + " parallel " +
+                                std::to_string(route.parallel) + " (kind " + std::to_string(static_cast<int>(finding.kind)) + ", " +
+                                what + "): " + finding.witness);
+        }
+    }
     std::map<std::pair<std::string, std::string>, OpenMagnetics::ConnectionKind> connectionKindOf;
     for (const auto& route : connectionLayout.routes) {
         if (route.fromTurn.empty() || route.toTurn.empty()) continue;   // a terminal
         connectionKindOf[{route.fromTurn, route.toTurn}] = route.kind;
     }
+    // ABT #2274 (Alf, 2026-11-05: "MKF owns the placement"): where MKF laid each return that lays a
+    // lane -- its face, its azimuth off the plane (round columns) and the ride level it belongs to.
+    struct MkfReturnPlacement {
+        int side = 0;
+        double azimuth = 0.0;   // ConnectionRoute::laneAzimuth [rad]
+        double step = 0.0;      // the level's ConnectionRideLevel::height [m]
+        double rise = 0.0;      // the level's ConnectionRideLevel::rise [m]
+        double levelRadius = 0.0;   // the level's ConnectionRideLevel::radius [m]
+    };
+    std::map<std::pair<std::string, std::string>, MkfReturnPlacement> mkfReturnPlacementOf;
+    for (const auto& route : connectionLayout.routes) {
+        if (!route.laneAzimuth) continue;
+        const double laneRadius = route.waypoints.back()[0];
+        const OpenMagnetics::ConnectionRideLevel* level = nullptr;
+        for (const auto& lv : connectionLayout.rideLevels)
+            if (lv.side == route.side && std::abs(lv.radius - laneRadius) <= 0.5 * lv.height) { level = &lv; break; }
+        if (level == nullptr)
+            throw std::runtime_error("ConductorBuilder: MKF placed the return '" + route.fromTurn + "' -> '" +
+                                     route.toTurn + "' but laid no ride level at its lane radius " +
+                                     std::to_string(laneRadius) + " m");
+        mkfReturnPlacementOf[{route.fromTurn, route.toTurn}] = {route.side, *route.laneAzimuth, level->height,
+                                                               level->rise, level->radius};
+    }
+    auto mkfReturnPlacement = [&](const std::string& fromTurn,
+                                  const std::string& toTurn) -> const MkfReturnPlacement& {
+        auto found = mkfReturnPlacementOf.find({fromTurn, toTurn});
+        if (found == mkfReturnPlacementOf.end())
+            throw std::runtime_error("ConductorBuilder: the return '" + fromTurn + "' -> '" + toTurn +
+                                     "' has no placement from MKF (ConnectionRoute::laneAzimuth): MKF lays no "
+                                     "lane there, so MVB++ has no face, azimuth or ride to draw it with");
+        if (found->second.side != 0)
+            throw std::runtime_error("ConductorBuilder: MKF lays the return '" + fromTurn + "' -> '" + toTurn +
+                                     "' on connection face 1 (+Z) of a round column; the round-column builder "
+                                     "draws returns, and lifts the turns over them, on face 0 (-Z) only");
+        return found->second;
+    };
     // Does MKF say this transition lays a RETURN the outer layers must ride over? Only a Z
     // dragback and an inter-section edge run do; a U turnaround, a tangential link and a final
     // landing reserve nothing.
@@ -8626,6 +10382,26 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
     };
 
     g_roundedLeadCorners = opts.roundedLeadCorners;   // ABT #685: corner style for this build
+    tlsDragbackBend.clear();
+    tlsHasZDragback.clear();
+    tlsWireBend = connectionLayout.wireBendRadius;
+    if (std::getenv("MVB_ROUTE_DIAG"))
+        for (const auto& route : connectionLayout.routes)
+            std::fprintf(stderr, "[route] %s p%lld kind %d '%s' -> '%s' lane %s dragbackBend %s\n", route.winding.c_str(),
+                         static_cast<long long>(route.parallel), static_cast<int>(route.kind), route.fromTurn.c_str(),
+                         route.toTurn.c_str(), route.laneOffset ? std::to_string(*route.laneOffset * 1e3).c_str() : "-",
+                         route.dragbackBendRadius ? std::to_string(*route.dragbackBendRadius * 1e3).c_str() : "-");
+    for (const auto& route : connectionLayout.routes) {
+        if (route.kind == OpenMagnetics::ConnectionKind::Z_DRAGBACK)
+            tlsHasZDragback.insert({route.winding, static_cast<size_t>(route.parallel)});
+        if (route.kind != OpenMagnetics::ConnectionKind::Z_DRAGBACK || !route.dragbackBendRadius) continue;
+        const std::pair<std::string, size_t> key{route.winding, static_cast<size_t>(route.parallel)};
+        const auto [at, fresh] = tlsDragbackBend.emplace(key, *route.dragbackBendRadius);
+        if (!fresh && std::abs(at->second - *route.dragbackBendRadius) > 1e-15)
+            throw std::runtime_error("ConductorBuilder: MKF planned two dragback bend radii for " + route.winding + " parallel " +
+                                     std::to_string(route.parallel) + " (" + std::to_string(at->second * 1e3) + " and " +
+                                     std::to_string(*route.dragbackBendRadius * 1e3) + " mm); the wire has no single one");
+    }
     auto turnsOpt = coil.get_turns_description();
     if (!turnsOpt || turnsOpt->empty()) {
         throw std::runtime_error(
@@ -8963,13 +10739,19 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 maxTube = std::max(maxTube,
                                    toroHalfD + std::max(0.0, (wwRadialHeight - r) - envelopeRadius));
             }
-            const double reach = kRoundCornerBendFactor * envelopeRadius;
+            const double reach = opts.effectiveBend(wireBendOf(envelopeConductor.winding));   // the corner's bend (MKF)
+            // ABT #2274: the envelope a lead touches is the ENAMEL's surface -- the coated radius past the outer
+            // tube centre and the coated pitch between stacked layers (the bare ones put 07_cmc's leads 34 um
+            // into the chords' enamel).
+            auto [cotW, cotH] = TurnBuilder::wireDimensions(envelopeWire, *envelopeConductor.turns.front(),
+                                                            /*withCoating=*/true);
+            const double coatedEnvelopeRadius = std::min(cotW, cotH) / 2.0;
             toroLeadEnvelopeTop =
-                std::max(toroLeadEnvelopeTop, maxTube + reach + envelopeRadius);
+                std::max(toroLeadEnvelopeTop, maxTube + reach + coatedEnvelopeRadius);
             toroLeadEnvelopeBot =
                 std::max(toroLeadEnvelopeBot,
-                         maxTube + double(ringBuckets.empty() ? 0 : ringBuckets.size() - 1) * envelopeOd +
-                             reach + envelopeRadius);
+                         maxTube + double(ringBuckets.empty() ? 0 : ringBuckets.size() - 1) * 2.0 * coatedEnvelopeRadius +
+                             reach + coatedEnvelopeRadius);
         }
     }
 
@@ -8991,8 +10773,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         const bool foil = wt == MAS::WireType::FOIL &&
                           !(std::getenv("MVB_FOIL_AS_RECT") &&
                             std::string(std::getenv("MVB_FOIL_AS_RECT")) == "0");
-        const bool rect = wt == MAS::WireType::RECTANGULAR || wt == MAS::WireType::PLANAR || foil;
-        auto [ww, wh] = TurnBuilder::wireDimensions(w, *c.turns.front(), opts.paintCoating);
+        const bool rect = TurnBuilder::rectangularSection(w, *c.turns.front()) || foil;
+        // ABT #2274: the COATED section -- a lead sits one enamel touch above the face, not one bare touch
+        auto [ww, wh] = TurnBuilder::wireDimensions(w, *c.turns.front(), /*withCoating=*/true);
         return foil ? 0.5 * ww : (rect ? 0.5 * std::hypot(ww, wh) : std::min(ww, wh) / 2.0);
     };
     if (isToroidal && opts.toroidMounting->mounting == ConductorBuilder::ToroidMounting::Vertical) {
@@ -9095,6 +10878,57 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
     // (Coil::terminal_exit_slots, the window end of route.pinWaypoints). The fan does not choose
     // that lead's slot: it draws the run there, or throws. Keyed by (conductor index, entrance).
     std::map<std::pair<size_t, bool>, double> mkfExitXOf;
+    // ABT #2274 (Alf, 2026-11-09: "MVB++ draws MKF's lanes + level rows" on round columns): conductor/end -> MKF's lane x
+    // (ConnectionRoute::exitSlot) of a free-air terminal lead on a ROUND column. The lane is MKF's point of the attach
+    // turn's circle at x = lane (Coil::terminal_lane_along: along = R asin(x / R)), so the lead's slot is the azimuth at
+    // which its ATTACH radius gives that x. The fan chooses nothing for these leads.
+    std::map<std::pair<size_t, bool>, double> mkfRoundLaneXOf;
+    // A ONE-TURN CONDUCTOR ON A ROUND COLUMN THAT MKF LAYS AS A U WITH TANGENTIAL LEADS (spec 17 /
+    // S0: TangentDeparture OFF_THE_BACK, OFF_THE_FACE_END; Alf, 2026-11-04: "they must be treated
+    // as a U, with the two terminals tangent to the curve"). Its whole centreline is MKF's: the
+    // lanes, the departure points, the straights and the corners. It is built from MKF's routes
+    // alone (buildMkfTangentU below), so neither the slot binding nor the lead fan places it.
+    std::set<size_t> mkfTangentU;
+    if (!isToroidal && effectivelyRound) {
+        for (size_t c = 0; c < conductors.size(); ++c) {
+            bool tangential = false;
+            for (const auto& r : connectionLayout.routes) {
+                if (r.winding != conductors[c].winding || r.parallel != conductors[c].parallel ||
+                    !r.tangentDeparture)
+                    continue;
+                if (r.tangentDeparture->kind == OpenMagnetics::TangentDeparture::Kind::LATERAL_FACE)
+                    throw std::runtime_error("ConductorBuilder: MKF lays a lateral-face tangent departure on " +
+                                             conductors[c].winding + " parallel " +
+                                             std::to_string(conductors[c].parallel) +
+                                             ", which only exists on a rectangular column");
+                tangential = true;
+            }
+            // A one-turn conductor whose two routes are MKF's U at slots (the same polyline, both
+            // terminals on one row, separated only by their exitSlot) is drawn the same way: its
+            // runs at MKF's lanes, parallel to the face normal.
+            if (!tangential && conductors[c].turns.size() == 1) {
+                const OpenMagnetics::ConnectionRoute *rin = nullptr, *rout = nullptr;
+                for (const auto& r : connectionLayout.routes) {
+                    if (r.winding != conductors[c].winding || r.parallel != conductors[c].parallel) continue;
+                    if (r.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE) rin = &r;
+                    if (r.kind == OpenMagnetics::ConnectionKind::TERMINAL_EXIT) rout = &r;
+                }
+                if (rin && rout && rin->exitSlot && rout->exitSlot && !rin->pinWaypoints.size() &&
+                    !rout->pinWaypoints.size()) {
+                    const auto rev = std::vector<std::vector<double>>(rout->waypoints.rbegin(), rout->waypoints.rend());
+                    if (rin->waypoints == rev || rin->waypoints == rout->waypoints) tangential = true;
+                }
+            }
+            if (!tangential) continue;
+            if (conductors[c].turns.size() != 1)
+                throw std::runtime_error("ConductorBuilder: MKF lays a tangential terminal lead on " +
+                                         conductors[c].winding + " parallel " +
+                                         std::to_string(conductors[c].parallel) + " (" +
+                                         std::to_string(conductors[c].turns.size()) +
+                                         " turns); on a round column only a one-turn U is drawn");
+            mkfTangentU.insert(c);
+        }
+    }
     if (!isToroidal) {
         for (size_t c = 0; c < conductors.size(); ++c) {
             const std::string who = conductors[c].winding + " parallel " + std::to_string(conductors[c].parallel);
@@ -9161,6 +10995,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         };
         for (size_t c = 0; c < conductors.size(); ++c) {
             if (mkfExitXOf.count({c, true}) || mkfExitXOf.count({c, false})) continue;   // on pins
+            if (mkfTangentU.count(c)) continue;   // MKF's U, built from its routes
             const std::string who = conductors[c].winding + " parallel " + std::to_string(conductors[c].parallel);
             const auto* in = terminalRouteFor(conductors[c].winding, conductors[c].parallel, true);
             const auto* out = terminalRouteFor(conductors[c].winding, conductors[c].parallel, false);
@@ -9187,6 +11022,23 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 std::fprintf(stderr, "[mkf-slot] %s: MKF draws one polyline for both terminals and "
                              "separates them by slot -- entrance at x %.9f mm, exit at x %.9f mm\n",
                              who.c_str(), *in->exitSlot * 1e3, *out->exitSlot * 1e3);
+        }
+        if (!rectFamily) {
+            for (size_t c = 0; c < conductors.size(); ++c) {
+                if (conductors[c].turns.empty() || wireMap.at(conductors[c].winding).get_type() == MAS::WireType::FOIL) continue;
+                if (mkfTangentU.count(c)) continue;   // MKF's U, built from its routes
+                const std::string who = conductors[c].winding + " parallel " + std::to_string(conductors[c].parallel);
+                for (bool entrance : {true, false}) {
+                    if (mkfExitXOf.count({c, entrance})) continue;   // on a pin, or MKF's one-polyline U
+                    const auto* r = terminalRouteFor(conductors[c].winding, conductors[c].parallel, entrance);
+                    if (!r || r->tangentDeparture || r->axialLead) continue;   // drawn from MKF's own record
+                    if (!r->exitSlot)
+                        throw std::runtime_error("ConductorBuilder: MKF lays the terminal lead of " + who +
+                                                 (entrance ? " entrance" : " exit") + " on a round column but gives it no lane "
+                                                 "(ConnectionRoute::exitSlot), so MVB++ has no x to attach it at");
+                    mkfRoundLaneXOf[{c, entrance}] = *r->exitSlot;
+                }
+            }
         }
     }
     paths.reserve(conductors.size());
@@ -9234,8 +11086,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         if (ct.turns.empty()) continue;
         const MAS::Wire& w = wireMap.at(ct.winding);
         auto [ew, eh] = TurnBuilder::wireDimensions(w, *ct.turns.front(), opts.paintCoating);
-        const bool rectW = w.get_type() == MAS::WireType::RECTANGULAR ||
-                           w.get_type() == MAS::WireType::PLANAR;
+        const bool rectW = TurnBuilder::rectangularSection(w, *ct.turns.front());
         const double rw = rectW ? 0.5 * std::hypot(ew, eh) : 0.5 * std::min(ew, eh);
         double maxR = 0.0;
         for (const MAS::Turn* t : ct.turns) maxR = std::max(maxR, station(t).x);
@@ -9246,6 +11097,28 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
     for (const auto& w : coil.get_functional_description())
         windingFace[w.get_name()] =
             (w.get_isolation_side() == MAS::IsolationSide::PRIMARY) ? 0 : 1;
+    // ABT #2274 (Alf, 2026-11-05: "MKF owns the placement"): on a rect/stadium column a winding's
+    // returns lie on its connection face (they leave and land at its crossings), and MKF decides
+    // that face -- ConnectionRoute::side, under real winding one face for every winding unless MKF
+    // moves or pins it (spec S0). The isolation-side face above is the ideal layout's; it put
+    // 17_cllc's Secondary returns on +Z where MKF lays them, and rides the turns over them, on -Z.
+    std::map<std::string, int> mkfFaceOf;
+    if (!isToroidal && !effectivelyRound) {
+        for (const auto& route : connectionLayout.routes) {
+            if (route.toroidal) continue;
+            auto [it, inserted] = mkfFaceOf.emplace(route.winding, route.side);
+            if (!inserted && it->second != route.side)
+                throw std::runtime_error("ConductorBuilder: MKF routes winding '" + route.winding +
+                                         "' on both connection faces; a rect-column winding is drawn on one");
+        }
+        for (auto& [wname, f] : windingFace) {
+            auto it = mkfFaceOf.find(wname);
+            if (it == mkfFaceOf.end())
+                throw std::runtime_error("ConductorBuilder: MKF lays no connection route for winding '" + wname +
+                                         "', so its connection face is unknown");
+            f = it->second;
+        }
+    }
     // Some cores open on ONE side only (Alf, 2026-08-07: EP/EPX-style plates wrap one Z
     // face). Before honouring the isolation-side faces, probe the core solids over both
     // +-Z connection corridors (the slot span x the winding's height band x the lead's
@@ -9307,6 +11180,11 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             const int open = blockNeg ? 1 : 0;
             for (auto& [wname, f] : windingFace)
                 if (f != open) {
+                    if (mkfFaceOf.count(wname))
+                        throw std::runtime_error(
+                            "ConductorBuilder: MKF lays winding '" + wname + "' on connection face " +
+                            std::to_string(f) + ", which the core blocks (" + (blockNeg ? "-Z" : "+Z") +
+                            " corridor); MVB++ draws MKF's face and does not move it");
                     std::cerr << "[ConductorBuilder] core blocks the "
                               << (blockNeg ? "-Z" : "+Z") << " connection corridor: winding '"
                               << wname << "' forced from its isolation-side face to the open "
@@ -9430,8 +11308,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 TurnBuilder::wireDimensions(w, *ct.turns.front(), /*paintCoating=*/true);
             const double diam = std::min(cw2, ch2);
             auto [ew, eh] = TurnBuilder::wireDimensions(w, *ct.turns.front(), opts.paintCoating);
-            const bool rectW = w.get_type() == MAS::WireType::RECTANGULAR ||
-                               w.get_type() == MAS::WireType::PLANAR;
+            const bool rectW = TurnBuilder::rectangularSection(w, *ct.turns.front());
             const double rw = rectW ? 0.5 * std::hypot(ew, eh) : 0.5 * std::min(ew, eh);
             // ABT #1295: rectStation's sweep guard (the corner itself is MKF's).
             const double mb = (w.get_type() == MAS::WireType::FOIL || rectW) ? 0.5 * ew : rw;
@@ -9499,135 +11376,151 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 }
             }
         }
-        // One x slot per conductor that lays a chain, a coated OD apart (layout criterion:
-        // insulation touching). PER FACE, IN PARALLEL ORDER, DOWNSTREAM (ABT #1359, Alf: "the
-        // parallel order is not respected"): conductors on opposite faces never meet, so each
-        // face packs from its own crossing; conductor order is winding-major, parallel-minor,
-        // so within a winding p0 steps at the crossing and each later parallel one lane further
-        // along the travel direction (every wrap departs the crossing toward local -X). The
-        // previous centre-out alternation over ALL conductors let the Primary use up the first
-        // lanes and scattered the Secondary's four at 3, 1, 0, 2 along the face.
-        std::map<int, int> laneOfFace;
-        // A LEVEL return steps across at the crossing itself, so on its face the crossing is
-        // taken: the first laned conductor there starts one OD out (cm37 with the pre-#1361
-        // shared band: p0 level at x = 0, p1's chain also at lane 0 -- distance 0).
-        for (const auto& r : rectReturns)
-            if (r.levelBand) laneOfFace[r.side] = 1;
-        for (auto& [cv, slot] : slotOf) {
-            const int k = laneOfFace[windingFace.at(conductors[cv].winding)]++;
-            if (stadiumColumn) {
-                // Stadium lanes fan on ONE side of the cap apex (the rising turn's shortened
-                // final quarter ends there; a negative slot would overrun the apex into the
-                // next wrap's territory).
-                slot = double(k) * maxDiam;
+        // ABT #2274 (Alf, 2026-11-06: "MKF owns each return lane's x along the face"): the x slot of
+        // every return that lays a chain is MKF's ConnectionRoute::laneOffset -- one lane per
+        // conductor, spec S0's halves (the primary group on -x, every other group on +x; all on +x
+        // on a stadium). It was MVB++'s own allocation here (laneOfFace: every conductor on -x, one
+        // OD apart in conductor order). A LEVEL return (RectReturn::levelBand) steps across at the
+        // crossing and lays no lane, so MKF gives it none. Any disagreement about which return lays
+        // a lane, or a conductor whose returns MKF puts in different lanes, is refused by name.
+        (void) maxDiam;
+        std::map<std::pair<std::string, std::string>, std::optional<double>> mkfLaneOffsetOf;
+        for (const auto& route : connectionLayout.routes)
+            if (!route.fromTurn.empty() && !route.toTurn.empty())
+                mkfLaneOffsetOf[{route.fromTurn, route.toTurn}] = route.laneOffset;
+        for (const auto& r : rectReturns) {
+            const std::string& fromName = conductors[r.ci].turns[r.trans]->get_name();
+            const std::string& toName = conductors[r.ci].turns[r.trans + 1]->get_name();
+            auto found = mkfLaneOffsetOf.find({fromName, toName});
+            const bool mkfLane = found != mkfLaneOffsetOf.end() && found->second.has_value();
+            if (r.levelBand) {
+                if (mkfLane) {
+                    const std::string disagreement = "ConductorBuilder: MKF lays a return lane at x = " +
+                        std::to_string(found->second.value()) + " m for '" + fromName + "' -> '" + toName +
+                        "', a level step MVB++ draws at the crossing with no lane";
+                    // Debug (--skip-collision-check): drawn as the level step, reported, so the design can be looked at.
+                    if (!collisionDiagnostic()) throw std::runtime_error(disagreement);
+                    std::cerr << "[ConductorBuilder] FINDING (debug build, --skip-collision-check; not a part): "
+                              << disagreement << "; drawn as the level step" << std::endl;
+                }
+                continue;
             }
-            else {
-                slot = -double(k) * maxDiam;
+            if (!mkfLane)
+            {
+                std::ostringstream m;
+                m.precision(9);
+                const PlanePt sFrom = station(conductors[r.ci].turns[r.trans]), sTo = station(conductors[r.ci].turns[r.trans + 1]);
+                m << "ConductorBuilder: the return '" << fromName << "' -> '" << toName
+                  << "' lays a chain on a flat-faced column, but MKF gives it no lane (ConnectionRoute::laneOffset), so MVB++ "
+                     "has no x to draw it at; its stations stand at (" << sFrom.x * 1e3 << ", " << sFrom.y * 1e3 << ") and ("
+                  << sTo.x * 1e3 << ", " << sTo.y * 1e3 << ") mm, " << std::abs(sTo.y - sFrom.y) * 1e3 << " mm apart in height for a wire of "
+                  << r.diam * 1e3 << " mm (a level step is at most half of it)";
+                throw std::runtime_error(m.str());
             }
+            auto [it, inserted] = slotOf.insert_or_assign(r.ci, found->second.value());
+            (void) it;
+            (void) inserted;
+        }
+        for (const auto& r : rectReturns) {
+            if (r.levelBand) continue;
+            const std::string& fromName = conductors[r.ci].turns[r.trans]->get_name();
+            const std::string& toName = conductors[r.ci].turns[r.trans + 1]->get_name();
+            if (std::abs(mkfLaneOffsetOf.at({fromName, toName}).value() - slotOf.at(r.ci)) > 1e-12)
+                throw std::runtime_error("ConductorBuilder: MKF lays the returns of conductor '" + conductors[r.ci].winding +
+                                         "' parallel " + std::to_string(conductors[r.ci].parallel) +
+                                         " in different lanes; a conductor's returns share one lane");
         }
         for (auto& r : rectReturns) r.xSlot = r.levelBand ? 0.0 : slotOf.at(r.ci);
-        // Terminal-lead slots, allocated PER FACE: conductors on opposite isolation sides never
-        // share a face, so each side packs from its own crossing outwards, one coated OD apart
-        // (insulation touching -- the same layout criterion as the dragback lanes). One-sided,
-        // because the entrance offset is measured from the crossing along the face and a turn
-        // cannot begin behind it. Entrance and exit take opposite ends (-s and +s), so a
-        // conductor's own two leads separate for free.
+        // ABT #2274 (agent 22): MKF publishes the interval along the face each Z dragback's copper takes
+        // (ConnectionRoute::dragbackAlongFace) and judges the level lead rows against it. The return is drawn
+        // at xSlot with its wire's lane width; a drawing whose interval differs from MKF's by more than 1 nm is
+        // refused by name.
         {
-            std::map<int, double> odOfFace;
+            std::map<std::pair<std::string, std::string>, const OpenMagnetics::ConnectionRoute*> dragbackOf;
+            for (const auto& route : connectionLayout.routes)
+                if (route.kind == OpenMagnetics::ConnectionKind::Z_DRAGBACK) dragbackOf[{route.fromTurn, route.toTurn}] = &route;
+            for (const auto& r : rectReturns) {
+                if (r.levelBand) continue;
+                const std::string& fromName = conductors[r.ci].turns[r.trans]->get_name();
+                const std::string& toName = conductors[r.ci].turns[r.trans + 1]->get_name();
+                auto found = dragbackOf.find({fromName, toName});
+                if (found == dragbackOf.end()) continue;   // an edge continuation lays a lane but is no dragback
+                const auto& along = found->second->dragbackAlongFace;
+                if (!along)
+                    throw std::runtime_error("ConductorBuilder: MKF gives the dragback '" + fromName + "' -> '" + toName +
+                                             "' no interval along the face (ConnectionRoute::dragbackAlongFace), so MVB++ "
+                                             "cannot check where it draws it");
+                const double drawnFrom = r.xSlot - r.diam / 2;
+                const double drawnTo = r.xSlot + r.diam / 2;
+                if (std::abs(drawnFrom - along->first) > 1e-9 || std::abs(drawnTo - along->second) > 1e-9) {
+                    std::ostringstream out;
+                    out << std::setprecision(9) << "ConductorBuilder: the dragback '" << fromName << "' -> '" << toName
+                        << "' is drawn along the face over [" << drawnFrom * 1e3 << ", " << drawnTo * 1e3 << "] mm, MKF lays it over ["
+                        << along->first * 1e3 << ", " << along->second * 1e3 << "] mm (differs by more than 1 nm)";
+                    throw std::runtime_error(out.str());
+                }
+                std::cerr << std::setprecision(9) << "[dragback-x] '" << fromName << "' -> '" << toName << "' drawn ["
+                          << drawnFrom * 1e3 << ", " << drawnTo * 1e3 << "] mm == MKF [" << along->first * 1e3 << ", "
+                          << along->second * 1e3 << "] mm" << std::endl;
+            }
+        }
+        // TERMINAL-LEAD SLOTS ARE MKF'S (ABT #2274 / #2292, Alf 2026-11-07: "Yes: MVB++ draws MKF's
+        // slots now"). The terminal lead of a flat-faced column attaches at MKF's
+        // ConnectionRoute::exitSlot -- the lane MKF's lane planner chose (spec S0: the primary on the
+        // -x half of its face, the other windings on +x) and every MKF check (the pitch-true stub, its
+        // ramp, the lane clearances) was made at. MVB++ allocates none of its own any more: the
+        // per-face packer that used to stand here put 02_flyback's Secondary leads on the opposite
+        // half of the face from MKF's (entrances at -1.602/-1.068/-0.534 mm against MKF's
+        // +1.550/+1.016/+0.482). Frame: the face's own, x = 0 at the crossing, a wrap leaving it
+        // towards -x; this builder puts an entrance's copper at x = -leadSlot and an exit's at
+        // x = +exitSlot. So an entrance MKF lays at x > 0 begins its first turn UPSTREAM of the
+        // crossing and an exit at x < 0 ends its last turn PAST it -- MKF's own height model
+        // (Coil::terminal_turn_height_along: station - advance * along / L, along > 0 upstream), which
+        // appendRectWrap's full-path pitch-true profile reproduces for a negative begX / endX.
+        // A terminal MKF lays on its face with no slot is refused: there is no x to draw it at.
+        {
             for (size_t cv = 0; cv < conductors.size(); ++cv) {
                 const auto& ct = conductors[cv];
-                if (ct.turns.empty()) continue;
-                auto [cw2, ch2] = TurnBuilder::wireDimensions(
-                    wireMap.at(ct.winding), *ct.turns.front(), /*paintCoating=*/true);
-                const int face = windingFace.at(ct.winding);
-                odOfFace[face] = std::max(odOfFace[face], std::min(cw2, ch2));
+                if (ct.turns.empty() || wireMap.at(ct.winding).get_type() == MAS::WireType::FOIL) continue;
+                for (const auto& r : connectionLayout.routes) {
+                    if (r.winding != ct.winding || r.parallel != ct.parallel) continue;
+                    const bool in = r.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE;
+                    if (!in && r.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT) continue;
+                    if (r.tangentDeparture || r.axialLead) continue;   // drawn from MKF's own record, no lane
+                    if (!r.exitSlot)
+                        throw std::runtime_error("ConductorBuilder: MKF lays the terminal lead of " + ct.winding +
+                                                 " parallel " + std::to_string(ct.parallel) +
+                                                 (in ? " entrance" : " exit") +
+                                                 " on its connection face but gives it no exit slot "
+                                                 "(ConnectionRoute::exitSlot), so MVB++ has no x to attach it at");
+                    if (in)
+                        leadSlotOf[cv] = -*r.exitSlot;
+                    else
+                        exitSlotOf[cv] = *r.exitSlot;
+                }
             }
-            // ORDER BY ROW, HIGHEST FIRST. A rising turn CLIMBS as it runs along the face
-            // (measured on isolated_buck: 64.9 um per mm), so a lead sitting above a sibling's
-            // crossing is approached by that sibling's turn as x grows, while one sitting below
-            // is left behind. Giving the highest row the smallest x puts every lead on the side
-            // its siblings' turns move AWAY from. Allocating in conductor order instead left the
-            // upper parallel 42 um short (1.0760 mm against 1.1154) purely from the 74 um the
-            // sibling's turn had climbed by the time it reached that slot.
-            std::vector<std::pair<double, size_t>> byRow;   // (row, conductor)
-            for (size_t cv = 0; cv < conductors.size(); ++cv) {
-                const auto& ct = conductors[cv];
-                if (ct.turns.empty()) continue;
-                byRow.push_back({station(ct.turns.front()).y, cv});
-            }
-            std::sort(byRow.begin(), byRow.end(),
-                      [](const auto& a, const auto& b) { return a.first > b.first; });
-            // KEEP OFF THE DRAGBACK LANES. Lanes and leads are measured from the same
-            // crossing but in opposite directions -- a lead slot s puts copper at world +s, a
-            // lane slot t at world -t -- so the two can only ever meet at the crossing itself,
-            // x = 0. Where a lane already owns it, the leads start one OD out (isolated_buck:
-            // Secondary parallel 0's dragback runs the full height of the winding at x = 0, and
-            // the upper parallel's lead was placed straight down it).
-            std::map<int, bool> crossingTaken;
-            for (const auto& [cv, t] : slotOf)
-                if (std::abs(t) < 1e-12 && cv < conductors.size())
-                    crossingTaken[windingFace.at(conductors[cv].winding)] = true;
-            // ABT #1360: a LEVEL inter-section return steps across AT the crossing, so it owns
-            // x = 0 on its face just as a lane there would (a sibling's lead dropped straight
-            // down the crossing would run into the step at its station).
-            for (const auto& r : rectReturns)
-                if (r.levelBand) crossingTaken[r.side] = true;
-            std::map<int, int> kOfFace;
-            for (const auto& [row, cv] : byRow) {
-                const int face = windingFace.at(conductors[cv].winding);
-                const int k = kOfFace[face]++ + (crossingTaken[face] ? 1 : 0);
-                leadSlotOf[cv] = double(k) * odOfFace.at(face);
-            }
-            // EXIT LANES (ABT #849, Alf 2026-08-22: 'as parallels they should be going out
-            // side by side'). The exit of every conductor on a face used to leave at the
-            // crossing, x = 0 -- fine while each parallel's last turn sat on its own row,
-            // but MKF lays a multi-parallel winding's exit leads on ONE shared group row, so
-            // two exits ran radially coincident and the upper one's stub descended straight
-            // through its sibling's last face straight (cm37: Primary p1 exit vs p0 turn 21
-            // 'face -Z in', centreline distance 1e-18). Exits get their own lanes exactly as
-            // entrances do, on the OPPOSITE end of the face (+X, the arrival side: the last
-            // straight arrives +segX -> 0, so ending it at +slot shortens it, never runs past
-            // the crossing and back). Same ordering rule as the entrance: highest row ->
-            // smallest x, so the arriving sibling straights (which CLIMB as they run) move away
-            // from the lead above them. A conductor alone on its face keeps lane 0.
-            std::map<int, int> kExitOfFace;
-            std::vector<std::pair<double, size_t>> byLastRow;   // (last row, conductor)
-            for (size_t cv = 0; cv < conductors.size(); ++cv) {
-                const auto& ct = conductors[cv];
-                if (ct.turns.empty()) continue;
-                byLastRow.push_back({station(ct.turns.back()).y, cv});
-            }
-            // ABT #1377: "highest row -> smallest x" is right only when the arriving straights
-            // DESCEND toward the crossing. A winding that climbs to its exit arrives LOWER at an
-            // upstream lane than at its station, so a lower sibling's lead placed upstream meets
-            // that straight where it has not finished climbing: 22_margin_tape_forward's
-            // Secondary (0.5 mm, 2p, rows 0.5466 apart) put p0's exit step at +0.534 under
-            // p1's last straight, 13.4 um below p1's row -- 198.7 nm inside the enamel. The
-            // ordering follows the direction the last turns actually move: descending exits
-            // keep the highest row at the crossing; ascending exits put the LOWEST row there,
-            // so every sibling straight that still runs past a lane is on the side it moves
-            // away from. Per face, from the conductors' own last wraps.
-            std::map<int, double> exitClimbOfFace;
-            for (size_t cv = 0; cv < conductors.size(); ++cv) {
-                const auto& ct = conductors[cv];
-                if (ct.turns.size() < 2) continue;
-                exitClimbOfFace[windingFace.at(ct.winding)] +=
-                    station(ct.turns.back()).y - station(ct.turns[ct.turns.size() - 2]).y;
-            }
-            std::sort(byLastRow.begin(), byLastRow.end(), [&](const auto& a, const auto& b) {
-                const int fa = windingFace.at(conductors[a.second].winding);
-                const int fb = windingFace.at(conductors[b.second].winding);
-                if (fa != fb) return fa < fb;
-                const bool ascending = exitClimbOfFace.count(fa) && exitClimbOfFace.at(fa) > 0.0;
-                return ascending ? a.first < b.first : a.first > b.first;
-            });
-            // MVB_NO_EXIT_LANES bisects the whole exit-lane mechanism: with no lanes allocated,
-            // stopX falls back to NaN and the lead's xShift to 0, i.e. exactly the old behaviour.
-            const bool noExitLanes = std::getenv("MVB_NO_EXIT_LANES") != nullptr;
-            for (const auto& [row, cv] : byLastRow) {
-                const int face = windingFace.at(conductors[cv].winding);
-                const int k = kExitOfFace[face]++;
-                exitSlotOf[cv] = noExitLanes ? 0.0 : double(k) * odOfFace.at(face);
+            if (std::getenv("MVB_LEAD_DIAG")) {
+                for (size_t cv = 0; cv < conductors.size(); ++cv) {
+                    for (const auto& r : connectionLayout.routes) {
+                        if (r.winding != conductors[cv].winding || r.parallel != conductors[cv].parallel) continue;
+                        const bool in = r.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE;
+                        if (!in && r.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT) continue;
+                        std::fprintf(stderr,
+                                     "[slot-cmp] %s p%lld %s: mvb %s=%.6f mm, mkf exitSlot=%s laneHalf=%s side=%d "
+                                     "tangent=%d axial=%d pin=%d ramp=%s wp:",
+                                     conductors[cv].winding.c_str(), (long long) conductors[cv].parallel,
+                                     in ? "IN" : "OUT", in ? "-leadSlot" : "exitSlot",
+                                     (in ? -(leadSlotOf.count(cv) ? leadSlotOf.at(cv) : 0.0)
+                                         : (exitSlotOf.count(cv) ? exitSlotOf.at(cv) : 0.0)) * 1e3,
+                                     r.exitSlot ? std::to_string(*r.exitSlot * 1e3).c_str() : "none",
+                                     r.laneHalf ? std::to_string(*r.laneHalf).c_str() : "none", r.side,
+                                     (int) r.tangentDeparture.has_value(), (int) r.axialLead.has_value(),
+                                     (int) !r.pinWaypoints.empty(),
+                                     r.rampLength ? std::to_string(*r.rampLength * 1e3).c_str() : "none");
+                        for (const auto& w : r.waypoints) std::fprintf(stderr, " (%.4f,%.4f)", w[0] * 1e3, w[1] * 1e3);
+                        std::fprintf(stderr, "\n");
+                    }
+                }
             }
         }
         // Distinct destination depths, ascending, PER SIDE. Each level displaces everything
@@ -9766,7 +11659,13 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         }
         return bobbinOuterX;
     };
-    struct LaidDragback { double az; double radius; double diam; };
+    // yLo/yHi: the axial band the return's copper occupies (its chain's band widened by its coated
+    // radius), so the tip plane's column stacks only returns that really meet (tallestRealStack).
+    // levelRadius: the radius of the MKF ride level the return belongs to (ConnectionRideLevel::radius).
+    // A turn at radius R rides over the return exactly when MKF's ride_at(R) counts that level:
+    // levelRadius <= R + diam / 2 (diam = the level's height). That is the one selection rule every
+    // ride below uses (wraps, fan, one-turn rings), so the drawn ride is MKF's ride turn by turn.
+    struct LaidDragback { double az; double radius; double diam; double yLo; double yHi; double rise; double levelRadius; };
     std::vector<LaidDragback> laidDragbacks;
     std::map<std::pair<size_t, size_t>, double> dragAzOf;   // (conductor, transition) -> azimuth
     std::map<std::pair<size_t, size_t>, double> linkAzOf;   // ABT #831: the same, for U links
@@ -9774,6 +11673,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
     // conductor -> the length of the LEVEL leg its lead keeps at the attach before climbing to
     // MKF's row (the fan's answer, from the terminal fillet it derives; see emittedRoute)
     std::map<size_t, std::pair<double, double>> leadLegIn, leadLegOut;   // (dr, dy)
+    // ABT #2274 (agent 44): how much of the lead's attach leg its terminal fillet takes, measured by the fan on the
+    // fillet it hands the emitter (assigned roll, final slot); appendFilletedPolyline's allotted-space rule reads it.
+    std::map<size_t, double> leadTerminalClaimIn, leadTerminalClaimOut;
     // The ROLL the fan solved for at each terminal corner (radians about the helix tangent);
     // absent = the historical corner.
     std::map<size_t, double> leadFilletIn, leadFilletOut;
@@ -9811,6 +11713,18 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             double y0Ideal = 0.0, y1Ideal = 0.0;
             double rw;         // COATED wire radius -- slot clearance is physical
             double rwBare;     // bare-copper radius -- what the collision gate enforces
+            // Dragbacks: how far a turn riding over this return is lifted (laidDragbacks' step).
+            // A round wire's is its coated diameter; a non-round section's is the RADIAL depth
+            // MKF gives the turn the return lands on (Alf, 2026-11-05: "Use radial depth") --
+            // the narrow side of a stadium litz lifted a ride-over 0.60 mm off a 0.80 mm deep
+            // return on 750372247r01.
+            double bumpStep = 0.0;
+            // ABT #2274 (Alf, 2026-11-05: "MKF owns the placement"): the azimuth off the plane MKF laid
+            // this return at (ConnectionRoute::laneAzimuth) and the rise of the ride level it belongs to
+            // (ConnectionRideLevel::rise). The fan pins the return there; it never chooses its slot.
+            double mkfAzimuth = 0.0;
+            double bumpRise = 0.0;
+            double mkfLevelRadius = 0.0;   // the MKF ride level's radius (LaidDragback::levelRadius)
             // ABT #685 PITCH-TRUE DIP (Alf, 2026-08-16): the conductor's first/last wrap
             // advance per revolution, used to shift the route's ATTACH endpoint by
             // advance*(planeOffset)/2pi once the slot is known — the emission attaches the
@@ -9851,6 +11765,20 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // Rectangular wire: the BARE section (width radial, height axial) the gate's box
             // test uses, and the COATED axial half-height the flange containment uses.
             double condW = 0.0, condH = 0.0, rwAxialCoat = 0.0;
+        };
+        // The axial band a return's drawn chain spans (centreline; ABT #830: radial run-out at the
+        // height it leaves, then the drop to the height it lands), or its bare vertical while it has
+        // no chain. need() exempts two returns whose bands cannot meet, and the tip plane's column
+        // (tallestRealStack) stacks only returns whose bands do: both read this one band.
+        auto returnAxialBand = [](const Vert& v) {
+            if (v.segs.empty()) return std::pair<double, double>{v.y0, v.y1};
+            double lo = std::numeric_limits<double>::max();
+            double hi = std::numeric_limits<double>::lowest();
+            for (const auto& s : v.segs) {
+                lo = std::min({lo, s[1], s[3]});
+                hi = std::max({hi, s[1], s[3]});
+            }
+            return std::pair<double, double>{lo, hi};
         };
         // Min distance between two 2D segment sets -- the exact clearance criterion for
         // two lead routes (or a route and a dragback descent) sharing an azimuth plane.
@@ -9920,6 +11848,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                      // geometry, and lead corridors past them are planned at
                                      // the full bare separation (see the drift model below)
         for (size_t cv = 0; cv < conductors.size(); ++cv) {
+            if (mkfTangentU.count(cv)) continue;   // MKF's U: its leads are not the fan's to place
             const auto& ct = conductors[cv];
             const MAS::Wire& w = wireMap.at(ct.winding);
             auto [cw, chh] = TurnBuilder::wireDimensions(w, *ct.turns.front(),
@@ -9931,8 +11860,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // Detection mirrors the emission loop EXACTLY (same wire footprint, same median
             // pitch), so every dragback the loop emits has a fan azimuth waiting for it.
             auto [ew, eh] = TurnBuilder::wireDimensions(w, *ct.turns.front(), opts.paintCoating);
-            const bool rectW = w.get_type() == MAS::WireType::RECTANGULAR ||
-                               w.get_type() == MAS::WireType::PLANAR;
+            const bool rectW = TurnBuilder::rectangularSection(w, *ct.turns.front());
             const double rwEmit = rectW ? 0.5 * std::hypot(ew, eh) : 0.5 * std::min(ew, eh);
             double mp = 0.0, adv = 0.0;
             {
@@ -9982,6 +11910,16 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     dv.kind = 1; dv.ci = cv; dv.trans = i; dv.entrance = false;
                     dv.r = b.x; dv.y0 = std::min(a.y, b.y); dv.y1 = std::max(a.y, b.y);
                     dv.rw = rwCoat; dv.rwBare = rwBare;
+                    {
+                        // ABT #2274: MKF's placement of this return -- its face, its azimuth and the
+                        // ride level it lays (step and rise). A return MVB++ draws that MKF did not
+                        // place is a disagreement about the winding itself: refuse it by name.
+                        const auto& place = mkfReturnPlacement(ct.turns[i]->get_name(), ct.turns[i + 1]->get_name());
+                        dv.bumpStep = place.step;
+                        dv.bumpRise = place.rise;
+                        dv.mkfLevelRadius = place.levelRadius;
+                        dv.mkfAzimuth = place.azimuth;
+                    }
                     // ABT #830: a dragback is a CHAIN, not a bare vertical. appendZDragback draws
                     // it as the winder lays it -- step out radially at the height it arrived at,
                     // drop at the next layer's radius, then ride out onto the turn it feeds -- and
@@ -10047,8 +11985,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 if (wv.get_type() == MAS::WireType::FOIL && !ct.turns.empty())
                     foilRadialV.foilRadial = TurnBuilder::wireDimensions(wv, *ct.turns.front(),
                                                                          opts.paintCoating).first;
-                else if ((wv.get_type() == MAS::WireType::RECTANGULAR ||
-                          wv.get_type() == MAS::WireType::PLANAR) && !ct.turns.empty())
+                else if (!ct.turns.empty() && TurnBuilder::rectangularSection(wv, *ct.turns.front()))
                     std::tie(foilRadialV.wireWidth, foilRadialV.wireHeight) =
                         TurnBuilder::wireDimensions(wv, *ct.turns.front(), opts.paintCoating);
             }
@@ -10140,14 +12077,44 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // foil branch of the emission loop, not laid out by this fan. Giving the fan a
             // 25.9 mm tall "lead" packed one coated OD per lane is what put six of eight exits
             // a sheet-height outside the window (ABT #1000).
+            // ABT #2274 (agent 44): the fan judges the route the emitter SWEEPS, so MKF's level row
+            // (applyMkfLevelRow) and its row end / row start (drawMkfRowRoute) are applied here exactly as the
+            // emitter applies them after terminalWaypoints. Without them the fan proved a lead that drops from
+            // its turn to the section row (23_interleaved_llc's Secondary exits: a fillet 0.35 mm below the
+            // drawn level lead) and refused a layout whose drawn copper clears.
+            // A lead on MKF's LEVEL ROW attaches on that row: the row IS its turn's height at the lane, where the
+            // emitter starts it (entranceAttachY / exitAttachY). The fan kept the attach at the crossing's station, so
+            // its trial lead carried a jog of the whole row shift that the emitted lead does not have
+            // (23_interleaved_llc, Secondary exits: 0.14-0.32 mm, too short for the bend -- every slot judged on a
+            // sharp corner). `levelRow` receives the row when the route has one.
+            auto mkfDrawnRoute = [&](std::vector<PlanePt> wpv, bool entrance, std::optional<double>& levelRow) {
+                const std::string who = whoV + (entrance ? " entrance" : " exit");
+                for (const auto& r : connectionLayout.routes)
+                    if (r.winding == ct.winding && static_cast<size_t>(r.parallel) == ct.parallel && r.levelRowShift &&
+                        r.kind == (entrance ? OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE
+                                            : OpenMagnetics::ConnectionKind::TERMINAL_EXIT) && wpv.size() >= 2)
+                        levelRow = wpv[1].y + *r.levelRowShift;
+                applyMkfLevelRow(wpv, connectionLayout, ct.winding, ct.parallel, entrance, who);
+                if (levelRow) wpv.front().y = *levelRow;
+                drawMkfRowRoute(wpv,
+                                entrance ? mkfRowStartRoute(connectionLayout, ct.winding, ct.parallel)
+                                         : mkfRowEndRoute(connectionLayout, ct.winding, ct.parallel),
+                                entrance, who);
+                return wpv;
+            };
             if (foilRadialV.foilRadial <= 0.0) {
-            routeVert(terminalWaypoints(egrp, pf, whoV + " entrance", foilRadialV,
-                                        ct.turns.front()->get_coordinates()[0]),
-                      true, pf, advIn, 0);
-            if (!xgrp.empty())
-                routeVert(terminalWaypoints(xgrp, pl, whoV + " exit", foilRadialV,
-                                            ct.turns[nEmitP - 1]->get_coordinates()[0]),
-                          false, pl, advOut, nEmitP - 1);
+            {
+                std::optional<double> levelRow;
+                const auto route = mkfDrawnRoute(terminalWaypoints(egrp, pf, whoV + " entrance", foilRadialV,
+                                                                   ct.turns.front()->get_coordinates()[0]), true, levelRow);
+                routeVert(route, true, levelRow ? PlanePt{pf.x, *levelRow} : pf, levelRow ? 0.0 : advIn, 0);
+            }
+            if (!xgrp.empty()) {
+                std::optional<double> levelRow;
+                const auto route = mkfDrawnRoute(terminalWaypoints(xgrp, pl, whoV + " exit", foilRadialV,
+                                                                   ct.turns[nEmitP - 1]->get_coordinates()[0]), false, levelRow);
+                routeVert(route, false, levelRow ? PlanePt{pl.x, *levelRow} : pl, levelRow ? 0.0 : advOut, nEmitP - 1);
+            }
             else   // one drawn lead: synthesized straight-out exit (see splitTerminalGroups)
                 routeVert({{pl.x, pl.y}, {pl.x + 1.0, pl.y}}, false, pl, advOut, nEmitP - 1);
             }
@@ -10188,6 +12155,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         // row's copper extent on the lead or return that carries its crossing.
         std::vector<double> az(verts.size(), 0.0);
         std::vector<char> azAssigned(verts.size(), 0);
+        bool fanPlacedASlot = false;   // the fan itself placed a member (every other slot is MKF's: lane, azimuth, pin, plane)
         // The CANDIDATE slots of the lead block being evaluated (boost_inductor_complete,
         // 2026-09-02). A block's members are unassigned while their anchor is tested, so the
         // helix a member's own lead terminates (its stub) and the sibling helices that end at
@@ -10347,6 +12315,20 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 // ride-over (23_interleaved: the secondary's exit rode 1.97 mm -- its own
                 // return piled onto the primary's column -- while its entrance rode 1.07).
                 if (A.ci == B.ci) return 0.0;
+                // ...UNLESS THEY CAN NEVER MEET AXIALLY (Alf, 2026-11-05: "Fix it"). A return is
+                // drawn as its chain -- radial run-out at the height it leaves, then the drop to
+                // the height it lands -- and both legs live inside the axial band its segs span.
+                // Two returns whose bands are separated by at least their summed coated
+                // envelopes cannot touch at ANY azimuth, so asking them for distinct angles
+                // reserves nothing the copper needs. 750372247r01 (one Primary parallel per
+                // section, P/S/P/T/P): parallel 0's returns span y 4.03..5.82 mm and parallel
+                // 2's -5.82..-4.03, 8 mm apart against a 0.597 mm envelope, and this rule still
+                // demanded 3.49 deg between them -- which the climb-aware permutation then
+                // broke across bands, and the fan refused its own slots. The exact 3D checks
+                // (and the certified gate) stay the acceptance.
+                const auto [aLo, aHi] = returnAxialBand(A);
+                const auto [bLo, bHi] = returnAxialBand(B);
+                if (std::max(bLo - aHi, aLo - bHi) >= dSep) return 0.0;
             }
             // Perpendicular clearance, not the chord: a vertical's RUN-OUT is a radial line
             // through the neighbour's band, so the closest approach between two slots dAz
@@ -10542,40 +12524,29 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         // (laidDragbacks stacked per azimuth, consecutive returns of one conductor chained onto
         // one azimuth), from the same slots the emitter will receive. Returns place before leads,
         // so a lead's tip plane is final by the time the lead is evaluated.
+        // Only returns that REALLY stack add up (tallestRealStack: same column, overlapping axial
+        // copper, one step per radius level), each by its bumpStep -- the step laidDragbacks gives
+        // the emitter, so plan and drawing agree.
         auto fanRaiseNow = [&]() {
             std::map<std::pair<size_t, size_t>, double> dAz;
-            std::map<std::pair<size_t, size_t>, double> dDiam;
+            std::map<std::pair<size_t, size_t>, size_t> dIdx;
             for (size_t k = 0; k < verts.size(); ++k) {
                 if (verts[k].kind != 1 || !azAssigned[k]) continue;
                 dAz[{verts[k].ci, verts[k].trans}] = az[k];
-                dDiam[{verts[k].ci, verts[k].trans}] = 2.0 * verts[k].rw;
+                dIdx[{verts[k].ci, verts[k].trans}] = k;
             }
             for (auto& [key, a] : dAz) {
                 if (key.second == 0) continue;
                 auto prev = dAz.find({key.first, key.second - 1});
                 if (prev != dAz.end()) a = prev->second;
             }
-            std::vector<std::pair<double, double>> cols;
+            std::vector<StackedReturn> stack;
             for (const auto& [key, a] : dAz) {
-                bool found = false;
-                for (auto& col : cols) {
-                    if (std::abs(std::remainder(a - col.first, kTwoPi)) < 1e-9) {
-                        col.second += dDiam.at(key);
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) cols.push_back({a, dDiam.at(key)});
+                const Vert& d = verts[dIdx.at(key)];
+                const auto [lo, hi] = returnAxialBand(d);
+                stack.push_back({a, d.r, d.bumpStep, lo - d.rw, hi + d.rw});
             }
-            double raise = 0.0;
-            for (const auto& col : cols) raise = std::max(raise, col.second);
-            return raise;
-        };
-        // The common tip plane this conductor's leads finish on -- leadTipRadius in the emitter,
-        // from the same inputs.
-        auto tipRadiusFor = [&](size_t ciQ) {
-            return std::max(commonTipBase + fanRaiseNow() + maxRideAll,
-                            bobbinOuterXFor(ciQ) + 2.0 * commonTipWireRadius);
+            return tallestRealStack(stack);
         };
         // The fan-frame azimuth at which conductor ci's station s crosses: the slot of the return
         // or lead that carries it (a return wins, as crossAz in the emitter), the plane otherwise
@@ -10622,13 +12593,23 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             std::vector<WrapBump> out;
             for (const auto& [key, a] : dAz) {
                 const Vert& d = verts[dIdx.at(key)];
-                if (turnRadius < d.r - rwEmitOf) continue;   // bumpsForTurn's selection
-                out.push_back({kPlaneAz + a, d.r, 2.0 * d.rw});
+                (void) rwEmitOf;
+                if (!(d.mkfLevelRadius <= turnRadius + 0.5 * d.bumpStep)) continue;   // bumpsForTurn's selection (MKF's)
+                out.push_back({kPlaneAz + a, d.mkfLevelRadius, d.bumpStep, d.bumpRise});   // MKF's level, step and rise
             }
             return out;
         };
         auto fanRaiseAt = [&](double turnRadius, double rwEmitOf) {
             return tallestBumpColumn(fanBumpsAt(turnRadius, rwEmitOf)).first;
+        };
+        // The common tip plane this conductor's leads finish on -- leadTipRadius in the emitter,
+        // from the same inputs: beyond the tallest column AND beyond the largest lift a lead is
+        // drawn with (every placed return beneath it; see fanMaxRaise).
+        auto tipRadiusFor = [&](size_t ciQ) {
+            const double raise =
+                std::max(fanRaiseNow(), fanRaiseAt(std::numeric_limits<double>::infinity(), 0.0));
+            return std::max(commonTipBase + raise + maxRideAll,
+                            bobbinOuterXFor(ciQ) + 2.0 * commonTipWireRadius);
         };
         // The exact helix of the wrap LEAVING station R.station (a wrap's two rows describe one
         // helix; the leaving row carries it): anchored at the plane, y = R.y + adv*(az - plane)/2pi,
@@ -11689,117 +13670,14 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // NO azimuth satisfies both, the block takes the tightest hard-feasible position
             // and the collision gate keeps the final word.
             if (verts[k].kind == 1) {
-                // ABT #685 (Alf, 2026-08-15, reinstated): sibling dragbacks block-allocate too —
-                // "the vertical dragbacks [must be] consecutive". Placed one at a time they
-                // scattered across the drift-forbid holes (06_llc: s0 at +7.6, s1 pushed to
-                // +16.3 with the primary's columns between them). Same rule as the leads: the
-                // winding's returns of one radius band place as ONE contiguous block, and the
-                // SIDES RULE holds — the whole block lives on [0, -X), never a negative slot.
-                // The block is the winding's WHOLE return corridor, all bands at once: a
-                // conductor's returns share ONE column (offset zero — the layer-reuse rule as
-                // block structure), and the parallels' columns sit consecutively, one column
-                // clearance apart. Grouping per band could not do this: the plane-pinned links
-                // push each band off by a different amount (deeper band, bigger asin), so no
-                // shared column exists band-by-band — 06_llc's p0 sprawled 5.7..34 deg and the
-                // secondary was exiled beyond the fan's validity.
-                std::vector<size_t> group;
-                std::vector<size_t> columnOfMember;
-                std::vector<size_t> columnCis;
-                for (size_t j = k; j < verts.size(); ++j) {
-                    if (azAssigned[j] || verts[j].kind != 1) continue;
-                    if (verts[j].wname != verts[k].wname) continue;
-                    size_t col = columnCis.size();
-                    for (size_t c2 = 0; c2 < columnCis.size(); ++c2)
-                        if (columnCis[c2] == verts[j].ci) { col = c2; break; }
-                    if (col == columnCis.size()) columnCis.push_back(verts[j].ci);
-                    group.push_back(j);
-                    columnOfMember.push_back(col);
-                }
-                // Column spacing: the widest need between any member of one column and any of the
-                // next — the deepest bands dominate, so every band clears at once.
-                std::vector<double> columnOffset(columnCis.size(), 0.0);
-                for (size_t c2 = 1; c2 < columnCis.size(); ++c2) {
-                    double widest = 0.0;
-                    for (size_t a = 0; a < group.size(); ++a)
-                        for (size_t b = 0; b < group.size(); ++b)
-                            if (columnOfMember[a] == c2 - 1 && columnOfMember[b] == c2)
-                                widest = std::max(widest, need(verts[group[a]], verts[group[b]]));
-                    columnOffset[c2] = columnOffset[c2 - 1] + widest;
-                }
-                std::vector<double> offset(group.size(), 0.0);
-                for (size_t g = 0; g < group.size(); ++g)
-                    offset[g] = columnOffset[columnOfMember[g]];
-                const double blockSpan = columnOffset.empty() ? 0.0 : columnOffset.back();
-                auto blockHardOk = [&](double c) {
-                    for (size_t g = 0; g < group.size(); ++g)
-                        for (size_t j = 0; j < verts.size(); ++j)
-                            if (azAssigned[j] && std::abs(c + offset[g] - az[j]) + 1e-12 <
-                                                     need(verts[j], verts[group[g]]))
-                                return false;
-                    return true;
-                };
-                auto blockSoftOk = [&](double c) {
-                    for (size_t g = 0; g < group.size(); ++g)
-                        for (const auto& iv : forbid[group[g]])
-                            if (c + offset[g] > iv.lo + 1e-12 && c + offset[g] < iv.hi - 1e-12)
-                                return false;
-                    return true;
-                };
-                bool have = false;
-                double best = 0.0;
-                auto consider = [&](double c, bool withSoft) {
-                    if (c < -1e-12) return;   // sides rule: returns on [0, -X) only
-                    if (!blockHardOk(c) || (withSoft && !blockSoftOk(c))) return;
-                    const double centre = c + blockSpan / 2.0;
-                    const double centreBest = best + blockSpan / 2.0;
-                    if (!have || std::abs(centre) < std::abs(centreBest) - 1e-12 ||
-                        (std::abs(centre) <= std::abs(centreBest) + 1e-12 && centre > centreBest)) {
-                        best = c;
-                        have = true;
-                    }
-                };
-                // COLUMN REUSE first (the layer-reuse rule): a block position that stacks any
-                // member onto its conductor's already-placed column wins outright.
-                std::vector<double> snapCand;
-                for (size_t g = 0; g < group.size(); ++g)
-                    for (size_t j = 0; j < verts.size(); ++j)
-                        if (azAssigned[j] && verts[j].kind == 1 && verts[j].ci == verts[group[g]].ci)
-                            snapCand.push_back(az[j] - offset[g]);
-                for (int tier = 0; tier < 2 && !have; ++tier)
-                    for (double c : snapCand) consider(c, tier == 0);
-                std::vector<double> cand{0.0};
-                for (size_t g = 0; g < group.size(); ++g) {
-                    for (size_t j = 0; j < verts.size(); ++j) {
-                        if (!azAssigned[j]) continue;
-                        const double nd = need(verts[j], verts[group[g]]);
-                        if (nd > 0.0) {
-                            cand.push_back(az[j] + nd - offset[g]);
-                            cand.push_back(az[j] - nd - offset[g]);
-                        }
-                    }
-                    for (const auto& iv : forbid[group[g]]) {
-                        if (std::abs(iv.lo) <= kFanReach) cand.push_back(iv.lo - offset[g]);
-                        if (std::abs(iv.hi) <= kFanReach) cand.push_back(iv.hi - offset[g]);
-                    }
-                }
-                for (int tier = 0; tier < 2 && !have; ++tier) {
-                    for (double c : cand) consider(c, tier == 0);
-                    // A soft-clean position only counts while it stays INSIDE the bump model's
-                    // validity: the ride treatment (one raised half, risers at the global plane
-                    // crossings) and the drift linearization assume a tight fan, and kFanReach is
-                    // their hard bound. On 06_llc the only position clearing every member's soft
-                    // window at once was 38..46 deg — s2 BEYOND kFanReach — where the over-dragback
-                    // junctions visibly fell apart and the rides degraded. A contiguous block near
-                    // the plane on HARD constraints (the gate arbitrating the soft model, as
-                    // everywhere else) beats a soft-clean block outside the model.
-                    if (have && std::abs(best + blockSpan / 2.0) > 0.5 * kFanReach && tier == 0) {
-                        have = false;
-                    }
-                }
-                for (size_t g = 0; g < group.size(); ++g) {
-                    az[group[g]] = best + offset[g];
-                    azAssigned[group[g]] = 1;
-                }
+                // ABT #2274 (Alf, 2026-11-05: "MKF owns the placement"): a return lies where MKF laid
+                // it (ConnectionRoute::laneAzimuth) and the fan packs everything else around it, as
+                // it does round the plane-pinned links. The fan used to choose the returns' slots
+                // itself (block allocation per winding, soft row-drift windows) and lift the turns
+                // over the angle it chose, so MKF's ride and the drawn one disagreed wherever that
+                // angle was not MKF's.
+                az[k] = verts[k].mkfAzimuth;
+                azAssigned[k] = 1;
                 continue;
             }
             // kind 0: gather the whole (winding, side) group and place it as ONE block.
@@ -12028,6 +13906,87 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // dodge. Every disagreement between the plan and the drawn copper then lands at the
             // certified gate as a named pair instead of being absorbed by an azimuth the rule
             // says the terminals should not need. Diagnostic campaign switch, default OFF.
+            // ABT #2274 (Alf, 2026-11-09: "MVB++ draws MKF's lanes + level rows"): a round column's free-air leads are drawn at
+            // MKF's lanes. Each member's slot is the azimuth at which its attach radius gives MKF's lane x -- where MKF's own
+            // height model (Coil::terminal_turn_height_along at terminal_lane_along) puts the lead on its turn -- and nothing
+            // here moves it. A lead that cannot stand there throws; the collision gate judges the copper.
+            {
+                size_t lanedMembers = 0;
+                std::vector<double> laneX(group.size(), 0.0);
+                for (size_t g = 0; g < group.size(); ++g) {
+                    std::optional<double> xg;
+                    for (size_t m : verts[group[g]].cis) {
+                        auto found = mkfRoundLaneXOf.find({m, verts[group[g]].entrance});
+                        if (found == mkfRoundLaneXOf.end()) continue;
+                        if (xg && std::abs(*xg - found->second) > 1e-12)
+                            throw std::runtime_error("ConductorBuilder: one lead slot of '" + verts[group[g]].wname +
+                                                     "' binds parallels MKF lays in different lanes (" + std::to_string(*xg * 1e3) +
+                                                     " and " + std::to_string(found->second * 1e3) + " mm)");
+                        xg = found->second;
+                    }
+                    if (xg) {
+                        ++lanedMembers;
+                        laneX[g] = *xg;
+                    }
+                }
+                if (lanedMembers > 0 && lanedMembers != group.size())
+                    throw std::runtime_error("ConductorBuilder: the " + std::string(verts[group[0]].entrance ? "entrance" : "exit") +
+                                             " leads of '" + verts[group[0]].wname + "' hold MKF's round-column lanes only in part");
+                if (lanedMembers > 0) {
+                    for (size_t g = 0; g < group.size(); ++g) {
+                        const Vert& v = verts[group[g]];
+                        double c = slotAtX(v, laneX[g], /*run=*/false);
+                        // ABT #2274 (Alf, 2026-11-09, option ii): a rect (edgewise) lead on a round column stands its RUN on
+                        // MKF's lane, parallel to Z. Its corner, of the radius MKF plans for it (plannedBendRadius), sweeps from
+                        // the turn's tangent to -Z, so the attach lies one bend earlier (exit) / later (entrance):
+                        // (r + Rc) cos(azA) = lane +/- Rc. Where that corner does not fit (no such attach on the turn, or a
+                        // radius at or below the section's radial half-extent, which sweeps a self-intersecting tube) the
+                        // corner is sharp, the attach at the lane, with a FINDING (rectLeadCorner draws it the same way).
+                        {
+                            const auto& ctv = conductors[v.ci];
+                            const MAS::Wire& wv = wireMap.at(ctv.winding);
+                            if (TurnBuilder::rectangularSection(wv, *ctv.turns.front())) {
+                                const OpenMagnetics::ConnectionRoute* rv = nullptr;
+                                const auto kindV = v.entrance ? OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE
+                                                              : OpenMagnetics::ConnectionKind::TERMINAL_EXIT;
+                                for (const auto& r : connectionLayout.routes)
+                                    if (r.winding == ctv.winding && r.parallel == static_cast<int64_t>(ctv.parallel) && r.kind == kindV) rv = &r;
+                                if (!rv || !(rv->plannedBendRadius > 0))
+                                    throw std::runtime_error("ConductorBuilder: MKF plans no corner radius (plannedBendRadius) for the " +
+                                                             std::string(v.entrance ? "entrance" : "exit") + " lead of " + ctv.winding +
+                                                             " parallel " + std::to_string(ctv.parallel));
+                                auto [ew, eh] = TurnBuilder::wireDimensions(wv, *ctv.turns.front(), opts.paintCoating);
+                                (void) eh;
+                                const double Rc = rv->plannedBendRadius;
+                                const double cosA = v.entrance ? (laneX[g] - Rc) / (v.r + Rc) : (laneX[g] + Rc) / (v.r + Rc);
+                                if (Rc > 0.5 * ew && std::abs(cosA) < 1.0) {
+                                    c = std::asin(-cosA);
+                                } else {
+                                    std::fprintf(stderr, "FINDING: the %s lead corner of %s parallel %zu (MKF bend %.6f mm, section radial "
+                                                         "half-extent %.6f mm, attach radius %.6f mm, lane %.6f mm) does not fit: drawn sharp at the lane\n",
+                                                 v.entrance ? "entrance" : "exit", ctv.winding.c_str(), (size_t) ctv.parallel, Rc * 1e3,
+                                                 0.5 * ew * 1e3, v.r * 1e3, laneX[g] * 1e3);
+                                }
+                            }
+                        }
+                        if (std::isnan(c))
+                            throw std::runtime_error("ConductorBuilder: MKF lays the " + std::string(v.entrance ? "entrance" : "exit") +
+                                                     " lead of " + conductors[v.ci].winding + " parallel " +
+                                                     std::to_string(conductors[v.ci].parallel) + " at x = " + std::to_string(laneX[g] * 1e3) +
+                                                     " mm, beyond its attach radius " + std::to_string(v.r * 1e3) + " mm");
+                        az[group[g]] = c;
+                        azAssigned[group[g]] = 1;
+                        permSig += " L:" + std::to_string(group[g]);
+                        if (std::getenv("MVB_LEAD_DIAG"))
+                            std::fprintf(stderr, "[round-lane] %s parallel %zu %s: MKF lane x %.9f mm, attach r %.9f mm -> slot %.9f deg "
+                                                 "(attach x %.9f mm)\n",
+                                         conductors[v.ci].winding.c_str(), (size_t) conductors[v.ci].parallel,
+                                         v.entrance ? "entrance" : "exit", laneX[g] * 1e3, v.r * 1e3, c * 180 / kPi,
+                                         -v.r * std::sin(c) * 1e3);
+                    }
+                    continue;
+                }
+            }
             // ABT #1237 (WP3): LEADS ON PINS START AT MKF'S SLOT. MKF plans the run to the pin from its
             // own exit x (Coil::terminal_exit_slots); every member of this bundle that ends on a pin
             // is drawn with its straight run AT that x -- the slot at which the run radius gives
@@ -12071,7 +14030,14 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     std::string why;
                     for (size_t g = 0; g < group.size() && why.empty(); ++g) {
                         fixedAz[g] = slotAtX(verts[group[g]], fixedX[g], /*run=*/true);
-                        if (std::isnan(fixedAz[g])) why = "the exit x is beyond the lead's run radius";
+                        if (std::isnan(fixedAz[g])) {
+                            const Vert& v = verts[group[g]];
+                            const double runR = (v.kind == 0 && runRadiusOf) ? runRadiusOf(v, 0.0) : v.r;
+                            why = "the exit x " + std::to_string(fixedX[g] * 1e3) +
+                                  " mm is beyond the lead's run radius " + std::to_string(runR * 1e3) +
+                                  " mm (attach radius " + std::to_string(v.r * 1e3) + " mm, kind " +
+                                  std::to_string(v.kind) + ", member " + std::to_string(g) + ")";
+                        }
                     }
                     if (why.empty()) {
                         for (size_t g = 0; g < group.size(); ++g) {
@@ -12449,13 +14415,13 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     std::vector<std::pair<std::string, size_t>> atMinimum, sharp;
                     for (size_t g = 0; g < group.size(); ++g) {
                         const auto key = std::make_pair(conductors[verts[group[g]].ci].winding, conductors[verts[group[g]].ci].parallel);
-                        if (!tlsLeadsAtMinimumBend.count(key)) atMinimum.push_back(key);
-                        else if (!tlsLeadsSharp.count(key)) sharp.push_back(key);
+                        // ABT #2274 (Alf, 2026-11-07): MKF's bend or sharp -- no smallest-buildable tier.
+                        if (!tlsLeadsSharp.count(key)) sharp.push_back(key);
                     }
                     // Sharp for both windings at once (Alf, 2026-10-31): where the group goes sharp -- or already is
                     // and still has no layout -- every parallel of the winding its binding constraint names goes sharp
                     // with it. 23_interleaved_llc: Primary's leads have no layout against Secondary's round corners.
-                    if (atMinimum.empty() && bindingCi && conductors[*bindingCi].winding != conductors[verts[group[0]].ci].winding) {
+                    if (sharp.empty() && bindingCi && conductors[*bindingCi].winding != conductors[verts[group[0]].ci].winding) {
                         for (const auto& cd : conductors) {
                             if (cd.winding != conductors[*bindingCi].winding) continue;
                             const auto key = std::make_pair(cd.winding, cd.parallel);
@@ -12464,7 +14430,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                         }
                     }
                     const std::string why = "the terminal leads of '" + verts[group[0]].wname + "' " +
-                                            (atMinimum.empty() ? "at the smallest buildable bend" : "at MKF's bend") + ": " +
+                                            (sharp.empty() ? "drawn sharp" : "at MKF's bend") + ": " +
                                             (bindingWhy.empty() ? std::string("(none reported)") : bindingWhy);
                     if (!atMinimum.empty()) throw FanBendRetry(why, std::move(atMinimum), /*sharp=*/false);
                     if (!sharp.empty()) throw FanBendRetry(why, std::move(sharp), /*sharp=*/true);
@@ -12510,6 +14476,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                     : "the anchor the block was placed at") +
                         ": parallel " + std::to_string(g) + " has no slot clear of the others there.");
                 azAssigned[group[g]] = 1;
+                fanPlacedASlot = true;
             }
         }
         // ABT #685 (Alf, 2026-08-14): "put the parallel with the lower turn on the most -X
@@ -12535,7 +14502,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 bool onPins = false;
                 for (size_t k : members)
                     for (size_t m : verts[k].cis)
-                        if (mkfExitXOf.count({m, verts[k].entrance})) onPins = true;
+                        if (mkfExitXOf.count({m, verts[k].entrance}) ||
+                            mkfRoundLaneXOf.count({m, verts[k].entrance}))   // MKF's round-column lanes (ABT #2274)
+                            onPins = true;
                 if (onPins) continue;
                 // The permutation is separation-neutral only while every member converts its
                 // slot to the SAME run X, i.e. while they share a radius (ABT #685: the
@@ -12909,6 +14878,28 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             auto it = m.find(V.ci);
             return it == m.end() ? std::numeric_limits<double>::quiet_NaN() : it->second;
         };
+        for (size_t k = 0; k < verts.size(); ++k) {
+            const Vert& V = verts[k];
+            if (V.kind != 0 || V.rectWire || !azAssigned[k]) continue;
+            if (!leadCornersRound(conductors[V.ci].winding, conductors[V.ci].parallel)) continue;
+            const std::vector<PlanePt> wpk = emittedRoute(V, az[k]);
+            if (wpk.empty()) continue;
+            const gp_Pnt attach = liftedPt(V, wpk.front().x, wpk.front().y, az[k]);
+            // No fillet fits: the terminal corner is the sharp crossing vertex and takes nothing of the leg.
+            double claim = 0.0;
+            if (const auto prims = leadPrims3D(V, az[k], assignedRollOf(V))) {
+                double nearest = std::numeric_limits<double>::max();
+                for (const auto& pr : *prims) {
+                    if (pr.kind != Primitive::SEG) continue;
+                    nearest = std::min({nearest, attach.Distance(pr.seg.a), attach.Distance(pr.seg.b)});
+                }
+                if (nearest == std::numeric_limits<double>::max())
+                    throw std::logic_error("ConductorBuilder: the fan's filleted lead of conductor " + std::to_string(V.ci) +
+                                           " has no straight segment left");
+                claim = nearest;
+            }
+            for (size_t m : V.cis) (V.entrance ? leadTerminalClaimIn : leadTerminalClaimOut)[m] = claim;
+        }
         std::vector<std::string> fanViolations;
         for (size_t j = 0; j < verts.size(); ++j) {
             if (verts[j].kind == 2) continue;
@@ -12975,6 +14966,17 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             if (std::getenv("MVB_LEAD_NO_VALIDATE")) {
                 std::cerr << "[ConductorBuilder] MVB_LEAD_NO_VALIDATE set: emitting the leads THROUGH "
                              "each other. " << m.str() << "\n";
+            } else if (!fanPlacedASlot) {
+                // EVERY SLOT IS MKF'S (Alf, 2026-11-15: "Report only"). The fan placed nothing here -- each lead stands
+                // on MKF's lane, each return on MKF's azimuth -- so its clearance model has no layout of its own to
+                // refuse, and that model is cruder than the copper: on the isolated buck-boost and the complete flyback
+                // it found a Secondary lead 0.59 / 0.15 mm from its own conductor's dragback along x, where the lead
+                // passes below the dragback's end and the certified gate finds no contact. What it found is reported;
+                // the certified enamel gate on the emitted copper decides whether the part is refused.
+                std::cerr << "[ConductorBuilder] FINDING: the lead fan's clearance model, on slots that are all MKF's ("
+                          << fanViolations.size() << " violation(s); the certified enamel gate decides):";
+                for (const auto& v : fanViolations) std::cerr << "\n  - " << v;
+                std::cerr << "\n";
             } else {
                 refuseCollision(m.str());   // the collision debug switch emits them as planned
             }
@@ -12987,8 +14989,11 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             if (prev != dragAzOf.end()) a = prev->second;
         }
         for (const auto& v : verts)
-            if (v.kind == 1)
-                laidDragbacks.push_back({dragAzOf.at({v.ci, v.trans}), v.r, 2.0 * v.rw});
+            if (v.kind == 1) {
+                const auto [lo, hi] = returnAxialBand(v);
+                laidDragbacks.push_back(
+                    {dragAzOf.at({v.ci, v.trans}), v.r, v.bumpStep, lo - v.rw, hi + v.rw, v.bumpRise, v.mkfLevelRadius});
+            }
         if (std::getenv("MVB_DRAG_DIAG")) {
             std::cerr << "[fan] " << verts.size() << " verticals, width "
                       << fanWidth * 180.0 / kPi << " deg\n";
@@ -13008,21 +15013,29 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
     }
     // Tallest vertical-fan column overall: every lead must clear it on its way out, so the
     // common tip radius sits this much further beyond the winding.
+    // Only REAL stacks count (tallestRealStack): returns sharing an azimuth whose axial copper
+    // meets, one step per radius level -- the fan's fanRaiseNow from the same returns.
     double fanMaxRaise = 0.0;
     {
-        std::vector<std::pair<double, double>> cols;
-        for (const auto& ld : laidDragbacks) {
-            bool found = false;
-            for (auto& c : cols) {
-                if (std::abs(std::remainder(ld.az - c.first, kTwoPi)) < 1e-9) {
-                    c.second += ld.diam;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) cols.push_back({ld.az, ld.diam});
-        }
-        for (const auto& c : cols) fanMaxRaise = std::max(fanMaxRaise, c.second);
+        std::vector<StackedReturn> stack;
+        for (const auto& ld : laidDragbacks)
+            stack.push_back({ld.az, ld.radius, ld.diam, ld.yLo, ld.yHi});
+        fanMaxRaise = tallestRealStack(stack);
+        // ...AND BEYOND THE LIFT THE LEADS ARE DRAWN WITH (Alf, 2026-11-05, PQ 27/15 S/P/S/P:
+        // "Primary parallel 1 / exit lead seg 1 is looking to +Z??? why not x axis?"). Every
+        // lead waypoint but the tip is lifted by tallestBumpColumn of the returns at or inside
+        // it (pushPlaneSegs' raiseAt), which since ABT #685 SUMS one step per return LEVEL
+        // across all azimuths -- while the column maximum above counts only the returns that
+        // share one azimuth. On an interleaved window whose returns sit in different slots the
+        // lift outgrew the plane: the outermost conductor's exit attach rode 2.652 mm over
+        // three levels to r = 13.600 mm, its elbow to 14.049 mm, and the tip plane stood at
+        // 13.645 mm (0.899 mm column + 4 ODs), so the run folded back along +Z and the port
+        // drop then carried its +Z port across the whole coil. The tip plane clears both: the
+        // tallest column, and the largest lift (every return in the window is beneath a lead
+        // outside them all, bumpsForTurn(infinity) -- the exit lift's own list).
+        std::vector<WrapBump> allBumps;
+        for (const auto& ld : laidDragbacks) allBumps.push_back({ld.az, ld.levelRadius, ld.diam, ld.rise});
+        fanMaxRaise = std::max(fanMaxRaise, tallestBumpColumn(allBumps).first);
     }
 
     // TOROID: STRAIGHT BOTTOM CHORD, OR THE ROUND-Z BAND? ABT #685 (Alf, 2026-08-18): "the
@@ -13160,7 +15173,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     minOut = std::min(minOut, tc.pout.Modulus());
                 }
                 const double rMid = 0.5 * (maxIn + minOut);
-                const double b = opts.effectiveBend(kRoundCornerBendFactor * cross[cv].front().rwEmit);
+                const double b = opts.effectiveBend(wireBendOf(conductors[cv].winding));
                 if (rMid - b <= b) { toroBandForAll = false; break; }
                 const double rt1 = std::sqrt(std::max(0.0, (rMid + b) * (rMid + b) - b * b));
                 const double rt2 = std::sqrt(std::max(0.0, (rMid - b) * (rMid - b) - b * b));
@@ -13203,6 +15216,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
 
     for (size_t ci = 0; ci < conductors.size(); ++ci) {
         const auto& ct = conductors[ci];
+        if (isToroidal && mirrorHanded.count({ct.winding, static_cast<int64_t>(ct.parallel)}))
+            throw std::runtime_error("ConductorBuilder: '" + ct.winding + " parallel " + std::to_string(ct.parallel) +
+                                     "' is a counter-clockwise toroidal conductor, which MVB++ does not yet draw mirror-handed");
         // ABT #871: everything below runs in THIS conductor's leg frame (see conductorAxisX).
         // For a main-column conductor these are the magnetic-wide values computed above.
         const double rectHalfW = conductorRectHalfW[ci];
@@ -13218,8 +15234,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         const bool foilWire = wireType == MAS::WireType::FOIL &&
                               !(std::getenv("MVB_FOIL_AS_RECT") &&
                                 std::string(std::getenv("MVB_FOIL_AS_RECT")) == "0");
-        const bool rectWire = wireType == MAS::WireType::RECTANGULAR ||
-                              wireType == MAS::WireType::PLANAR || foilWire;
+        const bool rectWire = TurnBuilder::rectangularSection(wire, *ct.turns.front()) || foilWire;
         // Rectangular/planar wire: ROUND column -> one body via fixed binormal; RECT/OBLONG column
         // or TOROID -> per-primitive rect solids fused (emitRectColumn), with the section oriented
         // by the local bend/spacing axis (column Y, or the toroid's azimuthal tangent). Only FOIL
@@ -13260,10 +15275,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         // a GUARD, not a radius: a corner whose centreline radius does not exceed the section's
         // radial half-extent sweeps a self-intersecting tube, and rectStation refuses it.
         const double minBend = (foilWire || rectWire) ? 0.5 * wireW : wireRadius;
-        // The round-column terminal lead corners (rectLeadCorner) are LEADS, not turns, and keep
-        // their own bend rule for now: 1.02 x the envelope radius, unchanged by ABT #1295. The
-        // rect-column ones are MKF's (rectLeadCornerRadius below).
-        const double leadCornerBend = opts.effectiveBend(wireRadius * 1.02);
+        // The round-column terminal lead corners (rectLeadCorner) take MKF's plannedBendRadius (ABT #2274,
+        // Alf 2026-11-09: the 1.02 x envelope-radius bend rule is gone); the rect-column ones are MKF's too
+        // (rectLeadCornerRadius below).
         // This conductor's own former corner, from MKF's frame for its section (a lateral leg has
         // its own), shadowing the main column's for everything below.
         const bool rectColumnHere = !isToroidal && !ct.turns.empty() &&
@@ -13287,7 +15301,12 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 throw std::runtime_error("ConductorBuilder: MKF planned no terminal lead bend radius for " +
                                          ct.winding + " parallel " + std::to_string(ct.parallel) +
                                          ", so its rect-column lead corner has no radius to be drawn at");
-            if (!(planned > minBend)) {
+            // A DISPLAY drawing (the wire at its outer size: the web view, and the tool the bobbin is cut with) has the
+            // section's radial half-extent EQUAL to MKF's bend by MKF's own rule -- the copper's inner side bends round
+            // the coating thickness, so the coated section's inner side turns about a line (Coil::lead_bend_radius).
+            // That is the boundary, not a fold: the corner is drawn at MKF's radius there. A radius BELOW the
+            // half-extent folds in any drawing and is refused.
+            if (tlsDisplayOnly ? planned < minBend - 1e-12 : !(planned > minBend)) {
                 std::ostringstream m;
                 m.precision(9);
                 m << "ConductorBuilder: the terminal lead bend MKF planned for " << ct.winding << " parallel "
@@ -13325,12 +15344,22 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         path.winding = ct.winding;
         path.parallel = static_cast<size_t>(ct.parallel);
         path.wireRadius = wireRadius;
+        if (leadCornersRound(ct.winding, static_cast<size_t>(ct.parallel)))
+            path.leadBendRadius = plannedWireBendRadius(ct.winding, ct.parallel);
         path.isFoil = foilWire;
         path.condRadius = rectWire ? 0.5 * std::hypot(copW, copH) : std::min(copW, copH) / 2.0;
+        {
+            auto [cotW, cotH] = TurnBuilder::wireDimensions(wire, *ct.turns.front(), /*paintCoating=*/true);
+            path.coatedRadius = foilWire ? 0.5 * cotW
+                                         : (rectWire ? 0.5 * std::hypot(cotW, cotH) : std::min(cotW, cotH) / 2.0);
+        }
         path.condWidth = copW; path.condHeight = copH;
         path.isRectangular = rectWire;
         path.wireWidth = wireW;
         path.wireHeight = wireH;
+        // Compressed litz is a ROUNDED rectangle, at the corner radius MKF gives its cell
+        // (TurnBuilder::sectionCornerRadius); every other rectangular section is sharp.
+        path.wireCornerRadius = TurnBuilder::sectionCornerRadius(wire, *ct.turns.front(), opts.paintCoating);
         path.femReady = opts.femReady;
         if (rectWire) {
             // Round (or straight-less oblong) column: the section sweeps cleanly with a fixed
@@ -13359,6 +15388,355 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         }
 
         const auto& turns = ct.turns;
+
+        // MKF'S U (see mkfTangentU): the whole centreline from MKF's routes. Each terminal is
+        // either a slot lead (its radial run at MKF's exitSlot x, from the ring to the tip plane)
+        // or a tangential lead (TangentDeparture: the radial run at the lane, MKF's corner about
+        // cornerCentre, MKF's straight from `end` to the departure `point`, tangent to the ring).
+        // The ring runs from the entrance's point on it to the exit's, in the sense the tangential
+        // lead says the wire travels. Coordinates: MKF's face frame (x along the face, y the turn
+        // axis, z = -1 towards the face; side 1 mirrors the bobbin's z), into this builder's frame,
+        // whose side-0 face is -Z and side-1 face +Z. Nothing is chosen here: a route MKF does not
+        // fully state throws. Overlaps are NOT corrected: the collision gate reports them.
+        if (mkfTangentU.count(ci)) {
+            const int side = windingFace.at(ct.winding);
+            const double zSign = side == 0 ? 1.0 : -1.0;
+            auto toBuilder = [&](const std::vector<double>& v, const char* what) {
+                if (v.size() != 3)
+                    throw std::runtime_error("ConductorBuilder: MKF's tangent departure of " + path.name +
+                                             " has no 3-D " + what);
+                return gp_Pnt(v[0], v[1], zSign * v[2]);
+            };
+            const PlanePt s0 = station(turns[0]);
+            const double R = s0.x;
+            const double tipRadius = std::max(commonTipBase + fanMaxRaise + maxRideAll,
+                                              bobbinOuterXFor(ci) + 2.0 * commonTipWireRadius);
+            const double tipZ = zSign * -(tipRadius + zoff);   // builder z of the tip plane
+            const gp_Pnt centre(0.0, s0.y, 0.0);
+            auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const std::string& what, int terminal) {
+                if (a.Distance(b) < 1e-12) return;
+                Primitive pr;
+                pr.kind = Primitive::SEG;
+                pr.seg = {a, b};
+                pr.label = path.name + " " + what;
+                pr.isLead = terminal >= 0;
+                pr.terminal = terminal;
+                path.prims.push_back(std::move(pr));
+            };
+            // An arc about `c` (axis +-Y) from a to b, leaving a along `tangent`.
+            auto pushArc = [&](const gp_Pnt& c, const gp_Pnt& a, const gp_Pnt& b, const gp_XYZ& tangent,
+                               const std::string& what, int terminal) {
+                const gp_XYZ v0 = a.XYZ() - c.XYZ(), v1 = b.XYZ() - c.XYZ();
+                if (std::abs(v0.Y()) > 1e-9 || std::abs(v1.Y()) > 1e-9 ||
+                    std::abs(v0.Modulus() - v1.Modulus()) > 1e-6)
+                    throw std::runtime_error("ConductorBuilder: " + path.name + " " + what + ": MKF's arc ends are not "
+                                             "on one level circle about its centre (radii " +
+                                             std::to_string(v0.Modulus() * 1e3) + " and " +
+                                             std::to_string(v1.Modulus() * 1e3) + " mm)");
+                gp_XYZ axis(0, 1, 0);
+                if (axis.Crossed(v0).Dot(tangent) < 0) axis = gp_XYZ(0, -1, 0);
+                double sweep = std::atan2(v0.Crossed(v1).Dot(axis), v0.Dot(v1));
+                if (sweep <= 1e-12) sweep += kTwoPi;
+                Primitive pr;
+                pr.kind = Primitive::ARC3;
+                pr.arc.c = c;
+                pr.arc.axis = axis;
+                pr.arc.v0 = v0;
+                pr.arc.sweep = sweep;
+                pr.label = path.name + " " + what;
+                pr.isLead = terminal >= 0;
+                pr.terminal = terminal;
+                path.prims.push_back(std::move(pr));
+            };
+            struct End {
+                gp_Pnt onRing;                 // where the lead meets the ring
+                std::optional<gp_XYZ> travel;  // the wire's direction along the ring there (tangential leads)
+                const OpenMagnetics::ConnectionRoute* route = nullptr;
+            };
+            auto endOf = [&](bool entrance) {
+                const auto wantKind = entrance ? OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE
+                                               : OpenMagnetics::ConnectionKind::TERMINAL_EXIT;
+                End e;
+                for (const auto& r : connectionLayout.routes)
+                    if (r.kind == wantKind && r.winding == ct.winding && r.parallel == ct.parallel) {
+                        if (e.route)
+                            throw std::runtime_error("ConductorBuilder: MKF's connection layout carries two " +
+                                                     std::string(entrance ? "entrance" : "exit") +
+                                                     " routes for " + path.name);
+                        e.route = &r;
+                    }
+                if (!e.route)
+                    throw std::runtime_error("ConductorBuilder: MKF's connection layout has no " +
+                                             std::string(entrance ? "entrance" : "exit") + " route for " + path.name);
+                if (const auto& d = e.route->tangentDeparture) {
+                    e.onRing = toBuilder(d->point, "departure point");
+                    const gp_Pnt along = toBuilder(d->direction, "direction");
+                    const gp_XYZ out = along.XYZ();   // outward along the lead
+                    e.travel = entrance ? out * -1.0 : out;
+                } else {
+                    if (!e.route->exitSlot)
+                        throw std::runtime_error("ConductorBuilder: the " + std::string(entrance ? "entrance" : "exit") +
+                                                 " route of " + path.name + " has neither a tangent departure nor an exit slot");
+                    const double x = *e.route->exitSlot;
+                    if (std::abs(x) >= R)
+                        throw std::runtime_error("ConductorBuilder: the " + std::string(entrance ? "entrance" : "exit") +
+                                                 " slot of " + path.name + " (x " + std::to_string(x * 1e3) +
+                                                 " mm) is beyond its ring (radius " + std::to_string(R * 1e3) +
+                                                 " mm) and MKF gives it no tangent departure");
+                    e.onRing = gp_Pnt(x, s0.y, zSign * -std::sqrt(R * R - x * x));
+                }
+                const double off = std::hypot(e.onRing.X(), e.onRing.Z()) - R;
+                if (std::abs(off) > 1e-6 || std::abs(e.onRing.Y() - s0.y) > 1e-6)
+                    throw std::runtime_error("ConductorBuilder: the " + std::string(entrance ? "entrance" : "exit") +
+                                             " of " + path.name + " meets the ring " + std::to_string(off * 1e3) +
+                                             " mm off its radius, " + std::to_string((e.onRing.Y() - s0.y) * 1e3) +
+                                             " mm off its height");
+                return e;
+            };
+            const End in = endOf(true), out = endOf(false);
+            // The sense the ring is wound in, from the tangential lead(s); both must agree.
+            auto senseAt = [&](const End& e) {
+                const gp_XYZ v = e.onRing.XYZ() - centre.XYZ();
+                const double s = gp_XYZ(0, 1, 0).Crossed(v).Dot(*e.travel);
+                if (std::abs(s) < 0.99 * v.Modulus() * e.travel->Modulus())
+                    throw std::runtime_error("ConductorBuilder: the tangential lead of " + path.name +
+                                             " is not tangent to its ring");
+                return s > 0 ? 1.0 : -1.0;
+            };
+            std::optional<double> sense;
+            for (const End* e : {&in, &out})
+                if (e->travel) {
+                    const double s = senseAt(*e);
+                    if (sense && *sense != s)
+                        throw std::runtime_error("ConductorBuilder: MKF's entrance and exit leads of " + path.name +
+                                                 " wind its ring in opposite senses");
+                    sense = s;
+                }
+            // The ring of a one-turn conductor goes round the column: from entrance to exit the
+            // long way. With no tangential lead to state the sense, that is the only arc there is.
+            auto arcAbout = [&](double s) {
+                const gp_XYZ ax(0, s, 0), v0 = in.onRing.XYZ() - centre.XYZ(), v1 = out.onRing.XYZ() - centre.XYZ();
+                double a = std::atan2(v0.Crossed(v1).Dot(ax), v0.Dot(v1));
+                if (a <= 1e-12) a += kTwoPi;
+                return a;
+            };
+            if (!sense) {
+                const double a = arcAbout(1.0);
+                if (std::abs(a - kPi) < 1e-6)
+                    throw std::runtime_error("ConductorBuilder: the two slot leads of " + path.name +
+                                             " stand opposite each other, so which way its ring goes round is not stated");
+                sense = a > kPi ? 1.0 : -1.0;
+            }
+            if (arcAbout(*sense) < kPi)
+                throw std::runtime_error("ConductorBuilder: MKF's U of " + path.name + " lays its ring over " +
+                                         std::to_string(arcAbout(*sense) * 180 / kPi) +
+                                         " deg, less than half a revolution");
+            // The wire's travel along the ring at a point of it.
+            auto ringTravelAt = [&](const gp_Pnt& p) {
+                return gp_XYZ(0, *sense, 0).Crossed(p.XYZ() - centre.XYZ()).Normalized();
+            };
+
+            // THE CORNER OF A SLOT LEAD (Alf, 2026-11-04: "the omega connection ... is not done properly,
+            // the corner is missing, do it properly"). A slot lead runs along the face normal at MKF's
+            // lane and the ring is MKF's turn; butting the two at their centrelines left the outside of
+            // the bend open (a 1.8 x 1.6 mm notch on a flat one-turn Secondary of an ER 35/20/11). The wire bends from
+            // one into the other about the column axis, at the radius MKF planned for the lead
+            // (ConnectionRoute::plannedBendRadius): a fillet tangent to the lead on its lane and to
+            // the ring, on the side the ring leaves towards. The lead leaves the ring outward, so the
+            // fillet's centre lies outside the ring's circle: |C| = R + Rc. Where MKF's radius does not
+            // fit, the corner is refused with its numbers (ABT #2274: no smaller bend chosen here).
+            // THE RING RIDES OVER THE DRAGBACKS BENEATH IT (Alf, 2026-11-04: "you forgot to include the bump
+            // radius increase when there is only one turn"). A one-turn ring is a turn like any other: every
+            // return laid at or inside its radius lifts it, by the same tallestBumpColumn the wraps use
+            // (bumpsForTurn's selection), and by ALF'S RULE the bump moves the -Z half only -- that half is
+            // the same circle translated by -raise, bridged to the +Z half by straight risers at x = +-R.
+            // A slot lead on the raised half bends onto the raised circle.
+            std::vector<WrapBump> ringBumps;
+            for (const auto& ld : laidDragbacks)
+                if (ld.levelRadius <= R + 0.5 * ld.diam) ringBumps.push_back({ld.az, ld.levelRadius, ld.diam, ld.rise});
+            const double ringRaise = tallestBumpColumn(ringBumps).first;
+            if (std::getenv("MVB_RIDE_CMP"))
+                std::fprintf(stderr, "[ridecmp] RING '%s' winding %s face %d x %.9f mvb %.9f mkf0 %.9f mkf1 %.9f\n",
+                             path.name.c_str(), ct.winding.c_str(), windingFace.at(ct.winding), R, ringRaise,
+                             connectionLayout.ride_at(R, 0), connectionLayout.ride_at(R, 1));
+            // The z offset of the half a point of the unraised circle lies on.
+            auto halfShift = [&](const gp_Pnt& onCircle) { return ringRaise > 0.0 && onCircle.Z() < 0.0 ? -ringRaise : 0.0; };
+            struct SlotCorner {
+                gp_Pnt onLead, onRing, centre;
+            };
+            const double bendHalfExtent = path.isRectangular ? 0.5 * path.wireWidth : path.wireRadius;
+            auto slotCorner = [&](const End& e, bool entrance) {
+                const std::string who = entrance ? "entrance" : "exit";
+                // Along the ring, away from this lead: the way the entrance's ring leaves it, and the
+                // way back from the exit along the ring it arrived on.
+                const gp_XYZ away = entrance ? ringTravelAt(e.onRing) : ringTravelAt(e.onRing) * -1.0;
+                if (std::abs(away.X()) < 1e-9)
+                    throw std::runtime_error("ConductorBuilder: the ring of " + path.name + " leaves its " + who +
+                                             " lead along the lead itself, so the side of its corner is not stated");
+                const double side = away.X() > 0 ? 1.0 : -1.0;
+                const double zSide = e.onRing.Z() > 0 ? 1.0 : -1.0;
+                if (!((tipZ - e.onRing.Z()) * zSide > 0))
+                    throw std::runtime_error("ConductorBuilder: the " + who + " lead of " + path.name +
+                                             " does not leave its ring outward, towards the tip plane");
+                auto fits = [&](double Rc, SlotCorner& c, std::string& why) {
+                    if (!(Rc > bendHalfExtent)) {
+                        why = "radius " + std::to_string(Rc * 1e3) + " mm does not exceed the section's half extent " +
+                              std::to_string(bendHalfExtent * 1e3) + " mm";
+                        return false;
+                    }
+                    const double xc = e.onRing.X() + side * Rc;
+                    const double D = R + Rc;
+                    if (!(D > std::abs(xc))) {
+                        why = "radius " + std::to_string(Rc * 1e3) + " mm puts its centre beyond the ring's reach";
+                        return false;
+                    }
+                    const double zc = zSide * std::sqrt(D * D - xc * xc);
+                    const double shift = halfShift(e.onRing);   // the raised -Z half carries its leads with it
+                    if (!(std::abs(zc + shift) < std::abs(tipZ))) {
+                        why = "radius " + std::to_string(Rc * 1e3) + " mm ends the bend past the tip plane";
+                        return false;
+                    }
+                    c.centre = gp_Pnt(xc, s0.y, zc);
+                    c.onLead = gp_Pnt(e.onRing.X(), s0.y, zc);
+                    c.onRing = gp_Pnt(xc * R / D, s0.y, zc * R / D);
+                    // The bend must join the ring along the ring's own travel: turning about C from the
+                    // lead (travelling towards the ring) it must arrive moving as the wire moves there.
+                    const gp_XYZ v0 = c.onLead.XYZ() - c.centre.XYZ(), v1 = c.onRing.XYZ() - c.centre.XYZ();
+                    const gp_XYZ intoRing(0, 0, -zSide);
+                    gp_XYZ axis(0, 1, 0);
+                    if (axis.Crossed(v0).Dot(intoRing) < 0) axis = gp_XYZ(0, -1, 0);
+                    const gp_XYZ arrive = axis.Crossed(v1).Normalized();
+                    const gp_XYZ ringWay = entrance ? ringTravelAt(c.onRing) : ringTravelAt(c.onRing) * -1.0;
+                    if (arrive.Dot(ringWay) < 1.0 - 1e-9) {
+                        why = "radius " + std::to_string(Rc * 1e3) + " mm meets the ring against its travel";
+                        return false;
+                    }
+                    const gp_Vec up(0, 0, shift);
+                    c.centre.Translate(up);
+                    c.onLead.Translate(up);
+                    c.onRing.Translate(up);
+                    return true;
+                };
+                const double planned = plannedWireBendRadius(ct.winding, ct.parallel);
+                if (std::isnan(planned))
+                    throw std::runtime_error("ConductorBuilder: MKF planned no terminal lead bend radius for " +
+                                             path.name + ", so the corners of its omega have no radius");
+                SlotCorner c;
+                std::string why;
+                if (fits(planned, c, why)) return c;
+                // ABT #2274 (Alf, 2026-11-07): MKF's bend or nothing -- no smaller bend chosen here (no 1.05).
+                throw std::runtime_error("ConductorBuilder: the " + who + " corner of " + path.name +
+                                         " does not fit at MKF's planned bend: " + why);
+            };
+
+            // A lead from the tip plane to the ring (entrance) or back (exit).
+            std::optional<SlotCorner> inCorner, outCorner;
+            if (!in.route->tangentDeparture) inCorner = slotCorner(in, true);
+            if (!out.route->tangentDeparture) outCorner = slotCorner(out, false);
+            const gp_Pnt ringStart = inCorner ? inCorner->onRing : in.onRing;
+            const gp_Pnt ringEnd = outCorner ? outCorner->onRing : out.onRing;
+            const gp_XYZ ringStartTangent = ringTravelAt(ringStart);
+            auto leadPrims = [&](const End& e, bool entrance) {
+                const int term = entrance ? 0 : 1;
+                const std::string who = entrance ? "entrance" : "exit";
+                const auto& d = e.route->tangentDeparture;
+                if (!d) {   // a slot lead: straight along the face normal at its lane, bent onto the ring
+                    const SlotCorner& c = entrance ? *inCorner : *outCorner;
+                    const gp_Pnt tip(e.onRing.X(), s0.y, tipZ);
+                    const gp_XYZ towardsTip(0, 0, tipZ > c.onLead.Z() ? 1.0 : -1.0);
+                    if (entrance) {
+                        pushSeg(tip, c.onLead, who + " lead run", term);
+                        pushArc(c.centre, c.onLead, c.onRing, towardsTip * -1.0, who + " lead corner", term);
+                    } else {
+                        pushArc(c.centre, c.onRing, c.onLead, ringTravelAt(c.onRing), who + " lead corner", term);
+                        pushSeg(c.onLead, tip, who + " lead run", term);
+                    }
+                    return;
+                }
+                if (d->kind != OpenMagnetics::TangentDeparture::Kind::OFF_THE_BACK &&
+                    d->kind != OpenMagnetics::TangentDeparture::Kind::OFF_THE_FACE_END)
+                    throw std::runtime_error("ConductorBuilder: unexpected tangent departure kind on " + path.name);
+                if (halfShift(e.onRing) != 0.0)
+                    throw std::runtime_error("ConductorBuilder: MKF's tangent departure of " + path.name + " leaves the ring's "
+                                             "raised half (a ride of " + std::to_string(ringRaise * 1e3) +
+                                             " mm over the dragbacks beneath it), which its route does not describe");
+                const gp_Pnt end = toBuilder(d->end, "straight end");
+                const gp_Pnt cc = toBuilder(d->cornerCentre, "corner centre");
+                const gp_Pnt ce = toBuilder(d->cornerEnd, "corner end");
+                const gp_Pnt tip(ce.X(), ce.Y(), tipZ);
+                const gp_XYZ toFace(0, 0, zSign * -1.0);
+                if (entrance) {
+                    pushSeg(tip, ce, who + " lead run", term);
+                    pushArc(cc, ce, end, toFace * -1.0, who + " lead corner", term);
+                    pushSeg(end, e.onRing, who + " lead straight", term);
+                } else {
+                    pushSeg(e.onRing, end, who + " lead straight", term);
+                    pushArc(cc, end, ce, (end.XYZ() - e.onRing.XYZ()).Normalized(), who + " lead corner", term);
+                    pushSeg(ce, tip, who + " lead run", term);
+                }
+            };
+            leadPrims(in, true);
+            if (ringRaise <= 0.0) {
+                pushArc(centre, ringStart, ringEnd, ringStartTangent,
+                        "'" + turns[0]->get_name() + "' ring (MKF's U)", -1);
+            } else {
+                // The ring walked from its start to its end in the wire's sense, split where it crosses the
+                // XY plane (x = +-R): each piece on the -Z side is the raised circle, and a riser along z
+                // joins the two halves there (tangent: the circle's own direction at x = +-R is axial).
+                const double startShift = halfShift(in.onRing), endShift = halfShift(out.onRing);
+                const gp_Pnt s0L(ringStart.X(), ringStart.Y(), ringStart.Z() - startShift);
+                const gp_Pnt e0L(ringEnd.X(), ringEnd.Y(), ringEnd.Z() - endShift);
+                const double dir = -*sense;   // azimuth atan2(z, x) runs this way as the wire travels
+                const double phiS = std::atan2(s0L.Z(), s0L.X());
+                double span = dir * (std::atan2(e0L.Z(), e0L.X()) - phiS);
+                while (span <= 1e-12) span += kTwoPi;
+                while (span > kTwoPi + 1e-12) span -= kTwoPi;
+                std::vector<double> cuts{0.0};
+                for (int k = -4; k <= 4; ++k) {   // the plane crossings phi = k pi strictly inside the walk
+                    const double t = dir * (k * kPi - phiS);
+                    if (t > 1e-9 && t < span - 1e-9) cuts.push_back(t);
+                }
+                std::sort(cuts.begin(), cuts.end());
+                cuts.push_back(span);
+                auto at = [&](double phi, double shift) {
+                    return gp_Pnt(R * std::cos(phi), s0.y, R * std::sin(phi) + shift);
+                };
+                std::optional<gp_Pnt> previousEnd;
+                for (size_t k = 0; k + 1 < cuts.size(); ++k) {
+                    const double a = phiS + dir * cuts[k], b = phiS + dir * cuts[k + 1];
+                    const double shift = std::sin(0.5 * (a + b)) < 0.0 ? -ringRaise : 0.0;
+                    const gp_Pnt pa = k == 0 ? ringStart : at(a, shift);
+                    const gp_Pnt pb = k + 2 == cuts.size() ? ringEnd : at(b, shift);
+                    if (previousEnd && previousEnd->Distance(pa) > 1e-12)
+                        pushSeg(*previousEnd, pa, "'" + turns[0]->get_name() + "' bump riser", -1);
+                    const gp_Pnt c(0.0, s0.y, shift);
+                    pushArc(c, pa, pb, gp_XYZ(0, *sense, 0).Crossed(pa.XYZ() - c.XYZ()).Normalized(),
+                            "'" + turns[0]->get_name() + "' ring (MKF's U)" + (shift != 0.0 ? " (over dragback)" : ""), -1);
+                    previousEnd = pb;
+                }
+            }
+            leadPrims(out, false);
+            path.singleBodyCapable = false;
+            path.useRectSolids = true;
+            path.roundProfile = false;
+            path.seamRot = 0.0;
+            if (std::getenv("MVB_DIAG"))
+                for (const auto& pr : path.prims) {
+                    auto [a, b] = primEndpoints(pr);
+                    std::fprintf(stderr, "[mkf-u] %s (%.4f,%.4f,%.4f)->(%.4f,%.4f,%.4f) %s\n", pr.label.c_str(),
+                                 a.X() * 1e3, a.Y() * 1e3, a.Z() * 1e3, b.X() * 1e3, b.Y() * 1e3, b.Z() * 1e3,
+                                 pr.kind == Primitive::ARC3
+                                     ? ("sweep " + std::to_string(pr.arc.sweep * 180 / kPi) + " deg").c_str() : "");
+                }
+            if (conductorAxisX[ci] != 0.0)
+                throw std::runtime_error("ConductorBuilder: " + path.name + " is MKF's U on a lateral leg, "
+                                         "which MKF does not route");
+            if (mirrorHanded.count({ct.winding, static_cast<int64_t>(ct.parallel)}))
+                throw std::runtime_error("ConductorBuilder: " + path.name + " is MKF's U on a counter-clockwise conductor, "
+                                         "which MVB++ does not yet draw mirror-handed");
+            paths.push_back(std::move(path));
+            continue;
+        }
 
 
         // This conductor's drawn terminal rects, in MKF emission order (verified in
@@ -13553,11 +15931,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // diameter.
             double windingTop = 0.0, windingBot = 0.0, maxOuterR = 0.0;
             // ABT #685 (Alf, 2026-08-19): the chords sit a BEND radius past the tube, exactly as
-            // the comment above says (rh0 = tube + bend) -- but this used wireRadius, which is
-            // bend / 1.05. The missing 5% of a wire radius (17.0 um here) came straight out of
-            // the lead radial's vertical clearance over the chords: measured 0.6620 mm against
-            // the 0.679 mm coated envelope, the exact difference.
-            const double chordReach = kRoundCornerBendFactor * wireRadius;
+            // the comment above says (rh0 = tube + bend), not a wire radius. ABT #2274: that bend is
+            // MKF's (ConnectionLayout::wireBendRadius), the one the wraps are drawn at.
+            const double chordReach = opts.effectiveBend(wireBendOf(ct.winding));
             for (size_t i = 0; i + 1 < turns.size(); ++i) {
                 ToroCross c0 = toroCross(turns[i]), c1 = toroCross(turns[i + 1]);
                 windingTop = std::max(windingTop, c0.tube + chordReach);
@@ -13658,11 +16034,13 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                                  "assigned to '" + who + "'");
                     level = found->second;
                 } else if (isExit) {
-                    level = toroLeadEnvelopeTop + wireRadius;
-                    toroLeadEnvelopeTop = level + wireRadius;
+                    // ABT #2274: the touch is the ENAMEL's -- one coated radius each side, never the bare one
+                    // (07_cmc's leads sat 0.500 mm over 0.534 mm-coated chords: 34 um into the enamel).
+                    level = toroLeadEnvelopeTop + coatedRadiusOf(path);
+                    toroLeadEnvelopeTop = level + coatedRadiusOf(path);
                 } else if (!straightEntrance) {
-                    level = -(toroLeadEnvelopeBot + wireRadius);
-                    toroLeadEnvelopeBot = -level + wireRadius;
+                    level = -(toroLeadEnvelopeBot + coatedRadiusOf(path));
+                    toroLeadEnvelopeBot = -level + coatedRadiusOf(path);
                 }
                 double beyondR = maxOuterR + 3.0 * od;
                 gp_XY dir = cross.pin;
@@ -13793,7 +16171,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                         const double worstV =
                             routeWorstPoly({tipV, elbowA, pCross}, {"drop", "axial"});
                         if (worstV < 0.0)
-                            throw std::runtime_error(
+                            refuseCollision(   // debug (--skip-collision-check): drawn and reported
                                 "ConductorBuilder: no clear vertical-mount terminal lead for '" + who +
                                 "': its " + worstLegName + " leg interferes with " + worstWhat +
                                 " of turn " + std::to_string(worstTurn) + " by " +
@@ -13986,13 +16364,34 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                         }
                         const gp_XYZ u = inVec.XYZ() / lenIn, w = outVec.XYZ() / lenOut;
                         const double cosTurn = u.Dot(w);
-                        const double b = opts.effectiveBend(kRoundCornerBendFactor * wireRadius);
+                        // ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"): the lead's corner is bent at
+                        // MKF's lead radius (plannedBendRadius) where its tangent fits the space it has -- the leg
+                        // behind it minus what the previous corner took, the whole leg ahead -- else it is sharp and
+                        // reported. No factor of MVB++'s own, no leg share.
+                        const double planned = plannedWireBendRadius(ct.winding, ct.parallel);
+                        if (std::isnan(planned))
+                            throw std::runtime_error("ConductorBuilder: MKF planned no terminal lead bend radius for " +
+                                                     path.name + ", so its toroid lead corners have no radius");
+                        const double b = opts.effectiveBend(planned);
                         const double tangentLen =
                             b * std::sqrt(std::max(0.0, (1.0 - cosTurn) / (1.0 + cosTurn)));
-                        // Room is judged on the FULL legs: a leg shared by two corners gives at
-                        // most 0.49 of itself to each, so a straight piece always remains between.
-                        if (cosTurn > 1.0 - 1e-9 || tangentLen > 0.49 * std::min(lenIn, lenOut)) {
-                            pushLeadSeg(segStart, mid, legs[v - 1]);   // straight or no room
+                        const double roomIn = mid.Distance(segStart);
+                        if (cosTurn > 1.0 - 1e-9) {
+                            pushLeadSeg(segStart, mid, legs[v - 1]);   // straight through
+                            segStart = mid;
+                            continue;
+                        }
+                        if (!(b > wireRadius) || tangentLen > roomIn || tangentLen > lenOut) {
+                            std::cerr << "[ConductorBuilder] FINDING: toroid lead corner " << v << " of " << path.name << " "
+                                      << who << " (at " << mid.X() << ", " << mid.Y() << ", " << mid.Z() << " m) cannot hold "
+                                      << "MKF's bend of " << b << " m: its tangent length " << tangentLen << " m against legs "
+                                      << roomIn << " and " << lenOut << " m left (wire radius " << wireRadius
+                                      << " m); it is drawn sharp (bisection mitre)\n";
+                            if (std::getenv("MVB_CORNER_LIST"))
+                                std::fprintf(stderr, "[corner-list]\ttoroid-lead\t%s %s\tcorner %zu\t%.6f,%.6f,%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n",
+                                             path.name.c_str(), who.c_str(), v, mid.X() * 1e3, mid.Y() * 1e3, mid.Z() * 1e3,
+                                             b * 1e3, tangentLen * 1e3, roomIn * 1e3, lenOut * 1e3);
+                            pushLeadSeg(segStart, mid, legs[v - 1]);
                             segStart = mid;
                             continue;
                         }
@@ -14135,7 +16534,8 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     auto [cw, ch] = TurnBuilder::wireDimensions(wireMap.at(ct2.winding),
                                                                 *ct2.turns.front(), true);
                     const double rw = 0.5 * std::min(ew, eh);
-                    const double bend = opts.effectiveBend(kRoundCornerBendFactor * rw);
+                    const double bend = opts.effectiveBend(wireBendOf(ct2.winding));
+                    (void) rw;
                     const double coatedRw = 0.5 * std::min(cw, ch);
                     for (size_t i = 0; i + 1 < ct2.turns.size(); ++i) {
                         const auto& ca = ct2.turns[i]->get_coordinates();
@@ -15030,7 +17430,18 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 // same margin appendFilletedPolyline already uses for exactly this reason, and
                 // it is also the honest physics — a wire does not bend tighter than its own
                 // radius.
-                const double toroBend = opts.effectiveBend(kRoundCornerBendFactor * wireRadius);
+                // ABT #2274 (Alf, 2026-11-13): MKF's radius (ConnectionLayout::wireBendRadius), no factor of
+                // MVB++'s own. One not above the wire radius cannot be swept round: the wraps are mitred
+                // (sharp) and reported.
+                const double toroBend = opts.effectiveBend(wireBendOf(ct.winding));
+                const bool toroBendSharp = !(toroBend > wireRadius);
+                if (toroBendSharp && i == 0)
+                    std::cerr << "[ConductorBuilder] FINDING: MKF's wire bend for " << path.name << " is " << toroBend
+                              << " m, not above its wire radius " << wireRadius << " m; its toroid wrap corners are drawn "
+                              << "sharp (mitre)\n";
+                if (toroBendSharp && i == 0 && std::getenv("MVB_CORNER_LIST"))
+                    std::fprintf(stderr, "[corner-list]\ttoroid-wrap\t%s\tall wraps\t-\t%.6f\t-\t%.6f\t-\n",
+                                 path.name.c_str(), toroBend * 1e3, wireRadius * 1e3);
                 if (r0 != r1)
                     // Same per-parallel nesting as below: once every turn is on a band, a ring
                     // change that ignored the strand index shared its lane with the others'
@@ -15040,7 +17451,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                         path, c0, c1, toroBend,
                         (std::max(0, std::max(r0, r1) - 1) +
                          (toroBandForAll ? toroParIndex : 0)) * od,
-                        toroBandRadius, wlabel, i);
+                        toroBandRadius, wlabel, i, opts.toroidMitreCorners || toroBendSharp);
                 else if (toroBandForAll)
                     // Same ring, but the straight chords collide somewhere in this design, so
                     // EVERY turn takes the band (Alf: "once one turn needs it, use it for all of
@@ -15052,10 +17463,10 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     // never converge, which is the whole point of using an arc over a chord.
                     appendToroTransitionBand(path, c0, c1, toroBend,
                                              (wrapDepthOds(i) + toroParIndex) * od,
-                                             toroBandRadius, wlabel, i);
+                                             toroBandRadius, wlabel, i, opts.toroidMitreCorners || toroBendSharp);
                 else
                     appendToroWrap(path, c0, c1, toroBend, wrapDepthOds(i) * od, wlabel, i,
-                                   opts.toroidMitreCorners,
+                                   opts.toroidMitreCorners || toroBendSharp,
                                    toroCornerDir(i, true), toroCornerDir(i, false),
                                    &allRimTubes);
             }
@@ -15214,7 +17625,31 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // the surrounding copper around it, and holding the row walked 06_llc to 14.9 um
             // and 14_dab to 3.6 um. The elbow belongs exactly where no azimuth funds a slope:
             // rect columns, and the hard plane anchor.
-            if ((rectFamily || planeAnchored) && !rectWire && kept.size() >= 2) {
+            // ABT #2274 (Alf, 2026-11-07, "slot-step ramp"): a lead MKF gave a slot ramp
+            // (ConnectionRoute::slotRampLength) leaves its turn at its ROW: the step from the turn to the row
+            // is climbed along the turn as MKF's cosine S (drawSlotRamps), not in an elbow leg here. The
+            // attach is held at MKF's row; drawSlotRamps joins it to the wrap.
+            const OpenMagnetics::ConnectionRoute* slotRamped = nullptr;
+            for (const auto& r : connectionLayout.routes) {
+                const auto kind = stationAtFront ? OpenMagnetics::ConnectionKind::TERMINAL_EXIT
+                                                 : OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE;
+                if (r.winding == path.winding && static_cast<size_t>(r.parallel) == path.parallel && r.kind == kind &&
+                    r.slotRampLength)
+                    slotRamped = &r;
+            }
+            if (slotRamped && kept.size() >= 2) {
+                if (rectWire)
+                    throw std::runtime_error("ConductorBuilder: MKF planned a slot-step ramp for the rectangular-wire " + what +
+                                             " of " + path.name + "; drawing it on a rectangular wire is not implemented");
+                const size_t attIdx = stationAtFront ? 0 : kept.size() - 1;
+                const auto& mkfAttach = stationAtFront ? slotRamped->waypoints.front() : slotRamped->waypoints.back();
+                if (std::getenv("MVB_LEAD_DIAG"))
+                    std::cerr << "[slot-ramp] " << path.name << " " << what << " attach y " << kept[attIdx].y << " -> MKF row "
+                              << mkfAttach.at(1) << " (step " << mkfAttach.at(1) - kept[attIdx].y << " m, MKF "
+                              << *slotRamped->slotRampHeight << " m)\n";
+                kept[attIdx].y = mkfAttach.at(1);
+            }
+            else if ((rectFamily || planeAnchored) && !rectWire && kept.size() >= 2) {
                 const size_t attIdx = stationAtFront ? 0 : kept.size() - 1;
                 const size_t nbIdx = stationAtFront ? 1 : kept.size() - 2;
                 const PlanePt att = kept[attIdx];
@@ -15301,9 +17736,132 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 // 11_pushpull's Secondary 1 parallel 0).
                 leadPts[tip] = gp_Pnt(leadPts[nb].X(), kept[tip].y,
                                       -(leadTipRadius + zoff));
+                // The run reaches the tip plane OUTWARD (-Z here, before the seam rotation). A
+                // lifted waypoint at or past the plane makes the run fold back along +Z, and the
+                // port drop then carries that port across the coil.
+                if (!(leadPts[tip].Z() < leadPts[nb].Z())) {
+                    std::ostringstream m;
+                    m.precision(9);
+                    m << "ConductorBuilder: " << path.name << " " << what << " is lifted to z = "
+                      << leadPts[nb].Z() * 1e3 << " mm before its run to the tip plane (z = "
+                      << leadPts[tip].Z() * 1e3 << " mm), so the run would fold back; the tip "
+                      << "plane does not clear the lead's ride-over lift";
+                    throw std::runtime_error(m.str());
+                }
             }
-            if (xShift != 0.0)
+            // ABT #2274 (Alf, 2026-11-09, decision 2: "every run stands on MKF's lane"): a round-wire lead that holds an MKF
+            // round-column lane is drawn in the plane x = lane, not on its slot's radial ray. Each waypoint (r, y) of MKF's
+            // 2-D route is the point of the circle of radius r (about the column axis, raised by the same lift as above) at
+            // x = lane; the run to the tip plane is parallel to Z at x = lane. On the ray a waypoint beyond the attach radius
+            // stood at x = lane * r / r_attach (06 Secondary p0 entrance at its crossing row: -3.697 mm for lane -3.467).
+            if (!rectWire && leadPts.size() > 1 && effectivelyRound) {
+                if (auto laneIt = mkfRoundLaneXOf.find({ci, !stationAtFront}); laneIt != mkfRoundLaneXOf.end()) {
+                    const double lane = laneIt->second;
+                    const size_t tip = stationAtFront ? leadPts.size() - 1 : 0;
+                    for (size_t i = 0; i < leadPts.size(); ++i) {
+                        if (i == tip) continue;
+                        const double r = kept[i].x + zoff;
+                        const double liftHere = raiseAt ? raiseAt(kept[i].x) : liftRaise;
+                        if (!(std::abs(lane) < r)) {
+                            std::ostringstream m;
+                            m.precision(9);
+                            m << "ConductorBuilder: the waypoint " << i << " of " << path.name << " " << what << " (radius " << r * 1e3
+                              << " mm) does not reach MKF's lane x = " << lane * 1e3 << " mm";
+                            throw std::runtime_error(m.str());
+                        }
+                        leadPts[i] = gp_Pnt(lane, kept[i].y, -(liftHere > 0.0 ? liftHere : 0.0) - std::sqrt(r * r - lane * lane));
+                    }
+                    leadPts[tip] = gp_Pnt(lane, kept[tip].y, -(leadTipRadius + zoff));
+                    const size_t nbLane = stationAtFront ? tip - 1 : 1;
+                    if (!(leadPts[tip].Z() < leadPts[nbLane].Z()))
+                        throw std::runtime_error("ConductorBuilder: " + path.name + " " + what + " reaches the tip plane before its run at MKF's lane");
+                }
+            }
+            // ABT #2274 (Alf, 2026-11-09: "MVB++ draws MKF's lanes" on round columns): a rect-wire lead at MKF's lane off the
+            // plane keeps the same rule as a round wire's (above): its waypoints on the slot's radial ray, its RUN parallel to Z
+            // at the world X of the waypoint before the tip, landing on the common tip plane. At the plane (every rect-family
+            // lead, and every round-column lead before MKF's lanes were drawn) nothing changes.
+            if (rectWire && leadPts.size() > 1 && std::abs(azLead - kPlaneAz) > 1e-12) {
+                const size_t tip = stationAtFront ? leadPts.size() - 1 : 0;
+                const size_t nb = stationAtFront ? tip - 1 : 1;
+                leadPts[tip] = gp_Pnt(leadPts[nb].X(), kept[tip].y, -(leadTipRadius + zoff));
+                if (!(leadPts[tip].Z() < leadPts[nb].Z()))
+                    throw std::runtime_error("ConductorBuilder: " + path.name + " " + what + " reaches the tip plane before its run");
+            }
+            if (xShift != 0.0) {
                 for (auto& q : leadPts) q.SetX(q.X() + xShift);
+                // ABT #2274 (Alf, 2026-11-15, PSPS E16: "leave from the arc"): a lane past the face straight stands on
+                // the turn's corner arc, so the lead's points at the winding (all but the tip) stand on the arc of their
+                // own radius there -- nearer the column than the flat face by R (1 - cos theta), sin theta = (|x| - segX) / R.
+                // The run stays parallel to Z at the lane.
+                if (!effectivelyRound && !rectWire) {
+                    const PlanePt attachWp = stationAtFront ? kept.front() : kept.back();
+                    const RectStation rsLane = rectStation(attachWp, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);
+                    const double over = std::abs(xShift) - rsLane.segX;
+                    if (rsLane.segX > 1e-12 && over > 0.0) {
+                        if (leadPts.size() != kept.size())
+                            throw std::logic_error("ConductorBuilder: " + path.name + " " + what + " has " + std::to_string(leadPts.size()) +
+                                                   " points for " + std::to_string(kept.size()) + " waypoints at a lane on the corner arc");
+                        const size_t tip = stationAtFront ? leadPts.size() - 1 : 0;
+                        for (size_t i = 0; i < leadPts.size(); ++i) {
+                            if (i == tip) continue;
+                            const double R = rsLane.cornerR + (kept[i].x - attachWp.x);
+                            if (!(over < R)) {
+                                std::ostringstream m;
+                                m.precision(9);
+                                m << "ConductorBuilder: the lane x = " << xShift * 1e3 << " mm of " << path.name << " " << what
+                                  << " lies " << over * 1e3 << " mm past the face straight, beyond the corner arc of radius "
+                                  << R * 1e3 << " mm its waypoint " << i << " stands on";
+                                throw std::runtime_error(m.str());
+                            }
+                            leadPts[i].SetZ(leadPts[i].Z() + R - std::sqrt(R * R - over * over));
+                        }
+                        if (!(leadPts[tip].Z() < leadPts[stationAtFront ? tip - 1 : 1].Z()))
+                            throw std::runtime_error("ConductorBuilder: " + path.name + " " + what + " reaches the tip plane before its run on the corner arc");
+                    }
+                }
+            }
+            // ABT #2274 (Alf, 2026-11-08, after agent 24): MKF ended this exit's turn ON its crossing row at its lane
+            // (rowEndX), so the lead leaves the attach at the lane, level on that row, and runs out at it: no step.
+            if (stationAtFront) {
+                if (const auto* rowEnd = mkfRowEndRoute(connectionLayout, path.winding, path.parallel)) {
+                    const std::string who = path.name + " " + what;
+                    if (rectWire || pinLead)
+                        throw std::runtime_error("ConductorBuilder: MKF's row end on " + who + " is drawn only for a round-wire exit without a pin");
+                    std::ostringstream w;
+                    w.precision(9);
+                    if (leadPts.size() < 2 || std::abs(leadPts[0].X() - *rowEnd->rowEndX) > 1e-9 ||
+                        std::abs(leadPts[0].Y() - *rowEnd->rowEndHeight) > 1e-9 || std::abs(leadPts[1].Y() - *rowEnd->rowEndHeight) > 1e-9) {
+                        w << "ConductorBuilder: the exit of " << who << " does not leave MKF's row end (lane " << *rowEnd->rowEndX * 1e3
+                          << " mm, row " << *rowEnd->rowEndHeight * 1e3 << " mm) level: attach (" << leadPts[0].X() * 1e3 << ", "
+                          << leadPts[0].Y() * 1e3 << ") mm, next row " << (leadPts.size() > 1 ? leadPts[1].Y() * 1e3 : 0.0) << " mm";
+                        throw std::runtime_error(w.str());
+                    }
+                    if (std::getenv("MVB_LEAD_DIAG"))
+                        std::cerr << "[row-end] " << who << ": leaves its turn's row end at the lane " << leadPts[0].X() * 1e3
+                                  << " mm, level on the row " << leadPts[0].Y() * 1e3 << " mm\n";
+                }
+            }
+            // ABT #2274 (decision 2): MKF started this round entrance's first wrap ON its crossing row at its lane, so the lead
+            // joins the attach at the lane, level on that row.
+            if (!stationAtFront && effectivelyRound) {
+                if (const auto* rowStart = mkfRowStartRoute(connectionLayout, path.winding, path.parallel)) {
+                    const std::string who = path.name + " " + what;
+                    if (rectWire || pinLead)
+                        throw std::runtime_error("ConductorBuilder: MKF's row start on " + who + " is drawn only for a round-wire entrance without a pin");
+                    const size_t att = leadPts.size() - 1;
+                    if (leadPts.size() < 2 || std::abs(leadPts[att].X() - *rowStart->rowEndX) > 1e-9 ||
+                        std::abs(leadPts[att].Y() - *rowStart->rowEndHeight) > 1e-9 ||
+                        std::abs(leadPts[att - 1].Y() - *rowStart->rowEndHeight) > 1e-9) {
+                        std::ostringstream w;
+                        w.precision(9);
+                        w << "ConductorBuilder: the entrance of " << who << " does not join MKF's row start (lane " << *rowStart->rowEndX * 1e3
+                          << " mm, row " << *rowStart->rowEndHeight * 1e3 << " mm) level: attach (" << leadPts[att].X() * 1e3 << ", "
+                          << leadPts[att].Y() * 1e3 << ") mm, previous row " << (leadPts.size() > 1 ? leadPts[att - 1].Y() * 1e3 : 0.0) << " mm";
+                        throw std::runtime_error(w.str());
+                    }
+                }
+            }
             // ABT #1172 (WP3): A LEAD ASSIGNED TO A PIN. The lead is drawn exactly as above -- its
             // straight parallel-Z run to the common tip plane included -- and every later stage
             // (seam aim, end-run planning, link smoothing, terminal fillets) runs on that
@@ -15455,13 +18013,28 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 // are no terminal, so it takes no tag: everything it appends HERE is this lead
                 // (its segments and its rounded corners) and is tagged afterwards.
                 const size_t before = path.prims.size();
+                // The attach end's claim: a rect path has no terminal fillet (its corner prim stands before
+                // leadPts); a round wire's terminal fillet takes what the fan measured on it.
+                std::optional<double> attachClaim;
+                if (path.isRectangular) attachClaim = 0.0;
+                else if (leadCornersRound(path.winding, path.parallel)) {
+                    // ABT #2274 (agent 46): only the fan measures this claim, and the fan runs only on round
+                    // columns. A lead with no interior corner (a rect column's single radial run) never reads it,
+                    // so its absence is not an error here: appendFilletedPolyline throws if a corner needs it.
+                    const auto& claims = leadTerminal == 0 ? leadTerminalClaimIn : leadTerminalClaimOut;
+                    const auto it = claims.find(ci);
+                    if (it != claims.end()) attachClaim = it->second;
+                }
                 appendFilletedPolyline(path.prims, leadPts, wireRadius, what, ordinal,
                                        /*isLead=*/true, /*isConnection=*/false,
                                        /*rounded=*/leadCornersRound(path.winding, path.parallel) ||
                                            path.isRectangular,
-                                       leadCornersRound(path.winding, path.parallel)
-                                           ? std::optional<double>(leadBendFor(path.winding, path.parallel, wireRadius))
-                                           : std::nullopt);
+                                       (leadCornersRound(path.winding, path.parallel) || path.isRectangular)
+                                           ? std::optional<double>(leadBendRadius(path.winding, path.parallel))
+                                           : std::nullopt,
+                                       stationAtFront ? attachClaim : std::optional<double>(0.0),
+                                       stationAtFront ? std::optional<double>(0.0) : attachClaim,
+                                       /*deferDragbackCorners=*/false, /*owner=*/path.name);
                 for (size_t k = before; k < path.prims.size(); ++k) path.prims[k].terminal = leadTerminal;
             }
             else {
@@ -15569,10 +18142,11 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 // slots sit side by side. A return lies in its destination layer's space, so
                 // that layer steps over it; the step puts the wire where the layer outside would
                 // be, so that one steps over too, and so on outward.
-                if (turnRadius < ld.radius - wireRadius) continue;
-                // Raise by the dragback wire's own COATED diameter: that is what has to be
-                // cleared, and different windings use different wire.
-                out.push_back({ld.az, ld.radius, ld.diam});
+                // ABT #2274: MKF's selection (ConnectionLayout::ride_at): the level counts when its
+                // radius is at most half its step outside the turn's.
+                if (!(ld.levelRadius <= turnRadius + 0.5 * ld.diam)) continue;
+                // Raise by MKF's rise over the level (LaidDragback::rise).
+                out.push_back({ld.az, ld.levelRadius, ld.diam, ld.rise});
             }
             return out;
         };
@@ -15798,6 +18372,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 pushSegF(path, P3(-segX, y, zR + G), P3(xReturnEnd, y, zR + G), wl + " connection face (return)", j, false);
                 zFaceEnd = zR + G;
             }
+            const size_t foilPathsBegin = paths.size();   // ABT #2293 (agent 23): the sheet and its two leads, mirrored below
             paths.push_back(std::move(path));
 
             // ---- THE AXIAL LEADS (ABT #1907): MKF's ConnectionRoute::axialLead, drawn ----------
@@ -15843,7 +18418,8 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             const double faceInLo = axIn.alongFace - 0.5 * axIn.outerDiameter, faceInHi = rs0ForLeads.segX;
             const double faceOutLo = -rs0ForLeads.segX,
                          faceOutHi = -(axOut.alongFace - 0.5 * axOut.outerDiameter + seamGapForLeads);
-            auto makeLead = [&](bool entrance, const OpenMagnetics::AxialLead& ax, double zWire, double slotX,
+            auto makeLead = [&](bool entrance, const OpenMagnetics::ConnectionRoute& route,
+                                const OpenMagnetics::AxialLead& ax, double zWire, double slotX,
                                 const std::string& nm) {
                 ConductorPath L;
                 L.name = nm;
@@ -15852,6 +18428,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 L.leadOnlyTerminal = entrance ? 0 : 1;
                 L.wireRadius = 0.5 * (opts.paintCoating ? ax.outerDiameter : ax.conductingDiameter);
                 L.condRadius = 0.5 * ax.conductingDiameter;
+                L.coatedRadius = 0.5 * ax.outerDiameter;
                 L.condWidth = ax.conductingDiameter; L.condHeight = ax.conductingDiameter;
                 L.isRectangular = false;
                 L.isFoil = true;   // its attached end is a joint on the sheet, not a port
@@ -15890,17 +18467,89 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     L.weldCornerA = P3(xLo, wd.from, zWire + (wd.layerFrom - ax.layerAxis));
                     L.weldCornerB = P3(xHi, wd.to, zWire + (wd.layerTo - ax.layerAxis));
                 }
-                if (entrance)
-                    pushSegF(L, tip, attached, "entrance lead seg 0 (axial, through the end face and along the sheet)", 0, true);
-                else
-                    pushSegF(L, attached, tip, "exit lead seg 0 (axial, along the sheet and through the end face)",
-                             turns.size() - 1, true);
+                // ABT #2291 (Alf, 2026-11-06): past the flange the lead turns 90 degrees out of the connection
+                // face, along Z (AxialLead::radialEnd). MKF's waypoints ARE the route: the attach's far end, the
+                // corner at (layerAxis, end), the run's end at (radialEnd, end), in electrical order. The layer
+                // axis maps onto this face's depth about the lead's own (zWire is its layerAxis there).
+                const std::vector<std::vector<double>> expectTurnFirst{{ax.layerAxis, ax.attachFrom},
+                                                                       {ax.layerAxis, ax.end},
+                                                                       {ax.radialEnd, ax.end}};
+                {
+                    auto expect = expectTurnFirst;
+                    if (entrance) std::reverse(expect.begin(), expect.end());
+                    bool same = route.waypoints.size() == expect.size();
+                    for (size_t k = 0; same && k < expect.size(); ++k)
+                        same = route.waypoints[k].size() == 2 && std::abs(route.waypoints[k][0] - expect[k][0]) <= 1e-12 &&
+                               std::abs(route.waypoints[k][1] - expect[k][1]) <= 1e-12;
+                    if (!same) {
+                        std::ostringstream w;
+                        w.precision(9);
+                        w << "ConductorBuilder: foil conductor '" << path.name << "': MKF's " << (entrance ? "start" : "finish")
+                          << " lead route has " << route.waypoints.size() << " waypoints, not its axial lead's run to "
+                          << ax.end * 1e3 << " mm and out along the layer axis to " << ax.radialEnd * 1e3 << " mm (ABT #2291)";
+                        throw std::runtime_error(w.str());
+                    }
+                }
+                std::vector<gp_Pnt> pts;
+                for (const auto& wp : route.waypoints)
+                    pts.push_back(P3(slotX, wp[1], zWire + (wp[0] - ax.layerAxis)));
+                (void) attached;
+                (void) tip;
+                const bool roundBend = route.plannedBendRadius > 0.0;
+                if (!roundBend)
+                    std::cerr << "[ConductorBuilder] FINDING: MKF planned no bend radius for the "
+                              << (entrance ? "start" : "finish") << " lead of foil conductor '" << path.name
+                              << "' (plannedBendRadius), so its corner out of the face is drawn sharp (bisection mitre)\n";
+                appendFilletedPolyline(L.prims, pts, L.wireRadius,
+                                       entrance ? "entrance lead (axial, out of the face, through the end face and along the sheet)"
+                                                : "exit lead (axial, along the sheet, through the end face and out of the face)",
+                                       entrance ? 0 : turns.size() - 1, /*isLead=*/true, /*isConnection=*/false,
+                                       /*rounded=*/roundBend,
+                                       roundBend ? std::optional<double>(route.plannedBendRadius) : std::nullopt,
+                                       /*startClaim=*/0.0, /*endClaim=*/0.0);   // the sheet and the tip: no fillet there
                 paths.push_back(std::move(L));
             };
-            makeLead(true, axIn, zFaceStart + tangencyIn, +axIn.alongFace,
+            makeLead(true, *axialRouteIn, axIn, zFaceStart + tangencyIn, +axIn.alongFace,
                      ct.winding + " parallel " + std::to_string(ct.parallel) + " entrance lead");
-            makeLead(false, axOut, zFaceEnd + tangencyOut, -axOut.alongFace,
+            makeLead(false, *axialRouteOut, axOut, zFaceEnd + tangencyOut, -axOut.alongFace,
                      ct.winding + " parallel " + std::to_string(ct.parallel) + " exit lead");
+            // ABT #2293 (agent 23, inside #2274; "MVB++ always obeys MKF"): the foil above is laid with its sheet leaving the
+            // crossing towards +x, its start leads at +alongFace and its finish leads at -alongFace. MKF's frame is the
+            // other way round when its routes say so (ConnectionRoute::wrapDirection -1: the first turn leaves towards -x,
+            // AxialLead::alongFace measured that way; an entrance stands on x <= 0, an exit on x >= 0). The face is
+            // straight and the column symmetric in x, so the drawing becomes MKF's by the mirror x -> -x of the sheet and
+            // its leads (an arc's axis is a pseudo-vector: (ax, -ay, -az), the same sweep). No wrap direction: throw.
+            {
+                if (!axialRouteIn->wrapDirection || !axialRouteOut->wrapDirection)
+                    throw std::runtime_error("ConductorBuilder: foil conductor '" + ct.winding + " parallel " + std::to_string(ct.parallel) +
+                                             "': MKF's axial lead routes carry no wrap direction, so the way the sheet leaves is unknown");
+                if (*axialRouteIn->wrapDirection != *axialRouteOut->wrapDirection)
+                    throw std::runtime_error("ConductorBuilder: foil conductor '" + ct.winding + " parallel " + std::to_string(ct.parallel) +
+                                             "': MKF's start and finish leads disagree on the wrap direction");
+                if (*axialRouteIn->wrapDirection < 0) {
+                    auto mirror = [](gp_Pnt& q) { q.SetX(-q.X()); };
+                    for (size_t k = foilPathsBegin; k < paths.size(); ++k) {
+                        auto& fp = paths[k];
+                        for (auto& pr : fp.prims) {
+                            if (pr.kind == Primitive::SEG) {
+                                mirror(pr.seg.a);
+                                mirror(pr.seg.b);
+                            } else if (pr.kind == Primitive::ARC3) {
+                                mirror(pr.arc.c);
+                                pr.arc.v0.SetX(-pr.arc.v0.X());
+                                pr.arc.axis = gp_XYZ(pr.arc.axis.X(), -pr.arc.axis.Y(), -pr.arc.axis.Z());
+                            } else {
+                                throw std::runtime_error("ConductorBuilder: foil conductor '" + fp.name +
+                                                         "' holds a spiral/blend piece, which the MKF-frame mirror does not map");
+                            }
+                        }
+                        if (fp.hasWeldStrip) {
+                            mirror(fp.weldCornerA);
+                            mirror(fp.weldCornerB);
+                        }
+                    }
+                }
+            }
             if (std::getenv("MVB_FOIL_DIAG")) {
                 std::fprintf(stderr,
                              "[foil] %s: %zu turn(s), parallels=%d pitch=%.4f mm y=%.4f mm face=%s "
@@ -16002,6 +18651,24 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 entranceAttachY = t0.y - (t1.y - t0.y) * (kPlaneAz - azEntrance) / kTwoPi;
             }
         }
+        // ABT #2274 (Alf, 2026-11-09, decision 2): MKF starts this round entrance's first wrap ON its crossing row at its
+        // lane (the row start); the lead attaches there, level, and the first wrap climbs uniformly onto its helix.
+        const OpenMagnetics::ConnectionRoute* rowStartRoute =
+            effectivelyRound ? mkfRowStartRoute(connectionLayout, ct.winding, ct.parallel) : nullptr;
+        // ABT #2274 (Alf, 2026-11-15): the same on a flat-faced column, where appendRectWrap draws the first piece.
+        const OpenMagnetics::ConnectionRoute* rectRowStartRoute =
+            effectivelyRound ? nullptr : mkfRowStartRoute(connectionLayout, ct.winding, ct.parallel);
+        if (rowStartRoute) {
+            if (turns.size() < 2 || zDragbackAzimuth.count(0) || rectWire)
+                throw std::runtime_error("ConductorBuilder: MKF's row start of " + path.name +
+                                         " meets a first wrap that is not a round-wire one-layer revolution");
+            if (std::getenv("MVB_LEAD_DIAG"))
+                std::fprintf(stderr, "[row-start] %s: first wrap starts at az %.6f deg on row %.9f mm (helix there %.9f mm), lane %.9f "
+                                     "mm, joins its helix at %.9f mm (MKF)\n",
+                             path.name.c_str(), azEntrance * 180 / kPi, *rowStartRoute->rowEndHeight * 1e3, entranceAttachY * 1e3,
+                             *rowStartRoute->rowEndX * 1e3, *rowStartRoute->rowEndFromHeight * 1e3);
+            entranceAttachY = *rowStartRoute->rowEndHeight;
+        }
         // ABT #685 (A2): pitch-true landing heights, keyed by the landing turn's index -- set
         // where the dragback is emitted, consumed by the landing wrap's start and by the stub
         // terminal below (declared here so both the loop and the lead emitters see one map).
@@ -16078,46 +18745,77 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         // corner met the rising wrap at a ~2 deg kink, and the spine filleter's 1.25*r trim
         // then ate the whole quarter arc into a degenerate edge (BRepAdaptor: No geometry).
         auto rectLeadCorner = [&](const PlanePt& st, double azL, bool isExit, double slope,
-                                  const std::string& what) {
+                                  const std::string& what, double bumpShiftZ = 0.0) {
             const gp_XYZ Rhat(std::cos(azL), 0.0, -std::sin(azL));
-            const gp_XYZ That(-std::sin(azL), 0.0, -std::cos(azL));
-            const double Rc = std::max(leadCornerBend, 1.02 * 0.5 * path.wireWidth);
-            const double q = 0.5 * kPi * Rc;
-            const gp_XYZ C2 = azPointC(0, 0, st.x, st.y, azL).XYZ() + Rhat * Rc;
-            const double runLen = leadTipRadius - st.x;
-            // y along the wire: the crossing keeps the station row; corner and run continue
-            // at the wrap's slope (entrance: the wire RISES into the wrap; exit: it keeps
-            // climbing away).
-            const double yP = st.y;
-            const double yQ = isExit ? yP + slope * q : yP - slope * q;
-            const double yTip = isExit ? yQ + slope * runLen : yQ - slope * runLen;
+            (void) slope;   // the corner carries the climb to MKF's row; the wrap's slope no longer shapes the run
+            // ABT #2274 (Alf, 2026-11-09, option ii): the run stands on MKF's lane, parallel to Z, level at MKF's route
+            // row (lane = run). The corner, of the radius MKF plans (plannedBendRadius), sweeps from the turn's tangent to
+            // -Z (exit: azL, entrance: pi - azL) and carries the climb from the attach to that row. Where it does not fit
+            // (the fan found no attach azimuth for it, or the radius is at or below the section's radial half-extent) the
+            // corner is SHARP: the run leaves the attach at the lane (FINDING printed by the fan). MVB++ throws when the
+            // run does not stand on MKF's lane.
+            if (!effectivelyRound)
+                throw std::logic_error("ConductorBuilder: the rect lead corner of " + path.name + " " + what + " is drawn only on a round column");
+            const auto kind = isExit ? OpenMagnetics::ConnectionKind::TERMINAL_EXIT : OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE;
+            const OpenMagnetics::ConnectionRoute* route = nullptr;
+            for (const auto& r : connectionLayout.routes)
+                if (r.winding == path.winding && static_cast<size_t>(r.parallel) == path.parallel && r.kind == kind) route = &r;
+            if (!route || route->waypoints.empty() || !route->exitSlot || !(route->plannedBendRadius > 0))
+                throw std::runtime_error("ConductorBuilder: MKF gives the " + what + " of " + path.name +
+                                         " no route, lane (exitSlot) or corner radius (plannedBendRadius)");
+            const double lane = *route->exitSlot;
+            const double Rc = route->plannedBendRadius;
+            const double yRow = (isExit ? route->waypoints.back() : route->waypoints.front()).at(1);
+            const double cosA = isExit ? (lane + Rc) / (st.x + Rc) : (lane - Rc) / (st.x + Rc);
+            const bool fits = Rc > 0.5 * path.wireWidth && std::abs(cosA) < 1.0;
+            const gp_Pnt attachPt = azPointC(0, 0, st.x, st.y, azL).Translated(gp_Vec(0, 0, bumpShiftZ));
+            gp_Pnt Q;
             Primitive arc;
-            arc.kind = Primitive::SPIRAL;
-            if (isExit) {
-                // P (az azL+pi about C) -> Q (az azL+pi/2), azimuth decreasing.
-                arc.spiral = {C2.X(), C2.Z(), Rc, yP, azL + kPi, Rc, yQ, azL + kPi / 2.0};
+            if (fits) {
+                const gp_XYZ C2 = attachPt.XYZ() + Rhat * Rc;
+                arc.kind = Primitive::SPIRAL;
+                if (isExit) arc.spiral = {C2.X(), C2.Z(), Rc, st.y, azL + kPi, Rc, yRow, kPi};
+                else        arc.spiral = {C2.X(), C2.Z(), Rc, yRow, 0.0, Rc, st.y, azL - kPi};
+                arc.label = path.name + " " + what + " corner";
+                arc.turnOrdinal = isExit ? turns.size() - 1 : 0;
+                arc.isLead = true;
+                Q = gp_Pnt(C2.X() + (isExit ? -Rc : Rc), yRow, C2.Z());
             } else {
-                // Q (az azL-pi/2) -> P (az azL-pi), azimuth decreasing.
-                arc.spiral = {C2.X(), C2.Z(), Rc, yQ, azL - kPi / 2.0, Rc, yP, azL - kPi};
+                if (std::abs(yRow - st.y) > 1e-9) {
+                    std::ostringstream m;
+                    m << std::setprecision(9) << "ConductorBuilder: the sharp " << what << " corner of " << path.name << " leaves its turn at y "
+                      << st.y * 1e3 << " mm, off MKF's row " << yRow * 1e3 << " mm: a sharp corner cannot carry the climb";
+                    throw std::runtime_error(m.str());
+                }
+                Q = gp_Pnt(attachPt.X(), yRow, attachPt.Z());
             }
-            arc.label = path.name + " " + what + " corner";
-            arc.turnOrdinal = isExit ? turns.size() - 1 : 0;
-            arc.isLead = true;
-            const gp_Pnt Q(isExit ? C2 + That * Rc + gp_XYZ(0, yQ - st.y, 0)
-                                  : C2 - That * Rc + gp_XYZ(0, yQ - st.y, 0));
-            const gp_Pnt tipPt(Q.XYZ() + Rhat * runLen + gp_XYZ(0, yTip - yQ, 0));
+            if (std::abs(Q.X() - lane) > 1e-9) {
+                std::ostringstream m;
+                m << std::setprecision(9) << "ConductorBuilder: the " << what << " run of " << path.name << " stands at x = " << Q.X() * 1e3
+                  << " mm, off MKF's lane " << lane * 1e3 << " mm";
+                throw std::runtime_error(m.str());
+            }
+            const gp_Pnt tipPt(Q.X(), yRow, -leadTipRadius);
+            if (!(tipPt.Z() < Q.Z()))
+                throw std::runtime_error("ConductorBuilder: the run of " + path.name + " " + what + " has no length");
+            if (std::getenv("MVB_LEAD_DIAG"))
+                std::fprintf(stderr, "[rect-corner] %s %s: attach (%.9f, %.9f, %.9f) mm, Rc %.9f, %s, climb %.9f mm, run x %.9f mm (MKF lane "
+                                     "%.9f) at row %.9f mm, z %.6f -> %.6f mm\n",
+                             path.name.c_str(), what.c_str(), attachPt.X() * 1e3, st.y * 1e3, attachPt.Z() * 1e3, Rc * 1e3,
+                             fits ? "round" : "SHARP", (yRow - st.y) * 1e3, Q.X() * 1e3, lane * 1e3, yRow * 1e3, Q.Z() * 1e3,
+                             tipPt.Z() * 1e3);
             Primitive run;
             run.kind = Primitive::SEG;
             run.seg = isExit ? Seg{Q, tipPt} : Seg{tipPt, Q};
             run.label = path.name + " " + what + " run";
-            run.turnOrdinal = arc.turnOrdinal;
+            run.turnOrdinal = isExit ? turns.size() - 1 : 0;
             run.isLead = true;
             if (isExit) {
-                path.prims.push_back(std::move(arc));
+                if (fits) path.prims.push_back(std::move(arc));
                 path.prims.push_back(std::move(run));
             } else {
                 path.prims.push_back(std::move(run));
-                path.prims.push_back(std::move(arc));
+                if (fits) path.prims.push_back(std::move(arc));
             }
         };
             // RECT-WIRE LEAD CORNER (Alf, 18_stacked: "the connections are not
@@ -16237,15 +18935,20 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                  : (rectWire && turns.size() == 2
                                         ? rectLeadCornerRadius()
                                         : std::numeric_limits<double>::quiet_NaN());
-                    if (begX0 > 1e-12) {
+                    // Either sign: an entrance MKF lays upstream of the crossing (begX0 < 0) starts its
+                    // first turn below its station, one downstream above it (ABT #2274 / #2292).
+                    if (std::abs(begX0) > 1e-12) {
                         const double endCut0 = rectRisingEndCut(rsE, stopX0);
+                        const double begCut0 = rectFaceAlong(rsE, begX0, path.name + " entrance");
                         const double L0 = rectRisingLength(
                             rsE, rectRideFor(rsE.zPos, sideE),
-                            rectRideFor(rsE.zPos, 1 - sideE), endCut0, begX0);
+                            rectRideFor(rsE.zPos, 1 - sideE), endCut0, begCut0);
                         const double dy0 = station(turns[1]).y - first.y;
                         rectEntranceAttachY =
-                            first.y + dy0 * begX0 / (L0 + begX0 + endCut0);
+                            first.y + dy0 * begCut0 / (L0 + begCut0 + endCut0);
                     }
+                    // MKF's row start: the first turn starts ON the crossing row at its lane, so the lead attaches there.
+                    if (rectRowStartRoute) rectEntranceAttachY = *rectRowStartRoute->rowEndHeight;
                 }
             }
             if (tangentIn) {
@@ -16336,6 +19039,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 }
                 wp = terminalWaypoints(entranceGroup, fLead, path.name + " entrance", foilRadial,
                                        turns.front()->get_coordinates()[0]);
+                applyMkfLevelRow(wp, connectionLayout, path.winding, path.parallel, /*entrance=*/true, path.name + " entrance");
+                drawMkfRowRoute(wp, mkfRowStartRoute(connectionLayout, path.winding, path.parallel), /*entrance=*/true,
+                                path.name + " entrance");
             }
             if (!wp.empty()) {
                 extendBorder(wp);
@@ -16379,6 +19085,18 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             PlanePt nxt = station(turns[i + 1]);
             std::string label = "wrap '" + turns[i]->get_name() + "' -> '" +
                                 turns[i + 1]->get_name() + "'";
+            if (std::getenv("MVB_RIDE_CMP")) {
+                const int faceCmp = windingFace.at(ct.winding);
+                double offMax = 0.0;
+                for (const auto& bmp : bumpsForTurn(s.x))
+                    offMax = std::max(offMax, std::abs(std::remainder(bmp.azimuth - kPlaneAz, kTwoPi)));
+                std::fprintf(stderr, "[ridecmp] %s turn '%s' winding %s face %d x %.9f %s mvb %.9f mkf0 %.9f mkf1 %.9f off %.4f\n",
+                             effectivelyRound ? "ROUND" : (rectFamily ? "RECT" : "OTHER"),
+                             turns[i]->get_name().c_str(), ct.winding.c_str(), faceCmp, s.x,
+                             effectivelyRound ? "round" : "rect",
+                             effectivelyRound ? tallestBumpColumn(bumpsForTurn(s.x)).first : -1.0,
+                             connectionLayout.ride_at(s.x, 0), connectionLayout.ride_at(s.x, 1), offMax * 180.0 / kPi);
+            }
             if (effectivelyRound && dragDiag) {
                 double raise = 0.0;
                 for (const auto& bmp : bumpsForTurn(s.x)) raise += bmp.distance;
@@ -16438,8 +19156,11 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                             sSrc.y = s.y + (s.y - before.y) * rem / kTwoPi;
                         }
                     }
+                    double landAz = zit->second;
                     appendZDragback(path, sSrc, nDest, wireRadius, zit->second, label, i,
-                                    bumpsForTurn(s.x), bumpsForTurn(nxt.x));
+                                    bumpsForTurn(s.x), bumpsForTurn(nxt.x), &landAz);
+                    // The landing turn starts where the radial step lands (ABT #2274), on its own circle.
+                    crossAz[i + 1] = landAz;
                     continue;
                 }
                 const bool weldable = turns.size() > 1 &&
@@ -16458,7 +19179,27 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 // revolution's whole purpose is to arrive exactly there, on the exit row, and
                 // extrapolating one pitch-share past it sloped the exit run 0.3 mm off its row
                 // into the next winding's entrance stub (14_dab, 0.61 mm vs 0.8 needed).
-                const double endY = wrapEndYOverride(i);
+                double endY = wrapEndYOverride(i);
+                // ABT #2274 (Alf, 2026-11-09, decision 2): MKF ended this
+                // round exit's turn on its crossing row at its lane (rowEndX). The last wrap climbs uniformly from where it
+                // starts (the previous crossing) to (lane, rowEndHeight) at its lane azimuth, and the lead leaves level there.
+                bool roundRowEnd = false;
+                double roundRowEndFrom = std::numeric_limits<double>::quiet_NaN();
+                if (i + 2 == nEmit) {
+                    if (const auto* rowEnd = mkfRowEndRoute(connectionLayout, ct.winding, ct.parallel)) {
+                        if (std::isnan(endY))
+                            throw std::runtime_error("ConductorBuilder: MKF's round row end of " + path.name +
+                                                     " meets a last wrap that is not a one-layer revolution");
+                        if (std::getenv("MVB_LEAD_DIAG"))
+                            std::fprintf(stderr, "[row-end] %s: last wrap start az %.6f deg y %.9f mm (MKF from %.9f), end az %.6f deg "
+                                                 "helix y %.9f -> row %.9f mm (lane %.9f mm)\n",
+                                         path.name.c_str(), crossAz[i] * 180 / kPi, s.y * 1e3, *rowEnd->rowEndFromHeight * 1e3,
+                                         crossAz[i + 1] * 180 / kPi, endY * 1e3, *rowEnd->rowEndHeight * 1e3, *rowEnd->rowEndX * 1e3);
+                        endY = *rowEnd->rowEndHeight;
+                        roundRowEnd = true;
+                        roundRowEndFrom = *rowEnd->rowEndFromHeight;
+                    }
+                }
                 if (!std::isnan(endY) && i + 2 == nEmit) {
                     exitAttachY = endY;
                 }
@@ -16478,6 +19219,25 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 if (auto lit = landingAttach.find(i); lit != landingAttach.end()) {
                     sWrap.y = lit->second;   // pitch-true landing (see the dragback branch)
                 }
+                // ABT #2274 (decision 2): the wrap MKF re-slopes must start (row end) / end (row start) where MKF says it
+                // meets its helix; MVB++ draws MKF's numbers and throws on a mismatch.
+                if (roundRowEnd && std::abs(sWrap.y - roundRowEndFrom) > 1e-9) {
+                    std::ostringstream m;
+                    m.precision(9);
+                    m << "ConductorBuilder: the last wrap of " << path.name << " starts at y " << sWrap.y * 1e3
+                      << " mm, but MKF's row end leaves the helix at " << roundRowEndFrom * 1e3 << " mm";
+                    throw std::runtime_error(m.str());
+                }
+                if (i == 0 && rowStartRoute) {
+                    const double joinY = std::isnan(endY) ? nxt.y : endY;
+                    if (std::abs(joinY - *rowStartRoute->rowEndFromHeight) > 1e-9) {
+                        std::ostringstream m;
+                        m.precision(9);
+                        m << "ConductorBuilder: the first wrap of " << path.name << " ends at y " << joinY * 1e3
+                          << " mm, but MKF's row start joins the helix at " << *rowStartRoute->rowEndFromHeight * 1e3 << " mm";
+                        throw std::runtime_error(m.str());
+                    }
+                }
                 appendRoundWrap(path, sWrap, nxt, wireRadius, label, i, bumpsForTurn(s.x),
                                 crossAz[i], crossAz[i + 1], bumpsForTurn(nxt.x), ct.parallels,
                                 /*stubAtStart=*/i == 0, /*stubAtEnd=*/i + 2 == nEmit, endY,
@@ -16490,7 +19250,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                                      : std::numeric_limits<double>::infinity(),
                                 // ABT #1366: where this wrap's climb ends -- from the height it
                                 // really starts at (sWrap), at MKF's own grid advance.
-                                wrapClimbEndAz(i, sWrap.y, endY),
+                                // ABT #2274 (decision 2): a row end / row start climbs uniformly over the whole sweep.
+                                (roundRowEnd || (i == 0 && rowStartRoute)) ? crossAz[i + 1] + kTwoPi
+                                                                            : wrapClimbEndAz(i, sWrap.y, endY),
                                 // ABT #1403: the bend MKF planned for this wire.
                                 plannedWireBendRadius(ct.winding, ct.parallel));
             } else if (rectFamily) {
@@ -16498,6 +19260,11 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     const RectStation rs0 = rectStation(s, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);
                     const RectStation rs1 = rectStation(nxt, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);
                     const int side = windingFace.at(ct.winding);
+                    if (std::getenv("MVB_RIDE_CMP"))
+                        std::fprintf(stderr, "[ridecmp] RECTW turn '%s' winding %s face %d x %.9f z %.9f own %.9f back %.9f mkfown %.9f mkfback %.9f\n",
+                                     turns[i]->get_name().c_str(), ct.winding.c_str(), side, s.x, rs0.zPos,
+                                     rectRideFor(rs0.zPos, side), rectRideFor(rs0.zPos, 1 - side),
+                                     connectionLayout.ride_at(s.x, side), connectionLayout.ride_at(s.x, 1 - side));
                     if (rectTangential.count({ci, i})) {
                         // Single-turn layer -> U-style tangential continuation (Alf).
                         const double r0a = rectRideFor(rs0.zPos, side);
@@ -16584,8 +19351,23 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     // A last wrap with NO lane and round wire keeps stopX = NaN exactly as before
                     // (a non-NaN 0.0 is a descent slot AT the crossing, which re-shapes the wrap's
                     // end and collided the U layer link on realwinding_round_2p, measured).
-                    const bool hasExitSlot = exitSlotOf.count(ci) && exitSlotOf.at(ci) > 1e-12;
+                    // Either sign (ABT #2274 / #2292): MKF's exit at x < 0 ends the last turn PAST the
+                    // crossing (endX < 0 lengthens it; its climb ends that share above the station).
+                    const bool hasExitSlot = exitSlotOf.count(ci) && std::abs(exitSlotOf.at(ci)) > 1e-12;
                     const double exitSlot = hasExitSlot ? exitSlotOf.at(ci) : 0.0;
+                    // ABT #2274 (Alf, 2026-11-08, after agent 24): MKF ends this exit's turn ON its crossing row at its lane:
+                    // the last piece on the face climbs from MKF's start (the face straight's end) to the row at the lane.
+                    const OpenMagnetics::ConnectionRoute* rowEnd = nullptr;
+                    if (i + 2 == nEmit && !nextRet) {
+                        rowEnd = mkfRowEndRoute(connectionLayout, path.winding, path.parallel);
+                        if (rowEnd && (!hasExitSlot || std::abs(*rowEnd->rowEndX - exitSlot) > 1e-9 || rw)) {
+                            std::ostringstream m;
+                            m.precision(9);
+                            m << "ConductorBuilder: MKF ends the last turn of " << label << " on its row at x = " << *rowEnd->rowEndX * 1e3
+                              << " mm, but its exit lane is " << (hasExitSlot ? exitSlot * 1e3 : 0.0) << " mm" << (rw ? " (rect wire)" : "");
+                            throw std::runtime_error(m.str());
+                        }
+                    }
                     // ABT #1423: a tangent exit ends the last wrap at its +X face's end instead.
                     const bool tangentEndHere = i + 2 == nEmit && tangentOut != nullptr;
                     const bool tangentStartHere = i == 0 && tangentIn != nullptr;
@@ -16666,11 +19448,12 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                         const bool rwN = path.isRectangular;
                         if (std::isnan(stopXN) && rwN && i + 3 == nEmit) stopXN = rectLeadCornerRadius();
                         const double endCutN = rectRisingEndCut(rs1, stopXN);
+                        const double begCutN = rectFaceAlong(rs1, begXN, label);
                         const double LN = rectRisingLength(rs1, rectRideFor(rs1.zPos, side),
                                                            rectRideFor(rs1.zPos, 1 - side),
-                                                           endCutN, begXN);
+                                                           endCutN, begCutN);
                         const double dyN = rsN.y - rs1.y;
-                        chainEndY = rs1.y + dyN * begXN / (LN + begXN + endCutN);
+                        chainEndY = rs1.y + dyN * begCutN / (LN + begCutN + endCutN);
                     }
                     double riseEndY = std::numeric_limits<double>::quiet_NaN();
                     const size_t primsBeforeWrap = path.prims.size();
@@ -16679,7 +19462,18 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                    rectRideFor(rs0.zPos, 1 - side), ret != nullptr,
                                    chainRide, destRide, xSlot, stopX, startX, bandY,
                                    ret ? nullptr : &riseEndY, chainStartY, chainEndY,
-                                   ret ? ret->levelBand : false, tangentStartHere, tangentEndHere);
+                                   ret ? ret->levelBand : false, tangentStartHere, tangentEndHere,
+                                   rowEnd ? *rowEnd->rowEndFromX : kNaN, rowEnd ? *rowEnd->rowEndFromHeight : kNaN,
+                                   rowEnd ? *rowEnd->rowEndHeight : kNaN,
+                                   (i == 0 && rectRowStartRoute) ? *rectRowStartRoute->rowEndFromX : kNaN,
+                                   (i == 0 && rectRowStartRoute) ? *rectRowStartRoute->rowEndFromHeight : kNaN,
+                                   (i == 0 && rectRowStartRoute) ? *rectRowStartRoute->rowEndHeight : kNaN);
+                    // The row start's / row end's piece rejoins the turn's climb through a round bend (roundRowKink).
+                    // The end first: its indices do not move when the start's bend is inserted after it.
+                    if (!ret && rowEnd && path.prims.size() >= primsBeforeWrap + 2)
+                        roundRowKink(path.prims, path.prims.size() - 2, wireBendOf(path.winding), path.name);
+                    if (!ret && i == 0 && rectRowStartRoute && path.prims.size() >= primsBeforeWrap + 2)
+                        roundRowKink(path.prims, primsBeforeWrap, wireBendOf(path.winding), path.name);
                     if (tangentStartHere)
                         requireAtDeparture(path.prims.at(primsBeforeWrap).seg.a, *tangentIn, "first");
                     if (tangentEndHere)
@@ -16819,7 +19613,20 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                         lastAttach.y = term->y;
                     }
                 }
-                rectLeadCorner(lastAttach, azExit, /*isExit=*/true, sOut, "exit lead");
+                // THE EXIT RIDES THE BUMP (Alf, 2026-11-05: "fix the lead exit, add the bump!"). The last
+                // wrap's terminal stub rides over the dragbacks beneath it: its circle is moved along z by
+                // the bump (pushStub), so it ends that far from the plain ring. The corner leaves from
+                // where the stub ends -- moved by exactly that z -- as the one-turn omega's leads do on
+                // its raised half. Any other mismatch is left for the spine to refuse.
+                double exitBumpShiftZ = 0.0;
+                if (!path.prims.empty()) {
+                    const gp_Pnt stubEnd = primEndpoints(path.prims.back()).second;
+                    const gp_Pnt plain = azPointC(0, 0, lastAttach.x, lastAttach.y, azExit);
+                    const gp_XYZ d = stubEnd.XYZ() - plain.XYZ();
+                    if (std::abs(d.X()) < 1e-9 && std::abs(d.Y()) < 1e-9 && std::abs(d.Z()) > 1e-9)
+                        exitBumpShiftZ = d.Z();
+                }
+                rectLeadCorner(lastAttach, azExit, /*isExit=*/true, sOut, "exit lead", exitBumpShiftZ);
             } else if (!exitGroup.empty()) {
                 // The MKF-DRAWN exit route, every column shape (Alf, 2026-08-07 -- see
                 // the entrance).
@@ -16854,6 +19661,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 }
                 wp = terminalWaypoints(exitGroup, lLead, path.name + " exit", foilRadial,
                                        turns.back()->get_coordinates()[0]);
+                applyMkfLevelRow(wp, connectionLayout, path.winding, path.parallel, /*entrance=*/false, path.name + " exit");
+                drawMkfRowRoute(wp, mkfRowEndRoute(connectionLayout, path.winding, path.parallel), /*entrance=*/false,
+                                path.name + " exit");
             } else {
                 // MKF drew only one lead (see splitTerminalGroups): synthesized minimal
                 // straight-out exit at the last turn's own row.
@@ -17153,6 +19963,15 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         // downstream (Z end-run planning, the collision gate, emission) then sees one common
         // frame again. A no-op for main-column conductors, which is every conductor of every
         // single-window design.
+        // ABT #2274 (agent 27): a counter-clockwise conductor was built in its mirrored frame; mirror it back (leg frame).
+        if (mirrorHanded.count({ct.winding, static_cast<int64_t>(ct.parallel)})) {
+            if (path.seamRot != 0.0)
+                throw std::runtime_error("ConductorBuilder: the mirror-handed conductor " + path.name + " carries a seam rotation of " +
+                                         std::to_string(path.seamRot) + " rad, which its mirror does not define");
+            mirrorPathX(path);
+            if (std::getenv("MVB_LEAD_DIAG"))
+                std::cerr << "[mirror-handed] " << path.name << ": built clockwise in its mirrored frame, mirrored x -> -x (MKF wrapDirection +1)\n";
+        }
         if (conductorAxisX[ci] != 0.0) {
             if (pendingPinLeads.count(path.name))   // ABT #1172: MKF routes main-column pins only
                 throw std::runtime_error("ConductorBuilder: " + path.name +
@@ -17222,26 +20041,29 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
     // conductor. Named so the post-emission repair below cannot smooth without it -- doing that
     // let the roundest transition through and put complete_pushpull's Primary 2 wrap 40 um inside
     // a Secondary wrap.
-    auto linkVetoFor = [&](size_t pi) {
-        return [&, pi](const Primitive& a1, const Primitive& a2) {
-            for (size_t qi = 0; qi < paths.size(); ++qi) {
-                if (qi == pi) continue;
-                const double envelope = paths[pi].wireRadius + paths[qi].wireRadius;
-                for (const auto& other : paths[qi].prims) {
-                    for (const Primitive* arc : {&a1, &a2}) {
-                        const auto ends = primEndpoints(*arc);
-                        const auto oends = primEndpoints(other);
-                        const double reach = 4.0 * envelope + ends.first.Distance(ends.second);
-                        if (ends.first.Distance(oends.first) > reach &&
-                            ends.first.Distance(oends.second) > reach &&
-                            ends.second.Distance(oends.first) > reach &&
-                            ends.second.Distance(oends.second) > reach)
-                            continue;
-                        if (!cert::provePairClears(*arc, other, envelope).clears) return false;
-                    }
-                }
-            }
-            return true;
+    // SIBLING LINKS TAKE THE SAME TRANSITION (Alf, 2026-11-15, realwinding_round_2p: "why is parallel 0 using a stub to
+    // increase the radius and not parallel 1? both should be like parallel 1"). The paths used to be smoothed one after
+    // the other, each transition proven against the others as they stood: the first parallel met its sibling's wrap still
+    // running to the crossing -- a stretch the sibling's own link then cuts away -- and fell to the tightest transition
+    // (3 deg, 0.53 mm) while the second took the roundest (18 deg, 5.3 mm). Judging each against the others at THEIR
+    // roundest instead put 14_dab_xfmr_pm8770_n97's parallel 0 on the tightest beside three roundest siblings, 220 um
+    // into the next one. So the transition is chosen per GROUP -- the same link of every parallel of a winding -- as a
+    // step of smoothLayerLinks' azimuth sequence: every link starts at its roundest, all paths are smoothed, and each
+    // link arc is proven against every other path as smoothed (at the gate's own statement, envelope less half the
+    // coordinate grid). A group one of whose arcs does not clear is lowered one step, and the whole is smoothed and
+    // proven again, until every arc clears or a group has no tighter step that fits all its members (then it stays,
+    // and the certified gate has the last word on the result).
+    std::map<std::string, int> linkStepCap;
+    auto linkGroupOf = [](const ConductorPath& p, const std::string& linkLabel) {
+        std::string key = linkLabel;
+        const std::string tag = " parallel " + std::to_string(p.parallel);
+        for (size_t at = key.find(tag); at != std::string::npos; at = key.find(tag)) key.erase(at, tag.size());
+        return p.winding + "|" + key;
+    };
+    auto linkCapOf = [&](const ConductorPath& p) {
+        return [&linkStepCap, &linkGroupOf, &p](const std::string& label) {
+            const auto found = linkStepCap.find(linkGroupOf(p, label));
+            return found == linkStepCap.end() ? 39 : found->second;
         };
     };
     // A slanted step moves copper along its run, toward the conductor's own other turns (13_current_sense: 1.7 um into
@@ -17255,7 +20077,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             const auto& pr = prims[i];
             if (!proven(pr)) continue;
             const auto a = primEndpoints(pr);
-            const double envelope = 2.0 * p.wireRadius;
+            const double envelope = 2.0 * coatedRadiusOf(p);
             for (size_t j = 0; j < prims.size(); ++j) {
                 const auto& other = prims[j];
                 if (j + 1 >= i && j <= i + 1) continue;   // itself and its neighbours
@@ -17277,7 +20099,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // straight face came 0.152 mm from the sibling's entrance lead.
             for (const auto& q : paths) {
                 if (&q == &p || q.isRectangular) continue;
-                const double qEnvelope = p.wireRadius + q.wireRadius;
+                const double qEnvelope = coatedRadiusOf(p) + coatedRadiusOf(q);
                 for (const auto& other : q.prims) {
                     const auto b = primEndpoints(other);
                     const double reach = 4.0 * qEnvelope + a.first.Distance(a.second) + b.first.Distance(b.second);
@@ -17304,12 +20126,168 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         return leadCornersRound(p.winding, p.parallel) ? std::optional<double>(leadBendFor(p.winding, p.parallel, p.wireRadius))
                                                        : std::nullopt;
     };
+    // ABT #2274 (Alf, 2026-11-07, "slot-step ramp"; MKF decides, MVB++ draws): a lead MKF gave a slot ramp left
+    // its turn at its row (pushPlaneSegs held the attach there), one step off the wrap's start. The junction is
+    // drawn as MKF planned it: the lead bends onto the turn's direction at MKF's plannedBendRadius, then the
+    // cosine S (Primitive::BLEND, MKF's model) of MKF's slotRampLength along the turn takes the step down to the
+    // wrap, whose straight is trimmed by both. A wrap straight shorter than that throws.
+    for (auto& p : paths) {
+        if (p.isRectangular) continue;
+        for (const auto& route : connectionLayout.routes) {
+            if (route.winding != p.winding || static_cast<size_t>(route.parallel) != p.parallel || !route.slotRampLength) continue;
+            const bool entrance = route.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE;
+            if (!entrance && route.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT) continue;
+            const int terminal = entrance ? 0 : 1;
+            std::optional<size_t> leadAt;   // the lead piece at the junction; the wrap piece is next to it
+            for (size_t i = 0; i + 1 < p.prims.size(); ++i) {
+                const Primitive& a = p.prims[i];
+                const Primitive& b = p.prims[i + 1];
+                const bool aWrap = !a.isLead && !a.isConnection, bWrap = !b.isLead && !b.isConnection;
+                if (entrance && a.isLead && a.terminal == terminal && bWrap) leadAt = i;
+                if (!entrance && aWrap && b.isLead && b.terminal == terminal) leadAt = i + 1;
+            }
+            const std::string who = p.name + (entrance ? " entrance" : " exit") + " lead";
+            if (!leadAt)
+                throw std::runtime_error("ConductorBuilder: MKF planned a slot-step ramp for the " + who +
+                                         ", which meets no wrap piece");
+            const size_t li = *leadAt, wi = entrance ? li + 1 : li - 1;
+            Primitive& lead = p.prims[li];
+            Primitive& wrap = p.prims[wi];
+            if (lead.kind != Primitive::SEG || wrap.kind != Primitive::SEG)
+                throw std::runtime_error("ConductorBuilder: the slot-step ramp of the " + who + " meets '" + lead.label + "' / '" +
+                                         wrap.label + "', not a lead straight and a wrap straight");
+            const gp_Pnt Vl = entrance ? lead.seg.b : lead.seg.a;   // the lead at its row
+            const gp_Pnt Vw = entrance ? wrap.seg.a : wrap.seg.b;   // the wrap's start at the lane
+            const gp_Pnt wrapFar = entrance ? wrap.seg.b : wrap.seg.a;
+            const gp_Pnt leadFar = entrance ? lead.seg.a : lead.seg.b;
+            const gp_XYZ u = gp_Vec(Vw, wrapFar).Normalized().XYZ();     // along the turn, into the wrap
+            const gp_XYZ dl = gp_Vec(leadFar, Vl).Normalized().XYZ();    // along the lead, towards the turn
+            const double R = route.plannedBendRadius;
+            const double S = *route.slotRampLength;
+            const double cosT = std::max(-1.0, std::min(1.0, dl.Dot(u)));
+            const double t = R * std::sqrt((1.0 - cosT) / (1.0 + cosT));
+            const double wrapLen = Vw.Distance(wrapFar), leadLen = Vl.Distance(leadFar);
+            const gp_XYZ step = Vl.XYZ() - Vw.XYZ();
+            const double drawnStep = (step - u * step.Dot(u)).Modulus();
+            // ABT #2274 (Alf, 2026-11-07: "MVB++ must always obey MKF"): the S ends where MKF judged it on the face
+            // straight (slotRampEndX / slotRampEndHeight); nothing about its far end is computed here.
+            if (!route.slotRampEndX || !route.slotRampEndHeight || !route.exitSlot || !route.slotRampHeight)
+                throw std::runtime_error("ConductorBuilder: MKF planned a slot-step ramp for the " + who +
+                                         " but published no end of it (slotRampEndX / slotRampEndHeight / exitSlot)");
+            const double endAlong = std::abs(*route.slotRampEndX - *route.exitSlot);   // MKF: bend + S, from the lane
+            // endAlong is MKF's ALONG-FACE (plan-view x) distance; the wrap climbs at its slope, so the S's end lies
+            // endAlong / cos(slope) along u -- stepping endAlong along u fell short of MKF's farX by endAlong (1 - cos)
+            // and rose endAlong sin where MKF's turn rises endAlong tan (0.3-0.6 um on 02/04/17; coordinator, agent 17).
+            const gp_XYZ axial(0, 1, 0);
+            const double alongFace = std::sqrt(std::max(0.0, 1.0 - u.Dot(axial) * u.Dot(axial)));   // |u . xhat|
+            if (!(alongFace > 0.0))
+                throw std::runtime_error("ConductorBuilder: the wrap of the " + who + " runs along the column axis, so MKF's "
+                                         "along-face slot-ramp end cannot be placed on it");
+            const double endOnWrap = endAlong / alongFace;
+            const gp_Pnt W(Vw.XYZ() + u * endOnWrap);     // the S's end, on the wrap, at MKF's far x
+            const double drawnEndHeight = (Vl.XYZ() - W.XYZ()).Dot(axial);
+            const double drawnVerticalStep = step.Dot(axial);
+            // The drawn wrap and MKF's turn agree to MKF's emitted grid (roundFloat, 1 nm) per coordinate.
+            constexpr double kMkfGrid = 1e-9;
+            std::ostringstream numbers;
+            numbers.precision(9);
+            numbers << "the " << who << "'s slot ramp (MKF: step " << *route.slotRampHeight << " m, S " << S << " m, bend " << R
+                    << " m, end " << endAlong << " m from the lane at " << *route.slotRampEndHeight << " m below the row; drawn step "
+                    << drawnVerticalStep << " m vertical (" << drawnStep << " m perpendicular to the wrap), drawn end " << drawnEndHeight
+                    << " m below the row) needs " << endOnWrap << " m of its wrap straight '"
+                    << wrap.label << "' (" << wrapLen << " m) and " << t << " m of its lead straight '" << lead.label << "' (" << leadLen
+                    << " m)";
+            if (!(R > 0.0) || !(endOnWrap < wrapLen) || !(t < leadLen) || !(endOnWrap > t))
+                throw std::runtime_error("ConductorBuilder: " + numbers.str());
+            if (std::abs(drawnEndHeight - *route.slotRampEndHeight) > 2 * kMkfGrid) {
+                const std::string message = "the drawn wrap does not end MKF's slot ramp where MKF planned it (" +
+                                            std::to_string((drawnEndHeight - *route.slotRampEndHeight) * 1e9) + " nm off): " +
+                                            numbers.str();
+                // ABT #2274 (Alf, 2026-11-08: "show me the step of the multicolumn"): the debug build draws the S as MKF
+                // planned it and reports the mismatch; a production build refuses.
+                if (!collisionDiagnostic()) throw std::runtime_error("ConductorBuilder: " + message);
+                std::cerr << "[ConductorBuilder] FINDING (slot ramp drawn by --skip-collision-check; not a part): " << message
+                          << std::endl;
+            }
+            if (std::getenv("MVB_LEAD_DIAG")) std::cerr << "[slot-ramp] " << numbers.str() << "\n";
+            // ABT #2274 (agent 18): MKF's bend ends at along-face x = lane + plannedBendRadius (slot_ramp_point: the S
+            // starts there), so the bend's end is placed R / |u . xhat| along the sloped u -- stepping t along u put it
+            // at t |u . xhat| = R (1 + sin slope) and stretched or shrank the S by the difference. Both tangent lengths
+            // are that distance, so the drawn radius is tt / tan(theta / 2); one tighter than MKF's bend throws.
+            const double tt = R / alongFace;
+            const double drawnR = tt * std::sqrt((1.0 + cosT) / (1.0 - cosT));
+            const gp_Pnt T1(Vl.XYZ() - dl * tt);          // on the lead
+            const gp_Pnt T2(Vl.XYZ() + u * tt);           // the bend's end, at MKF's x
+            // Along-face x: the wrap's direction without its axial climb (the lead leaves along the face normal).
+            gp_XYZ xhat = u - axial * u.Dot(axial);
+            xhat /= xhat.Modulus();
+            auto faceX = [&](const gp_XYZ& v) { return std::abs(v.Dot(xhat)); };
+            const double drawnBendX = faceX(T2.XYZ() - T1.XYZ()), drawnSX = faceX(W.XYZ() - T2.XYZ());
+            const double drawnSpanX = faceX(W.XYZ() - T1.XYZ());
+            std::ostringstream spans;
+            spans.precision(9);
+            spans << "the " << who << "'s slot ramp spans " << drawnSpanX << " m along the face (bend " << drawnBendX << " m, S "
+                  << drawnSX << " m; MKF: " << endAlong << " m = bend " << R << " m + S " << S << " m), drawn bend radius " << drawnR
+                  << " m (MKF " << R << " m), tangent " << tt << " m (lead straight " << leadLen << " m, wrap S end " << endOnWrap << " m)";
+            if (std::getenv("MVB_LEAD_DIAG")) std::cerr << "[slot-ramp-x] " << spans.str() << "\n";
+            if (std::abs(drawnSpanX - endAlong) > 2 * kMkfGrid || std::abs(drawnBendX - R) > 2 * kMkfGrid ||
+                std::abs(drawnSX - S) > 2 * kMkfGrid)
+                throw std::runtime_error("ConductorBuilder: the drawn slot ramp does not span MKF's bend + S along the face: " +
+                                         spans.str());
+            if (drawnR < R - 2 * kMkfGrid || !(tt < leadLen) || !(endOnWrap > tt))
+                throw std::runtime_error("ConductorBuilder: the slot ramp's bend, ended at MKF's x, cannot be drawn: " + spans.str());
+            // The bend in travel order (an exit runs wrap -> S -> bend -> lead).
+            const gp_XYZ din = entrance ? dl : u.Reversed();
+            const gp_XYZ dout = entrance ? u : dl.Reversed();
+            const gp_Pnt tA = entrance ? T1 : T2;
+            gp_XYZ normal = dout - din * cosT;
+            normal /= normal.Modulus();
+            gp_XYZ axis = din.Crossed(dout);
+            axis /= axis.Modulus();
+            Primitive arc;
+            arc.kind = Primitive::ARC3;
+            arc.arc.c = gp_Pnt(tA.XYZ() + normal * drawnR);
+            arc.arc.axis = axis;
+            arc.arc.v0 = tA.XYZ() - arc.arc.c.XYZ();
+            arc.arc.sweep = std::acos(cosT);
+            arc.label = lead.label + " slot ramp bend";
+            arc.turnOrdinal = lead.turnOrdinal;
+            arc.isLead = true;
+            arc.terminal = lead.terminal;
+            Primitive blend;
+            blend.kind = Primitive::BLEND;
+            blend.blendc.a = entrance ? T2 : W;
+            blend.blendc.b = entrance ? W : T2;
+            blend.blendc.u = entrance ? u : u.Reversed();
+            blend.label = wrap.label + " slot ramp";
+            blend.turnOrdinal = wrap.turnOrdinal;
+            if (entrance) {
+                lead.seg.b = T1;
+                wrap.seg.a = W;
+                p.prims.insert(p.prims.begin() + static_cast<std::ptrdiff_t>(li) + 1, {arc, blend});
+            } else {
+                wrap.seg.b = W;
+                lead.seg.a = T1;
+                p.prims.insert(p.prims.begin() + static_cast<std::ptrdiff_t>(li), {blend, arc});
+            }
+        }
+    }
+    auto dragBendFor = [&](const ConductorPath& p) {
+        for (const auto& pr : p.prims)
+            if (pr.isConnection && pr.label.find("(dragback) seg") != std::string::npos)
+                return std::optional<double>(dragbackBendOf(p.winding, p.parallel));
+        return std::optional<double>();
+    };
     std::vector<std::vector<Primitive>> preJunctionPrims(paths.size());
     for (size_t pi = 0; pi < paths.size(); ++pi) {
         auto& p = paths[pi];
         if (p.isRectangular || !opts.roundedLeadCorners) continue;
         preJunctionPrims[pi] = p.prims;
-        filletLeadJunctions(p.prims, junctionBendFor(p), p.wireRadius, p.name);
+        filletLeadJunctions(p.prims, junctionBendFor(p), p.wireRadius, p.name, dragBendFor(p));
+        // ABT #2274 (Alf, 2026-11-07: "MVB++ must always obey MKF"): no slanted dragback step. MKF's dragback model
+        // (dragbackBendRadius / dragbackBendAngle) is planar in the section and publishes no slant for the step met by
+        // the wrap's tangential run, so a step whose corners cannot hold MKF's bend stays sharp (appendFilletedPolyline
+        // reported it); slantDragbackSteps is kept for when MKF publishes that slant.
     }
     // Every path has its junctions: what they drew -- the bends, a slanted step, a lead redrawn as one straight -- is
     // proven against the copper it must clear. Where it does not clear, the junctions are drawn again without slants
@@ -17320,18 +20298,62 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         if (p.isRectangular || !opts.roundedLeadCorners) continue;
         std::set<std::string> before;
         for (const auto& pr : preJunctionPrims[pi]) before.insert(primChainKey({pr}));
-        const auto drawnHere = [&before](const Primitive& pr) { return !before.count(primChainKey({pr})); };
+        // A wrap arc the junction only SHORTENED (bendLeadOntoCornerArc cuts the corner arc back to its bend) is
+        // copper that was already there, not copper drawn here: a spiral lying within one of the path's own spirals
+        // (same axis, radius and climb per radian) is not proven again.
+        const std::vector<Primitive>& beforePrims = preJunctionPrims[pi];
+        const auto shortenedWrap = [&beforePrims](const Primitive& pr) {
+            if (pr.kind != Primitive::SPIRAL || pr.spiral.blend || pr.spiral.levelOut) return false;
+            const Spiral& c = pr.spiral;
+            for (const auto& b0 : beforePrims) {
+                if (b0.kind != Primitive::SPIRAL || b0.spiral.blend || b0.spiral.levelOut || b0.label != pr.label) continue;
+                const Spiral& b = b0.spiral;
+                const double spanB = b.az1 - b.az0, spanC = c.az1 - c.az0;
+                if (std::abs(spanB) < 1e-15 || std::abs(spanC) < 1e-15 || (spanB > 0) != (spanC > 0)) continue;
+                if (std::abs(b.cx - c.cx) > 1e-12 || std::abs(b.cz - c.cz) > 1e-12 || std::abs(b.r0 - c.r0) > 1e-12 ||
+                    std::abs(b.r1 - c.r1) > 1e-12 || std::abs(b.r0 - b.r1) > 1e-12)
+                    continue;
+                const double lo = std::min(b.az0, b.az1) - 1e-12, hi = std::max(b.az0, b.az1) + 1e-12;
+                if (c.az0 < lo || c.az0 > hi || c.az1 < lo || c.az1 > hi) continue;
+                const double yAtC0 = b.y0 + (b.y1 - b.y0) * (c.az0 - b.az0) / spanB, yAtC1 = b.y0 + (b.y1 - b.y0) * (c.az1 - b.az0) / spanB;
+                if (std::abs(yAtC0 - c.y0) <= 1e-12 && std::abs(yAtC1 - c.y1) <= 1e-12) return true;
+            }
+            return false;
+        };
+        const auto drawnHere = [&before, &shortenedWrap](const Primitive& pr) {
+            return !before.count(primChainKey({pr})) && !shortenedWrap(pr);
+        };
         std::string why;
         if (piecesClear(p, drawnHere, &why)) continue;
         std::cerr << "[ConductorBuilder] FINDING: a lead junction of " << p.name << " on a straight face reaches copper it "
                   << "must clear (" << why << "); its junctions are drawn without slanted steps or merged straights.\n";
         p.prims = preJunctionPrims[pi];
-        filletLeadJunctions(p.prims, junctionBendFor(p), p.wireRadius, p.name, /*allowSlant=*/false, /*allowMerge=*/false);
+        filletLeadJunctions(p.prims, junctionBendFor(p), p.wireRadius, p.name, dragBendFor(p), /*allowSlant=*/false,
+                            /*allowMerge=*/false);
         why.clear();
         if (piecesClear(p, drawnHere, &why)) continue;
+        // ABT #2274 (Alf, 2026-11-15, PSPS E16: "fix all sharp corners, make them round"): a junction goes sharp only
+        // where SHARP CLEARS. Parallels MKF stacks exactly one coated wire apart touch along their whole wraps, and a
+        // bend there comes nanometres inside its sibling's (their steps are not exactly parallel) -- but so do the
+        // straights the sharp corner keeps, proven here the same way: the pieces the bends replaced, against the same
+        // copper. Where those do not clear either, sharp buys nothing and the round junctions stand, reported; the
+        // enamel gate judges them with everything else.
+        const std::vector<Primitive> roundPrims = p.prims;
+        std::set<std::string> roundKeys;
+        for (const auto& pr : roundPrims) roundKeys.insert(primChainKey({pr}));
+        p.prims = preJunctionPrims[pi];
+        std::string whySharp;
+        const bool sharpClears = piecesClear(
+            p, [&roundKeys](const Primitive& pr) { return !roundKeys.count(primChainKey({pr})); }, &whySharp);
+        if (!sharpClears) {
+            p.prims = roundPrims;
+            std::cerr << "[ConductorBuilder] FINDING: a round lead junction of " << p.name << " reaches copper it must clear ("
+                      << why << "), and so do the straights a sharp corner would keep (" << whySharp
+                      << "); its junctions stay round.\n";
+            continue;
+        }
         std::cerr << "[ConductorBuilder] FINDING: a round lead junction of " << p.name << " still reaches copper it must "
                   << "clear (" << why << "); its junctions on straight faces are drawn sharp (bisection mitre).\n";
-        p.prims = preJunctionPrims[pi];
     }
     std::vector<std::vector<Primitive>> preFilletPrims(paths.size());
     for (size_t pi = 0; pi < paths.size(); ++pi) preFilletPrims[pi] = paths[pi].prims;
@@ -17345,7 +20367,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 // The conductor's own copper too, as the gate judges it: its other terminal (14_dab: Primary p3's
                 // entrance fillet touched its own exit lead) and every piece two or more turns away (13_current_sense:
                 // the entrance fillet 1.6 nm into the same conductor's dragback).
-                const double envelope = paths[pi].wireRadius + paths[qi].wireRadius;
+                const double envelope = coatedRadiusOf(paths[pi]) + coatedRadiusOf(paths[qi]);
                 for (const auto& other : paths[qi].prims) {
                     if (qi == pi) {
                         const bool crossTerminal = pr.terminal >= 0 && other.terminal >= 0 && pr.terminal != other.terminal;
@@ -17381,30 +20403,169 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
     };
     std::map<size_t, std::string> unclearedFillet;   // path -> witness of a corner none of whose fillets cleared
     // A round Z dragback has round ends where it meets a helical wrap (Alf, 2026-10-28), at the bend its own corners
-    // take (pushPlaneSegs: kRoundCornerBendFactor x the wire radius). On a straight face the junction is
+    // take (MKF's dragbackBendRadius). On a straight face the junction is
     // filletLeadJunctions'.
     auto roundDragbackEnds = [&](ConductorPath& p, const FilletClears& clears, size_t* uncleared, std::string* why) {
         if (!opts.roundedLeadCorners || p.isRectangular) return;
+        // ABT #2274 (Alf, 2026-11-07): at MKF's dragback bend (ConnectionRoute::dragbackBendRadius), never a
+        // radius chosen here; a path with no dragback has no dragback end, and MKF's sharp plan (radius not
+        // above the wire's) leaves the ends sharp.
+        const auto planned = tlsDragbackBend.find({p.winding, p.parallel});
+        if (planned == tlsDragbackBend.end()) return;
+        const double dragBend = planned->second;
+        if (dragBend < p.wireRadius * (1.0 - 1e-12)) {   // equal = round (ABT #2274: inner radius = coating, on the copper)
+            std::cerr << "[ConductorBuilder] FINDING: MKF's dragback bend for " << p.name << " is " << dragBend
+                      << " m, not above the wire radius " << p.wireRadius << " m; its dragback ends are drawn sharp\n";
+            return;
+        }
+        // A STRAIGHT THE KERNEL CANNOT HOLD IS NOT A PIECE. A dragback's one-OD step is exactly two quarter bends, and
+        // what MKF's nanometre grid leaves between them is no designed straight: on realwinding_e16_litz_2layer_
+        // leadcollision the step 9_ending -> 10 kept 0.925 nm of 'seg 0' between its two bends, a tube the assembler
+        // has no valid solid for ("Refusing to emit a conductor with missing copper"). Below the kernel's own
+        // point-coincidence tolerance (Precision::Confusion) the straight's two ends are one point to every boolean
+        // that follows, so the bends either side meet there and the straight is not emitted.
+        const auto dropUnmodellableStraights = [&]() {
+            for (size_t k = 1; k + 1 < p.prims.size();) {
+                const Primitive& pr = p.prims[k];
+                if (pr.kind == Primitive::SEG && pr.isConnection && p.prims[k - 1].kind == Primitive::ARC3 &&
+                    p.prims[k + 1].kind == Primitive::ARC3 && pr.seg.a.Distance(pr.seg.b) < Precision::Confusion()) {
+                    if (std::getenv("MVB_LEAD_DIAG"))
+                        std::fprintf(stderr, "[no-straight] %s '%s': %.3f nm between two bends, not emitted\n", p.name.c_str(),
+                                     pr.label.c_str(), pr.seg.a.Distance(pr.seg.b) * 1e9);
+                    p.prims.erase(p.prims.begin() + static_cast<long>(k));
+                    continue;
+                }
+                ++k;
+            }
+        };
         const std::vector<Primitive> before = p.prims;
         const size_t unclearedBefore = uncleared ? *uncleared : 0;
-        filletDragbackEnds(p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius, p.name, clears, uncleared, why);
+        filletDragbackEnds(p.prims, dragBend, p.wireRadius, p.name, clears, uncleared, why);
         std::string slantWhy;
-        if (slantsClear(p, &slantWhy)) return;
+        if (slantsClear(p, &slantWhy)) {
+            filletDragbackInteriorCorners(p.prims, dragBend, p.wireRadius, p.name);
+            dropUnmodellableStraights();
+            return;
+        }
         // Alf, 2026-10-30: where rounding cannot be used the corner is sharp -- no slant, the end a mitre.
         std::cerr << "[ConductorBuilder] FINDING: a slanted dragback step of " << p.name << " reaches copper it must clear ("
                   << slantWhy << "); its dragback ends are drawn without slants, sharp where no round bend fits.\n";
         p.prims = before;
         if (uncleared) *uncleared = unclearedBefore;
-        filletDragbackEnds(p.prims, kRoundCornerBendFactor * p.wireRadius, p.wireRadius, p.name, clears, uncleared, why,
+        filletDragbackEnds(p.prims, dragBend, p.wireRadius, p.name, clears, uncleared, why,
                            /*allowSlant=*/false);
+        filletDragbackInteriorCorners(p.prims, dragBend, p.wireRadius, p.name);
+        dropUnmodellableStraights();
     };
+    // ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"): a layer link's bends at MKF's wire bend
+    // (ConnectionLayout::wireBendRadius), no factor of MVB++'s own. One not above the wire radius cannot be swept
+    // round: the link stays the straight radial step (sharp) and is reported.
+    auto smoothLinksOf = [&](ConductorPath& p, size_t pi) {
+        // ONE corner style (Alf, 2026-11-13: "ALL of them round when we say round, and all of them rectangular when
+        // we say rectangular"): with sharp corners a layer link stays its straight radial step, a mitre at each end.
+        // Rectangular wire is always round (its sweep cannot close a sharp spine).
+        if (!opts.roundedLeadCorners && !p.isRectangular) return;
+        const double bend = opts.effectiveBend(wireBendOf(p.winding));
+        if (bend < p.wireRadius * (1.0 - 1e-12)) {   // equal = round (ABT #2274)
+            bool hasLink = false;
+            for (const auto& pr : p.prims) hasLink = hasLink || (pr.kind == Primitive::SEG && pr.label.find("(layer link)") != std::string::npos);
+            if (!hasLink) return;
+            std::cerr << "[ConductorBuilder] FINDING: MKF's wire bend for " << p.name << " is " << bend << " m, not above "
+                      << "its wire radius " << p.wireRadius << " m; its layer links are drawn sharp (straight radial step)\n";
+            if (std::getenv("MVB_CORNER_LIST"))
+                std::fprintf(stderr, "[corner-list]\tlayer-link\t%s\tall links\t-\t%.6f\t-\t%.6f\t-\n", p.name.c_str(),
+                             bend * 1e3, p.wireRadius * 1e3);
+            return;
+        }
+        (void) pi;
+        smoothLayerLinks(p.prims, bend, p.name, nullptr, linkCapOf(p));
+    };
+    {
+        struct Box { double lo[3], hi[3]; };
+        auto boxOf = [](const Primitive& pr, double wireRadius) {
+            Box b{{1e300, 1e300, 1e300}, {-1e300, -1e300, -1e300}};
+            const double sag = samplingSag(wireRadius);
+            for (const gp_Pnt& q : samplePrim(pr, wireRadius)) {
+                const double c[3] = {q.X(), q.Y(), q.Z()};
+                for (int d = 0; d < 3; ++d) { b.lo[d] = std::min(b.lo[d], c[d] - sag); b.hi[d] = std::max(b.hi[d], c[d] + sag); }
+            }
+            return b;
+        };
+        auto boxGap = [](const Box& a, const Box& b) {
+            double g2 = 0.0;
+            for (int d = 0; d < 3; ++d) {
+                const double g = std::max({a.lo[d] - b.hi[d], b.lo[d] - a.hi[d], 0.0});
+                g2 += g * g;
+            }
+            return std::sqrt(g2);
+        };
+        const bool linkDiag = std::getenv("MVB_LEAD_DIAG") != nullptr;
+        for (int round = 0; round < 64; ++round) {
+            std::vector<ConductorPath> rounded = paths;
+            std::vector<std::map<std::string, std::pair<int, int>>> steps(paths.size());
+            for (size_t qi = 0; qi < rounded.size(); ++qi) {
+                auto& q = rounded[qi];
+                if (q.isRectangular || (!opts.roundedLeadCorners && !q.isRectangular)) continue;
+                const double bend = opts.effectiveBend(wireBendOf(q.winding));
+                if (bend < q.wireRadius * (1.0 - 1e-12)) continue;   // its links stay straight steps (smoothLinksOf reports it)
+                smoothLayerLinks(q.prims, bend, q.name, nullptr, linkCapOf(paths[qi]), &steps[qi]);
+            }
+            // The tightest step every member of a group can take: no cap goes below it.
+            std::map<std::string, int> groupFloor;
+            for (size_t qi = 0; qi < paths.size(); ++qi)
+                for (const auto& [label, st] : steps[qi]) {
+                    int& floor = groupFloor.try_emplace(linkGroupOf(paths[qi], label), 0).first->second;
+                    floor = std::max(floor, st.second);
+                }
+            std::vector<std::vector<Box>> boxes(rounded.size());
+            for (size_t qi = 0; qi < rounded.size(); ++qi)
+                for (const auto& pr : rounded[qi].prims) boxes[qi].push_back(boxOf(pr, rounded[qi].wireRadius));
+            std::map<std::string, int> lowerTo;
+            for (size_t pi = 0; pi < rounded.size(); ++pi) {
+                for (size_t k = 0; k < rounded[pi].prims.size(); ++k) {
+                    const Primitive& arc = rounded[pi].prims[k];
+                    const size_t tagAt = arc.label.rfind(" arc ");
+                    if (tagAt == std::string::npos || arc.label.find("(layer link)") == std::string::npos) continue;
+                    const std::string linkLabel = arc.label.substr(0, tagAt);
+                    const auto st = steps[pi].find(linkLabel);
+                    if (st == steps[pi].end()) continue;
+                    const Primitive* blocker = nullptr;
+                    size_t blockerPath = 0;
+                    for (size_t qi = 0; qi < rounded.size() && !blocker; ++qi) {
+                        if (qi == pi) continue;
+                        const double envelope = coatedRadiusOf(paths[pi]) + coatedRadiusOf(paths[qi]);
+                        for (size_t m = 0; m < rounded[qi].prims.size(); ++m) {
+                            if (boxGap(boxes[pi][k], boxes[qi][m]) > envelope) continue;
+                            if (!cert::provePairClears(arc, rounded[qi].prims[m], envelope - cert::kCoordinateGridHalf).clears) {
+                                blocker = &rounded[qi].prims[m];
+                                blockerPath = qi;
+                                break;
+                            }
+                        }
+                    }
+                    if (!blocker) continue;
+                    const std::string group = linkGroupOf(paths[pi], linkLabel);
+                    const bool canLower = st->second.first - 1 >= groupFloor[group];
+                    if (linkDiag)
+                        std::fprintf(stderr, "[link-veto] round %d: %s '%s' (step %d) does not clear %s '%s'%s\n", round,
+                                     paths[pi].name.c_str(), arc.label.c_str(), st->second.first, paths[blockerPath].name.c_str(),
+                                     blocker->label.c_str(), canLower ? "" : "; no tighter step fits every parallel");
+                    if (!canLower) continue;
+                    auto [it, fresh] = lowerTo.try_emplace(group, st->second.first - 1);
+                    if (!fresh) it->second = std::min(it->second, st->second.first - 1);
+                }
+            }
+            if (lowerTo.empty()) break;
+            for (const auto& [group, step] : lowerTo) linkStepCap[group] = step;
+        }
+    }
     for (size_t pi = 0; pi < paths.size(); ++pi) {
         auto& p = paths[pi];
         if (p.isRectangular) continue;
         if (!leadCornersRound(p.winding, p.parallel)) {
             // Sharp lead corners (Options::roundedLeadCorners, or no bend from MKF): no terminal fillet, so the layer
             // links are smoothed as before and the terminal corners stay the crossing vertex.
-            smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name, linkVetoFor(pi));
+            smoothLinksOf(p, pi);
             roundDragbackEnds(p, {}, nullptr, nullptr);
             continue;
         }
@@ -17415,8 +20576,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         // is kindest to the wire, but on 14_dab it reached 11.7 um into a sibling parallel. The
         // veto walks down to tighter transitions; if none clears, the tightest is kept and the
         // certified gate below has the last word (no silent acceptance).
-        smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name,
-                         linkVetoFor(pi));
+smoothLinksOf(p, pi);
         // The dragback ends before the terminal corner: whether they end sharp moves the dragback's straights, and
         // the terminal fillet is proven against the copper as it finally is (13_current_sense).
         roundDragbackEnds(p, {}, nullptr, nullptr);
@@ -17428,6 +20588,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             p.prims, p.winding, p.parallel, p.wireRadius, p.name,
             leadFilletIn.count(pi) ? leadFilletIn.at(pi) : std::numeric_limits<double>::quiet_NaN(),
             leadFilletOut.count(pi) ? leadFilletOut.at(pi) : std::numeric_limits<double>::quiet_NaN(), /*report=*/true);
+        // The lead corners appendFilletedPolyline deferred (no fan claim: a rect column) take what the terminal fillet left.
+        if (std::any_of(p.prims.begin(), p.prims.end(), [](const Primitive& q) { return q.deferredCorners; }))
+            filletDeferredLeadCorners(p.prims, leadBendRadius(p.winding, p.parallel), p.wireRadius, p.name);
         if (std::getenv("MVB_DIAG") && filleted)
             std::cerr << "[buildAll] '" << p.name << "' filleted " << filleted
                       << " terminal corner(s)\n";
@@ -17461,7 +20624,38 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         for (size_t pi = 0; pi < paths.size(); ++pi) {
             auto& p = paths[pi];
             if (std::getenv("MVB_NO_CORNER_REPAIR")) break;   // bisect switch
-            if (p.isRectangular || !leadCornersRound(p.winding, p.parallel)) continue;
+            if (p.isRectangular) continue;
+            if (!leadCornersRound(p.winding, p.parallel)) {
+                // ABT #2274 (23_interleaved_llc: Primary parallel 1's '(over dragback) fillet arc 1' 4560 nm
+                // inside Primary parallel 0's turn 17 -> 18): a path drawn with SHARP lead corners still has
+                // round dragback ends (roundDragbackEnds above, drawn unproven because the neighbours were not
+                // final yet). They are proven here like any other fillet, and where one does not clear they are
+                // drawn again with every candidate proven; a corner none of whose round bends clears in the
+                // space it has is sharp (Alf: "only round corner if you can do it in the alloted space, NEVER
+                // more!").
+                if (arcsClear(pi)) continue;
+                const std::string firstWhy = arcsWhy;
+                const std::vector<Primitive> drawnPrims = p.prims;
+                p.prims = preFilletPrims[pi];
+                smoothLinksOf(p, pi);
+                size_t uncleared = 0;
+                std::string unclearedWhy;
+                roundDragbackEnds(p, filletClearsFor(pi), &uncleared, &unclearedWhy);
+                if (uncleared > 0) {
+                    unclearedFillet[pi] = unclearedWhy;
+                    std::cerr << "[ConductorBuilder] FINDING: " << unclearedWhy << " -- " << uncleared
+                              << " dragback end(s) of " << p.name << " are drawn sharp (bisection mitre): no round "
+                              << "bend clears the other copper in the space they have.\n";
+                }
+                if (!arcsClear(pi)) {
+                    refuseCollision("ConductorBuilder: the re-searched dragback ends of " + p.name +
+                                    " do not clear the other conductors. Witness: " + arcsWhy);
+                    p.prims = drawnPrims;
+                    std::cerr << "[ConductorBuilder] FINDING: '" << p.name << "' keeps its first-drawn "
+                                 "dragback ends; their first collision witness: " << firstWhy << std::endl;
+                }
+                continue;
+            }
             // Every drawn corner is proven here, against the other conductors as they finally are;
             // one that does not clear is re-searched with each candidate proven before it is taken.
             if (arcsClear(pi)) continue;
@@ -17471,7 +20665,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // along it clears, and otherwise walks the default snap and 24 even rolls
             // (filletTerminalCorners with `clears`), taking the first proven fit.
             p.prims = preFilletPrims[pi];
-            smoothLayerLinks(p.prims, kRoundCornerBendFactor * p.wireRadius, p.name, linkVetoFor(pi));
+            smoothLinksOf(p, pi);
             size_t uncleared = 0;
             std::string unclearedWhy;
             roundDragbackEnds(p, filletClearsFor(pi), &uncleared, &unclearedWhy);   // first: see the first pass
@@ -17480,6 +20674,8 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 leadFilletIn.count(pi) ? leadFilletIn.at(pi) : std::numeric_limits<double>::quiet_NaN(),
                 leadFilletOut.count(pi) ? leadFilletOut.at(pi) : std::numeric_limits<double>::quiet_NaN(),
                 /*report=*/false, filletClearsFor(pi), &uncleared, &unclearedWhy);
+            if (std::any_of(p.prims.begin(), p.prims.end(), [](const Primitive& q) { return q.deferredCorners; }))
+            filletDeferredLeadCorners(p.prims, leadBendRadius(p.winding, p.parallel), p.wireRadius, p.name);
             // A corner none of whose fillets clears is left sharp by the re-search (Alf, 2026-10-30: below the
             // smallest buildable bend, or where no bend clears, the corner is a bisection mitre).
             if (uncleared > 0) {
@@ -17562,11 +20758,17 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // which are out of scope by the time a saved design is drawn: a magnetic routed by a
             // caller that declared no policy reports its own coated radius here (MKF planned SHARP
             // corners), and any rounded corner then exceeds it and is refused rather than drawn.
-            const double drawnBend = opts.effectiveBend(kRoundCornerBendFactor * p.wireRadius);
             if (pl.plannedBend <= 0.0)
                 throw std::runtime_error("ConductorBuilder: " + pl.label + "'s route to pin '" +
                                          pl.pinName + "' carries no planned bend radius; MKF did not "
                                          "record what its corners were planned for (ABT #1172)");
+            // ABT #2274 (Alf, 2026-11-07): the run is drawn at MKF's planned bend, never a radius chosen here; a
+            // planned bend not above the wire radius is MKF's SHARP plan.
+            const double drawnBend = pl.plannedBend > p.wireRadius ? pl.plannedBend : 0.0;
+            if (drawnBend == 0.0)
+                std::cerr << "[ConductorBuilder] FINDING: " << pl.label << "'s run to pin '" << pl.pinName
+                          << "' has MKF bend " << pl.plannedBend << " m, not above the wire radius " << p.wireRadius
+                          << " m; its corners are drawn sharp\n";
             if (drawnBend > pl.plannedBend + 1e-12) {
                 std::ostringstream m;
                 m.precision(9);
@@ -17696,7 +20898,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         std::vector<size_t> primIndexPerSolid;
         TopoDS_Shape cond =
             emitConductor(p, opts.wirePolygonSegments, &primIndexPerSolid, opts.cutterOnly,
-                          opts.weld);
+                          weldMode);
         // ABT #1907: the foil sheet takes its leads and weld strips into its one body.
         std::array<const ConductorPath*, 2> foilLeads{nullptr, nullptr};
         const bool foilSheet = foilFuse && p.isFoil && p.leadOnlyTerminal < 0;
@@ -17708,13 +20910,13 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             foilLeads = it->second;
             std::vector<std::pair<TopoDS_Shape, const ConductorPath*>> leadBodies;
             for (const ConductorPath* lp : foilLeads)
-                leadBodies.emplace_back(emitConductor(*lp, opts.wirePolygonSegments, nullptr, opts.cutterOnly, opts.weld), lp);
+                leadBodies.emplace_back(emitConductor(*lp, opts.wirePolygonSegments, nullptr, opts.cutterOnly, weldMode), lp);
             cond = fuseFoilParallel(cond, leadBodies, p.name);
             primIndexPerSolid.clear();   // one body: the per-primitive mapping no longer applies
         }
         // ABT #1265: one object per wire for the FEM product -- leads included.
         static const bool noOneBody = std::getenv("MVB_NO_ONE_BODY") != nullptr;
-        if (opts.femReady && opts.oneBodyPerConductor && opts.weld != WeldMode::Off &&
+        if (opts.femReady && opts.oneBodyPerConductor && weldMode != WeldMode::Off &&
             !opts.cutterOnly && !noOneBody && !p.isFoil) {
             const TopoDS_Shape one = fuseConductorToOneBody(cond, p.name);
             if (!one.IsNull()) {
@@ -17854,7 +21056,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         if (foilSheet && std::abs(foilLeads[1]->wireRadius - capOf.wireRadius) > 1e-12)
             throw std::runtime_error("ConductorBuilder: foil sheet '" + p.name + "' has leads of two diameters; its "
                                      "port caps are matched on one (ABT #1907)");
-        const double wantArea = capOf.isRectangular ? (capOf.wireWidth * capOf.wireHeight)
+        const double wantArea = capOf.isRectangular ? rectSectionArea(capOf.wireWidth, capOf.wireHeight, capOf.wireCornerRadius)
                                                     : (kPi * capOf.wireRadius * capOf.wireRadius);
         // characteristic radius for the centroid-match tolerance: the round radius, or half the
         // rectangle's diagonal (its own bounding radius) so a wide flat cap is never missed.
@@ -18321,6 +21523,15 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil, const MAS::CoreBobbinPro
     }
 }
 
+// An OCCT exception (Standard_Failure is not a std::exception) escaping the build reached no handler and
+// terminated the process (17_cllc / 13_current_sense, agent 16). It leaves as a std::runtime_error naming
+// the OCCT type and its message, so every caller sees an error, never a core dump.
+static std::runtime_error occtFailureAsError(const Standard_Failure& e) {
+    const char* msg = e.GetMessageString();
+    return std::runtime_error(std::string("ConductorBuilder::buildAll: OCCT ") + e.DynamicType()->Name() + ": " +
+                              (msg && *msg ? msg : "(no message)"));
+}
+
 std::vector<NamedShape> ConductorBuilder::buildAll(
     const MAS::Coil& coil, const MAS::CoreBobbinProcessedDescription& bobbin, bool isToroidal,
     const Options& opts) {
@@ -18332,8 +21543,12 @@ std::vector<NamedShape> ConductorBuilder::buildAll(
     OpenMagnetics::Coil omCoil(cj, /*windInConstructor=*/false);
     auto layout = omCoil.get_connection_layout();
     auto spaces = omCoil.get_connection_reserved_spaces();
-    return buildAllImpl<MAS::Coil, MAS::Wire>(coil, bobbin, isToroidal, std::move(spaces), layout,
-                                              opts);
+    try {
+        return buildAllImpl<MAS::Coil, MAS::Wire>(coil, bobbin, isToroidal, std::move(spaces), layout,
+                                                  opts);
+    } catch (const Standard_Failure& e) {
+        throw occtFailureAsError(e);
+    }
 }
 
 std::vector<NamedShape> ConductorBuilder::buildAll(
@@ -18343,8 +21558,12 @@ std::vector<NamedShape> ConductorBuilder::buildAll(
     OpenMagnetics::Coil coilCopy = coil;
     auto layout = coilCopy.get_connection_layout();
     auto spaces = coilCopy.get_connection_reserved_spaces();
-    return buildAllImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, bobbin, isToroidal,
-                                                                  std::move(spaces), layout, opts);
+    try {
+        return buildAllImpl<OpenMagnetics::Coil, OpenMagnetics::Wire>(coil, bobbin, isToroidal,
+                                                                      std::move(spaces), layout, opts);
+    } catch (const Standard_Failure& e) {
+        throw occtFailureAsError(e);
+    }
 }
 
 std::map<std::string, ConductorBuilder::TerminalLeadLength>
@@ -18609,7 +21828,7 @@ ConductorBuilder::LeadBendPolicy::LeadBendPolicy(double minBendRadius) {
     _previousMinimum = settings.get_coil_lead_minimum_bend_radius();
     _previousRealWinding = settings.get_coil_use_real_winding_geometry();
     settings.set_coil_use_real_winding_geometry(true);
-    settings.set_coil_lead_bend_radius_factor(std::optional<double>(kRoundCornerBendFactor));
+    settings.set_coil_lead_bend_radius_factor(std::nullopt);   // MKF decides the lead bend (ABT #2274: no 1.05)
     settings.set_coil_lead_minimum_bend_radius(minBendRadius > 0 ? std::optional<double>(minBendRadius)
                                                                  : std::nullopt);
 }

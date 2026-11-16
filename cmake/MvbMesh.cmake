@@ -25,7 +25,13 @@ set(MVBPP_MMG_PREFIX "$ENV{HOME}/OpenMagnetics/mmg-5.8.0-install"
 # (fork commit 268c22d3a4: the fragment's certified-disjoint conductors as one argument), which Mesh3d.cpp sets.
 # -vis-sd3- adds Mesh.MinInsertedTetVolumeRatio (fork commit 799066a7e8: Delaunay refinement refuses a point
 # whose new tets would have no volume), which SizeField.cpp sets.
-set(MVBPP_GMSH_PREFIX "$ENV{HOME}/OpenMagnetics/gmsh-om-4.15.2-vis-sd3-install"
+# -vis-sd4- adds fork commit 469f58ae07: Delaunay refinement's memoryCleanup runs only once the tet set
+# has doubled since the last one (it ran on EVERY iteration above 7 tets per vertex: 1-2 it/s on 06_llc,
+# 6 it/s on 08_pq). It frees only deleted tets, so meshes are unchanged.
+# -vis-sd5- adds fork commit ce0ec8eb58: OCCRegion::containsPoint keeps one solid classifier per region
+# instead of building one per call (13 of 30 min on 06_llc's corridor verification). Meshes are unchanged
+# (06_llc byte-identical).
+set(MVBPP_GMSH_PREFIX "$ENV{HOME}/OpenMagnetics/gmsh-om-4.15.2-vis-sd5-install"
     CACHE PATH "gmsh (OpenMagnetics fork) install prefix (shared across build trees; built once)")
 
 # An install that already exists is reused, never rebuilt (same reason as OCCT's).

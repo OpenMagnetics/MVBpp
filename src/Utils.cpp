@@ -280,17 +280,16 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
         useRealWindingGeometry);
 
     // ABT #1172/#1237: MKF plans a pin run's corners as straight legs meeting at an obstacle edge,
-    // and offsets each leg for the bend radius the CONSUMER will draw (d >= R - (R - r) sin(theta/2),
-    // Settings::lead_leg_clearance). Unset, MKF plans SHARP corners (R = r) and any rounded corner
-    // then cuts the edge -- measured as copper inside the pin rail on the boost PQ 26/25. MVB++ is
-    // that consumer and rounds every corner, so it declares its own bend policy here: the corner
-    // rule (kRoundCornerBendFactor) and the user's minimum-bend floor, the same two numbers
-    // ConductorBuilder::Options draws with. MKF is told; it never guesses.
+    // and offsets each leg for the bend radius the lead will be drawn at (d >= R - (R - r) sin(theta/2),
+    // Settings::lead_leg_clearance). MKF decides that radius (Coil::lead_bend_radius: the IEC 60317 rule
+    // of the wire, the sleeve's rating, else the swept radius, i.e. SHARP); MVB++ draws it. MVB++ declares
+    // no factor of its own (ABT #2274, Alf 2026-11-07: no 1.05), only the user's minimum-bend floor, and
+    // clears any ambient factor so MKF never plans with a number MVB++ does not draw.
     OpenMagnetics::SettingsGuard<std::optional<double>> leadBendFactorGuard(
         OpenMagnetics::Settings::GetInstance(),
         &OpenMagnetics::Settings::get_coil_lead_bend_radius_factor,
         &OpenMagnetics::Settings::set_coil_lead_bend_radius_factor,
-        std::optional<double>(mvb::kRoundCornerBendFactor));
+        std::nullopt);
     const double minBend = mvb::ConductorBuilder::Options().minBendRadius;
     OpenMagnetics::SettingsGuard<std::optional<double>> leadBendMinimumGuard(
         OpenMagnetics::Settings::GetInstance(),

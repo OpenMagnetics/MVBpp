@@ -35,25 +35,11 @@ constexpr double kTwoPi = 2.0 * std::numbers::pi;
 // a DISCRETIZATION-DENSITY parameter of the measurement (like polygonSegments), not a
 // clearance policy.
 constexpr double kMaxSagFraction = 0.02;
-// ABT #685: a ROUND corner's bend radius, as a multiple of the wire radius. It must be
-// strictly greater than 1: a centreline radius EQUAL to the wire radius sweeps a HORN TORUS,
-// whose tube touches its own axis of revolution, so no valid solid exists. It is also the
-// physics — a wire does not bend tighter than its own radius. Where a corner has no room for
-// this, it takes the BisectionMitre construction instead, which has no radius to violate.
-//
-// 1.05 is the smallest margin that is buildable, and it is deliberately the SAME floor
-// appendFilletedPolyline already applies to its fillets — one number for one constraint. It is
-// not slack to be spent: a round corner intrudes (factor - 1) * wireRadius into its own inside,
-// and on a toroid that space belongs to the terminal lead's drop. Measured on the common-mode
-// choke, a 1.5 factor put the poloidal corner 0.5 * wireRadius = 219 um into the entrance
-// lead's corridor and the router (correctly) refused the design.
-constexpr double kRoundCornerBendFactor = 1.05;
-// A DRAGBACK corner's fillet radius, as a multiple of the dragback's own bend radius (not of the
-// wire radius). Strictly above 1 for the same horn-torus reason as above; 1.5 rather than the
-// buildable floor because real wire cannot bend to its own radius without crushing the inner
-// fibre, and a dragback is a formed bend in the finished part. Named here, not repeated as a bare
-// literal at the site (Alf, 2026-09-19: no magic numbers); the value is unchanged from the site's.
-constexpr double kDragbackFilletBendFactor = 1.5;
+// ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"; "I never want to hear about the 1.05 again, it is a
+// magic number hardcoded"): no corner radius is chosen here. Every round corner is drawn at the radius MKF exports for
+// it (a route's plannedBendRadius / dragbackBendRadius, a turn's charged bend radius, ConnectionLayout::wireBendRadius
+// for the corners no route carries), where its tangent fits the space the corner has; otherwise it is SHARP (bisection
+// mitre) and reported. A radius not above the wire's own sweeps a horn torus and is sharp for that reason.
 // FACETED MODE ONLY (segments > 0): an arc bent tighter than this many wire radii is revolved
 // on the EXACT round profile, not the polygon (ABT #1111, 2026-09-06; Alf's call: "do option
 // 1"). A 12-gon revolved about an axis 1.05 r away puts its innermost facet ~0.08 r from the
@@ -184,6 +170,10 @@ struct Primitive {
     // (wrap chains are tangent-continuous), and OCCT's pipe-shell mitre flares unboundedly
     // across them, while lead chains sweep robustly as exact cylinders + sphere elbows.
     bool isLead = false;
+    // A lead straight whose corners wait for its terminal fillet (appendFilletedPolyline found no measured claim
+    // for that fillet, e.g. a rect column, where the fan does not run): filletDeferredLeadCorners bends them once the
+    // terminal fillet has taken its share of the attach leg.
+    bool deferredCorners = false;
     // An inter-layer link (MKF's blue ConnectionReservedSpace box): the straight radial
     // step that carries the wire from one concentric layer out to the next. Like a lead it
     // meets its neighbouring wraps at 90-degree corners, so it is isolated into its own run
@@ -308,8 +298,13 @@ gp_Dir primFwdEnd(const Primitive& p, double r);
 TopoDS_Wire wireProfileWire(const gp_Pnt& center, const gp_Dir& normal, double radius, int segments);
 TopoDS_Face wireProfile(const gp_Pnt& center, const gp_Dir& normal, double radius, int segments);
 TopoDS_Wire wireProfileWireSplit(const gp_Pnt& center, const gp_Dir& normal, double radius, int segments);
+// The area of that section: the rectangle less the (4 - pi) r^2 its four rounded corners leave out.
+inline double rectSectionArea(double width, double height, double cornerRadius) {
+    return width * height - (4.0 - std::numbers::pi) * cornerRadius * cornerRadius;
+}
+// cornerRadius > 0 rounds the four corners (compressed litz); 0 is the sharp rectangle.
 TopoDS_Wire rectProfileWire(const gp_Pnt& center, const gp_Dir& tangent, const gp_Dir& axialAxis,
-                            double width, double height);
+                            double width, double height, double cornerRadius);
 // Growth (overA/overB, in arc length) is folded into the pcurve for spirals that support it --
 // see primEdgeGrowsAnalytically. Everything else ignores it and is grown by the caller.
 TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA = 0.0,

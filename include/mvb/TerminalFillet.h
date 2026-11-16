@@ -14,6 +14,7 @@
 #include <gp_Vec.hxx>
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <limits>
 #include <string>
@@ -66,12 +67,23 @@ std::optional<SlantedStep> slantOneOdStep(std::vector<Primitive>& prims, size_t 
                                           double kinkBend);
 
 using FilletClears = std::function<bool(const std::vector<Primitive>& arcs, std::string* witness)>;
+// ABT #2274 item E (agent 48, Alf: "MKF plans what is built"): the terminal corner MKF planned for a ramped
+// round-column lead (ConnectionRoute::terminalClimbTangentLength / terminalClimbPhiDegrees). A planned corner is
+// drawn exactly as MKF planned it -- the natural-plane roll, MKF's tangent length and bend angle -- whatever roll the
+// caller asks for and without the clearance search: its clearance is VALIDATED by the caller (a collision finding),
+// never cured here by another corner. MVB++'s construction landing anywhere else than MKF's plan throws.
+struct PlannedClimb {
+    double tangentLength = 0.0;   // m
+    double phiDegrees = 0.0;
+};
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
                              const std::string& who,
                              double entranceRoll = std::numeric_limits<double>::quiet_NaN(),
                              double exitRoll = std::numeric_limits<double>::quiet_NaN(),
                              const FilletClears& clears = {}, size_t* uncleared = nullptr,
-                             std::string* witness = nullptr);
+                             std::string* witness = nullptr,
+                             const std::optional<PlannedClimb>& entranceClimb = std::nullopt,
+                             const std::optional<PlannedClimb>& exitClimb = std::nullopt);
 
 // The same corner where a wrap meets a Z dragback's straight (its "(dragback) seg"), in either order: a
 // round dragback has round ends (Alf, 2026-10-28), bent at `minBend` -- the radius its own corners take.
@@ -80,21 +92,29 @@ size_t filletDragbackEnds(std::vector<Primitive>& prims, double minBend, double 
                           const FilletClears& clears = {}, size_t* uncleared = nullptr,
                           std::string* witness = nullptr, bool allowSlant = true);
 
+// ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"; agent 45): a Z dragback's INTERIOR corners, bent at
+// MKF's dragbackBendRadius `bend` once the dragback's ENDS have taken their share (call after filletDragbackEnds and
+// filletLeadJunctions). See TerminalFillet.cpp. Returns the corners bent; a corner whose tangent does not fit is sharp
+// and reported.
+size_t filletDragbackInteriorCorners(std::vector<Primitive>& prims, double bend, double wireRadius, const std::string& who);
+// A lead's corners that appendFilletedPolyline deferred (Primitive::deferredCorners: no measured claim for its terminal
+// fillet), bent at `bend` by the same allotted-space rule once the terminal fillet has taken its share. Call after the
+// terminal fillets. Returns the corners bent; a corner whose tangent does not fit is sharp and reported.
+size_t filletDeferredLeadCorners(std::vector<Primitive>& prims, double bend, double wireRadius, const std::string& who);
+
 // Replaces each straight radial LAYER LINK by a biarc tangent to the two wraps it joins, taking
 // the azimuth it needs from each (ABT #969, Alf's option 2). `clears` decides between the
 // candidate transitions: the roundest one is the kindest to the wire, but a long transition
 // sweeps azimuth and can reach a neighbouring parallel (14_dab: 11.7 um), so the caller -- which
 // is the only place that can see the other conductors -- vetoes. Candidates run from the roundest
 // down to the tightest that still respects the bend radius; without a predicate the roundest wins.
+// `maxStepOf` caps a link's transition (by the link's label): the roundest candidate taken is the one at that step of
+// the azimuth sequence or below; `stepsOf`, when given, receives per link label the step taken and the first step that
+// fits (the tightest), so a caller can lower a cap and try again (ConductorBuilder: the parallels of one winding take
+// their sibling links at the SAME step, the roundest at which every one of them clears the others).
 size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std::string& who,
-                        const std::function<bool(const Primitive&, const Primitive&)>& clears = {});
-// Bend radius = kRoundCornerBendFactor * wire radius (the corner rule everywhere else).
-inline size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend,
-                                    const std::string& who,
-                                    double entranceRoll = std::numeric_limits<double>::quiet_NaN(),
-                                    double exitRoll = std::numeric_limits<double>::quiet_NaN()) {
-    return filletTerminalCorners(prims, minBend, minBend / kRoundCornerBendFactor, who,
-                                 entranceRoll, exitRoll);
-}
+                        const std::function<bool(const Primitive&, const Primitive&)>& clears = {},
+                        const std::function<int(const std::string&)>& maxStepOf = {},
+                        std::map<std::string, std::pair<int, int>>* stepsOf = nullptr);
 
 }  // namespace mvb

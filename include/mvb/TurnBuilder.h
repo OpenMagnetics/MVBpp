@@ -80,6 +80,12 @@ public:
     // footprint, whereas the context-less overload can only fall back to the wire's own
     // diameters (a bare round wire then resolves to its CONDUCTING diameter — too thin
     // for paintCoating=true). Throws on missing wire data (no fallbacks).
+    // Whether a turn of this wire is drawn with a RECTANGULAR section: rectangular or planar
+    // wire, or a litz bundle MKF wound into a rectangular cell (its turn says rectangular).
+    static bool rectangularSection(const MAS::Wire& wire, const MAS::Turn& turn);
+    // The corner radius of that section: MKF's rounded-rectangle radius for compressed litz (the cell's
+    // with paintCoating, the copper's inside the serving without), 0 for every sharp rectangle.
+    static double sectionCornerRadius(const MAS::Wire& wire, const MAS::Turn& turn, bool paintCoating);
     static std::pair<double, double> wireDimensions(const MAS::Wire& wire, bool paintCoating);
     static std::pair<double, double> wireDimensions(const MAS::Wire& wire,
                                                     const MAS::Turn& turn,

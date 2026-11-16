@@ -130,28 +130,105 @@ namespace {
 // conductor, and of its own conductor further than half a wrap away along the wire.
 struct ChordPoints {
     std::vector<double> x, y, z, h, reach;
-    double cell = 0.0;                                       // query-grid cell = the largest influence
-    std::unordered_map<long long, std::vector<int>> grid;
     size_t samples = 0, close = 0;
     double hmin = 1e30, dmin = 1e30; std::array<double, 3> at{0, 0, 0};
     static long long key(long long i, long long j, long long k) {
         return (i & 0x1FFFFF) | ((j & 0x1FFFFF) << 21) | ((k & 0x1FFFFF) << 42);
     }
     // the size the corridors ask for at a point: h inside the reach, graded to the conductor target over 4 h
-    double size_at(double px, double py, double pz, double condT) const {
-        double best = 1e30;
-        const long long ci = static_cast<long long>(std::floor(px / cell)), cj = static_cast<long long>(std::floor(py / cell)),
-                        ck = static_cast<long long>(std::floor(pz / cell));
-        for (long long a = -1; a <= 1; ++a) for (long long b = -1; b <= 1; ++b) for (long long c = -1; c <= 1; ++c) {
-            const auto it = grid.find(key(ci + a, cj + b, ck + c));
-            if (it == grid.end()) continue;
-            for (int i : it->second) {
+    // QUERY TREE (the size callback runs at every point gmsh sizes: 1D integration, 2D, 3D). A kd-tree over
+    // the corridor points, each node holding its points' box and the range of their h. A node is skipped
+    // when no point in it can reach the query (D >= 5.5 h_max: reach 1.5 h + grading 4 h) or when no point
+    // in it can ask for less than the best size found so far: every point's size at distance d is at least
+    // h_min + max(0, D - 1.5 h_max) (condT - h_max) / (4 h_max) over the node's h range, D the distance to
+    // its box. Both skips carry a 1e-12 relative margin, so a point that rounding could let win is still
+    // evaluated, with the per-point test and formula the grid search used: the answer is the same minimum
+    // over the same points. The grid it replaces (one cell = the LARGEST influence, 27 cells per query)
+    // evaluated thousands of points per query on 06_llc's sheets of 0.15 mm-spaced corridor points, and
+    // 1D meshing alone spent 9 min in it.
+    struct Node { double lo[3], hi[3]; double hmin, hmax; int left = -1, right = -1, begin = 0, end = 0; };
+    std::vector<Node> nodes;
+    std::vector<int> order;   // point indices, leaves own contiguous ranges
+    double condT_ = 0.0;
+    void build_tree(double condT) {
+        condT_ = condT;
+        order.resize(h.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int>(i);
+        nodes.clear();
+        if (!order.empty()) build_node(0, static_cast<int>(order.size()));
+    }
+    int build_node(int begin, int end) {
+        Node n; n.begin = begin; n.end = end;
+        n.lo[0] = n.lo[1] = n.lo[2] = 1e300; n.hi[0] = n.hi[1] = n.hi[2] = -1e300; n.hmin = 1e300; n.hmax = -1e300;
+        for (int k = begin; k < end; ++k) {
+            const int i = order[k]; const double p[3] = {x[i], y[i], z[i]};
+            for (int d = 0; d < 3; ++d) { n.lo[d] = std::min(n.lo[d], p[d]); n.hi[d] = std::max(n.hi[d], p[d]); }
+            n.hmin = std::min(n.hmin, h[i]); n.hmax = std::max(n.hmax, h[i]);
+        }
+        const int id = static_cast<int>(nodes.size());
+        nodes.push_back(n);
+        if (end - begin > 8) {
+            // split on the widest of x, y, z and h (h in units of the reach it sets, 5.5 h), so that a
+            // node's h range narrows as well as its box and the size bound can prune it
+            int ax = 0;
+            for (int d = 1; d < 3; ++d) if (n.hi[d] - n.lo[d] > n.hi[ax] - n.lo[ax]) ax = d;
+            if (5.5 * (n.hmax - n.hmin) > n.hi[ax] - n.lo[ax]) ax = 3;
+            const int mid = (begin + end) / 2;
+            const std::vector<double>* c = ax == 0 ? &x : ax == 1 ? &y : ax == 2 ? &z : &h;
+            std::nth_element(order.begin() + begin, order.begin() + mid, order.begin() + end,
+                             [c](int a, int b) { return (*c)[a] < (*c)[b]; });
+            const int l = build_node(begin, mid), r = build_node(mid, end);
+            nodes[id].left = l; nodes[id].right = r;
+        }
+        return id;
+    }
+    double box_distance(const Node& n, double px, double py, double pz) const {
+        const double dx = std::max({n.lo[0] - px, 0.0, px - n.hi[0]}), dy = std::max({n.lo[1] - py, 0.0, py - n.hi[1]}),
+                     dz = std::max({n.lo[2] - pz, 0.0, pz - n.hi[2]});
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    // The least size any point of the node can ask for at distance >= D from the query: the minimum over
+    // h in [hmin, hmax] of f(h) = h (D <= 1.5 h) or h + (D - 1.5 h)(condT - h)/(4 h) (beyond), the latter
+    // convex in h with its minimum at sqrt(D condT / 5.5). Distance only increases the size, so a point
+    // at d >= D asks for at least f at D.
+    double least_size(double D, double a, double b) const {
+        double lb = 1e300;
+        const double hTurn = D / 1.5;                              // f = h for h >= hTurn
+        if (b >= hTurn) lb = std::max(a, hTurn);
+        const double top = std::min(b, hTurn);
+        if (a <= top) {
+            const double hs = std::clamp(std::sqrt(D * condT_ / 5.5), a, top);
+            for (double hh : {hs, a, top}) lb = std::min(lb, hh + std::max(0.0, D - 1.5 * hh) * (condT_ - hh) / (4.0 * hh));
+        }
+        return lb;
+    }
+    bool may_improve(const Node& n, double D, double best) const {
+        if (D * (1.0 - 1e-12) >= 5.5 * n.hmax * (1.0 + 1e-12)) return false;   // out of every point's reach
+        return least_size(D * (1.0 - 1e-12), n.hmin, n.hmax) * (1.0 - 1e-12) < best;
+    }
+    void search(int id, double px, double py, double pz, double& best) const {
+        const Node& n = nodes[id];
+        if (n.left < 0) {
+            for (int k = n.begin; k < n.end; ++k) {
+                const int i = order[k];
                 const double dist = std::sqrt((px - x[i]) * (px - x[i]) + (py - y[i]) * (py - y[i]) + (pz - z[i]) * (pz - z[i]));
                 if (dist >= reach[i] + 4.0 * h[i]) continue;
-                const double sz = dist <= reach[i] ? h[i] : h[i] + (dist - reach[i]) * (condT - h[i]) / (4.0 * h[i]);
+                const double sz = dist <= reach[i] ? h[i] : h[i] + (dist - reach[i]) * (condT_ - h[i]) / (4.0 * h[i]);
                 best = std::min(best, sz);
             }
+            return;
         }
+        const double dl = box_distance(nodes[n.left], px, py, pz), dr = box_distance(nodes[n.right], px, py, pz);
+        const int first = dl <= dr ? n.left : n.right, second = dl <= dr ? n.right : n.left;
+        const double d1 = std::min(dl, dr), d2 = std::max(dl, dr);
+        if (may_improve(nodes[first], d1, best)) search(first, px, py, pz, best);
+        if (may_improve(nodes[second], d2, best)) search(second, px, py, pz, best);
+    }
+    // min(lc, the size the corridors ask for at a point): lc seeds the bound, which only prunes points
+    // that could not go below it, so this equals std::min(lc, size_at(...)) of the grid search.
+    double size_below(double px, double py, double pz, double lc) const {
+        double best = lc;
+        if (!nodes.empty() && may_improve(nodes[0], box_distance(nodes[0], px, py, pz), best)) search(0, px, py, pz, best);
         return best;
     }
 };
@@ -238,12 +315,7 @@ ChordPoints chord_points_3d(const Paths& paths, double condT) {
             out.x[i] = mid[0]; out.y[i] = mid[1]; out.z[i] = mid[2]; out.h[i] = bestH; out.reach[i] = 1.5 * bestH;
         }
     }
-    double infl = 0.0; for (size_t i = 0; i < out.h.size(); ++i) infl = std::max(infl, out.reach[i] + 4.0 * out.h[i]);
-    out.cell = infl > 0.0 ? infl : condT;
-    for (size_t i = 0; i < out.h.size(); ++i) {
-        double p[3] = {out.x[i], out.y[i], out.z[i]}; long long a, b, c; cellOf(p, out.cell, a, b, c);
-        out.grid[ChordPoints::key(a, b, c)].push_back(static_cast<int>(i));
-    }
+    out.build_tree(condT);
     return out;
 }
 
@@ -2321,7 +2393,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                                              skinDeep, deepest * 1e6);
                             const double ct = cond_t;
                             gmsh::model::mesh::setSizeCallback([cp, ct](int, int, double x, double y, double z, double lc) {
-                                return std::min(lc, cp->size_at(x, y, z, ct));
+                                (void) ct; return cp->size_below(x, y, z, lc);
                             });
                             cmin = std::min(cmin, cp->hmin);
                             std::fprintf(stderr, "[mesh3d] local chord-bound refinement (3D centrelines): %zu corridor "

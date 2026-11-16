@@ -392,7 +392,9 @@ bool filletable(const Primitive& helixSide, const Primitive& straightSide) {
 // travel, which at an 11.5 mm radius is ~4 deg. The straight chunk is gone, not reshaped.
 // MVB_STRAIGHT_LINK=1 restores it (bisect switch).
 size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std::string& who,
-                        const std::function<bool(const Primitive&, const Primitive&)>& clears) {
+                        const std::function<bool(const Primitive&, const Primitive&)>& clears,
+                        const std::function<int(const std::string&)>& maxStepOf,
+                        std::map<std::string, std::pair<int, int>>* stepsOf) {
     if (std::getenv("MVB_STRAIGHT_LINK") != nullptr) return 0;
     size_t done = 0;
     for (size_t i = 0; i + 2 < prims.size(); ++i) {
@@ -406,13 +408,15 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
         const SpiralEval endA = evalSpiral(a, a.az1);
         std::optional<Biarc> best;
         std::vector<std::pair<Biarc, double>> candidates;   // (transition, azimuth taken per wrap)
+        std::vector<int> candidateStep;                     // the step of the azimuth sequence each was found at
+        const int maxStep = maxStepOf ? maxStepOf(prims[i + 1].label) : 39;
         double dA = 0.0, dB = 0.0;
         // THE GENTLEST TRANSITION THAT FITS, not the tightest. A winder does not bend at the
         // minimum radius unless the space forces it, and the tightest biarc leans hardest
         // towards the sibling: on 23_illc the first fit left arc 2 grazing the neighbouring
         // parallel by 0.89 nm at exact touch. So keep growing the azimuth taken from each wrap
         // while the arcs keep getting rounder, and take the last fit before the wraps run out.
-        for (int it = 0; it < 40; ++it) {
+        for (int it = 0; it < 40 && it <= maxStep; ++it) {
             const double L = minBend * std::tan(0.25 * kPi) * (0.5 + 0.15 * it);
             const double dTry = L / std::max(endA.dsdaz, 1e-18);
             if (dTry > 0.45 * spanA || dTry > 0.45 * spanB) break;
@@ -427,6 +431,7 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
             best = fit;
             dA = dB = dTry;
             candidates.push_back({*fit, dTry});
+            candidateStep.push_back(it);
         }
         // Roundest first, then progressively tighter, until the caller stops vetoing.
         if (clears) {
@@ -443,14 +448,38 @@ size_t smoothLayerLinks(std::vector<Primitive>& prims, double minBend, const std
                 dA = dB = candidates.front().second;
             }
         }
+        if (stepsOf && best) {
+            int taken = candidateStep.front();
+            for (size_t ci = 0; ci < candidates.size(); ++ci)
+                if (candidates[ci].second == dA) taken = candidateStep[ci];
+            (*stepsOf)[prims[i + 1].label] = {taken, candidateStep.front()};
+        }
+        if (std::getenv("MVB_LEAD_DIAG") && best) {
+            size_t chosen = candidates.size();
+            for (size_t ci = 0; ci < candidates.size(); ++ci)
+                if (candidates[ci].second == dA) chosen = ci;
+            std::fprintf(stderr, "[link-smooth] %s '%s': %zu transitions fit (azimuth %.3f..%.3f deg, min radius %.4f..%.4f mm); "
+                         "taken #%zu: azimuth %.3f deg, min radius %.4f mm%s\n", who.c_str(), prims[i + 1].label.c_str(),
+                         candidates.size(), candidates.empty() ? 0.0 : candidates.front().second * 180.0 / kPi,
+                         candidates.empty() ? 0.0 : candidates.back().second * 180.0 / kPi,
+                         candidates.empty() ? 0.0 : candidates.front().first.minRadius * 1e3,
+                         candidates.empty() ? 0.0 : candidates.back().first.minRadius * 1e3, chosen, dA * 180.0 / kPi,
+                         best->minRadius * 1e3, chosen + 1 < candidates.size() ? " (rounder ones vetoed: they reach a neighbour)" : "");
+        }
         if (!best) {
             std::ostringstream m;
             m.precision(9);
-            m << "TerminalFillet: the layer link of " << who << " at '" << prims[i + 1].label
+            m << "the layer link of " << who << " at '" << prims[i + 1].label
               << "' cannot be made smooth: no biarc of radius >= " << minBend * 1e3
-              << " mm joins the two wraps within 60% of either's azimuth (" << spanA * 180.0 / kPi
-              << " and " << spanB * 180.0 / kPi << " deg available).";
-            throw std::runtime_error(m.str());
+              << " mm (MKF's wire bend) joins the two wraps within 45% of either's azimuth (" << spanA * 180.0 / kPi
+              << " and " << spanB * 180.0 / kPi << " deg available)";
+            // ABT #2274 (Alf, 2026-11-13: "use round corners everywhere! if not let me know!"): the link stays the
+            // straight radial step -- sharp -- and is reported, never bent tighter than MKF's radius.
+            std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; it is drawn sharp (straight radial step)\n";
+            if (std::getenv("MVB_CORNER_LIST"))
+                std::fprintf(stderr, "[corner-list]\tlayer-link\t%s\t%s\t-\t%.6f\t-\t%.6f\t%.6f\n", who.c_str(),
+                             prims[i + 1].label.c_str(), minBend * 1e3, spanA * 180.0 / kPi, spanB * 180.0 / kPi);
+            continue;
         }
         auto cut = [](Spiral& sp, double az, bool cutEnd) {
             const double span = sp.az1 - sp.az0;
@@ -621,13 +650,17 @@ bool sharpenSegCorner(std::vector<Primitive>& prims, size_t k) {
 static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
                                  const std::string& who, double entranceRoll, double exitRoll,
                                  const FilletClears& clears, size_t* uncleared, std::string* witness,
-                                 bool dragbackEnds, bool allowSlant);
+                                 bool dragbackEnds, bool allowSlant,
+                                 const std::optional<PlannedClimb>& entranceClimb = std::nullopt,
+                                 const std::optional<PlannedClimb>& exitClimb = std::nullopt);
 
 size_t filletTerminalCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
                              const std::string& who, double entranceRoll, double exitRoll,
-                             const FilletClears& clears, size_t* uncleared, std::string* witness) {
+                             const FilletClears& clears, size_t* uncleared, std::string* witness,
+                             const std::optional<PlannedClimb>& entranceClimb,
+                             const std::optional<PlannedClimb>& exitClimb) {
     return filletHelixCorners(prims, minBend, wireRadius, who, entranceRoll, exitRoll, clears, uncleared, witness,
-                              /*dragbackEnds=*/false, /*allowSlant=*/true);
+                              /*dragbackEnds=*/false, /*allowSlant=*/true, entranceClimb, exitClimb);
 }
 
 namespace {
@@ -648,11 +681,59 @@ gp_Vec travelDirection(const Primitive& pr, bool atEnd) {
 }
 }  // namespace
 
+// Marks a level wrap arc while filletDragbackEnds draws it as a zero-pitch SPIRAL (see there).
+static constexpr const char* kLevelArcTag = "\x01level-arc";
+
 size_t filletDragbackEnds(std::vector<Primitive>& prims, double minBend, double wireRadius, const std::string& who,
                           const FilletClears& clears, size_t* uncleared, std::string* witness, bool allowSlant) {
+    // ABT #2274 (Alf, 2026-11-13: every corner round): a wrap that ends LEVEL at its dragback slot -- the flat arc
+    // carrying it from the crossing plane to the slot, axis along the column -- is a helix of zero pitch. Drawn as an
+    // ARC3 it was no wrap to the bend pass, and its corner onto the dragback's radial step stayed a silent 90-degree
+    // mitre (06_llc: 10 of them; the coated gate found them 30 um into the enamel of the wrap riding over). It is
+    // re-expressed as that exact zero-pitch SPIRAL, so the step bends round it like any other wrap.
+    for (size_t i = 0; i < prims.size(); ++i) {
+        if (!isDragbackSeg(prims[i])) continue;
+        for (const size_t w : {i - 1, i + 1}) {
+            if (w >= prims.size()) continue;   // i - 1 wraps round when i == 0
+            Primitive& a = prims[w];
+            if (a.kind != Primitive::ARC3 || a.isConnection || a.isLead) continue;
+            const double axLen = std::sqrt(a.arc.axis.SquareModulus());
+            if (!(axLen > 0.0) || std::abs(std::abs(a.arc.axis.Y()) / axLen - 1.0) > 1e-12 || std::abs(a.arc.v0.Y()) > 1e-12)
+                continue;   // not a level arc round the column's axis
+            Spiral sp;
+            sp.cx = a.arc.c.X();
+            sp.cz = a.arc.c.Z();
+            sp.r0 = sp.r1 = std::hypot(a.arc.v0.X(), a.arc.v0.Z());
+            sp.y0 = sp.y1 = a.arc.c.Y();
+            sp.az0 = std::atan2(-a.arc.v0.Z(), a.arc.v0.X());   // pos = (cx + r cos az, y, cz - r sin az)
+            sp.az1 = sp.az0 + (a.arc.axis.Y() > 0 ? 1.0 : -1.0) * a.arc.sweep;   // rotation about +y advances az
+            a.kind = Primitive::SPIRAL;
+            a.spiral = sp;
+            a.label += kLevelArcTag;
+        }
+    }
     const size_t done = filletHelixCorners(prims, minBend, wireRadius, who, std::numeric_limits<double>::quiet_NaN(),
                                            std::numeric_limits<double>::quiet_NaN(), clears, uncleared, witness,
                                            /*dragbackEnds=*/true, allowSlant);
+    // What the bend left of each level arc is drawn as the level ARC3 it was (the wrap's climb eases into level and
+    // meets it tangentially; as a SPIRAL the assembler swept it differently and the two solids overlapped at the
+    // crossing plane, "mitred corner did not abut"). The tag is dropped from every label it reached (the bend's arc
+    // takes its wrap's label).
+    for (auto& pr : prims) {
+        const size_t at = pr.label.find(kLevelArcTag);
+        if (at == std::string::npos) continue;
+        pr.label.erase(at, std::string(kLevelArcTag).size());
+        if (pr.kind != Primitive::SPIRAL) continue;
+        const Spiral sp = pr.spiral;
+        if (sp.y0 != sp.y1 || sp.r0 != sp.r1)
+            throw std::logic_error("filletDragbackEnds: a level arc came back from the bend pass no longer level");
+        const double sweep = sp.az1 - sp.az0;
+        pr.kind = Primitive::ARC3;
+        pr.arc.c = gp_Pnt(sp.cx, sp.y0, sp.cz);
+        pr.arc.axis = gp_XYZ(0.0, sweep >= 0 ? 1.0 : -1.0, 0.0);
+        pr.arc.v0 = gp_XYZ(sp.r0 * std::cos(sp.az0), 0.0, -sp.r0 * std::sin(sp.az0));
+        pr.arc.sweep = std::abs(sweep);
+    }
     // A dragback end left a mitre (a level wrap arc, or no round bend clear) grows wireRadius x tan(turn/2) into its
     // first or last straight; where the dragback's own round corner left less, that corner is sharp too (Alf,
     // 2026-10-30, "Fully sharp there"; flyback: 0.530 mm left of a 1.1155 mm step for a 0.558 mm mitre).
@@ -682,10 +763,206 @@ size_t filletDragbackEnds(std::vector<Primitive>& prims, double minBend, double 
     return done;
 }
 
+// ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"; agent 45): a Z dragback's INTERIOR corners, bent at
+// MKF's dragbackBendRadius once the dragback's ENDS have taken their share. appendFilletedPolyline leaves them sharp
+// (deferDragbackCorners) because the end fillets (filletDragbackEnds on a helix, filletLeadJunctions on a straight
+// face) are drawn later, and the old rule, not knowing their claim, split every leg between two corners in half and
+// let a corner next to an end take the whole leg. Here each straight is what is really left: a round end has already
+// trimmed it to its tangent point; a SHARP end (mitre) still needs wireRadius tan(turn/2) of it. A corner is round
+// where its tangent length bend tan(turn/2) fits both legs' room (a leg's length minus what the corner or mitre at its
+// other end takes); where two corners compete for one leg, the one needing less takes it first (ties: the earlier).
+// Otherwise it is SHARP (bisection mitre) and reported.
+namespace {
+size_t filletInteriorCornersOf(std::vector<Primitive>& prims, double bend, double wireRadius, const std::string& who,
+                               const std::function<bool(const Primitive&)>& inRun, const char* what, const char* joint);
+}
+
+size_t filletDragbackInteriorCorners(std::vector<Primitive>& prims, double bend, double wireRadius, const std::string& who) {
+    return filletInteriorCornersOf(prims, bend, wireRadius, who, isDragbackSeg, "dragback", " bend ");
+}
+
+// The same pass for a lead whose corners appendFilletedPolyline deferred (Primitive::deferredCorners): run after the
+// terminal fillet, so each straight is what that fillet left. A lead's joints are named " corner ", as
+// appendFilletedPolyline names them.
+size_t filletDeferredLeadCorners(std::vector<Primitive>& prims, double bend, double wireRadius, const std::string& who) {
+    const size_t bent = filletInteriorCornersOf(
+        prims, bend, wireRadius, who,
+        [](const Primitive& p) { return p.kind == Primitive::SEG && p.isLead && p.deferredCorners; }, "lead", " corner ");
+    for (auto& p : prims) p.deferredCorners = false;   // settled: round or reported sharp
+    return bent;
+}
+
+namespace {
+size_t filletInteriorCornersOf(std::vector<Primitive>& prims, double bend, double wireRadius, const std::string& who,
+                               const std::function<bool(const Primitive&)>& inRun, const char* what, const char* joint) {
+    auto dirOf = [](const Primitive& pr) {
+        const gp_XYZ d = pr.seg.b.XYZ() - pr.seg.a.XYZ();
+        return d / d.Modulus();
+    };
+    size_t bent = 0;
+    for (size_t i0 = 0; i0 < prims.size(); ++i0) {
+        if (!inRun(prims[i0])) continue;
+        size_t i1 = i0;   // the run [i0, i1]: dragback straights meeting end to end
+        while (i1 + 1 < prims.size() && inRun(prims[i1 + 1]) &&
+               prims[i1].seg.b.Distance(prims[i1 + 1].seg.a) <= 1e-9)
+            ++i1;
+        const size_t m = i1 - i0 + 1;
+        if (m < 2) { i0 = i1; continue; }
+        std::vector<double> len(m), halfTan(m, 0.0);
+        for (size_t k = 0; k < m; ++k) len[k] = prims[i0 + k].seg.a.Distance(prims[i0 + k].seg.b);
+        for (size_t k = 1; k < m; ++k) {
+            const double cosT = std::clamp(dirOf(prims[i0 + k - 1]).Dot(dirOf(prims[i0 + k])), -1.0, 1.0);
+            if (cosT > 1.0 - 1e-9) continue;
+            const double t = std::sqrt((1.0 - cosT) / (1.0 + cosT));
+            if (bend * t < 1e-7) continue;   // OCCT's confusion tolerance: no arc it can build
+            halfTan[k] = t;
+        }
+        // What a SHARP end takes of the run's first / last straight: the mitre against the wrap it meets.
+        auto mitreAt = [&](bool atStart) {
+            if ((atStart && i0 == 0) || (!atStart && i1 + 1 >= prims.size())) return 0.0;
+            const Primitive& wrap = prims[atStart ? i0 - 1 : i1 + 1];
+            // Agent 46: measured for EVERY neighbour, by the turn it really makes. A round end (filletDragbackEnds'
+            // arc) meets the straight tangentially, so its turn is 0 and it takes nothing more; any other neighbour
+            // -- a plain helix, or the level / blended wrap end a round column hands the dragback -- meets it in a
+            // mitre that takes wireRadius tan(turn/2) of the straight. (Skipping every non-plain-helix neighbour as
+            // "already trimmed" let 06/23's dragback bend 1 eat that mitre and overlap its own wrap, 0.0089 mm^3.)
+            auto dirOf = [](const Primitive& pr, bool atEnd) {
+                if (pr.kind == Primitive::ARC3)   // P(t) = c + rot(axis, t) v0, t from 0 to sweep (either sign)
+                    return pr.arc.sweep < 0.0 ? travelDirection(pr, atEnd).Reversed() : travelDirection(pr, atEnd);
+                return travelDirection(pr, atEnd);   // throws for a primitive with no defined travel direction
+            };
+            const gp_Vec tIn = atStart ? dirOf(wrap, true) : dirOf(prims[i1], true);
+            const gp_Vec tOut = atStart ? dirOf(prims[i0], false) : dirOf(wrap, false);
+            const double turn = tIn.Angle(tOut);
+            return turn < 1e-9 ? 0.0 : wireRadius * std::tan(0.5 * turn);
+        };
+        std::vector<double> takenAtStart(m, 0.0), takenAtEnd(m, 0.0), tanLen(m, 0.0);
+        takenAtStart.front() = mitreAt(true);
+        takenAtEnd.back() = mitreAt(false);
+        std::vector<size_t> order;
+        for (size_t k = 1; k < m; ++k)
+            if (halfTan[k] > 0.0) order.push_back(k);
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return halfTan[a] < halfTan[b]; });
+        // ABT #2274 (Alf, 2026-11-13: "I want ALL of them round when we say round"): a short straight between two
+        // corners that turn the wire off its direction and back onto it (a dragback's one-OD radial step between two
+        // axial legs) cannot hold two 90-degree bends of radius R when it is shorter than 2R. It is drawn as ONE
+        // S of two arcs of that same radius R, each turning by alpha with 2R (1 - cos alpha) = the step's offset:
+        // round all through, the step's own straight consumed, R sin(alpha) taken from each long leg.
+        std::vector<double> sAlpha(m + 1, 0.0);   // sAlpha[k] > 0: corners k and k+1 (around leg k) are one S
+        for (size_t k = 1; k + 1 < m; ++k) {
+            if (halfTan[k] <= 0.0 || halfTan[k + 1] <= 0.0) continue;
+            const gp_XYZ a = dirOf(prims[i0 + k - 1]), u = dirOf(prims[i0 + k]), b = dirOf(prims[i0 + k + 1]);
+            if (a.Dot(b) < 1.0 - 1e-9 || std::abs(a.Dot(u)) > 1e-6) continue;   // not an offset step
+            if (bend * (halfTan[k] + halfTan[k + 1]) <= len[k]) continue;        // the two bends fit as they are
+            const double h = len[k];
+            if (!(h < 2.0 * bend)) continue;
+            const double alpha = std::acos(1.0 - h / (2.0 * bend));
+            const double take = bend * std::sin(alpha);
+            if (take > len[k - 1] - takenAtStart[k - 1] || take > len[k + 1] - takenAtEnd[k + 1]) continue;
+            sAlpha[k] = alpha;
+            tanLen[k] = take;          // what the S takes of the leg before it
+            tanLen[k + 1] = take;      // and of the leg after it
+            takenAtEnd[k - 1] = take;
+            takenAtStart[k + 1] = take;
+            halfTan[k] = halfTan[k + 1] = 0.0;   // settled: no plain bend at either corner
+            ++k;
+        }
+        order.erase(std::remove_if(order.begin(), order.end(), [&](size_t k) { return halfTan[k] <= 0.0; }), order.end());
+        for (size_t k : order) {
+            const double need = bend * halfTan[k];
+            const double roomBefore = len[k - 1] - takenAtStart[k - 1];
+            const double roomAfter = len[k] - takenAtEnd[k];
+            // Equal is a fit: MKF makes a dragback's radial leg exactly one bend long, and need == room then
+            // differs only by floating-point round-off (17_cllc: 0.00098225 vs 0.00098225 m). A few ulps, no length.
+            auto fits = [](double nd, double rm) { return nd <= rm + 8.0 * std::numeric_limits<double>::epsilon() * std::max(std::abs(nd), std::abs(rm)); };
+            if (fits(need, roomBefore) && fits(need, roomAfter)) {
+                tanLen[k] = need;
+                takenAtEnd[k - 1] = need;
+                takenAtStart[k] = need;
+                continue;
+            }
+            const gp_Pnt at = prims[i0 + k].seg.a;
+            std::cerr << "[ConductorBuilder] FINDING: " << what << " corner " << k << " of '" << prims[i0 + k].label << "' of "
+                      << who << " (at " << at.X() << ", " << at.Y() << ", " << at.Z() << " m) cannot hold MKF's bend of "
+                      << bend << " m: its tangent length " << need << " m against legs " << roomBefore << " and "
+                      << roomAfter << " m left beside what its neighbours take (" << takenAtStart[k - 1] << " and "
+                      << takenAtEnd[k] << " m); it is drawn sharp (bisection mitre)\n";
+            if (std::getenv("MVB_CORNER_LIST"))
+                std::fprintf(stderr, "[corner-list]\t%s\t%s\t%s\t%.6f,%.6f,%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n", what, who.c_str(),
+                             prims[i0 + k].label.c_str(), at.X() * 1e3, at.Y() * 1e3, at.Z() * 1e3, bend * 1e3,
+                             need * 1e3, roomBefore * 1e3, roomAfter * 1e3);
+        }
+        std::vector<Primitive> rebuilt;
+        for (size_t k = 0; k < m; ++k) {
+            if (k >= 1 && sAlpha[k] > 0.0) continue;   // the S's own short step: consumed by its two arcs
+            Primitive sg = prims[i0 + k];
+            const gp_XYZ d = dirOf(sg);
+            const gp_Pnt b0 = sg.seg.b;
+            sg.seg.a = gp_Pnt(sg.seg.a.XYZ() + d * tanLen[k]);
+            sg.seg.b = gp_Pnt(b0.XYZ() - d * (k + 1 < m ? tanLen[k + 1] : 0.0));
+            if (sg.seg.a.Distance(sg.seg.b) >= 1e-12) rebuilt.push_back(sg);
+            if (k + 1 < m && sAlpha[k + 1] > 0.0) {
+                // The S across leg k+1: from this leg's trimmed end, tangent to it, to the step's midpoint, then on
+                // to the next leg's trimmed start -- two arcs of radius `bend` (arcFromTangent derives the radius
+                // from the chord; 2R(1 - cos alpha) = the step makes it exactly `bend`).
+                const Primitive& step = prims[i0 + k + 1];
+                const gp_Pnt mid((step.seg.a.XYZ() + step.seg.b.XYZ()) * 0.5);
+                const gp_XYZ dNext = dirOf(prims[i0 + k + 2]);
+                const gp_Pnt endS(step.seg.b.XYZ() + dNext * tanLen[k + 2]);
+                const std::string& lb = step.label;
+                const std::string base = lb.substr(0, lb.rfind(" seg "));
+                ArcOut a1 = arcFromTangent(sg.seg.b, gp_Vec(d), mid, step, "s1");
+                ArcOut a2 = arcFromTangent(mid, a1.tEnd, endS, step, "s2");
+                if (a2.tEnd.Angle(gp_Vec(dNext)) > 1e-7 || std::abs(a1.radius - bend) > 1e-9 * bend ||
+                    std::abs(a2.radius - bend) > 1e-9 * bend)
+                    throw std::logic_error("filletDragbackInteriorCorners: the S of " + who + " at '" + lb +
+                                           "' does not close at radius " + std::to_string(bend));
+                a1.pr.label = base + joint + std::to_string(k + 1);
+                a2.pr.label = base + joint + std::to_string(k + 2);
+                rebuilt.push_back(a1.pr);
+                rebuilt.push_back(a2.pr);
+                bent += 2;
+                continue;
+            }
+            if (k + 1 >= m || tanLen[k + 1] <= 0.0) continue;
+            const gp_XYZ d1 = dirOf(prims[i0 + k + 1]);
+            const double cosT = std::clamp(d.Dot(d1), -1.0, 1.0);
+            gp_XYZ normal = d1 - d * cosT;
+            const gp_XYZ axis = d.Crossed(d1);
+            if (normal.Modulus() < 1e-12 || axis.Modulus() < 1e-12)
+                throw std::logic_error("filletDragbackInteriorCorners: corner " + std::to_string(k + 1) + " of " + who +
+                                       " has a turn but no plane");
+            normal /= normal.Modulus();
+            const gp_Pnt tA(b0.XYZ() - d * tanLen[k + 1]);
+            Primitive pr = prims[i0 + k];
+            pr.kind = Primitive::ARC3;
+            pr.arc.c = gp_Pnt(tA.XYZ() + normal * bend);
+            pr.arc.axis = axis / axis.Modulus();
+            pr.arc.v0 = tA.XYZ() - pr.arc.c.XYZ();
+            pr.arc.sweep = std::acos(cosT);
+            const std::string& lb = prims[i0 + k].label;
+            // " bend " as appendFilletedPolyline names a connection's joint (not " corner ": 02_flyback reads those).
+            pr.label = lb.substr(0, lb.rfind(" seg ")) + joint + std::to_string(k + 1);
+            rebuilt.push_back(std::move(pr));
+            ++bent;
+        }
+        if (rebuilt.empty())
+            throw std::logic_error("filletDragbackInteriorCorners: the dragback run of " + who + " at '" + prims[i0].label +
+                                   "' has no copper left");
+        prims.erase(prims.begin() + static_cast<std::ptrdiff_t>(i0), prims.begin() + static_cast<std::ptrdiff_t>(i1) + 1);
+        prims.insert(prims.begin() + static_cast<std::ptrdiff_t>(i0), rebuilt.begin(), rebuilt.end());
+        i0 += rebuilt.size() - 1;
+    }
+    return bent;
+}
+}  // namespace
+
 static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, double wireRadius,
                                  const std::string& who, double entranceRoll, double exitRoll,
                                  const FilletClears& clears, size_t* uncleared, std::string* witness,
-                                 bool dragbackEnds, bool allowSlant) {
+                                 bool dragbackEnds, bool allowSlant,
+                                 const std::optional<PlannedClimb>& entranceClimb,
+                                 const std::optional<PlannedClimb>& exitClimb) {
     // The corners this pass owns: a terminal stub and its lead, or (dragbackEnds) a wrap and the Z
     // dragback straight it meets -- the wrap it leaves (exit order) or the wrap it lands on (entrance).
     auto cornerOf = [&](const Primitive& helixSide, const Primitive& straightSide) {
@@ -693,14 +970,10 @@ static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, 
                             : filletable(helixSide, straightSide);
     };
     size_t done = 0;
-    // THE SLANTED STEP (Alf, 2026-10-28): a corner whose lead leg is a one-OD step between the lead's own
-    // rounded corner and the helix, with no biarc fitting, is retried on a slanted step (slantOneOdStep)
-    // whose slant gives the terminal bend 1, 1.2, 1.44, ... times its plain tangent length -- the biarc
-    // leaves a helix, so it needs more than a straight corner would, by the same 1.2 steps the biarc
-    // search itself takes. Per corner, by its stub's label: the attempt, and the corner as it stood.
-    std::map<std::string, size_t> slantAttempt;
-    std::map<std::string, std::vector<Primitive>> beforeSlant;
-    constexpr size_t kSlantAttempts = 12;
+    // ABT #2274 (Alf, 2026-11-13): every corner here is ONE planar 90-degree bend at MKF's radius, or sharp and
+    // reported -- never a rolled biarc, so the fan's rolls, the slanted step and the per-candidate clearance search
+    // have nothing left to choose. The bend is judged with the rest of the copper by the enamel gate.
+    (void)entranceRoll; (void)exitRoll; (void)clears; (void)uncleared; (void)witness; (void)allowSlant;
     for (size_t i = 0; i + 1 < prims.size(); ++i) {
         const bool exitCorner = cornerOf(prims[i], prims[i + 1]);
         const bool entranceCorner = cornerOf(prims[i + 1], prims[i]);
@@ -708,15 +981,16 @@ static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, 
         const size_t stubIdx = exitCorner ? i : i + 1;
         size_t leadIdx = exitCorner ? i + 1 : i;
         const std::string stubLabel = prims[stubIdx].label;
-        std::optional<SlantedStep> slanted;
-        if (const size_t attempt = slantAttempt[stubLabel]; attempt > 0) {
-            const Spiral& st = prims[stubIdx].spiral;
-            const gp_Vec t = evalSpiral(st, exitCorner ? st.az1 : st.az0).t;
-            slanted = slantOneOdStep(prims, leadIdx, exitCorner, exitCorner ? t.Reversed() : t, minBend,
-                                     0.9 / std::pow(1.2, static_cast<double>(attempt - 1)), minBend);
-        }
-        else {
-            beforeSlant[stubLabel] = prims;
+        // ABT #2274 item E (agent 48): the chain's TERMINAL corner (no helix before an entrance corner, none after an
+        // exit corner) takes the climb MKF planned for it, when MKF planned one.
+        std::optional<PlannedClimb> planned;
+        if (!dragbackEnds) {
+            bool helixBeyond = false;
+            if (entranceCorner)
+                for (size_t k = 0; k < i + 1 && !helixBeyond; ++k) helixBeyond = prims[k].kind == Primitive::SPIRAL;
+            else
+                for (size_t k = i + 1; k < prims.size() && !helixBeyond; ++k) helixBeyond = prims[k].kind == Primitive::SPIRAL;
+            if (!helixBeyond) planned = entranceCorner ? entranceClimb : exitClimb;
         }
         Primitive& sp = prims[stubIdx];
         const double sgn = sp.spiral.az1 >= sp.spiral.az0 ? 1.0 : -1.0;
@@ -768,364 +1042,279 @@ static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, 
               << "' reverses the wire by " << theta * 180.0 / kPi << " deg; no fillet exists.";
             throw std::runtime_error(m.str());
         }
-        double L0 = std::max(minBend * std::tan(0.5 * theta), 1e-9);
-        bool consumeLeg = false;
-        if (0.9 * usable < L0) {
-            const long prev = entranceCorner ? static_cast<long>(leadIdx) - 1 : static_cast<long>(leadIdx) + 1;
-            if (prev >= 0 && prev < static_cast<long>(prims.size()) &&
-                prims[static_cast<size_t>(prev)].kind == Primitive::SEG) {
-                gp_Vec t2; double len2 = 0.0, usable2 = 0.0;
-                legInfo(static_cast<size_t>(prev), entranceCorner, t2, len2, usable2);
-                if (len2 > 1e-12) {
-                    consumeLeg = true;
-                    leadIdx = static_cast<size_t>(prev);
-                    tSeg = t2; segLen = len2; usable = usable2;
-                }
-            }
-        }
-        Primitive& sg = prims[leadIdx];
-        // the lead-side anchor: where the fillet's straight tangent leg starts/ends
-        const gp_Pnt anchor = entranceCorner ? sg.seg.b : sg.seg.a;
-        const gp_Vec tIn2 = exitCorner ? atJoint.t : tSeg;
-        const gp_Vec tOut2 = exitCorner ? tSeg : atJoint.t;
-        const double theta2 = tIn2.Angle(tOut2);
-        double L = std::max(minBend * std::tan(0.5 * theta2), 1e-9);
-        // A dragback's wrap is a whole turn, not a stub: the corner never reaches past it into another.
-        const bool neighbourOk = dragbackEnds ? false : exitCorner ? (i > 0 && sameHelix(prims[i - 1], prims[i]))
-                                            : (i + 2 < prims.size() && sameHelix(prims[i + 1], prims[i + 2]));
-        const size_t nbIdx = exitCorner ? (i > 0 ? i - 1 : 0) : i + 2;
-        const double spanAbs = std::abs(sp.spiral.az1 - sp.spiral.az0);
-        const double nbSpanAbs = neighbourOk ? std::abs(prims[nbIdx].spiral.az1 - prims[nbIdx].spiral.az0) : 0.0;
-        if (std::getenv("MVB_FILLET_DIAG")) {
-            std::fprintf(stderr, "[fillet] '%s' %s theta=%.4f deg L0=%.6f mm dsdaz=%.6f m/rad span=%.4f deg (neighbour helix %s, %.4f deg) lead leg %.6f mm (%.6f usable)%s\n",
-                         sp.label.c_str(), exitCorner ? "EXIT" : "ENTRANCE", theta2 * 180.0 / kPi, L * 1e3,
-                         atJoint.dsdaz, spanAbs * 180.0 / kPi, neighbourOk ? "yes" : "no",
-                         nbSpanAbs * 180.0 / kPi, segLen * 1e3, usable * 1e3,
-                         consumeLeg ? " [short leg consumed, previous leg used]" : "");
-        }
-        std::optional<Fillet> best, gentle;
-        size_t rejected = 0;
-        std::string lastWitness;
-        gp_Pnt P1, P2, gentleP1, gentleP2;
-        bool intoNeighbour = false, gentleNb = false;
-        double azCut = azJoint, gentleCut = azJoint;
-        // The ROLL of the corner: the caller's, and -- when the fillet must be proven (clears) and
-        // none at that roll clears -- every other: the default snap, then 24 even rolls. Each is
-        // searched along the corner exactly as before; the first proven fit is taken.
-        std::vector<double> rollsToTry{exitCorner ? exitRoll : entranceRoll};
-        if (clears) {
-            if (std::isfinite(rollsToTry.front())) rollsToTry.push_back(std::numeric_limits<double>::quiet_NaN());
-            for (int k = 0; k < 24; ++k) rollsToTry.push_back(2.0 * kPi * k / 24.0);
-        }
-        const double Lstart = L;
-        for (size_t rollIndex = 0; rollIndex < rollsToTry.size() && !best; ++rollIndex) {
-        const double rollNow = rollsToTry[rollIndex];
-        L = Lstart;
-        gentle.reset();
-        for (int it = 0; it < 24; ++it, L *= 1.2) {
-            const double dAz = L / std::max(atJoint.dsdaz, 1e-18);
-            if (L > 0.9 * usable) break;
-            bool useNb = false;
-            if (dAz <= 0.98 * spanAbs) {
-                azCut = exitCorner ? azJoint - sgn * dAz : azJoint + sgn * dAz;
-            }
-            else if (neighbourOk && dAz - spanAbs <= 0.9 * nbSpanAbs) {
-                useNb = true;
-                const double rest = dAz - spanAbs;
-                const Spiral& nb = prims[nbIdx].spiral;
-                azCut = exitCorner ? nb.az1 - sgn * rest : nb.az0 + sgn * rest;
-            }
-            else {
-                break;
-            }
-            const SpiralEval atCut = evalSpiral(useNb ? prims[nbIdx].spiral : sp.spiral, azCut);
-            gp_Vec t1, t2;
-            if (exitCorner) {
-                P1 = atCut.p; t1 = atCut.t;
-                P2 = anchor.Translated(tSeg * L); t2 = tSeg;
-            }
-            else {
-                P1 = anchor.Translated(tSeg * (-L)); t1 = tSeg;
-                P2 = atCut.p; t2 = atCut.t;
-            }
+        // ABT #2274 (Alf, 2026-11-13: "always do 90 degree in either radial or tangential direction"; "the inner
+        // radius of the turns should be the coating thickness"): the helix-to-lead corner is ONE planar bend at MKF's
+        // radius (minBend: the coated half size plus the coating), never a rolled biarc. The helix is cut back by the
+        // bend's tangent length L = R tan(theta/2); its tangent line there and the lead's leg meet at a vertex V, so
+        // the arc from the cut point to V + d L is a circle of radius R in the plane of the two lines -- no roll, no
+        // search. When the stub is shorter than L the cut continues into the same helix's neighbouring piece. When
+        // neither the helix nor the leg has the room, the corner stays sharp and says so.
+        {
+            const double R = minBend;
+            const bool nbOk = dragbackEnds ? false
+                                           : exitCorner ? (i > 0 && sameHelix(prims[i - 1], prims[i]))
+                                                        : (i + 2 < prims.size() && sameHelix(prims[i + 1], prims[i + 2]));
+            const size_t nbI = exitCorner ? (i > 0 ? i - 1 : 0) : i + 2;
+            const double span0 = std::abs(sp.spiral.az1 - sp.spiral.az0);
+            const double nbSpan = nbOk ? std::abs(prims[nbI].spiral.az1 - prims[nbI].spiral.az0) : 0.0;
+            Primitive& lg = prims[leadIdx];
+            gp_Pnt farEnd = entranceCorner ? lg.seg.a : lg.seg.b;
+            double L = R * std::tan(0.5 * theta);
+            double Lv = L;   // the tangent length V was placed at: Q uses the same, so the arc is exactly symmetric
+            double azC = azJoint;
+            bool intoNb = false, ok = true;
+            gp_Pnt Pc, V, Q;
+            gp_Vec tc, d;
+            // EXACT ON THE LEG'S OWN LINE (ABT #2274): when the helix's tangent and the leg are coplanar (a level wrap
+            // and a level step, 06_llc's dragback starts), the bend is solved with the leg unmoved -- the cut point
+            // whose tangent line meets the leg's line exactly R tan(theta/2) away. Re-aiming the leg from its far end
+            // (the general method below, for skew lines) tilted 06_llc's dragback steps by 0.15 mrad, which turned
+            // their next bend 2 nm into the sibling lane.
+            bool exact = false;
             {
-                const Spiral& cutSp = useNb ? prims[nbIdx].spiral : sp.spiral;
-                // The helix-side bend turns TOWARDS THE LEAD: in the plane of the helix tangent
-                // and the direction from the helix point to the lead's tangent point. For a
-                // radial leg that is the osculating plane (radial departure, neutral to the
-                // axial siblings); for an axial leg it is the layer's tangent plane (no radial
-                // excursion into the next layer -- a bend in the osculating plane there swung
-                // 150 um outward on pushpull/06 and 20-100 um into the neighbouring layer).
-                gp_Vec nH = spiralPrincipalNormal(cutSp, azCut);
-                // THE ROLL: which way, about the helix's own tangent, the corner escapes. The
-                // caller gives it when it can see the neighbours; NaN keeps the historical snap
-                // to the natural plane nearest the lead.
-                const double roll = rollNow;
-                {
-                    // Snap the bend direction to one of the helix's two natural planes: the
-                    // osculating plane (T, N) when the lead lies radially, the rectifying plane
-                    // (T, B) when it lies axially. Using the raw direction to the lead point
-                    // carried the leg's few-um axial offset into the plane -> a 2.25 mrad tilt
-                    // of the helix-side arc -> 1.3 nm into the axial sibling (boost, measured).
-                    // The residual belongs to the lead-side arcs of the biarc.
-                    const gp_Pnt& PHx = exitCorner ? P1 : P2;
-                    const gp_Pnt& PLx = exitCorner ? P2 : P1;
-                    const gp_Vec& tHx = exitCorner ? t1 : t2;
-                    gp_Vec toLead(PHx, PLx);
-                    toLead -= tHx * toLead.Dot(tHx);
-                    if (toLead.Magnitude() > 1e-12 && nH.Magnitude() > 1e-30) {
-                        toLead.Normalize();
-                        gp_Vec B = tHx.Crossed(nH);
-                        B.Normalize();
-                        if (std::isfinite(roll)) {
-                            // Exactly the direction the caller solved for.
-                            nH = nH * std::cos(roll) + B * std::sin(roll);
-                        }
-                        else {
-                            const double cN = toLead.Dot(nH), cB = toLead.Dot(B);
-                            nH = (std::abs(cN) >= std::abs(cB)) ? nH * (cN >= 0 ? 1.0 : -1.0)
-                                                                : B * (cB >= 0 ? 1.0 : -1.0);
-                        }
+                auto cutPoint = [&](double Ltry, gp_Pnt& P, gp_Vec& t, double& az, bool& nb) {
+                    const double dAz = Ltry / std::max(atJoint.dsdaz, 1e-18);
+                    if (dAz <= 0.98 * span0) {
+                        nb = false;
+                        az = exitCorner ? azJoint - sgn * dAz : azJoint + sgn * dAz;
+                    } else if (nbOk && dAz - span0 <= 0.98 * nbSpan) {
+                        nb = true;
+                        const Spiral& s2 = prims[nbI].spiral;
+                        az = exitCorner ? s2.az1 - sgn * (dAz - span0) : s2.az0 + sgn * (dAz - span0);
+                    } else {
+                        return false;
+                    }
+                    const SpiralEval e = evalSpiral(nb ? prims[nbI].spiral : sp.spiral, az);
+                    P = e.p;
+                    t = e.t;
+                    return true;
+                };
+                // g(L): how far the tangent line at the cut point L back meets the leg's line, less the tangent
+                // length the bend there needs. Coplanarity is required (skew distance below a picometre).
+                auto g = [&](double Ltry, double& out) {
+                    gp_Pnt P; gp_Vec t; double az; bool nb;
+                    if (!cutPoint(Ltry, P, t, az, nb)) return false;
+                    const gp_Vec n = t.Crossed(tSeg);
+                    if (n.SquareMagnitude() < 1e-24) return false;
+                    const gp_Vec w(P, farEnd);
+                    if (std::abs(w.Dot(n)) / n.Magnitude() > 1e-12) return false;   // skew: no exact planar bend
+                    const double s = w.Crossed(tSeg).Dot(n) / n.SquareMagnitude();   // P + t s is on the leg's line
+                    const double th = t.Angle(tSeg);
+                    if (th > 170.0 * kPi / 180.0) return false;
+                    out = (exitCorner ? s : -s) - R * std::tan(0.5 * th);
+                    return true;
+                };
+                double x0 = L, x1 = L * 1.001, g0 = 0.0, g1 = 0.0;
+                bool okSolve = g(x0, g0) && g(x1, g1);
+                for (int it = 0; okSolve && it < 60 && std::abs(g1) > 1e-14; ++it) {
+                    if (std::abs(g1 - g0) < 1e-300) { okSolve = false; break; }
+                    const double x2 = x1 - g1 * (x1 - x0) / (g1 - g0);
+                    x0 = x1; g0 = g1; x1 = x2;
+                    if (!(x1 > 0.0) || !g(x1, g1)) okSolve = false;
+                }
+                if (okSolve && std::abs(g1) <= 1e-14) {
+                    gp_Pnt P; gp_Vec t; double az; bool nb;
+                    cutPoint(x1, P, t, az, nb);
+                    const double th = t.Angle(tSeg);
+                    const double Lx = R * std::tan(0.5 * th);
+                    // the vertex: on the tangent line, Lx from the cut point (= on the leg's line, to |g| <= 1e-14)
+                    const gp_Pnt Vx = P.Translated(t * (exitCorner ? Lx : -Lx));
+                    const double legLen = Vx.Distance(farEnd);
+                    if (Lx < legLen) {
+                        Pc = P; tc = t; azC = az; intoNb = nb; L = Lx; Lv = Lx; d = tSeg; V = Vx;
+                        exact = true;
                     }
                 }
-                best.reset();
-                // PLANAR CORNER: when the lead leaves in the helix's osculating plane (t1, t2 and
-                // the chord coplanar), one circular arc of radius L/tan(theta/2) is the exact
-                // fillet -- no tilt towards the axial siblings, nothing to absorb.
-                {
-                    const gp_Vec chord(P1, P2);
-                    gp_Vec nPlane = t1.Crossed(t2);
-                    if (nPlane.Magnitude() > 1e-12 && chord.Magnitude() > 1e-15) {
-                        nPlane.Normalize();
-                        const double off = std::abs(chord.Dot(nPlane));
-                        const double th = t1.Angle(t2);
-                        // tangent lengths must be equal for a single arc: |chord| = 2 L sin... check
-                        // the arc through P1 tangent t1 lands on P2 with tangent t2
-                        if (off < 1e-12 && th > 1e-9) {
-                            // Corner point X of the two tangent lines; the single arc needs equal
-                            // tangent lengths from X. The helix side is fixed (P2 on the helix);
-                            // slide the lead-side point along its line to match.
-                            const gp_Vec w(P2, P1);
-                            const double c12 = t1.Dot(t2);
-                            const double den = 1.0 - c12 * c12;
-                            if (den > 1e-18) {
-                                // P1 + s1 t1 = P2 + s2 t2 (least squares on the coplanar lines)
-                                const double s1 = (-(w.Dot(t1)) + c12 * w.Dot(t2)) / den;
-                                const double s2 = (w.Dot(t2) - c12 * w.Dot(t1)) / den;
-                                const gp_Pnt X = P1.Translated(t1 * s1);
-                                // a corner: P1 before X along t1, P2 after X along t2
-                                if (s1 > 0 && s2 < 0) {
-                                    gp_Pnt P1x = P1, P2x = P2;
-                                    if (exitCorner) P2x = X.Translated(t2 * s1);      // helix at P1
-                                    else            P1x = X.Translated(t1 * s2);      // helix at P2 (s2 < 0)
-                                    const gp_Pnt& leadPt = exitCorner ? P2x : P1x;
-                                    // the lead-side point must stay on the usable part of the leg
-                                    const double along = exitCorner ? gp_Vec(anchor, leadPt).Dot(tSeg)
-                                                                    : -gp_Vec(anchor, leadPt).Dot(tSeg);
-                                    if (along > 0 && along <= 0.9 * usable) {
-                                        ArcOut a = arcFromTangent(P1x, t1, P2x, sp, "fillet arc 1");
-                                        if (!a.straight && a.tEnd.Angle(t2) < 1e-9 &&
-                                            a.radius >= minBend * (1.0 - 1e-9)) {
-                                            P1 = P1x;
-                                            P2 = P2x;
-                                            Fillet f;
-                                            f.arcs = {a};
-                                            f.minRadius = a.radius;
-                                            best = std::move(f);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+            }
+            // SKEW LINES (a pitched helix against a vertical lead): no planar bend keeps the leg's line, so the leg is
+            // re-aimed. When its far end is the end of the lead's own round corner, it is re-aimed about that corner's
+            // VERTEX and the corner is rebuilt at its new angle (same radius, same pieces): re-aiming about the arc's
+            // end left a 0.2-0.7 degree kink between the corner and the leg (06_llc's entrance leads).
+            const long kArc = exitCorner ? static_cast<long>(leadIdx) + 1 : static_cast<long>(leadIdx) - 1;
+            const long kSeg = exitCorner ? static_cast<long>(leadIdx) + 2 : static_cast<long>(leadIdx) - 2;
+            bool farCorner = false;
+            gp_Vec farDir;      // the corner's other straight, travel direction
+            double farRadius = 0.0;
+            if (!exact && kArc >= 0 && kSeg >= 0 && kSeg < static_cast<long>(prims.size()) &&
+                prims[static_cast<size_t>(kArc)].kind == Primitive::ARC3 &&
+                prims[static_cast<size_t>(kSeg)].kind == Primitive::SEG) {
+                const Primitive& ca = prims[static_cast<size_t>(kArc)];
+                const Primitive& cs = prims[static_cast<size_t>(kSeg)];
+                const auto ce = primEndpoints(ca);
+                const bool joins = exitCorner ? (ce.first.Distance(farEnd) < 1e-12 && ce.second.Distance(cs.seg.a) < 1e-12)
+                                              : (ce.second.Distance(farEnd) < 1e-12 && ce.first.Distance(cs.seg.b) < 1e-12);
+                gp_Vec dv(cs.seg.a, cs.seg.b);
+                if (joins && dv.Magnitude() > 1e-12) {
+                    dv.Normalize();
+                    farRadius = ca.arc.v0.Modulus();
+                    const double tl = farRadius * std::tan(0.5 * std::abs(ca.arc.sweep));
+                    farDir = dv;
+                    farEnd = exitCorner ? cs.seg.a.Translated(dv * (-tl)) : cs.seg.b.Translated(dv * tl);   // the vertex
+                    farCorner = true;
+                }
+            }
+            // THE LEAD STAYS IN ITS LANE'S PLANE (Alf, 2026-11-09, decision 2: "every run stands on MKF's lane"). The
+            // helix's tangent line never meets the leg's line, so the leg is re-aimed from the bend's vertex V to its far
+            // end; with the helix cut exactly one tangent length back, V stood a few micrometres off the lane sideways
+            // and the re-aimed leg -- and the lead's own corner rebuilt at its far end -- leaned out of the lane's plane
+            // by about a milliradian: on the isolated buck-boost and the complete flyback that corner bulged 1.9 / 1.7 nm
+            // into the neighbouring lead, which MKF lays touching. The plane is the lead's own: the leg and the straight
+            // beyond its far corner, or the leg and the column axis where the leg is the lead's last. The cut is moved
+            // along the helix until V lies in it; the leg then leans only within the plane, and its far corner stays there.
+            std::optional<gp_Vec> lanePlaneNormal;
+            if (!exact) {
+                gp_Vec nrm = farCorner ? tSeg.Crossed(farDir) : tSeg.Crossed(gp_Vec(0.0, 1.0, 0.0));
+                if (nrm.Magnitude() > 1e-9) {
+                    nrm.Normalize();
+                    lanePlaneNormal = nrm;
+                }
+            }
+            for (int pass = 0; pass < 4 && ok && !exact; ++pass) {
+                auto cutAt = [&](double dAzTry, gp_Pnt& P, gp_Vec& t, double& az, bool& nb) {
+                    if (dAzTry <= 0.98 * span0) {
+                        nb = false;
+                        az = exitCorner ? azJoint - sgn * dAzTry : azJoint + sgn * dAzTry;
+                    } else if (nbOk && dAzTry - span0 <= 0.98 * nbSpan) {
+                        nb = true;
+                        const double rest = dAzTry - span0;
+                        const Spiral& s2 = prims[nbI].spiral;
+                        az = exitCorner ? s2.az1 - sgn * rest : s2.az0 + sgn * rest;
+                    } else {
+                        return false;
                     }
+                    const SpiralEval e = evalSpiral(nb ? prims[nbI].spiral : sp.spiral, az);
+                    P = e.p;
+                    t = e.t;
+                    return true;
+                };
+                double dAz = L / std::max(atJoint.dsdaz, 1e-18);
+                if (lanePlaneNormal) {
+                    // off(dAz): how far the vertex of the cut dAz back stands off the lane's plane.
+                    auto off = [&](double dAzTry, double& out) {
+                        gp_Pnt P; gp_Vec t; double az; bool nb;
+                        if (!cutAt(dAzTry, P, t, az, nb)) return false;
+                        const gp_Pnt vertex = exitCorner ? P.Translated(t * L) : P.Translated(t * (-L));
+                        out = gp_Vec(farEnd, vertex).Dot(*lanePlaneNormal);
+                        return true;
+                    };
+                    double x0 = dAz, x1 = dAz * (1.0 + 1e-3), h0 = 0.0, h1 = 0.0;
+                    bool solved = off(x0, h0) && off(x1, h1);
+                    for (int it = 0; solved && it < 40 && std::abs(h1) > 1e-15; ++it) {
+                        if (std::abs(h1 - h0) < 1e-300) { solved = false; break; }
+                        const double x2 = x1 - h1 * (x1 - x0) / (h1 - h0);
+                        x0 = x1; h0 = h1; x1 = x2;
+                        if (!(x1 > 0.0) || !off(x1, h1)) solved = false;
+                    }
+                    if (solved && std::abs(h1) <= 1e-15) dAz = x1;   // else: the cut one tangent length back, as before
                 }
-                // The planar helix-side bend, from a SHALLOW angle up: its excursion from the
-                // helix is R(1-cos phi), so the smallest phi that closes the biarc is the one
-                // that stays nearest the wire's own path -- and the neighbours, whichever side
-                // they are on, sit one coated OD away with nothing to spare. (Measured the other
-                // way round on 14_dab: forcing the GENTLEST fit instead of the tightest took the
-                // intrusion from 4 nm to 551 nm.) 1 deg steps, so a 5 deg corner is not rounded
-                // to 5 deg of excursion when 1 deg would do.
-                const int wantVariant = 0;
-                int seen = 0;
-                std::optional<Fillet> lastFit;
-                // Spread the candidates across the whole admissible range rather than in 1 deg
-                // steps: six neighbouring angles are six almost identical fillets, and the fan
-                // needs genuinely different ones to choose from (14_dab).
-                // VARIANT 0 IS THE HISTORICAL FILLET: the first fit walking 5 degrees at a time,
-                // which is what the corpus was verified on. The finer and wider angles are extra
-                // CHOICES for the fan, never a change of default -- moving variant 0 to a 1 degree
-                // first step silently re-cornered every terminal in the corpus and broke two
-                // designs that had been clean (24_margin_interleaved_flyback, complete_flyback).
-                static const double kPhiDeg[] = {5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 85};
-                for (double phiDeg : kPhiDeg) {
-                    const double phi = phiDeg * kPi / 180.0;
-                    auto f = triarcHelixPlane(P1, t1, P2, t2, /*helixAtP2=*/!exitCorner, nH,
-                                              minBend, phi, sp);
-                    if (!(f && f->minRadius >= minBend * (1.0 - 1e-9))) continue;
-                    lastFit = f;
-                    if (seen++ == wantVariant) { best = std::move(f); break; }
+                if (!cutAt(dAz, Pc, tc, azC, intoNb)) {
+                    ok = false;
+                    break;
                 }
-                if (!best && lastFit) best = std::move(lastFit);   // fewer variants than asked
+                V = exitCorner ? Pc.Translated(tc * L) : Pc.Translated(tc * (-L));
+                Lv = L;
+                d = exitCorner ? gp_Vec(V, farEnd) : gp_Vec(farEnd, V);
+                const double legLen = d.Magnitude();
+                if (legLen < 1e-12) { ok = false; break; }
+                d.Normalize();
+                const double th = exitCorner ? tc.Angle(d) : d.Angle(tc);
+                if (th > 170.0 * kPi / 180.0) { ok = false; break; }
+                const double Lnew = R * std::tan(0.5 * th);
+                // The leg must hold this bend's tangent and still reach its far end (whose own corner the
+                // dragback/lead passes round with their own bends) -- and, re-aimed about a round corner's vertex,
+                // that corner's tangent at its new angle too.
+                double farTl = 0.0;
+                if (farCorner) {
+                    const double thc = exitCorner ? d.Angle(farDir) : farDir.Angle(d);
+                    farTl = farRadius * std::tan(0.5 * thc);
+                }
+                if (Lnew + farTl >= legLen) { ok = false; break; }
+                if (std::abs(Lnew - L) < 1e-12) { L = Lnew; break; }
+                L = Lnew;
             }
-            if (std::getenv("MVB_FILLET_DIAG")) {
-                std::fprintf(stderr, "[fillet] '%s' it=%d L=%.6f mm dAz=%.4f deg %s%s minR=%.6f mm (need %.6f)\n",
-                             sp.label.c_str(), it, L * 1e3, dAz * 180.0 / kPi, best ? "biarc" : "NO-BIARC",
-                             useNb ? " [into neighbour]" : "", best ? best->minRadius * 1e3 : -1.0, minBend * 1e3);
-            }
-            if (best && best->minRadius >= minBend * (1.0 - 1e-9) && clears) {
-                // Proven before it is taken: a fit that does not clear the other conductors is
-                // not a candidate, whatever its radius.
-                std::vector<Primitive> candidate;
-                for (const auto& ao : best->arcs) {
-                    candidate.push_back(ao.pr);
-                    candidate.back().terminal = prims[leadIdx].terminal;   // as taken (see Apply)
+            if (ok) {
+                // Equal tangent lengths from V on both lines: the circle is tangent to the helix at Pc and to the
+                // leg at Q exactly (its radius is Lv / tan(theta/2), R to the iteration's last step).
+                Q = exitCorner ? V.Translated(d * Lv) : V.Translated(d * (-Lv));
+                ArcOut a = exitCorner ? arcFromTangent(Pc, tc, Q, sp, "fillet arc 1")
+                                      : arcFromTangent(Q, d, Pc, sp, "fillet arc 1");
+                Primitive q = a.pr;
+                q.isConnection = false;
+                q.terminalFillet = isStub(sp);
+                q.terminal = lg.terminal;
+                if (exitCorner) lg.seg.a = Q; else lg.seg.b = Q;
+                if (farCorner && !exact) {
+                    // Rebuild the lead's round corner at the re-aimed leg's angle, about the same vertex.
+                    Primitive& ca = prims[static_cast<size_t>(kArc)];
+                    Primitive& cs = prims[static_cast<size_t>(kSeg)];
+                    const gp_XYZ dIn = exitCorner ? d.XYZ() : farDir.XYZ();     // travel into the corner
+                    const gp_XYZ dOut = exitCorner ? farDir.XYZ() : d.XYZ();    // travel out of it
+                    const double cosT = std::max(-1.0, std::min(1.0, dIn.Dot(dOut)));
+                    const double tl = farRadius * std::sqrt((1.0 - cosT) / (1.0 + cosT));
+                    const gp_Pnt tA(farEnd.XYZ() - dIn * tl), tB(farEnd.XYZ() + dOut * tl);
+                    if (exitCorner) { lg.seg.b = tA; cs.seg.a = tB; } else { cs.seg.b = tA; lg.seg.a = tB; }
+                    gp_XYZ nrm = dOut - dIn * cosT;
+                    gp_XYZ ax = dIn.Crossed(dOut);
+                    if (nrm.Modulus() < 1e-15 || ax.Modulus() < 1e-15)
+                        throw std::logic_error("filletHelixCorners: the re-aimed lead corner of " + who + " is straight");
+                    nrm /= nrm.Modulus();
+                    ax /= ax.Modulus();
+                    ca.arc.c = gp_Pnt(tA.XYZ() + nrm * farRadius);
+                    ca.arc.axis = ax;
+                    ca.arc.v0 = tA.XYZ() - ca.arc.c.XYZ();
+                    ca.arc.sweep = std::acos(cosT);
                 }
-                std::string why;
-                if (!clears(candidate, &why)) {
-                    ++rejected;
-                    lastWitness = "candidate it=" + std::to_string(it) + " (L " + std::to_string(L * 1e3) +
-                                  " mm, " + std::to_string(dAz * 180.0 / kPi) + " deg of helix): " + why;
-                    if (std::getenv("MVB_FILLET_DIAG"))
-                        std::fprintf(stderr, "[fillet] '%s' it=%d REJECTED, does not clear: %s\n",
-                                     sp.label.c_str(), it, why.c_str());
-                    best.reset();
-                    continue;
+                auto cutAt = [&](Spiral& s2, double az, bool cutEnd) {
+                    const double f = (az - s2.az0) / (s2.az1 - s2.az0);
+                    const double r = s2.r0 + (s2.r1 - s2.r0) * f;
+                    const double y = s2.y0 + (s2.y1 - s2.y0) * f;
+                    if (cutEnd) { s2.az1 = az; s2.r1 = r; s2.y1 = y; }
+                    else        { s2.az0 = az; s2.r0 = r; s2.y0 = y; }
+                };
+                cutAt(intoNb ? prims[nbI].spiral : sp.spiral, azC, /*cutEnd=*/exitCorner);
+                size_t insertAt = i + 1;
+                // What the bend leaves of the stub, when no longer than the wire is thick, is folded into the same
+                // helix's neighbouring piece (exact: one helix, one law). A piece that short cannot be swept or
+                // glued cleanly (ABT #1905), and faceted it has no room for the one-chord transition to the round
+                // bend (06_llc at --segments 12: "spiral shorter than its round transition (129.4 um)").
+                bool folded = false;
+                if (!intoNb && nbOk && primLength(prims[stubIdx]) < 2.0 * wireRadius) {
+                    Spiral& nb = prims[nbI].spiral;
+                    const Spiral& st = prims[stubIdx].spiral;
+                    if (exitCorner) { nb.az1 = st.az1; nb.r1 = st.r1; nb.y1 = st.y1; }
+                    else            { nb.az0 = st.az0; nb.r0 = st.r0; nb.y0 = st.y0; }
+                    folded = true;
                 }
-            }
-            if (best && best->minRadius >= minBend * (1.0 - 1e-9)) {
-                intoNeighbour = useNb;
-                // MVB_FILLET_GENTLE=1: keep growing, and take the LAST fit rather than the
-                // first. The tightest fillet leans hardest towards whatever the corner turns
-                // past -- the same effect the layer link showed against an exact-touch sibling.
-                if (std::getenv("MVB_FILLET_GENTLE") == nullptr) break;
-                gentle = best;
-                gentleCut = azCut;
-                gentleP1 = P1;
-                gentleP2 = P2;
-                gentleNb = useNb;
-                best.reset();
+                if (intoNb || folded) {
+                    prims.erase(prims.begin() + static_cast<long>(stubIdx));
+                    if (stubIdx < insertAt) --insertAt;
+                }
+                prims.insert(prims.begin() + static_cast<long>(insertAt), q);
+                i = insertAt;
+                ++done;
+                if (std::getenv("MVB_FILLET_DIAG"))
+                    std::fprintf(stderr, "[bend90] '%s' %s R=%.6f mm L=%.6f mm radius drawn %.6f mm%s cut (%.12g,%.12g,%.12g) onLeg (%.12g,%.12g,%.12g) far (%.12g,%.12g,%.12g)\n",
+                                 stubLabel.c_str(), exitCorner ? "EXIT" : "ENTRANCE", R * 1e3, L * 1e3,
+                                 a.radius * 1e3, intoNb ? " (into the neighbouring piece)" : "", Pc.X(), Pc.Y(), Pc.Z(),
+                                 Q.X(), Q.Y(), Q.Z(), farEnd.X(), farEnd.Y(), farEnd.Z());
                 continue;
             }
-            best.reset();
-        }
-        if (!best && gentle) {   // the loop ran past the last fit: take it
-            best = gentle;
-            azCut = gentleCut;
-            P1 = gentleP1;
-            P2 = gentleP2;
-            intoNeighbour = gentleNb;
-        }
-        }
-        if (!best && rejected > 0) {
-            std::ostringstream m;
-            m << "TerminalFillet: every fitting fillet of the terminal corner of " << who << " at '"
-              << sp.label << "' (" << rejected << " candidate(s)) comes closer to another conductor than "
-              << "their coated envelopes allow; last: " << lastWitness;
-            if (uncleared && dragbackEnds) {
-                // Alf, 2026-10-30 ("Fully sharp there"): a dragback end with no round bend clear of its
-                // neighbours (boost: the slanted step runs into the touching sibling parallel) is drawn sharp,
-                // and so is its step's other corner, which a mitre at the end would run into.
-                prims = beforeSlant.at(stubLabel);
-                const size_t stepCorner = exitCorner ? i + 2 : i - 1;
-                const bool stepSharpened = (exitCorner || i > 0) && sharpenSegCorner(prims, stepCorner);
-                if (stepSharpened && !exitCorner) --i;
-                std::cerr << "[TerminalFillet] FINDING: the dragback end of " << who << " at '" << stubLabel
-                          << "' has no round bend clear of the other conductors (" << lastWitness << "); it"
-                          << (stepSharpened ? " and its step's other corner are" : " is")
-                          << " drawn sharp (bisection mitre).\n";
-                continue;
-            }
-            if (uncleared) {
-                ++*uncleared;
-                if (witness) *witness = m.str();
-                continue;   // left as it was: the caller re-rolls or throws with this witness
-            }
-            throw std::runtime_error(m.str());
-        }
-        const size_t attemptNow = slantAttempt[stubLabel];
-        if (allowSlant && !best && (attemptNow == 0 || slanted) && attemptNow < kSlantAttempts) {
-            // The corner as it stood, then the next slant. A step that cannot be slanted at all (no
-            // rounded lead corner beyond it, no room on the run) ends the retries with the plain error.
-            std::vector<Primitive> trial = beforeSlant.at(stubLabel);
-            const Spiral& st = trial[stubIdx].spiral;
-            const gp_Vec t = evalSpiral(st, exitCorner ? st.az1 : st.az0).t;
-            if (slantOneOdStep(trial, exitCorner ? i + 1 : i, exitCorner, exitCorner ? t.Reversed() : t, minBend,
-                               0.9 / std::pow(1.2, static_cast<double>(attemptNow)), minBend)) {
-                prims = beforeSlant.at(stubLabel);
-                slantAttempt[stubLabel] = attemptNow + 1;
-                --i;   // this corner again, on the slant
-                continue;
-            }
-        }
-        if (!best && dragbackEnds) {
-            // Alf, 2026-10-30: a dragback end no round bend fits is sharp, and so is its step's other corner.
-            prims = beforeSlant.at(stubLabel);
-            const size_t stepCorner = exitCorner ? i + 2 : i - 1;
-            const bool stepSharpened = (exitCorner || i > 0) && sharpenSegCorner(prims, stepCorner);
-            if (stepSharpened && !exitCorner) --i;
-            std::cerr << "[TerminalFillet] FINDING: the dragback end of " << who << " at '" << stubLabel
-                      << "' holds no round bend of at least " << minBend * 1e3 << " mm; it"
-                      << (stepSharpened ? " and its step's other corner are" : " is") << " drawn sharp (bisection mitre).\n";
+            // The lead-slot planner's trial lead (who "... (fan)") is not the emitted chain: a corner it cannot bend is
+            // that slot's verdict, not a corner of the part, so it is not reported (23_interleaved_llc printed a sharp
+            // Secondary corner that the emitted leads, all round, do not have).
+            if (who.find(" (fan") != std::string::npos) continue;
+            static thread_local std::set<std::string> reportedSharp;
+            if (reportedSharp.insert(who + "|" + stubLabel).second)
+                std::cerr << "[TerminalFillet] FINDING: the " << (dragbackEnds ? "dragback end" : "terminal corner")
+                          << " of " << who << " at '" << stubLabel << "' has no room for its "
+                          << R * 1e3 << " mm bend (tangent " << L * 1e3 << " mm; stub "
+                          << span0 * 180.0 / kPi << " deg, lead leg " << segLen * 1e3
+                          << " mm); it is drawn sharp.\n";
+            if (std::getenv("MVB_CORNER_LIST"))
+                std::cerr << "[corner-list]\t" << who << "\t" << stubLabel << "\t"
+                          << (dragbackEnds ? "dragback-end" : "terminal") << "\twant=" << R * 1e3
+                          << "\tleg=" << segLen * 1e3 << "\n";
             continue;
-        }
-        if (!best) {
-            std::ostringstream m;
-            m.precision(9);
-            m << "TerminalFillet: no tangent biarc with radius >= " << minBend * 1e3
-              << " mm fits the terminal corner of " << who << " at '" << sp.label << "' ("
-              << theta2 * 180.0 / kPi << " deg between the helix and the lead; lead leg "
-              << segLen * 1e3 << " mm (" << usable * 1e3 << " mm beyond its own corner"
-              << (consumeLeg ? ", after consuming the short leg" : "") << "), stub span "
-              << spanAbs * 180.0 / kPi << " deg"
-              << (neighbourOk ? ", same-helix neighbour available" : ", no same-helix neighbour") << ").";
-            throw std::runtime_error(m.str());
-        }
-        auto cutSpiral = [&](Spiral& s2, double az, bool cutEnd) {
-            const double span = s2.az1 - s2.az0;
-            const double f = (az - s2.az0) / span;
-            const double r = s2.r0 + (s2.r1 - s2.r0) * f;
-            const double y = s2.y0 + (s2.y1 - s2.y0) * f;
-            if (cutEnd) { s2.az1 = az; s2.r1 = r; s2.y1 = y; }
-            else        { s2.az0 = az; s2.r0 = r; s2.y0 = y; }
-        };
-        std::vector<Primitive> arcs;
-        // ABT #1215: a terminal corner's arcs are tagged for the lead-length measurement (and only
-        // for it); a wrap-to-layer-link corner (MVB_LINK_FILLET) is not a terminal and stays untagged.
-        const bool terminalCorner = isStub(sp);
-        for (const auto& ao : best->arcs) {
-            Primitive q = ao.pr;
-            q.isConnection = false;
-            q.terminalFillet = terminalCorner;
-            // The lead's terminal, so the corner is proven against the same conductor's other terminal.
-            q.terminal = prims[leadIdx].terminal;
-            arcs.push_back(q);
-        }
-        // Apply. Order of operations keeps indices valid: shorten pieces in place first, then
-        // erase consumed pieces from the higher index down, then insert the arcs at the joint.
-        if (exitCorner) sg.seg.a = P2; else sg.seg.b = P1;
-        if (intoNeighbour) cutSpiral(prims[nbIdx].spiral, azCut, /*cutEnd=*/exitCorner);
-        else               cutSpiral(sp.spiral, azCut, /*cutEnd=*/exitCorner);
-        // pieces to erase: the stub when consumed, the short lead leg when consumed
-        std::vector<size_t> erase;
-        if (intoNeighbour) erase.push_back(stubIdx);
-        if (consumeLeg) erase.push_back(exitCorner ? i + 1 : i);
-        std::sort(erase.begin(), erase.end(), std::greater<size_t>());
-        size_t insertAt = exitCorner ? i + 1 : i + 1;   // between the (remaining) helix and lead
-        for (size_t k : erase) {
-            prims.erase(prims.begin() + static_cast<long>(k));
-            if (k < insertAt) --insertAt;
-        }
-        prims.insert(prims.begin() + static_cast<long>(insertAt), arcs.begin(), arcs.end());
-        i = insertAt + arcs.size() - 1;
-        ++done;
-        if (slanted) {
-            static thread_local std::set<std::string> reported;
-            if (reported.insert(who + "|" + stubLabel + "|" + std::to_string(minBend)).second)
-                std::cerr << "[TerminalFillet] FINDING: the terminal corner of " << who << " at '" << stubLabel
-                          << "' has no room for its bend on MKF's one-OD lead step; it is drawn as a slanted step "
-                             "meeting the lead's run " << slanted->slant * 1e3 << " mm on, "
-                          << slanted->departure * 1e3 << " mm off MKF's corner, bend " << minBend * 1e3 << " mm\n";
         }
     }
     return done;

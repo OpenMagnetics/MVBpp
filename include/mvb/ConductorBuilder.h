@@ -157,8 +157,7 @@ public:
         bool toroidMitreCorners = false;
         // MINIMUM BEND RADIUS for every drawn corner/fillet, in METRES (Alf, 2026-08-27:
         // "a setting that is the minimum radius in any turn"). 0 (default) keeps each site's
-        // own policy radius (kRoundCornerBendFactor x wire radius, 1.02 x wireRadius for rect
-        // stations, 1.5 x wireRadius for lead fillets). A positive value FLOORS every one of
+        // radius MKF exports for it (ABT #2274: no MVB++ factor; see WireAssembler.h). A positive value FLOORS every one of
         // those choices: effectiveBend() below is the single chokepoint, so no corner anywhere
         // can be drawn tighter than this. It can only widen a bend, never tighten one -- a
         // radius below the wire's own is a horn torus OCC cannot build, and that guard stays.

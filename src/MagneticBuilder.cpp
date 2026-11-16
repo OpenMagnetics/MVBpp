@@ -634,6 +634,11 @@ static void checkPinRailCollisions(const std::vector<OpenMagnetics::Bobbin::PinR
     }
 }
 
+template<typename CoilT>
+TopoDS_Shape buildWoundLegBobbins(const CoilT& coil, const MAS::MagneticCore& core,
+                                  const MAS::CoreBobbinProcessedDescription& bobbinPd, double flangeThickness,
+                                  int polygonSegments, bool& mainWound);
+
 // Internal bobbin builder. Public surface goes through buildBobbinNamed().
 template<typename CoilT>
 TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& core,
@@ -665,8 +670,21 @@ TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& c
     // actual winding-window cross-section, or BobbinBuilder is using the
     // wrong flange topology. Either way, the fix belongs upstream (in
     // BobbinBuilder or in MAS), not in a silent post-hoc cut here.
-    return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments,
-                                      getPinRails(coil));   // ABT #1249
+    // ABT #2274: a multi-column design wound on its lateral legs draws MKF's former on each wound leg, and the
+    // main column's only when a section is wound there (buildWoundLegBobbins).
+    bool mainWound = true;
+    TopoDS_Shape legFormers = buildWoundLegBobbins(coil, core, bobbinPd, flangeThickness, polygonSegments, mainWound);
+    if (legFormers.IsNull()) {
+        return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments,
+                                          getPinRails(coil));   // ABT #1249
+    }
+    if (!mainWound) return legFormers;
+    TopoDS_Compound comp;
+    BRep_Builder bld;
+    bld.MakeCompound(comp);
+    bld.Add(comp, BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments, {}));
+    bld.Add(comp, legFormers);
+    return comp;
 }
 
 // ---- Multi-column placement resolution -------------------------------------------------------
@@ -741,6 +759,16 @@ public:
                 }
             }
         }
+    }
+
+    // The winding window a section (else its winding) is placed in -- the lookup resolve() starts from.
+    int64_t windowIndexOf(const std::optional<std::string>& sectionName, const std::string& windingName) const {
+        if (sectionName) {
+            auto it = _sectionWindow.find(*sectionName);
+            if (it != _sectionWindow.end()) return it->second;
+        }
+        auto it = _windingWindow.find(windingName);
+        return it != _windingWindow.end() ? it->second : 0;
     }
 
     std::optional<TurnBuilder::WoundColumnSpec>
@@ -834,6 +862,105 @@ std::map<std::string, TurnBuilder::WoundColumnSpec> resolveWoundColumnsPerSectio
         }
     }
     return out;
+}
+
+// ABT #2274 (Alf, 2026-11-08: "for multicolumn, the bobbin must be drawn on the leg with the windings, not on the
+// middle"). A section placed in a winding window whose column edge is a LATERAL leg is wound on MKF's lateral former:
+// Coil::get_wound_column_frame_for_section ("the lateral bobbin wraps its leg like the main one wraps the main
+// column": half width/depth = leg/2 + column thickness, MKF's moulded corner, axis at the leg). Each wound leg gets
+// that former, built by the same BobbinBuilder rule as the main one from MKF's frame and its own winding window, at
+// the leg's MAS x. The main-column former is drawn only when a section is wound there (mainWound). A design whose
+// sections all wrap the main column returns a null shape and keeps the single-former path unchanged.
+template<typename CoilT>
+TopoDS_Shape buildWoundLegBobbins(const CoilT& coil, const MAS::MagneticCore& core,
+                                  const MAS::CoreBobbinProcessedDescription& bobbinPd, double flangeThickness,
+                                  int polygonSegments, bool& mainWound) {
+    mainWound = false;
+    auto sectionsOpt = coil.get_sections_description();
+    if (!sectionsOpt) {
+        mainWound = true;
+        return TopoDS_Shape();
+    }
+    const WoundColumnResolver resolver(coil, core, bobbinPd);
+    struct Leg { int64_t window; std::string section; TurnBuilder::WoundColumnSpec spec; };
+    std::vector<Leg> legs;
+    for (const auto& section : *sectionsOpt) {
+        auto spec = resolver.resolve(section.get_name(), "", section.get_name());
+        if (!spec) {
+            mainWound = true;
+            continue;
+        }
+        const int64_t window = resolver.windowIndexOf(section.get_name(), "");
+        bool known = false;
+        for (const auto& leg : legs) {
+            if (std::abs(leg.spec.axisX - spec->axisX) < 1e-12) {
+                if (leg.window != window) {
+                    throw std::runtime_error("buildWoundLegBobbins: sections '" + leg.section + "' (window " +
+                                             std::to_string(leg.window) + ") and '" + section.get_name() + "' (window " +
+                                             std::to_string(window) + ") wrap the same leg x = " +
+                                             std::to_string(spec->axisX * 1e3) + " mm from two winding windows; one former per "
+                                             "leg is drawn from one window");
+                }
+                known = true;
+            }
+        }
+        if (!known) legs.push_back({window, section.get_name(), *spec});
+    }
+    if (legs.empty()) return TopoDS_Shape();
+    if (!getPinRails(coil).empty()) {
+        throw std::runtime_error("buildWoundLegBobbins: MKF's pin rails hang from the main former's bottom flange; a "
+                                 "multi-column design wound on lateral legs carries rails no lateral former is drawn for");
+    }
+    const auto& windows = bobbinPd.get_winding_windows();
+    TopoDS_Compound comp;
+    BRep_Builder bld;
+    bld.MakeCompound(comp);
+    for (const auto& leg : legs) {
+        OpenMagnetics::WoundColumnFrame frame;
+        if constexpr (std::is_same_v<CoilT, OpenMagnetics::Coil>) {
+            OpenMagnetics::Coil c = coil;
+            frame = c.get_wound_column_frame_for_section(leg.section);
+        }
+        else {
+            throw std::runtime_error("buildWoundLegBobbins: the former on a lateral leg is MKF's wound column frame, which "
+                                     "only an MKF-wound OpenMagnetics::Coil carries");
+        }
+        if (std::abs(frame.axisX - std::abs(leg.spec.axisX)) > 1e-12 ||
+            std::abs(frame.columnWidth - leg.spec.halfWidth) > 1e-12 ||
+            std::abs(frame.columnDepth - leg.spec.halfDepth) > 1e-12) {
+            throw std::runtime_error("buildWoundLegBobbins: MKF's wound column frame of section '" + leg.section +
+                                     "' (axis " + std::to_string(frame.axisX * 1e3) + " mm, half " +
+                                     std::to_string(frame.columnWidth * 1e3) + " x " + std::to_string(frame.columnDepth * 1e3) +
+                                     " mm) disagrees with the leg its turns are drawn on (axis " +
+                                     std::to_string(leg.spec.axisX * 1e3) + " mm, half " + std::to_string(leg.spec.halfWidth * 1e3) +
+                                     " x " + std::to_string(leg.spec.halfDepth * 1e3) + " mm)");
+        }
+        if (leg.window < 0 || static_cast<std::size_t>(leg.window) >= windows.size()) {
+            throw std::runtime_error("buildWoundLegBobbins: section '" + leg.section + "' is in winding window " +
+                                     std::to_string(leg.window) + " but the bobbin states " + std::to_string(windows.size()));
+        }
+        auto legPd = bobbinPd;
+        legPd.set_column_shape(frame.shape);
+        legPd.set_column_width(frame.columnWidth);
+        legPd.set_column_depth(frame.columnDepth);
+        if (frame.shape == MAS::ColumnShape::RECTANGULAR || frame.shape == MAS::ColumnShape::IRREGULAR) {
+            legPd.set_column_corner_radius(frame.cornerRadius);
+        }
+        legPd.set_winding_windows({windows[static_cast<std::size_t>(leg.window)]});
+        TopoDS_Shape former = BobbinBuilder::buildBobbin(legPd, flangeThickness, true, polygonSegments, {});
+        if (former.IsNull()) {
+            throw std::runtime_error("buildWoundLegBobbins: the former of section '" + leg.section + "' built empty");
+        }
+        if (std::getenv("MVB_LEAD_DIAG")) {
+            std::cerr << std::setprecision(9) << "[leg-bobbin] section " << leg.section << " window " << leg.window
+                      << " axis x " << leg.spec.axisX * 1e3 << " mm half " << frame.columnWidth * 1e3 << " x "
+                      << frame.columnDepth * 1e3 << " mm corner " << frame.cornerRadius * 1e3 << " mm window "
+                      << windows[static_cast<std::size_t>(leg.window)].get_width().value_or(-1) * 1e3 << " x "
+                      << windows[static_cast<std::size_t>(leg.window)].get_height().value_or(-1) * 1e3 << " mm\n";
+        }
+        bld.Add(comp, translate_shape(former, leg.spec.axisX, 0.0, 0.0));
+    }
+    return comp;
 }
 
 // Internal turns builder. Public surface goes through buildTurnsNamed() or

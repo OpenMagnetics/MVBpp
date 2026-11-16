@@ -312,6 +312,8 @@ private:
     NCollection_DataMap<TopoDS_Shape, std::pair<double, double>, TopTools_ShapeMapHasher> myFactors;
 };
 
+} // namespace
+
 TopoDS_Shape unitParametrised(const TopoDS_Shape& shapeMm, const std::string& name) {
     bool anyBSpline = false;
     for (TopExp_Explorer fx(shapeMm, TopAbs_FACE); fx.More() && !anyBSpline; fx.Next())
@@ -360,6 +362,8 @@ TopoDS_Shape unitParametrised(const TopoDS_Shape& shapeMm, const std::string& na
     }
     return out;
 }
+
+namespace {
 
 // OCCT's STEP translators work in a PROCESS-GLOBAL length unit, the static "xstep.cascade.unit"
 // (millimetres by default). exportSTEP writes millimetre numbers under a millimetre header and
