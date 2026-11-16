@@ -4090,9 +4090,11 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
         // whose coated envelope contains the round bend's (the slot is the corner's, a little wider at the bend).
         std::vector<Primitive> mitred;
         std::vector<size_t> mitredFrom;   // mitred piece -> the path piece it came from (solid naming)
-        // The COPPER's bend stays round whatever its hole: the assembler revolves a bend the metre frame cannot hold in
-        // the millimetre frame (WireAssembler, THE REVOLVE'S FRAME).
-        const bool mitreUnsweepable = cutterOnly;
+        // A DISPLAY drawing does the same: a wire drawn at its outer diameter is the coated envelope too, so its bend at
+        // MKF's radius is the same horn torus (the ABT #646 litz design with paintCoating). The COPPER's bend stays
+        // round whatever its hole, in production and in debug: the assembler revolves a bend the metre frame cannot hold
+        // in the millimetre frame (WireAssembler, THE REVOLVE'S FRAME).
+        const bool mitreUnsweepable = cutterOnly || tlsDisplayOnly;
         if (mitreUnsweepable) {
             mitred.reserve(path.prims.size() + 8);
             for (size_t k = 0; k < path.prims.size(); ++k) {

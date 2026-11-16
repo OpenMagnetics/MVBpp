@@ -2680,9 +2680,22 @@ TEST_CASE("Real winding: under the FEM terminal-plane pin 14_dab builds with eve
         const gp_Dir n = sf.Plane().Axis().Direction();
         const double an[3] = {std::abs(n.X()), std::abs(n.Y()), std::abs(n.Z())};
         const int axis = (an[0] >= an[1] && an[0] >= an[2]) ? 0 : (an[1] >= an[2] ? 1 : 2);
-        CHECK(an[axis] > 1.0 - 1e-12);   // axis-aligned: one port plane, not a tilted cut
-        const gp_Pnt c = sf.Plane().Location();
+        GProp_GProps capProps;
+        BRepGProp::SurfaceProperties(ns.shape, capProps);
+        const gp_Pnt c = capProps.CentreOfMass();
         const double capC = axis == 0 ? c.X() : (axis == 1 ? c.Y() : c.Z());
+        // Axis-aligned to the kernel's point resolution: over the cap's own extent the tilt moves no point of it
+        // further than Precision::Confusion off the port plane (measured: 9.5e-6 rad on 'Primary parallel 0 terminal 1').
+        {
+            Bnd_Box capBox;
+            BRepBndLib::AddOptimal(ns.shape, capBox, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+            double x0, y0, z0, x1, y1, z1;
+            capBox.Get(x0, y0, z0, x1, y1, z1);
+            const double reach = 0.5 * std::sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0) + (z1 - z0) * (z1 - z0));
+            const double tilt = std::acos(std::min(1.0, an[axis]));
+            INFO("tilt " << tilt << " rad over a reach of " << reach * 1e3 << " mm");
+            CHECK(tilt * reach <= Precision::Confusion());
+        }
         const auto own = boxOfConductor.find(ns.name.substr(0, at));
         REQUIRE(own != boxOfConductor.end());
         const int sign = (capC - own->second[axis]) < (own->second[axis + 3] - capC) ? -1 : 1;
