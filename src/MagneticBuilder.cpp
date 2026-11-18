@@ -1774,7 +1774,7 @@ std::vector<NamedShape> MagneticBuilder::buildRealWindingConductorsNamed(
     bool toroidalCore = false;
     ConductorBuilder::Options copts = realWindingConductorOptions(
         magnetic, coreShapes, wirePolygonSegments, femReady, bobbinPd, toroidalCore);
-    copts.diagnosticSkipCollisionCheck = diagnosticSkipCollisionCheck;
+    copts.diagnosticSkipCollisionCheck = diagnosticSkipCollisionCheck || diagnosticSkipCollisionCheck_;
     copts.cutterOnly = cutterOnly;
     if (toroidTerminalPlaneOut) *toroidTerminalPlaneOut = std::numeric_limits<double>::quiet_NaN();
     if (enamelGateVerdictOut) *enamelGateVerdictOut = EnamelGateVerdict::NotRun;

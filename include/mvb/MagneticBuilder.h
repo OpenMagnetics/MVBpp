@@ -354,10 +354,18 @@ public:
     // leaves the Options' own default, round.
     void setRoundedLeadCorners(bool rounded) { roundedLeadCorners_ = rounded; }
     std::optional<bool> roundedLeadCorners() const { return roundedLeadCorners_; }
+    // The collision debug switch for every real-winding conductor this builder draws
+    // (ConductorBuilder::Options::diagnosticSkipCollisionCheck; the same switch as
+    // mvbpp_step_generator --skip-collision-check and MVB_SKIP_COLLISION_CHECK): a design whose
+    // copper does not fit is drawn as planned instead of refused, each refusal printed to stderr as
+    // a FINDING. The result may interpenetrate: a picture of the winding, never a part.
+    void setDiagnosticSkipCollisionCheck(bool skip) { diagnosticSkipCollisionCheck_ = skip; }
+    bool diagnosticSkipCollisionCheck() const { return diagnosticSkipCollisionCheck_; }
 
   private:
     std::optional<WeldMode> weldMode_;
     std::optional<bool> roundedLeadCorners_;
+    bool diagnosticSkipCollisionCheck_ = false;
     // Shared by buildRealWindingConductorsNamed and measureTerminalLeadLengths.
     ConductorBuilder::Options realWindingConductorOptions(
         const OpenMagnetics::Magnetic& magnetic, const std::vector<NamedShape>& coreShapes,

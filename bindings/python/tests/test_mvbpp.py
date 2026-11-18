@@ -120,6 +120,12 @@ class TestDrawMagnetic:
         assert isinstance(out, bytes) and is_step(out)
         assert len(out) > 1000
 
+    def test_skip_collision_check_is_accepted(self, basic_magnetic_raw):
+        # The debug switch only acts on a real winding; on the idealised turns it changes nothing.
+        debug = mvbpp.drawMagnetic(basic_magnetic_raw, skipCollisionCheck=True, **NO_FILTER)
+        assert isinstance(debug, bytes) and is_step(debug)
+        assert len(debug) > 1000
+
     def test_contains_brep_geometry(self, basic_magnetic_raw):
         text = mvbpp.drawMagnetic(basic_magnetic_raw, **NO_FILTER).decode("ascii", "replace")
         assert "CLOSED_SHELL" in text or "ADVANCED_BREP" in text

@@ -300,9 +300,16 @@ std::vector<mvb::NamedShape> build_winding(const std::string& json_str,
 
 std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments,
                                             bool paintCoating, bool useRealWindingGeometry,
-                                            bool femReady = false) {
+                                            bool femReady = false, bool skipCollisionCheck = false) {
     auto j = json::parse(json_str);
     mvb::MagneticBuilder b;
+    // skipCollisionCheck: the debug drawing (mvbpp_step_generator --skip-collision-check --weld off). A real
+    // winding whose copper does not fit is drawn as planned instead of refused, every refusal printed to
+    // stderr as a FINDING, and its pieces are left unwelded (overlapping copper cannot be welded).
+    if (skipCollisionCheck) {
+        b.setDiagnosticSkipCollisionCheck(true);
+        b.setWeldMode(mvb::WeldMode::Off);
+    }
     // Use polygonSegments for both wire and core for simplicity; the user
     // can craft separate paths later if they need finer-grained control.
     // paintCoating: true → OUTER (insulation) diameter [default], false →
@@ -441,6 +448,13 @@ Notes
   per (winding, parallel) where a sweep closes (columns, sparse toroids), a conformal
   (non-overlapping) mitre-jointed compound for dense toroids.  Use True only when
   exporting for FEM (it is ~20-30x slower on toroids).
+* skipCollisionCheck (drawMagnetic only, with useRealWindingGeometry=True): False
+  [default] refuses a winding whose copper does not fit (two conductors closer than
+  their coating allows) by raising.  True is the DEBUG drawing: the winding is drawn
+  as planned anyway, each refusal is printed to stderr as a FINDING, and the pieces
+  of each conductor are left unwelded.  The result may show copper inside copper: it
+  is a picture to look at, never a part to build or to mesh.  A design that cannot be
+  routed at all still raises.
 )doc";
 
     auto def_draw = [&](const char* name,
@@ -532,9 +546,10 @@ Notes
              const std::string& side,
              bool paintCoating,
              bool useRealWindingGeometry,
-             bool femReady) {
+             bool femReady,
+             bool skipCollisionCheck) {
               auto named = build_magnetic(json_str, polygonSegments, paintCoating,
-                                          useRealWindingGeometry, femReady);
+                                          useRealWindingGeometry, femReady, skipCollisionCheck);
               return deliver(std::move(named), outputPath, mode, plane, offset, format, scale,
                              symmetry, side);
           },
@@ -553,7 +568,8 @@ Notes
           // browser asks for the coated footprint, and it does so explicitly.
           py::arg("paintCoating") = false,
           py::arg("useRealWindingGeometry") = false,
-          py::arg("femReady") = false);
+          py::arg("femReady") = false,
+          py::arg("skipCollisionCheck") = false);
 
     // ABT #1215: terminal-lead copper length per winding, measured on the finished real-winding
     // centreline (same enrichment and settings as drawMagnetic(useRealWindingGeometry=True)).
