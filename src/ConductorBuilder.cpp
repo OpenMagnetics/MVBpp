@@ -15581,7 +15581,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     throw std::runtime_error("ConductorBuilder: the " + who + " lead of " + path.name +
                                              " does not leave its ring outward, towards the tip plane");
                 auto fits = [&](double Rc, SlotCorner& c, std::string& why) {
-                    if (!(Rc > bendHalfExtent)) {
+                    // A display drawing (the wire at its outer diameter) bends at its own half extent, as the rect lead
+                    // corner above allows: 13_current_sense's one-turn Primary, 0.267 mm on a 0.267 mm section.
+                    if (tlsDisplayOnly ? Rc < bendHalfExtent - 1e-12 : !(Rc > bendHalfExtent)) {
                         why = "radius " + std::to_string(Rc * 1e3) + " mm does not exceed the section's half extent " +
                               std::to_string(bendHalfExtent * 1e3) + " mm";
                         return false;
