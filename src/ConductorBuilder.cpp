@@ -153,8 +153,9 @@ struct CollisionDiagnosticScope {
     bool previous;
     explicit CollisionDiagnosticScope(bool on) : previous(tlsCollisionDiagnostic) {
         tlsCollisionDiagnostic = on || std::getenv("MVB_SKIP_COLLISION_CHECK") != nullptr;
+        setAbutmentFinding(tlsCollisionDiagnostic);
     }
-    ~CollisionDiagnosticScope() { tlsCollisionDiagnostic = previous; }
+    ~CollisionDiagnosticScope() { tlsCollisionDiagnostic = previous; setAbutmentFinding(previous); }
 };
 
 // A copper-collision refusal: thrown, or with the debug switch on, printed as a finding and the
@@ -8479,7 +8480,13 @@ std::optional<ToroFaceSpiral> trySolveToroFaceSpiral(const gp_XY& station,
                                                      // the rim end pinned to a POINT (the start of
                                                      // a bend arc) instead of pout -/+ heading*bend;
                                                      // the far tangent is then free.
-                                                     const std::optional<gp_XY>& farPointFixed = std::nullopt) {
+                                                     const std::optional<gp_XY>& farPointFixed = std::nullopt,
+                                                     // one prescribed end only: take the centre on THIS ray from
+                                                     // the axis (its angle), instead of the nearest over all rays.
+                                                     // The nearest-over-72-rays choice jumps from ray to ray as the
+                                                     // far point moves, so a caller root-finding over the far point
+                                                     // asks ray by ray, where the centre moves continuously.
+                                                     const std::optional<double>& onlyRayAngle = std::nullopt) {
     gp_XY natural = top ? pout - station : station - pout;   // the chord's travel direction
     if (natural.Modulus() < 1e-12) {
         throw std::runtime_error("ConductorBuilder: the toroid face spiral of " + who +
@@ -8593,8 +8600,8 @@ std::optional<ToroFaceSpiral> trySolveToroFaceSpiral(const gp_XY& station,
                     found = true;
                 }
                 else {
-                    for (int ray = 0; ray < nRays; ++ray) {
-                        const gp_XY dir = rayDir(kTwoPi * ray / nRays);
+                    for (int ray = 0; ray < (onlyRayAngle ? 1 : nRays); ++ray) {
+                        const gp_XY dir = rayDir(onlyRayAngle ? *onlyRayAngle : kTwoPi * ray / nRays);
                         const auto rho = rootAlongRay(dir, residualAt, bestRho);
                         if (!rho) continue;
                         const gp_XY c(dir.X() * *rho, dir.Y() * *rho);
@@ -8764,9 +8771,11 @@ std::optional<ToroChordBend> trySolveToroChordBend(const gp_XY& station,
         return {centre + rot(rRim, turn), centre, rot(rimHeading, turn)};
     };
     // Residual: the spiral's tangent at the joint against the arc's tangent there.
+    // `onRay`: the spiral's centre is taken on that ray from the axis (see trySolveToroFaceSpiral's onlyRayAngle).
+    std::optional<double> onRay;
     auto residual = [&](double turn, std::optional<ToroFaceSpiral>* spOut) -> std::optional<double> {
         const Arc a = arcFor(turn);
-        auto sp = trySolveToroFaceSpiral(station, heading, pout, bend, top, std::nullopt, who, nullptr, a.joint);
+        auto sp = trySolveToroFaceSpiral(station, heading, pout, bend, top, std::nullopt, who, nullptr, a.joint, onRay);
         if (!sp) return std::nullopt;
         if (spOut) *spOut = sp;
         return angleBetween(sp->farHeading, a.tJoint);
@@ -8811,6 +8820,26 @@ std::optional<ToroChordBend> trySolveToroChordBend(const gp_XY& station,
     return std::nullopt;
     };
     std::optional<ToroChordBend> result = solveTurn();
+    if (!result && heading) {
+        // The centre nearest the axis over a fan of rays is not a continuous function of the turning angle: it jumps
+        // from one ray to another, and where the residual's sign change falls on such a jump the bisection ends on the
+        // jump, not on a root (current_transformer_complete, 'turn 70 -> turn 71': 3.16 deg at a 12 deg turn, -0.93
+        // deg at 16 deg, on two different rays). On ONE ray the centre moves continuously with the turning angle, so
+        // each ray is solved on its own and the solution whose centre is nearest the axis is taken.
+        std::optional<double> bestRay;
+        double bestRho = std::numeric_limits<double>::max();
+        const int nRays = 72;
+        for (int ray = 0; ray < nRays; ++ray) {
+            onRay = kTwoPi * ray / nRays;
+            const auto candidate = solveTurn();
+            if (candidate && candidate->spiral.centre.Modulus() < bestRho) {
+                bestRho = candidate->spiral.centre.Modulus();
+                bestRay = onRay;
+                result = candidate;
+            }
+        }
+        onRay = bestRay;   // the radius rounds below stay on the ray that solved
+    }
     // Raise the radius until the arc is long enough (the turning angle barely moves with the
     // radius when the arc is short against the chord, so a few rounds settle it).
     for (int round = 0; result && round < 6; ++round) {
@@ -8833,7 +8862,10 @@ std::optional<ToroChordBend> trySolveToroChordBend(const gp_XY& station,
         m << "ConductorBuilder: the toroid chord of " << who << " at (" << station.X() << ", "
           << station.Y() << ") cannot bend into the poloidal rim heading (" << rimHeading.X()
           << ", " << rimHeading.Y() << ") with a bend of " << bend * 1e3
-          << " mm: no turning angle within +-80 deg makes the spiral tangent to the arc.";
+          << " mm: no turning angle within +-80 deg makes the spiral tangent to the arc (rim point (" << pout.X() << ", "
+          << pout.Y() << "), " << (top ? "top" : "bottom") << " face, inner heading ";
+        if (heading) m << "(" << heading->X() << ", " << heading->Y() << ")"; else m << "free";
+        m << ", shortest arc " << minArcLength * 1e3 << " mm).";
         *why = m.str();
     }
     return std::nullopt;
@@ -10389,9 +10421,10 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
     tlsWireBend = connectionLayout.wireBendRadius;
     if (std::getenv("MVB_ROUTE_DIAG"))
         for (const auto& route : connectionLayout.routes)
-            std::fprintf(stderr, "[route] %s p%lld kind %d '%s' -> '%s' lane %s dragbackBend %s\n", route.winding.c_str(),
+            std::fprintf(stderr, "[route] %s p%lld kind %d '%s' -> '%s' lane %s azimuth %s dragbackBend %s\n", route.winding.c_str(),
                          static_cast<long long>(route.parallel), static_cast<int>(route.kind), route.fromTurn.c_str(),
                          route.toTurn.c_str(), route.laneOffset ? std::to_string(*route.laneOffset * 1e3).c_str() : "-",
+                         route.laneAzimuth ? std::to_string(*route.laneAzimuth).c_str() : "-",
                          route.dragbackBendRadius ? std::to_string(*route.dragbackBendRadius * 1e3).c_str() : "-");
     for (const auto& route : connectionLayout.routes) {
         if (route.kind == OpenMagnetics::ConnectionKind::Z_DRAGBACK)
@@ -14560,61 +14593,10 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 }
             }
         }
-        // CLIMB-AWARE SLOT ORDER for sibling dragbacks (Alf's 14_dab). The slots are correct in
-        // SEPARATION but their ORDER matters once the layer they land on climbs steeply. Two
-        // parallels whose crossings sit dAz apart have their helices phase-shifted, so their
-        // constant separation becomes  -(dY) + pitch*dAz/2pi : the climb either adds to the
-        // station spacing or eats it. Assign the SAME set of slots so azimuth runs OPPOSITE to
-        // the destination-station height -- then the shift always ADDS. (14_dab's secondary
-        // returns onto a 15 mm-pitch layer: 2.29 deg of slot spacing ate 0.095 mm of an 0.855 mm
-        // budget, leaving 0.755 against a 0.784 requirement.)
-        // Permuting an already-validated set of slots cannot change any pairwise separation --
-        // need() between two dragbacks depends only on their radii and wire, not on which
-        // conductor holds which slot. Restricted to bands where each conductor has exactly ONE
-        // return, so the consecutive-return snap below still holds.
-        {
-            std::vector<size_t> dragIdx;
-            for (size_t k = 0; k < verts.size(); ++k)
-                if (verts[k].kind == 1) dragIdx.push_back(k);
-            std::vector<char> done(dragIdx.size(), 0);
-            for (size_t a0 = 0; a0 < dragIdx.size(); ++a0) {
-                if (done[a0]) continue;
-                std::vector<size_t> group{dragIdx[a0]};
-                done[a0] = 1;
-                for (size_t b0 = a0 + 1; b0 < dragIdx.size(); ++b0) {
-                    if (done[b0] ||
-                        std::abs(verts[dragIdx[b0]].r - verts[dragIdx[a0]].r) >
-                            verts[dragIdx[a0]].rw)
-                        continue;
-                    group.push_back(dragIdx[b0]);
-                    done[b0] = 1;
-                }
-                if (group.size() < 2) continue;
-                std::set<size_t> cis;
-                for (size_t g : group) cis.insert(verts[g].ci);
-                if (cis.size() != group.size()) continue;
-                // the climb of the layer these returns land on, from their own band
-                double advance = 0.0;
-                for (size_t g : group)
-                    if (std::abs(verts[g].destAdvance) > std::abs(advance))
-                        advance = verts[g].destAdvance;
-                if (std::abs(advance) < 1e-12) continue;
-                std::vector<double> slots;
-                for (size_t g : group) slots.push_back(az[g]);
-                std::sort(slots.begin(), slots.end());
-                // destination station height (a return lands at its low end when it descends)
-                std::sort(group.begin(), group.end(), [&](size_t x, size_t y) {
-                    // ABT #841: dragbacks are never dipped (the refinement touches kind 0 only),
-                    // so y0 here IS the undipped extent -- Ideal is used anyway so the invariant
-                    // "no permutation key reads a dip" is checkable by grep, not by argument.
-                    return advance > 0.0 ? verts[x].y0Ideal > verts[y].y0Ideal
-                                         : verts[x].y0Ideal < verts[y].y0Ideal;
-                });
-                for (size_t g = 0; g < group.size(); ++g) az[group[g]] = slots[g];
-                for (size_t g = 0; g < group.size(); ++g)
-                    permSig += " D:" + std::to_string(group[g]);
-            }
-        }
+        // The ORDER of sibling returns' slots is MKF's too (ABT #2274, "MKF owns the placement"): MKF places the column
+        // whose return lands furthest along the landing layer's climb on the plane and the others against the climb
+        // (Coil::compute_ride_placement), and judges the layout on those azimuths. The fan used to permute the
+        // returns' slots to that order itself, after MKF had judged another one.
         };   // runPack
         // ABT #841 PROOF OBLIGATION. runPack() hands out slots AND permutes them (the lead
         // bundle's lower-turn-furthest-in--X re-order, the climb-aware dragback order). Iterating
@@ -19191,6 +19173,10 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 double roundRowEndFrom = std::numeric_limits<double>::quiet_NaN();
                 if (i + 2 == nEmit) {
                     if (const auto* rowEnd = mkfRowEndRoute(connectionLayout, ct.winding, ct.parallel)) {
+                        // A lane on the crossing itself (x = 0: the wrap is one whole revolution, so nothing stretches it)
+                        // ends at its station; any other unstretched last wrap is not a one-layer revolution.
+                        if (std::isnan(endY) && std::abs(nxt.x - s.x) <= wireRadius && std::abs(crossAz[i + 1] - crossAz[i]) <= 1e-9)
+                            endY = nxt.y;
                         if (std::isnan(endY))
                             throw std::runtime_error("ConductorBuilder: MKF's round row end of " + path.name +
                                                      " meets a last wrap that is not a one-layer revolution");

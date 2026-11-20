@@ -207,6 +207,9 @@ enum class WeldMode { Off, Auto, All };
 // The build default when nothing asks for a mode: All when the environment sets MVB_WELD_ALL
 // (the step tools and the mesh recipe's geometry.weld_all), else Auto.
 WeldMode weldModeFromEnv();
+// The collision debug drawing (--skip-collision-check): a mitred corner that does not abut is reported as a FINDING
+// and the copper kept as built, instead of refusing the build. Thread-local; off by default.
+void setAbutmentFinding(bool on);
 // "off" | "auto" | "all"; anything else throws std::invalid_argument naming it.
 WeldMode parseWeldMode(const std::string& name);
 const char* weldModeName(WeldMode mode);

@@ -127,6 +127,7 @@
 
 namespace mvb {
 
+
 int curveSampleCount(double radius, double azSpan, double wireRadius) {
     double maxSag = samplingSag(wireRadius);
     double stepAz = (radius > 1e-12)
@@ -3039,6 +3040,11 @@ size_t requireManifoldCopper(const TopoDS_Shape& shape, const std::string& condu
     return checked;
 }
 
+// The collision debug drawing reports a mitred corner that does not abut as a FINDING and keeps the copper as built
+// (set for the build by ConductorBuilder's diagnostic scope); a part refuses it.
+static thread_local bool tlsAbutmentFinding = false;
+void setAbutmentFinding(bool on) { tlsAbutmentFinding = on; }
+
 WeldMode weldModeFromEnv() {
     return std::getenv("MVB_WELD_ALL") != nullptr ? WeldMode::All : WeldMode::Auto;
 }
@@ -3448,6 +3454,9 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
     // N-way glued fuse below; an overlapping (angS > 0) junction must stay on the general
     // boolean, where an intersection is what the algorithm is actually asked to compute.
     std::vector<bool> tangentToPrev;
+    // The junctions of a glued run that are EXACTLY tangent (shared caps): where a glued run comes back invalid it is
+    // cut at the others (see the glued fuse).
+    std::vector<bool> exactToPrev;
     // A joint sphere spans the junction it fills: half of it lies in the piece it is fused into
     // and half in the NEXT piece. Those two must therefore end up as ONE solid, or the sphere
     // simply becomes copper overlapping its own neighbour -- which is exactly what chunk 7
@@ -4588,6 +4597,7 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         // A joint sphere genuinely interpenetrates both neighbours, so a run carrying one is
         // not glue-eligible either.
         tangentToPrev.push_back(i > 0 && !bentS && tangentAngle(angS) && !sphereAtPrevJunction);
+        exactToPrev.push_back(i > 0 && !bentS && exactTangent(angS) && !sphereAtPrevJunction);
         sphereAtPrevJunction = false;
         if (std::getenv("MVB_CAP_DEBUG"))
             std::cerr << "[cap-debug] junction " << i << " angS=" << angS << " bentS=" << bentS
@@ -4623,7 +4633,16 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         // ABT #685: the same escape the certified enamel gate carries (MVB_ALLOW_ENAMEL) -- OFF by
         // default, so anything that ships is a design whose corners abut. Set it only to EXPORT a
         // known-faulty design for visual review; the fault is still printed in full.
-        if (std::getenv("MVB_ALLOW_ABUTMENT")) {
+        if (skipWeldIn) {
+            // A CUTTING TOOL (the bobbin cutter: the coated envelope, never shipped copper). Its pieces are united to
+            // cut, so two of them overlapping at a corner cut exactly what they cut abutting. 17_cllc's row bend
+            // (20 um of arc at the coated radius, cut as its two 10 um tangent straights) is such a corner: pieces
+            // shorter than their own mitre. Reported, not refused.
+            std::cerr << "[corners] cutting tool of " << conductorName << ": " << msg << "\n  (a tool's pieces are united; not refused)\n";
+        } else if (tlsAbutmentFinding) {
+            // The collision debug drawing (--skip-collision-check): drawn as built and reported, never a part.
+            std::cerr << "[ConductorBuilder] FINDING (corner drawn as built, not a part): " << msg << "\n";
+        } else if (std::getenv("MVB_ALLOW_ABUTMENT")) {
             std::cerr << "[corners] " << msg
                       << "\n  (MVB_ALLOW_ABUTMENT set: reported, not refused)\n";
         } else {
@@ -4844,7 +4863,21 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
                       << " tangent=" << nt << " keepLens=" << keepLens << "\n";
         }
         if (!keepLens && !noGlueFast) {
-            for (size_t s0 = 0; s0 < perPrimSolids.size();) {
+            std::vector<std::pair<size_t, size_t>> glueRuns;
+            // A stretch cut out of a run that failed is glued once more and, failing again, left to the ladder.
+            std::vector<bool> glueRunIsStretch;
+            for (size_t runStart = 0; runStart < perPrimSolids.size();) {
+                size_t runEnd = runStart;
+                while (runEnd + 1 < perPrimSolids.size() && runEnd + 1 < bridgedToPrev.size() &&
+                       bridgedToPrev[runEnd + 1] && runEnd + 1 < tangentToPrev.size() &&
+                       tangentToPrev[runEnd + 1])
+                    ++runEnd;
+                glueRuns.push_back({runStart, runEnd});
+                glueRunIsStretch.push_back(false);
+                runStart = runEnd + 1;
+            }
+            for (size_t runIndex = 0; runIndex < glueRuns.size(); ++runIndex) {
+                const size_t s0 = glueRuns[runIndex].first;
                 // The glued fuse takes a TANGENT run: bridged pieces whose every junction is a
                 // shared cap. A run interrupted by one non-tangent junction used to go to the
                 // pairwise ladder whole -- every piece fused into the growing body, ~20 s a turn
@@ -4852,11 +4885,7 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
                 // tangent junctions, 12 not) took hours to weld. The run is now cut at its
                 // non-tangent junctions: each tangent stretch is glued in one fuse here, and the
                 // ladder below welds the stretches to each other across those few junctions.
-                size_t e0 = s0;
-                while (e0 + 1 < perPrimSolids.size() && e0 + 1 < bridgedToPrev.size() &&
-                       bridgedToPrev[e0 + 1] && e0 + 1 < tangentToPrev.size() &&
-                       tangentToPrev[e0 + 1])
-                    ++e0;
+                const size_t e0 = glueRuns[runIndex].second;
                 if (e0 > s0) {
                     std::vector<TopoDS_Shape> gs;
                     double sum = 0.0, mn = std::numeric_limits<double>::max();
@@ -4972,8 +5001,33 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
                                   << std::chrono::duration_cast<std::chrono::milliseconds>(
                                          std::chrono::steady_clock::now() - tGlue0).count()
                                   << " ms\n";
+                    // A run is admitted on junctions within the kernel's confusion of tangent (tangentAngle), and one
+                    // junction that is not EXACTLY tangent -- a wrap MKF re-slopes onto its row meets its helix a
+                    // fraction of a degree off -- is bridged, not a shared cap: the glued fuse of the whole run then
+                    // comes back invalid, and the pairwise ladder took every one of its pieces in turn
+                    // (13_current_sense: one such junction in a 472-piece conductor, hours). The run is cut at those
+                    // junctions and each exactly tangent stretch is glued on its own, under the same acceptance; the
+                    // ladder welds the stretches across the few junctions left.
+                    if (!runFused.count(s0) && !glueRunIsStretch[runIndex]) {
+                        std::vector<std::pair<size_t, size_t>> stretches;
+                        size_t from = s0;
+                        for (size_t k = s0 + 1; k <= e0; ++k)
+                            if (k >= exactToPrev.size() || !exactToPrev[k]) {
+                                stretches.push_back({from, k - 1});
+                                from = k;
+                            }
+                        stretches.push_back({from, e0});
+                        if (stretches.size() > 1) {
+                            std::cerr << "[glue-fuse] run " << s0 << ".." << e0 << " is cut at its " << stretches.size() - 1
+                                      << " junction(s) that are not exactly tangent and glued stretch by stretch\n";
+                        }
+                        if (stretches.size() > 1)
+                            for (const auto& stretch : stretches) {
+                                glueRuns.push_back(stretch);
+                                glueRunIsStretch.push_back(true);
+                            }
+                    }
                 }
-                s0 = e0 + 1;
             }
             if (std::getenv("MVB_WELD_DEBUG"))
                 std::cerr << "[weld-stats] glued runs=" << runFused.size() << "\n";

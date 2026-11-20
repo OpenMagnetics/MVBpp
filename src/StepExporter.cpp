@@ -10,7 +10,13 @@
 #include <BRepCheck_Result.hxx>
 #include <BRepTools.hxx>
 #include <BRepTools_Modification.hxx>
+#include <Geom_ConicalSurface.hxx>
+#include <algorithm>
+#include <vector>
 #include <BRepTools_Modifier.hxx>
+#include <BRepTools_NurbsConvertModification.hxx>
+#include <TopTools_MapOfShape.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <Geom2d_Curve.hxx>
 #include <Geom2d_BSplineCurve.hxx>
 #include <Geom2d_BezierCurve.hxx>
@@ -31,6 +37,7 @@
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <GProp_GProps.hxx>
+#include <NCollection_Map.hxx>
 #include <Geom_Surface.hxx>
 #include <Precision.hxx>
 #include <Standard_Failure.hxx>
@@ -52,6 +59,7 @@
 #include <TDocStd_Application.hxx>
 #include <TDocStd_Document.hxx>
 #include <TCollection_ExtendedString.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS_Builder.hxx>
 #include <TopoDS_Compound.hxx>
@@ -116,6 +124,159 @@ std::string label_name(const TDF_Label& label) {
 // condemned every all-planar prism of the conductor, and two abutting prisms' independently
 // converted caps are what the fragment then imprints as nm slivers). A planar solid stays
 // analytic: its junction caps remain the same exact planes as its neighbour's.
+namespace {
+// NurbsConvert with some faces left as they are: neither their surface, nor their edges' curves, nor the edges'
+// pcurves on them are rewritten (the neighbouring faces' pcurves of those edges still are).
+class NurbsConvertExcept : public BRepTools_NurbsConvertModification {
+public:
+    DEFINE_STANDARD_RTTI_INLINE(NurbsConvertExcept, BRepTools_NurbsConvertModification)
+    void Keep(const TopoDS_Shape& face) {
+        myFaces.Add(face);
+        for (TopExp_Explorer e(face, TopAbs_EDGE); e.More(); e.Next()) myEdges.Add(e.Current());
+    }
+    Standard_Boolean NewSurface(const TopoDS_Face& F, Handle(Geom_Surface)& S, TopLoc_Location& L, Standard_Real& Tol,
+                                Standard_Boolean& RevWires, Standard_Boolean& RevFace) override {
+        if (myFaces.Contains(F)) return Standard_False;
+        return BRepTools_NurbsConvertModification::NewSurface(F, S, L, Tol, RevWires, RevFace);
+    }
+    Standard_Boolean NewCurve(const TopoDS_Edge& E, Handle(Geom_Curve)& C, TopLoc_Location& L, Standard_Real& Tol) override {
+        if (myEdges.Contains(E)) return Standard_False;
+        return BRepTools_NurbsConvertModification::NewCurve(E, C, L, Tol);
+    }
+    Standard_Boolean NewCurve2d(const TopoDS_Edge& E, const TopoDS_Face& F, const TopoDS_Edge& NewE, const TopoDS_Face& NewF,
+                                Handle(Geom2d_Curve)& C, Standard_Real& Tol) override {
+        if (myFaces.Contains(F)) return Standard_False;
+        return BRepTools_NurbsConvertModification::NewCurve2d(E, F, NewE, NewF, C, Tol);
+    }
+    Standard_Boolean NewParameter(const TopoDS_Vertex& V, const TopoDS_Edge& E, Standard_Real& P, Standard_Real& Tol) override {
+        if (myEdges.Contains(E)) return Standard_False;
+        return BRepTools_NurbsConvertModification::NewParameter(V, E, P, Tol);
+    }
+
+private:
+    TopTools_MapOfShape myFaces, myEdges;
+};
+
+// One solid's B-spline conversion. A VALID solid whose conversion reads invalid on some faces is converted again
+// with those faces left analytic, and that result is taken when it is valid: the checker judges a wire's closure in
+// the face's parameter space, and on a face that degenerates towards a revolve's axis (flyback_transformer_complete at
+// 12 segments: a 0.018 mm2 cone patch of a litz bend whose 12-gon stands 22 nm off the bend's axis) the converted
+// surface's parameters no longer close a wire that closes on the cone. Which faces, and how much of them, is said.
+TopoDS_Shape nurbsConvertOneSolid(const TopoDS_Shape& solid, const std::string& name) {
+    TopTools_IndexedMapOfShape facesBefore;
+    TopExp::MapShapes(solid, TopAbs_FACE, facesBefore);
+    // A CONE REVOLVED THROUGH ITS OWN APEX stays a cone. A faceted bend revolves the wire's polygon about the bend's
+    // axis; where the bend's radius is the wire's (the mesh draws every bend that way: MKF bends the copper round its
+    // coating) one corner of the polygon stands on that axis to the model's resolution, and the two facets beside it
+    // are cones that reach their apex. As a B-spline such a patch has a collapsed boundary: the converted wire no
+    // longer reads closed (flyback_transformer_complete, 'Secondary parallel 0', 0.018 mm2), or the conversion itself
+    // throws on the collapsed curve ('Secondary parallel 1': "Knots interval values too close").
+    // Only where the plain conversion fails: a solid that converts whole is converted whole, as it always was.
+    std::vector<Standard_Integer> keep;
+    auto keepApexCones = [&]() {
+        for (Standard_Integer k = 1; k <= facesBefore.Extent(); ++k) {
+            const TopoDS_Face face = TopoDS::Face(facesBefore(k));
+            Handle(Geom_ConicalSurface) cone = Handle(Geom_ConicalSurface)::DownCast(BRep_Tool::Surface(face));
+            if (cone.IsNull()) continue;
+            double u0, u1, v0, v1;
+            BRepTools::UVBounds(face, u0, u1, v0, v1);
+            // The cone's radius at v is RefRadius + v sin(SemiAngle); it is least at an end of the face's v range, or
+            // zero inside it where the range holds the apex.
+            const double r0 = cone->RefRadius() + v0 * std::sin(cone->SemiAngle());
+            const double r1 = cone->RefRadius() + v1 * std::sin(cone->SemiAngle());
+            const double least = (r0 < 0.0) != (r1 < 0.0) ? 0.0 : std::min(std::abs(r0), std::abs(r1));
+            if (least <= BRep_Tool::Tolerance(face) && std::find(keep.begin(), keep.end(), k) == keep.end()) keep.push_back(k);
+        }
+    };
+    auto bad = [](const BRepCheck_Analyzer& verdict, const TopoDS_Shape& sub) {
+        Handle(BRepCheck_Result) res;
+        try {
+            res = verdict.Result(sub);
+        } catch (const Standard_Failure&) {
+            return false;   // not a sub-shape the analyzer judged
+        }
+        if (res.IsNull()) return false;
+        for (BRepCheck_ListIteratorOfListOfStatus it(res->Status()); it.More(); it.Next())
+            if (it.Value() != BRepCheck_NoError) return true;
+        for (res->InitContextIterator(); res->MoreShapeInContext(); res->NextShapeInContext())
+            for (BRepCheck_ListIteratorOfListOfStatus it(res->StatusOnShape()); it.More(); it.Next())
+                if (it.Value() != BRepCheck_NoError) return true;
+        return false;
+    };
+    auto convert = [&]() -> TopoDS_Shape {
+        if (keep.empty()) {
+            BRepBuilderAPI_NurbsConvert conversion(solid, /*Copy=*/Standard_True);
+            return conversion.Shape();
+        }
+        Handle(NurbsConvertExcept) except = new NurbsConvertExcept;
+        for (Standard_Integer k : keep) except->Keep(facesBefore(k));
+        BRepTools_Modifier modifier(solid);
+        modifier.Perform(except);
+        if (!modifier.IsDone())
+            throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name + "' did not complete");
+        return modifier.ModifiedShape(solid);
+    };
+    auto say = [&](const char* why) {
+        double area = 0.0;
+        for (Standard_Integer k : keep) {
+            GProp_GProps g;
+            BRepGProp::SurfaceProperties(facesBefore(k), g);
+            area += std::abs(g.Mass());
+        }
+        std::cerr << "[nurbs] '" << name << "': " << keep.size() << " face(s), " << area << " mm2 in all, stay analytic ("
+                  << why << "); every other face of the solid is a B-spline\n";
+    };
+    const bool wasValid = BRepCheck_Analyzer(solid).IsValid();
+    TopoDS_Shape converted;
+    std::string threw;
+    try {
+        converted = convert();
+    } catch (const Standard_Failure& e) {
+        threw = e.GetMessageString();
+    }
+    if (threw.empty()) {
+        if (converted.IsNull()) return solid;
+        if (!wasValid || BRepCheck_Analyzer(converted).IsValid()) return converted;
+    }
+    // The plain conversion threw, or gave an invalid solid from a valid one. It is done again with the apex cones left
+    // analytic, and with every face the first result's checker faulted: the conversion rebuilds the solid face for
+    // face, in the solid's own order (it changes no topology), so the k-th face of the result is the k-th of the solid.
+    keepApexCones();
+    if (threw.empty()) {
+        BRepCheck_Analyzer verdict(converted);
+        TopTools_IndexedMapOfShape facesAfter;
+        TopExp::MapShapes(converted, TopAbs_FACE, facesAfter);
+        if (facesBefore.Extent() == facesAfter.Extent())
+            for (Standard_Integer k = 1; k <= facesBefore.Extent(); ++k) {
+                if (std::find(keep.begin(), keep.end(), k) != keep.end()) continue;
+                const TopoDS_Shape& after = facesAfter(k);
+                bool faceBad = bad(verdict, after);
+                for (TopExp_Explorer wx(after, TopAbs_WIRE); wx.More() && !faceBad; wx.Next()) faceBad = bad(verdict, wx.Current());
+                if (faceBad) keep.push_back(k);
+            }
+    }
+    if (keep.empty()) {
+        if (!threw.empty())
+            throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name + "' threw: " + threw);
+        return converted;   // nothing to leave out: the caller refuses the invalid conversion
+    }
+    TopoDS_Shape retried;
+    try {
+        retried = convert();
+    } catch (const Standard_Failure& e) {
+        throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name + "' threw: " + (threw.empty() ? std::string() : threw + "; and, with " + std::to_string(keep.size()) + " face(s) left analytic: ") + e.GetMessageString());
+    }
+    if (retried.IsNull() || !BRepCheck_Analyzer(retried).IsValid()) {
+        if (!threw.empty())
+            throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name + "' threw: " + threw + "; with " + std::to_string(keep.size()) + " face(s) left analytic it gives an invalid solid");
+        return converted;
+    }
+    say(threw.empty() ? "cones revolved through their own apex, and faces whose converted wire no longer reads valid"
+                      : "cones revolved through their own apex; the whole solid's conversion threw");
+    return retried;
+}
+}   // namespace
+
 TopoDS_Shape nurbsConvertPeriodicSolidsMm(const TopoDS_Shape& shapeMm, const std::string& name) {
     auto hasPeriodicFace = [](const TopoDS_Shape& s) {
         for (TopExp_Explorer fx(s, TopAbs_FACE); fx.More(); fx.Next()) {
@@ -135,16 +296,14 @@ TopoDS_Shape nurbsConvertPeriodicSolidsMm(const TopoDS_Shape& shapeMm, const std
             for (TopoDS_Iterator it(shapeMm); it.More(); it.Next()) {
                 const TopoDS_Shape& child = it.Value();
                 if (hasPeriodicFace(child)) {
-                    BRepBuilderAPI_NurbsConvert cc(child, /*Copy=*/Standard_True);
-                    rb.Add(rebuilt, cc.Shape().IsNull() ? child : cc.Shape());
+                    rb.Add(rebuilt, nurbsConvertOneSolid(child, name));
                 } else {
                     rb.Add(rebuilt, child);
                 }
             }
             out = rebuilt;
         } else {
-            BRepBuilderAPI_NurbsConvert conv(shapeMm, /*Copy=*/Standard_True);
-            out = conv.Shape();
+            out = nurbsConvertOneSolid(shapeMm, name);
         }
         if (out.IsNull()) return shapeMm;
         // Conversion is exact, so both volume and validity must survive it. Anything else is OCC
@@ -185,9 +344,14 @@ TopoDS_Shape nurbsConvertPeriodicSolidsMm(const TopoDS_Shape& shapeMm, const std
               << err1 << "); an exact conversion cannot do that";
             throw std::runtime_error(m.str());
         }
-        if (wasValid && !BRepCheck_Analyzer(out).IsValid())
+        if (wasValid && !BRepCheck_Analyzer(out).IsValid()) {
+            if (const char* dump = std::getenv("MVB_REPARAM_DUMP")) {
+                BRepTools::Write(shapeMm, (std::string(dump) + ".nurbs_before.brep").c_str());
+                BRepTools::Write(out, (std::string(dump) + ".nurbs_after.brep").c_str());
+            }
             throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name +
                                      "' produced an invalid solid");
+        }
         return out;
     } catch (const Standard_Failure& e) {
         throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name + "' threw: " +
@@ -216,6 +380,7 @@ public:
     Standard_Boolean NewSurface(const TopoDS_Face& F, Handle(Geom_Surface)& S, TopLoc_Location& L,
                                 Standard_Real& Tol, Standard_Boolean& RevWires,
                                 Standard_Boolean& RevFace) override {
+        if (myKeptAsBuilt.Contains(F)) return Standard_False;
         Handle(Geom_Surface) s0 = BRep_Tool::Surface(F, L);
         Handle(Geom_BSplineSurface) bs = Handle(Geom_BSplineSurface)::DownCast(s0);
         if (bs.IsNull()) return Standard_False;
@@ -308,8 +473,12 @@ public:
         return BRep_Tool::Continuity(E, F1, F2);
     }
 
+    // A face that keeps the parametrisation it was built with (see unitParametrised).
+    void KeepAsBuilt(const TopoDS_Shape& face) { myKeptAsBuilt.Add(face); }
+
 private:
     NCollection_DataMap<TopoDS_Shape, std::pair<double, double>, TopTools_ShapeMapHasher> myFactors;
+    NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> myKeptAsBuilt;
 };
 
 } // namespace
@@ -326,7 +495,61 @@ TopoDS_Shape unitParametrised(const TopoDS_Shape& shapeMm, const std::string& na
     modifier.Perform(mod);
     if (!modifier.IsDone())
         throw std::runtime_error("exportSTEP: B-spline reparametrisation of '" + name + "' failed");
-    const TopoDS_Shape out = modifier.ModifiedShape(shapeMm);
+    TopoDS_Shape out = modifier.ModifiedShape(shapeMm);
+    // THE CHECKER'S VERDICT ON A NEEDLE FACE IS NOT AFFINE-INVARIANT. The change is exact (no point moves), yet
+    // BRepCheck judges a wire's self-intersection in parameter space with one tolerance for both directions, and the
+    // rescale is not the same in u and v. On a face a few micrometres wide (11_pushpull, 'Secondary 1 parallel 1':
+    // 0.0019 mm2 where two wraps of slightly different pitch are welded, its two long edges 7.7 um apart over
+    // 1 mm) a valid wire reads as self-intersecting after the rescale, with every edge still on the surface to
+    // 1e-5 mm before and after. Such a face keeps the parametrisation it was built with, which is the valid solid's
+    // own, and every other face is rescaled as before; it is said which. A solid still invalid after that throws.
+    if (wasValid && !BRepCheck_Analyzer(out).IsValid()) {
+        BRepCheck_Analyzer first(out);
+        auto bad = [&](const TopoDS_Shape& sub) {
+            // The analyzer holds a result for every sub-shape of the solid it was given; one it does not hold
+            // (Result throws) is not a sub-shape it judged, so it carries no verdict.
+            Handle(BRepCheck_Result) res;
+            try {
+                res = first.Result(sub);
+            } catch (const Standard_Failure&) {
+                return false;
+            }
+            if (res.IsNull()) return false;
+            for (BRepCheck_ListIteratorOfListOfStatus it(res->Status()); it.More(); it.Next())
+                if (it.Value() != BRepCheck_NoError) return true;
+            for (res->InitContextIterator(); res->MoreShapeInContext(); res->NextShapeInContext())
+                for (BRepCheck_ListIteratorOfListOfStatus it(res->StatusOnShape()); it.More(); it.Next())
+                    if (it.Value() != BRepCheck_NoError) return true;
+            return false;
+        };
+        Handle(UnitParametrisation) second = new UnitParametrisation;
+        int kept = 0;
+        double keptArea = 0.0;
+        for (TopExp_Explorer fx(shapeMm, TopAbs_FACE); fx.More(); fx.Next()) {
+            const TopoDS_Shape after = modifier.ModifiedShape(fx.Current());
+            bool faceBad = bad(after);
+            for (TopExp_Explorer wx(after, TopAbs_WIRE); wx.More() && !faceBad; wx.Next()) faceBad = bad(wx.Current());
+            if (!faceBad) continue;
+            second->KeepAsBuilt(fx.Current());
+            GProp_GProps area;
+            BRepGProp::SurfaceProperties(fx.Current(), area);
+            keptArea += std::abs(area.Mass());
+            ++kept;
+        }
+        if (kept > 0) {
+            BRepTools_Modifier again(shapeMm);
+            again.Perform(second);
+            if (!again.IsDone())
+                throw std::runtime_error("exportSTEP: B-spline reparametrisation of '" + name + "' failed");
+            const TopoDS_Shape retried = again.ModifiedShape(shapeMm);
+            if (BRepCheck_Analyzer(retried).IsValid()) {
+                std::cerr << "[reparam] '" << name << "': " << kept << " face(s), " << keptArea
+                          << " mm2 in all, keep the parametrisation they were built with (rescaled, a valid wire on them "
+                             "reads as self-intersecting); every other B-spline face is rescaled\n";
+                return retried;
+            }
+        }
+    }
     BRepCheck_Analyzer ana(out);
     if (wasValid && !ana.IsValid()) {
         // Name the statuses: a bare "invalid" cannot be acted on.
