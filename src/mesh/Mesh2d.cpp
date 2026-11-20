@@ -176,11 +176,13 @@ std::string mesh2d_from_mas(json magnetic, const MeshOptions& opt) {
     // enamel annulus exists as a dielectric, so it keeps painting the coating.
     const bool magnetics_copper = opt.conductor_conducting_diameter && !opt.electrostatic;
     const bool paint_coating = !magnetics_copper;
-    // A toroid core is a smooth annulus — build it with TRUE circles (0 polygon segments)
-    // so the ring and bore are exact, not faceted (the section then yields an exact annular
-    // area instead of a polygon approximation). Other cores keep the requested faceting.
+    // The core is built with TRUE circles (0 polygon segments) so its section is exact, not faceted: a toroid's ring
+    // and bore, and every round post and round window. A faceted window is cut circumscribed about E/2, so its wall
+    // lies past E/2 (E/2 / cos(pi/N) where a vertex meets the cut plane): the 2-D section of an ungapped PQ 27/17 had
+    // its lateral wall at 11.47 mm instead of 11.25 mm, 0.585 mm instead of 0.365 mm from the turns beside its
+    // residual gap. The winding keeps the requested faceting.
     const bool is_toroid_core = enriched.get_core().get_type() == MAS::CoreType::TOROIDAL;
-    const int core_segs = is_toroid_core ? 0 : opt.polygon_segments;
+    const int core_segs = 0;
     // Mesh the bobbin too (magnetically inert -> the field solver treats any non-core/non-turn
     // region as air) so the THERMAL FEA can conduct winding->bobbin->core. Opt out with
     // OMFEM_NO_BOBBIN if a bobbin geometry ever breaks meshing.
@@ -256,6 +258,85 @@ std::string mesh2d_from_mas(json magnetic, const MeshOptions& opt) {
             std::fprintf(stderr, "[coverage] core angular coverage f_covered=%.3f (axis=%d, winding OD/2=%.2f mm)\n",
                          f_cov, axis, r_in*1e3);
             std::ofstream cf(opt.out_msh + ".coverage"); if (cf) cf << f_cov << "\n";
+        }
+    }
+
+    // Plates of a round-post core in a planar section (OMFEM Problem::plates). The section extrudes every element by the
+    // post depth, but a yoke plate between the post (r = a) and the window wall (r = b) is a radial path whose ferrite
+    // covers a fraction K(r) of each circle, so its real reluctance per plate is int_a^b dr / (2 pi r K(r) h mu). The two
+    // sides of the section carry it in parallel, each (b - a) / (h d mu): the plate cells' mu is scaled by
+    //     s = ((b - a) / d) / int_a^b dr / (pi r K(r)),
+    // K(r) measured on this core's solid at mid-plate height (180 angles, 12 Gauss radii), not assumed. On an ungapped
+    // PQ 27/17 the uncorrected plates left the planar section's L 7.9 % under MKF's and its residual gaps 10-13 % short of
+    // MKF's MMF. Written to <mesh>.plates as "a b windowHalfHeight coreHalfHeight I" (m, and I = int_a^b dr / (pi r K)
+    // dimensionless), for OMFEM to scale with its section depth d; the corners above the post and
+    // the legs keep their section. Not written for a toroid or a non-round post.
+    std::remove((opt.out_msh + ".plates").c_str());   // never leave an earlier core's plates for this mesh
+    if (opt.planar && !is_toroid_core) {
+        const auto& core = enriched.get_core();
+        const auto& processed = core.get_processed_description();
+        if (!processed) throw std::runtime_error("plates: the core has no processed description");
+        const auto& columns = processed->get_columns();
+        const auto& windows = processed->get_winding_windows();
+        std::optional<size_t> mainColumn;
+        for (size_t i = 0; i < columns.size(); ++i)
+            if (columns[i].get_type() == MAS::ColumnType::CENTRAL) mainColumn = i;
+        if (mainColumn && columns[*mainColumn].get_shape() == MAS::ColumnShape::ROUND && windows.size() == 1 &&
+            windows[0].get_width() && windows[0].get_height()) {
+            std::vector<mvb::NamedShape> coreS;
+            for (auto& ns : named) {
+                std::string w; int i = 0;
+                const bool isb = ns.name.rfind("Bobbin",0)==0 || ns.name.rfind("FR4",0)==0;
+                if (!isb && classify(ns.name, w, i, nctx) == "core") coreS.push_back(ns);
+            }
+            if (coreS.empty()) throw std::runtime_error("plates: no core solid to measure");
+            const auto cb = mvb::aggregate_bbox(coreS);
+            const double lo[3] = {cb.xmin, cb.ymin, cb.zmin}, hi[3] = {cb.xmax, cb.ymax, cb.zmax};
+            // The post axis is the core's shortest extent (a pot/PQ core is flatter than it is wide).
+            int axis = 0;
+            for (int k = 1; k < 3; ++k) if (hi[k] - lo[k] < hi[axis] - lo[axis]) axis = k;
+            const int d1 = (axis + 1) % 3, d2 = (axis + 2) % 3;
+            const double centre[3] = {0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])};
+            const double a = columns[*mainColumn].get_width() / 2;
+            const double b = a + *windows[0].get_width();
+            const double windowHalf = *windows[0].get_height() / 2;
+            const double coreHalf = 0.5 * (hi[axis] - lo[axis]);
+            if (!(coreHalf > windowHalf) || !(b > a)) throw std::runtime_error("plates: the core has no plate above its window");
+            std::vector<BRepClass3d_SolidClassifier*> cls;
+            for (auto& ns : coreS)
+                for (TopExp_Explorer ex(ns.shape, TopAbs_SOLID); ex.More(); ex.Next())
+                    cls.push_back(new BRepClass3d_SolidClassifier(TopoDS::Solid(ex.Current())));
+            const double height = centre[axis] + 0.5 * (windowHalf + coreHalf);
+            constexpr int angles = 180;
+            static const double gx[12] = {0.1252334085114689,0.3678314989981802,0.5873179542866175,0.7699026741943047,0.9041172563704749,0.9815606342467192,
+                                          -0.1252334085114689,-0.3678314989981802,-0.5873179542866175,-0.7699026741943047,-0.9041172563704749,-0.9815606342467192};
+            static const double gw[6] = {0.2491470458134028,0.2334925365383548,0.2031674267230659,0.1600783285433462,0.1069393259953184,0.0471753363865118};
+            double integral = 0.0, minimumCoverage = 1.0;
+            for (int node = 0; node < 12; ++node) {
+                const double r = 0.5 * (a + b) + 0.5 * (b - a) * gx[node];
+                int covered = 0;
+                for (int k = 0; k < angles; ++k) {
+                    const double phi = 2.0 * M_PI * (k + 0.5) / angles;
+                    double pnt[3]; pnt[axis] = height;
+                    pnt[d1] = centre[d1] + r * std::cos(phi); pnt[d2] = centre[d2] + r * std::sin(phi);
+                    for (auto* c : cls) { c->Perform(gp_Pnt(pnt[0], pnt[1], pnt[2]), 1e-7);
+                        if (c->State() == TopAbs_IN || c->State() == TopAbs_ON) { ++covered; break; } }
+                }
+                const double coverage = double(covered) / angles;
+                if (!(coverage > 0.0)) {
+                    for (auto* c : cls) delete c;
+                    throw std::runtime_error("plates: no ferrite at r = " + std::to_string(r) + " m on the plate");
+                }
+                minimumCoverage = std::min(minimumCoverage, coverage);
+                integral += 0.5 * (b - a) * gw[node % 6] / (M_PI * r * coverage);
+            }
+            for (auto* c : cls) delete c;
+            std::fprintf(stderr, "[plates] post r=%.3f mm, wall r=%.3f mm, plate |y| %.3f..%.3f mm, min coverage %.3f, int dr/(pi r K) = %.5f\n",
+                         a * 1e3, b * 1e3, windowHalf * 1e3, coreHalf * 1e3, minimumCoverage, integral);
+            std::ofstream pf(opt.out_msh + ".plates");
+            if (!pf) throw std::runtime_error("plates: cannot write " + opt.out_msh + ".plates");
+            pf.precision(12);
+            pf << a << " " << b << " " << windowHalf << " " << coreHalf << " " << integral << "\n";
         }
     }
 
