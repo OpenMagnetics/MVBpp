@@ -110,6 +110,11 @@ struct Spiral {
     // here and is refused where it would be made). This is what joins a helix to the level run
     // past its station tangentially, where a plain junction left a C0 kink of the pitch angle.
     bool levelOut = false;
+    // ABT #2450: the slope a levelOut piece ARRIVES with, in units of its mean slope (y1 - y0) / (az1 - az0): 0 is
+    // the climb easing into level above. Any other value is the same quadratic between two helices of different
+    // pitch: y = y0 + (y1 - y0) (a t + (1 - a) t^2) with a = 2 - easeEndRate, so the slope runs linearly from a to
+    // easeEndRate times the mean. Read only where levelOut is set.
+    double easeEndRate = 0.0;
     // ABT #1528: a climb easing FOLDED INTO the level run after it (assembleWire does this when
     // the easing is shorter than one facet chord, whose facets would be micron strips). For
     // t in [0, easeIn] the height's slope falls linearly from 2 (y1 - y0) / easeIn to zero --
@@ -130,7 +135,7 @@ inline double spiralRadiusFracRate(const Spiral& sp, double t) {
 }
 inline double spiralHeightFrac(const Spiral& sp, double t) {
     if (sp.blend) return 0.5 * (1.0 - std::cos(std::numbers::pi * t));
-    if (sp.levelOut) return t * (2.0 - t);
+    if (sp.levelOut) { const double a = 2.0 - sp.easeEndRate; return t * (a + (1.0 - a) * t); }
     if (sp.easeIn > 0.0) {
         const double e = sp.easeIn;
         return t < e ? (2.0 / e) * (t - t * t / (2.0 * e)) : 1.0;
@@ -139,13 +144,13 @@ inline double spiralHeightFrac(const Spiral& sp, double t) {
 }
 inline double spiralHeightFracRate(const Spiral& sp, double t) {
     if (sp.blend) return 0.5 * std::numbers::pi * std::sin(std::numbers::pi * t);
-    if (sp.levelOut) return 2.0 * (1.0 - t);
+    if (sp.levelOut) { const double a = 2.0 - sp.easeEndRate; return a + 2.0 * (1.0 - a) * t; }
     if (sp.easeIn > 0.0) return t < sp.easeIn ? (2.0 / sp.easeIn) * (1.0 - t / sp.easeIn) : 0.0;
     return 1.0;
 }
 inline double spiralHeightFracCurvature(const Spiral& sp, double t) {
     if (sp.blend) return 0.5 * std::numbers::pi * std::numbers::pi * std::cos(std::numbers::pi * t);
-    if (sp.levelOut) return -2.0;
+    if (sp.levelOut) return 2.0 * (sp.easeEndRate - 1.0);
     if (sp.easeIn > 0.0) return t < sp.easeIn ? -2.0 / (sp.easeIn * sp.easeIn) : 0.0;
     return 0.0;
 }

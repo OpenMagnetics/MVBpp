@@ -374,7 +374,7 @@ inline double maxSecondDerivative(const Primitive& pr) {
                     throw std::runtime_error("cert::maxSecondDerivative: '" + pr.label +
                                              "' is an eased climb on a varying radius");
                 const double dy = std::abs(pr.spiral.y1 - pr.spiral.y0);
-                return std::hypot(rMax * S * S, 2.0 * dy);
+                return std::hypot(rMax * S * S, 2.0 * std::abs(pr.spiral.easeEndRate - 1.0) * dy);
             }
             return std::sqrt(4.0 * dr * dr * S * S + rMax * rMax * S * S * S * S);
         }
@@ -6576,7 +6576,7 @@ static std::string primChainKey(const std::vector<Primitive>& chain) {
         pnt(pr.seg.a); pnt(pr.seg.b);
         pnt(pr.arc.c); xyz(pr.arc.axis); xyz(pr.arc.v0); num(pr.arc.sweep);
         const auto& s = pr.spiral;
-        for (double v : {s.cx, s.cz, s.r0, s.y0, s.az0, s.r1, s.y1, s.az1, s.easeIn}) num(v);
+        for (double v : {s.cx, s.cz, s.r0, s.y0, s.az0, s.r1, s.y1, s.az1, s.easeIn, s.easeEndRate}) num(v);
         pnt(pr.blendc.a); pnt(pr.blendc.b); xyz(pr.blendc.u);
         k += static_cast<char>(pr.arc.exactRound | s.blend << 1 | s.levelOut << 2 | pr.isLead << 3 |
                                pr.isConnection << 4 | pr.terminalFillet << 5);
@@ -6817,6 +6817,81 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
 // requireAxisAlignedPort.
 static bool capAlongAnAxis(const gp_XYZ& u) {
     return std::max({std::abs(u.X()), std::abs(u.Y()), std::abs(u.Z())}) > 0.99;
+}
+
+// THE PITCH KINK OF A RE-SLOPED ROUND WRAP IS EASED (ABT #2450). MKF's round row end / row start re-slopes a turn's
+// last / first wrap uniformly onto its row, so that wrap meets the helix beside it on the same cylinder at the same
+// point but at another pitch: a kink of a fraction of a degree (11_pushpull 0.16 deg). Bridged and welded, it left a
+// needle face at the crossing (0.0019 mm2, its long edges 7.7 um apart) and cut every glued run there. prims[i] and
+// prims[i + 1] are those two helices. The joint becomes a piece whose slope runs LINEARLY from the one pitch to the
+// other (Spiral::levelOut with easeEndRate), centred on the joint: over a span w it climbs (kA + kB) w / 2, exactly
+// what the two helices climb over their halves of it, so it starts ON the first helix and ends ON the second, tangent
+// to both, and neither helix moves. Its span is the larger of one wire diameter of travel (a shorter piece cannot be
+// swept or glued cleanly, the short-spine rule of ABT #958) and the span that bends the wire at MKF's planned bend
+// radius (unrolled, the slope turns by |kA - kB| / r over w r: radius w r^2 / |kA - kB|). False (nothing changed,
+// reported) where the two pieces are not such a pair or are too short to give up half the span each.
+static bool easeHelixKink(std::vector<Primitive>& prims, size_t i, double bend, double wireRadius, const std::string& who,
+                          bool report) {
+    // `report`: say why a joint is not eased (a re-sloped wrap's, which must be); an ordinary wrap-to-wrap joint that
+    // is not such a pair (a dragback or a riser stands between the wraps) is simply not this function's.
+    auto no = [&](const std::string& why) {
+        if (report || std::getenv("MVB_LEAD_DIAG"))
+            std::fprintf(stderr, "[pitch-kink] %s: the joint is NOT eased (%s)\n", who.c_str(), why.c_str());
+        return false;
+    };
+    if (i + 1 >= prims.size()) return no("no piece after it");
+    const Primitive& pa = prims[i];
+    const Primitive& pb = prims[i + 1];
+    auto plain = [](const Primitive& p) {
+        return p.kind == Primitive::SPIRAL && !p.spiral.blend && !p.spiral.levelOut && !(p.spiral.easeIn > 0.0);
+    };
+    if (!plain(pa) || !plain(pb)) return no("'" + pa.label + "' and '" + pb.label + "' are not two plain helices");
+    const Spiral A = pa.spiral, B = pb.spiral;
+    const double spanA = A.az1 - A.az0, spanB = B.az1 - B.az0;
+    if (std::abs(spanA) < 1e-12 || std::abs(spanB) < 1e-12 || (spanA > 0) != (spanB > 0)) return no("a helix of no sweep, or the two run opposite ways");
+    const double r = A.r1;
+    if (std::abs(A.cx - B.cx) > 1e-12 || std::abs(A.cz - B.cz) > 1e-12 || std::abs(A.r1 - A.r0) > 1e-12 ||
+        std::abs(B.r1 - B.r0) > 1e-12 || std::abs(B.r0 - r) > 1e-12 || !(r > 0.0))
+        return no("the two helices are not on one cylinder");
+    if (azPointC(A.cx, A.cz, A.r1, A.y1, A.az1).Distance(azPointC(B.cx, B.cz, B.r0, B.y0, B.az0)) > 1e-9)
+        return no("the first helix does not end where the second starts");
+    const double sgn = spanA > 0 ? 1.0 : -1.0;
+    const double kA = (A.y1 - A.y0) / spanA, kB = (B.y1 - B.y0) / spanB;   // height per radian of azimuth, signed
+    {
+        const gp_Vec tA(-r * std::sin(A.az1), kA, -r * std::cos(A.az1)), tB(-r * std::sin(B.az0), kB, -r * std::cos(B.az0));
+        if (tA.Angle(tB) <= 1e-12) return false;   // one helix already: nothing to ease
+    }
+    if (!(bend > 0.0)) return no("MKF planned no bend radius for this wire");
+    const double w = std::max(2.0 * wireRadius / r, bend * std::abs(kA - kB) / (r * r));
+    const double half = 0.5 * w;
+    // Each helix keeps at least one wire diameter of its own travel.
+    if ((std::abs(spanA) - half) * r < 2.0 * wireRadius || (std::abs(spanB) - half) * r < 2.0 * wireRadius) {
+        std::ostringstream m;
+        m.precision(9);
+        m << "the easing needs " << half * 180.0 / kPi << " deg of each helix, which span " << std::abs(spanA) * 180.0 / kPi
+          << " and " << std::abs(spanB) * 180.0 / kPi << " deg";
+        return no(m.str());
+    }
+    Primitive E = pa;   // the first helix's own piece of wire: same label, turn and flags
+    E.spiral = A;
+    E.spiral.az0 = A.az1 - sgn * half;
+    E.spiral.y0 = A.y1 - kA * sgn * half;
+    E.spiral.az1 = E.spiral.az0 + sgn * w;
+    E.spiral.y1 = B.y0 + kB * sgn * half;
+    const double mean = (E.spiral.y1 - E.spiral.y0) / (sgn * w);
+    if (std::abs(mean) < 1e-15) return no("the two pitches cancel over the easing");
+    E.spiral.levelOut = true;
+    E.spiral.easeEndRate = kB / mean;
+    if (report || std::getenv("MVB_LEAD_DIAG"))
+        std::fprintf(stderr, "[pitch-kink] %s: '%s' -> '%s' eased over %.6f deg (%.3f um of wire) from %.6f to %.6f um/deg "
+                             "(bend %.4f mm)\n", who.c_str(), pa.label.c_str(), pb.label.c_str(), w * 180.0 / kPi, w * r * 1e6,
+                     kA * kPi / 180.0 * 1e6, kB * kPi / 180.0 * 1e6, w * r * r / std::abs(kA - kB) * 1e3);
+    prims[i].spiral.az1 = E.spiral.az0;
+    prims[i].spiral.y1 = E.spiral.y0;
+    prims[i + 1].spiral.az0 = B.az0 + sgn * half;
+    prims[i + 1].spiral.y0 = E.spiral.y1;
+    prims.insert(prims.begin() + static_cast<std::ptrdiff_t>(i) + 1, std::move(E));
+    return true;
 }
 
 // ABT #2274 (Alf, 2026-11-15, PSPS E16: "Ease the 5 deg joint"): where MKF's row start / row end piece -- a turn's first
@@ -19228,6 +19303,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                         throw std::runtime_error(m.str());
                     }
                 }
+                const size_t primsBeforeRoundWrap = path.prims.size();
                 appendRoundWrap(path, sWrap, nxt, wireRadius, label, i, bumpsForTurn(s.x),
                                 crossAz[i], crossAz[i + 1], bumpsForTurn(nxt.x), ct.parallels,
                                 /*stubAtStart=*/i == 0, /*stubAtEnd=*/i + 2 == nEmit, endY,
@@ -19245,6 +19321,16 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                                                             : wrapClimbEndAz(i, sWrap.y, endY),
                                 // ABT #1403: the bend MKF planned for this wire.
                                 plannedWireBendRadius(ct.winding, ct.parallel));
+                // ABT #2450: two consecutive wraps that meet as helices of different pitch on one cylinder are eased
+                // into each other. The wrap MKF re-slopes (a row end's last wrap, the wrap after a row start's first)
+                // must be, and says why if it is not; every other wrap-to-wrap joint is eased where it is such a pair
+                // (the isolated buck-boost: 23 joints bridged at 1e-6 to 0.03 deg, wraps whose stretch to their own
+                // crossing gives each its own pitch).
+                if (primsBeforeRoundWrap > 0 && path.prims.size() > primsBeforeRoundWrap && i > 0) {
+                    const double plannedBend = plannedWireBendRadius(ct.winding, ct.parallel);
+                    easeHelixKink(path.prims, primsBeforeRoundWrap - 1, plannedBend, wireRadius, path.name,
+                                  /*report=*/roundRowEnd || (i == 1 && rowStartRoute));
+                }
             } else if (rectFamily) {
                 {
                     const RectStation rs0 = rectStation(s, rectHalfW, rectHalfD, minBend, formerCornerRadius, path.name);

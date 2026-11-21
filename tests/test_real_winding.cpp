@@ -2443,6 +2443,8 @@ TEST_CASE("Real winding: no junction is bridged at a nonzero angle -- isolated b
     const auto paths = builder.buildRealWindingPaths(enriched);
     REQUIRE_FALSE(paths.empty());
     size_t junctions = 0, spiralArc = 0, kinkedBridges = 0;
+    std::ostringstream kinked;
+    kinked.precision(9);
     for (const auto& path : paths) {
         for (const auto& j : path.junctions) {
             ++junctions;
@@ -2451,8 +2453,8 @@ TEST_CASE("Real winding: no junction is bridged at a nonzero angle -- isolated b
             if (sa) ++spiralArc;
             if (j.verdict == mvb::JunctionVerdict::Bridge && j.angle > mvb::kTangentJunctionAngle) {
                 ++kinkedBridges;
-                UNSCOPED_INFO(path.name << ": '" << j.fromLabel << "' -> '" << j.toLabel << "' bridged at "
-                                        << j.angle * 180.0 / std::numbers::pi << " deg");
+                kinked << "\n  " << path.name << ": '" << j.fromLabel << "' -> '" << j.toLabel << "' bridged at "
+                       << j.angle * 180.0 / std::numbers::pi << " deg";
             }
         }
     }
@@ -2460,6 +2462,8 @@ TEST_CASE("Real winding: no junction is bridged at a nonzero angle -- isolated b
     // level runs past the stations are arcs).
     REQUIRE(junctions > 0);
     REQUIRE(spiralArc > 0);
+    // (Listed here, on the assertion they belong to: an UNSCOPED_INFO in the loop was consumed by the REQUIREs above.)
+    INFO("kinked bridged junctions:" << kinked.str());
     CHECK(kinkedBridges == 0);
 }
 
@@ -2492,6 +2496,67 @@ TEST_CASE("Assembler: a kinked SPIRAL->ARC3 bridge is refused, not welded (ABT #
     REQUIRE_THROWS_WITH(mvb::assembleWire(chain, rw, 12, mvb::CornerStyle::BisectionMitre, nullptr,
                                           false, "test conductor"),
                         Catch::Matchers::ContainsSubstring("refusing to bridge and weld"));
+}
+
+// ABT #1278 (13_current_sense, a 0.1 mm wire bent at 56.9 um). A faceted bend is the wire's 12-gon revolved about
+// the bend axis. In the metre frame OCC's revolve took a polygon edge lying a few degrees off that axis for one
+// parallel to it and made a CYLINDER of it instead of a cone: 3.4 um of vertex tolerance and 0.38 % of the bend's
+// volume gone, at the section phases 13_current_sense reaches on its second layer -- where the dragback's bends then
+// neither glued nor fused with the straight between them, the Secondary's weld split and its mesh failed. The bend is
+// built here at every section phase a 12-gon has (the bend axis turned in 2.5-degree steps through one facet), between
+// two straights, welded: one valid solid of exactly the swept volume, no vertex looser than the model's resolution.
+TEST_CASE("Assembler: a faceted bend is revolved exactly at every phase of its section to the bend axis (ABT #1278)",
+          "[realwinding][abt1278]") {
+    ScopedEnv1403 weld("MVB_WELD_ALL", "1");
+    const double rw = 50e-6, bend = 56.890675e-6, leg = 400e-6;
+    const int segments = 12;
+    int built = 0;
+    for (int step = 0; step < 12; ++step) {
+        const double phi = step * 2.5 * std::numbers::pi / 180.0;
+        const gp_XYZ axis(std::cos(phi), std::sin(phi), 0.0);
+        const gp_XYZ dIn(0.0, 0.0, 1.0);
+        const gp_XYZ dOut = axis.Crossed(dIn);   // the travel direction a quarter turn about `axis` later
+        const gp_Pnt bendStart(0.0, 0.0, 0.0);
+        mvb::Primitive in;
+        in.kind = mvb::Primitive::SEG;
+        in.seg = {gp_Pnt(bendStart.XYZ() - dIn * leg), bendStart};
+        in.label = "test straight in";
+        mvb::Primitive arc;
+        arc.kind = mvb::Primitive::ARC3;
+        arc.arc.c = gp_Pnt(bendStart.XYZ() + dOut * bend);
+        arc.arc.axis = axis;
+        arc.arc.v0 = bendStart.XYZ() - arc.arc.c.XYZ();
+        arc.arc.sweep = std::numbers::pi / 2.0;
+        arc.label = "test bend";
+        const gp_Pnt bendEnd(arc.arc.c.XYZ() + dIn * bend);
+        mvb::Primitive out;
+        out.kind = mvb::Primitive::SEG;
+        out.seg = {bendEnd, gp_Pnt(bendEnd.XYZ() + dOut * leg)};
+        out.label = "test straight out";
+        const std::vector<const mvb::Primitive*> chain{&in, &arc, &out};
+        const TopoDS_Shape wire = mvb::assembleWire(chain, rw, segments, mvb::CornerStyle::BisectionMitre, nullptr, false,
+                                                    "test conductor");
+        INFO("bend axis " << step * 2.5 << " deg from world x");
+        REQUIRE_FALSE(wire.IsNull());
+        CHECK(BRepCheck_Analyzer(wire).IsValid());
+        int solids = 0;
+        for (TopExp_Explorer e(wire, TopAbs_SOLID); e.More(); e.Next()) ++solids;
+        CHECK(solids == 1);
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(wire, props);
+        // a regular 12-gon inscribed in the wire's circle, carried along the centreline (Pappus for the bend)
+        const double section = 0.5 * segments * rw * rw * std::sin(2.0 * std::numbers::pi / segments);
+        const double exact = section * (2.0 * leg + bend * std::numbers::pi / 2.0);
+        INFO("volume " << props.Mass() << " m3, exact " << exact << " m3");
+        CHECK(std::abs(props.Mass() - exact) <= 1e-6 * exact);
+        double worst = 0.0;
+        for (TopExp_Explorer e(wire, TopAbs_VERTEX); e.More(); e.Next())
+            worst = std::max(worst, BRep_Tool::Tolerance(TopoDS::Vertex(e.Current())));
+        INFO("loosest vertex " << worst << " m; Precision::Confusion() = " << Precision::Confusion() << " m");
+        CHECK(worst <= Precision::Confusion() * (1.0 + 1e-9));
+        ++built;
+    }
+    REQUIRE(built == 12);
 }
 
 // The manifold gate, on shapes whose defect is certain by construction: a solid holding the same

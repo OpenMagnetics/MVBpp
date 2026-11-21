@@ -50,6 +50,7 @@
 #include "processors/Inputs.h"
 #include "support/Utils.h"
 #include <OSD_ThreadPool.hxx>
+#include <Precision.hxx>
 #include <TopExp_Explorer.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <GeomAbs_SurfaceType.hxx>
@@ -264,6 +265,7 @@ ChordPoints chord_points_3d(const Paths& paths, double condT) {
     }
     ChordPoints out; out.samples = smp.size();
     if (segs.empty()) throw std::runtime_error("chord bound: the real-winding centrelines have no segments");
+    const auto chordT0 = std::chrono::steady_clock::now();
     // the widest gap whose bound can still bind the target, for the thinnest wire
     const double dmax = (condT / 0.8) * (condT / 0.8) / (4.0 * rmin);
     const double R = 2.0 * rmax + dmax + 0.5 * segMax;         // candidate segment midpoints within R
@@ -315,7 +317,12 @@ ChordPoints chord_points_3d(const Paths& paths, double condT) {
             out.x[i] = mid[0]; out.y[i] = mid[1]; out.z[i] = mid[2]; out.h[i] = bestH; out.reach[i] = 1.5 * bestH;
         }
     }
+    const auto chordT1 = std::chrono::steady_clock::now();
     out.build_tree(condT);
+    std::fprintf(stderr, "[mesh3d] chord points: %zu sample(s) against %zu centreline segment(s) in %zu cell(s) of %.4g mm "
+                 "(longest segment %.4g mm): search %.1f s, tree %.1f s\n", smp.size(), segs.size(), sg.size(), R * 1e3,
+                 segMax * 1e3, std::chrono::duration<double>(chordT1 - chordT0).count(),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - chordT1).count());
     return out;
 }
 
@@ -1193,6 +1200,9 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
     // JOINT (a foil sheet end in its solder film, a lead's inner end on the sheet), not a place where current enters
     // the model. Decided by exact contact (BRepExtrema) with a tolerance of 1e-3 of the cap's own radius -- a round
     // wire's lead tip touches nothing and stays a port. Port numbering is per winding, entrance/start 0, exit/end 1.
+    // The conductors' own solids, as built: the chord bound's air check classifies its corridor points against these
+    // first (one classifier per solid, built once), and asks gmsh only about a point one of them holds.
+    std::vector<TopoDS_Shape> conductorSolids;
     {
         std::vector<std::pair<std::string, const TopoDS_Shape*>> bodies;   // conductor + solder bodies
         for (const auto& ns : named) {
@@ -1200,6 +1210,8 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
             std::string w; int ix = 0;
             const std::string role = classify(ns.name, w, ix, nctx3d);
             if (role == "winding" || role == "solder" || role == "turn") bodies.push_back({ns.name, &ns.shape});
+            if (role == "winding" || role == "turn")
+                for (TopExp_Explorer ex(ns.shape, TopAbs_SOLID); ex.More(); ex.Next()) conductorSolids.push_back(ex.Current());
         }
         // A FOIL parallel is ONE body (ABT #1907, Alf 2026-10-19): MVB++ fuses its sheet, its two axial leads and the
         // weld strips MKF lays between them, and caps only the lead tips (MKF's AxialLead::end), so its two caps are its
@@ -2361,7 +2373,25 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                             // whole gap. It is a disagreement only when the point is deeper than the size h it
                             // asks for -- then the ball no longer reaches the corridor it was placed for.
                             size_t skinDeep = 0; double deepest = 0.0;
-                            for (size_t i = 0; i < cp->h.size(); i += stride)
+                            const auto verifyT0 = std::chrono::steady_clock::now();
+                            // WHICH POINTS ARE ASKED (ABT #1278). gmsh's isInside builds a fresh solid classifier at every
+                            // call, over every face of the volume: 13_current_sense's 257 points against its welded
+                            // 80-turn Secondary took 2931 s, longer than the mesh itself. A point inside a meshed
+                            // conductor volume is inside the conductor solid it was imported from (the port clip only
+                            // removes copper), so each point is first classified against those solids -- one classifier
+                            // per solid, loaded once -- and only a point one of them holds (in or on) goes to gmsh,
+                            // whose answer and depth decide as before.
+                            std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> inSolid;
+                            for (const auto& cs : conductorSolids) inSolid.push_back(std::make_unique<BRepClass3d_SolidClassifier>(cs));
+                            size_t askedGmsh = 0;
+                            for (size_t i = 0; i < cp->h.size(); i += stride) {
+                                bool held = inSolid.empty();   // no solids to ask: every point goes to gmsh
+                                for (auto& c : inSolid) {
+                                    c->Perform(gp_Pnt(cp->x[i], cp->y[i], cp->z[i]), Precision::Confusion());
+                                    if (c->State() == TopAbs_IN || c->State() == TopAbs_ON) { held = true; break; }
+                                }
+                                if (!held) continue;
+                                ++askedGmsh;
                                 for (int v : cvols) {
                                     if (gmsh::model::isInside(3, v, {cp->x[i], cp->y[i], cp->z[i]}) <= 0) continue;
                                     const double px = cp->x[i], py = cp->y[i], pz = cp->z[i];
@@ -2387,6 +2417,11 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                                             "disagree with the solids");
                                     ++skinDeep; deepest = std::max(deepest, depth);
                                 }
+                            }
+                            std::fprintf(stderr, "[mesh3d] chord bound: corridor points checked against %zu conductor solid(s) in %.1f s "
+                                         "(%zu held by one and asked of gmsh's %zu volume(s))\n", inSolid.size(),
+                                         std::chrono::duration<double>(std::chrono::steady_clock::now() - verifyT0).count(), askedGmsh,
+                                         cvols.size());
                             if (skinDeep)
                                 std::fprintf(stderr, "[mesh3d] chord bound: %zu checked corridor point(s) lie under the copper "
                                              "skin, at most %.3g um deep (each within the size it asks for)\n",

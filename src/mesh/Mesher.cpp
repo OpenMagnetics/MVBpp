@@ -38,7 +38,9 @@ struct RecipeEnvironment {
     RecipeEnvironment() {
         std::string set;
         for (char** e = environ; e && *e; ++e)
-            if (std::string(*e).rfind("OMFEM_", 0) == 0 || std::string(*e).rfind("MVB_", 0) == 0)
+            // OMFEM_GMSH_VERBOSE only makes gmsh print what it does (stage, counts, memory): it changes no mesh.
+            if ((std::string(*e).rfind("OMFEM_", 0) == 0 && std::string(*e).rfind("OMFEM_GMSH_VERBOSE=", 0) != 0) ||
+                std::string(*e).rfind("MVB_", 0) == 0)
                 set += std::string(set.empty() ? "" : ", ") + std::string(*e).substr(0, std::string(*e).find('='));
         if (!set.empty())
             throw std::runtime_error("meshMagnetic: takes every meshing knob from the recipe, but the process "
