@@ -15,6 +15,9 @@
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
 #include <TopExp_Explorer.hxx>
+#include <BRepAlgoAPI_Common.hxx>
+#include <BRepGProp.hxx>
+#include <GProp_GProps.hxx>
 #include <fstream>
 #include <nlohmann/json.hpp>
 
@@ -112,4 +115,49 @@ TEST_CASE("A processed MAS magnetic wound on a lateral leg exports with that leg
     INFO(formers << " former solid(s)");
     CHECK(onLateralLeg > 0);    // the Secondary's leg
     CHECK(onMainColumn > 0);    // the Primary's column
+}
+
+// ABT #2489 (Alf, 2026-11-22, formers = B): where two wound columns share a winding window, each former's flange stops
+// halfway between the two former tubes. Each used to fill the whole window, 607 mm^3 of one former inside the other.
+TEST_CASE("Formers of two wound columns in one window stop halfway between their tubes",
+          "[bobbin][multicolumn][abt2489]") {
+    std::ifstream f(std::string(MAS_COMPLETE_DIR) + "/multicolumn_e42_transformer.json");
+    REQUIRE(f.is_open());
+    json j;
+    f >> j;
+    MAS::Magnetic magnetic = mvb::magnetic_from_json(j);
+    mvb::MagneticBuilder builder;
+    const std::vector<mvb::NamedShape> all = builder.buildAllNamed(magnetic);
+
+    std::vector<TopoDS_Shape> solids;
+    for (const auto& ns : all) {
+        if (ns.role != mvb::Role::Bobbin) continue;
+        for (TopExp_Explorer it(ns.shape, TopAbs_SOLID); it.More(); it.Next()) solids.push_back(it.Current());
+    }
+    REQUIRE(solids.size() >= 2);
+
+    double overlap = 0.0;
+    for (std::size_t i = 0; i < solids.size(); ++i) {
+        for (std::size_t k = i + 1; k < solids.size(); ++k) {
+            BRepAlgoAPI_Common common(solids[i], solids[k]);
+            REQUIRE(common.IsDone());
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(common.Shape(), props);
+            overlap += std::abs(props.Mass());
+        }
+    }
+    INFO("former in former: " << overlap * 1e9 << " mm^3");
+    CHECK(overlap < 1e-13);    // 1e-4 mm^3
+
+    // Main tube wall at -6.975 mm, the leg's at -14.05 mm: they meet at -10.5125 mm.
+    const double meetingX = -0.0105125;
+    double legReach = -1.0, mainReach = 1.0;
+    for (const auto& solid : solids) {
+        const BBox b = bbox_of(solid);
+        if (0.5 * (b.xmin + b.xmax) < meetingX) legReach = std::max(legReach, b.xmax);
+        else mainReach = std::min(mainReach, b.xmin);
+    }
+    INFO("leg former to " << legReach * 1e3 << " mm, main former from " << mainReach * 1e3 << " mm");
+    CHECK(std::abs(legReach - meetingX) < 1e-5);
+    CHECK(std::abs(mainReach - meetingX) < 1e-5);
 }
