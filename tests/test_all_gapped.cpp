@@ -268,6 +268,63 @@ TEST_CASE("PQ 20/16: a subtractive gap on each leg is machined, not just the cen
     CHECK(removedAll - removedCentre > 0.15e-9);
 }
 
+// ABT #1720. A POT core is round: its MAS shape has no C (P 59/36 carries A,B,D,E,F,G,H,M,r1), and
+// the side-gap knife used to be sized max(A, C)/2, so every pot core with side gaps threw
+// "applyMachining: P-family side gap needs dimensions A, C and E". OMFEM retypes MKF's 5 um residual
+// gaps -- centre + one per side of the skirt -- to subtractive whenever there is no functional gap,
+// so this blocked every ungapped pot core (the #2433 thermal reference: P 59/36, P 41/25). Same
+// question as the PQ case above: does each gap remove material? The gap layout is the one MKF emits
+// for P 59/36 (main.P59-1layer-Mix8, residual retyped).
+TEST_CASE("P 59/36: the side gaps of a round pot core are machined (no dimension C)",
+          "[shapes][gapping][sidegap][abt1720]") {
+    std::ifstream f(std::string(MAS_DATA_DIR) + "/core_shapes.ndjson");
+    REQUIRE(f.is_open());
+    json pot;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        json shape = json::parse(line, nullptr, false);
+        if (!shape.is_discarded() && shape.value("name", "") == "P 59/36") { pot = shape; break; }
+    }
+    REQUIRE(!pot.is_null());
+    REQUIRE(!pot["dimensions"].contains("C"));   // the premise: a pot core has no C
+    mvb::patch_dimension_nominals(pot);
+
+    const double gap = 5e-6;
+    json all = json::array({
+        {{"length", gap}, {"type", "subtractive"}, {"coordinates", {0.0, 0.0, 0.0}}, {"shape", "round"},
+         {"sectionDimensions", {0.0255, 0.0255}}},
+        {{"length", gap}, {"type", "subtractive"}, {"coordinates", {0.027075, 0.0, 0.0}}, {"shape", "irregular"},
+         {"sectionDimensions", {0.00515, 0.07702932}}},
+        {{"length", gap}, {"type", "subtractive"}, {"coordinates", {-0.027075, 0.0, 0.0}}, {"shape", "irregular"},
+         {"sectionDimensions", {0.00515, 0.07702932}}},
+    });
+    json centreOnly = json::array({all[0]});
+    json centreAndOneSide = json::array({all[0], all[1]});
+
+    auto vNone = build_with_gapping(pot, json::array());
+    auto vCentre = build_with_gapping(pot, centreOnly);
+    auto vOneSide = build_with_gapping(pot, centreAndOneSide);
+    auto vAll = build_with_gapping(pot, all);
+    INFO("ungapped: " << vNone.error << " centre: " << vCentre.error << " one side: " << vOneSide.error
+         << " all: " << vAll.error);
+    REQUIRE(vNone.ok); REQUIRE(vCentre.ok); REQUIRE(vOneSide.ok); REQUIRE(vAll.ok);
+
+    const double removedCentre = vNone.volume - vCentre.volume;
+    const double removedOneSide = vCentre.volume - vOneSide.volume;
+    const double removedOtherSide = vOneSide.volume - vAll.volume;
+    INFO("removed: centre " << removedCentre * 1e9 << " mm3, first side " << removedOneSide * 1e9
+         << " mm3, second side " << removedOtherSide * 1e9 << " mm3");
+    // centre post F = 25.5 mm round: 510.7 mm2 x 5 um ~ 2.55 mm3 (the polygon post is a little smaller)
+    CHECK(removedCentre > 2.2e-9);
+    CHECK(removedCentre < 2.7e-9);
+    // each side: half of the skirt outside the window, r in [E/2, A/2] = [24.5, 29.65] mm less the
+    // slots -- MKF's own section says ~397 mm2 -> ~2 mm3. At least half of that must be cut, per side,
+    // so a knife that misses one side (or both) fails here.
+    CHECK(removedOneSide > 1.0e-9);
+    CHECK(removedOtherSide > 1.0e-9);
+}
+
 // ---------------------------------------------------------------------------------------------
 // ABT #1184. "This cut removed nothing" answers two different questions, and only one of them is
 // a defect. Both are pinned here, so neither half of the distinction can be lost again.

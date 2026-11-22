@@ -7,6 +7,8 @@
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <gp_Pnt.hxx>
+#include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
 
 namespace mvb {
 namespace shapes {
@@ -84,13 +86,21 @@ TopoDS_Shape ShapeP::applyMachining(const TopoDS_Shape& piece,
         // the second cut is not a no-op. The knife overhangs every free face (1 mm) and extends
         // AWAY from the piece in y: nothing is there to over-cut, and coincident faces are what
         // makes OCCT's boolean drop a cut silently.
+        // THE KNIFE IS SIZED FROM THE PIECE ITSELF (ABT #1720). It used to be max(A, C)/2: right
+        // for PQ/RM/PM, whose footprint is A x C, but a POT core is round -- its footprint is A
+        // and the MAS shape carries no C (P 59/36: A,B,D,E,F,G,H,M,r1) -- so every pot core with
+        // side gaps threw "needs dimensions A, C and E". That is every pot core OMFEM meshes
+        // without a functional gap: retype_residual_gaps turns MKF's 5 um residual gaps
+        // (centre + one per side) into machined ones. The piece's bounding box is the outer
+        // extent of whatever the family is, so no dimension is read for it at all.
         const double e = dims.count("E") ? dims.at("E") : 0.0;
-        const double a = dims.count("A") ? dims.at("A") : 0.0;
-        const double c = dims.count("C") ? dims.at("C") : 0.0;
-        if (e <= 0.0 || a <= 0.0 || c <= 0.0)
-            throw std::runtime_error("applyMachining: P-family side gap needs dimensions A, C and E");
+        if (e <= 0.0)
+            throw std::runtime_error("applyMachining: P-family side gap needs dimension E (the winding window diameter)");
+        Bnd_Box bb; BRepBndLib::Add(piece, bb);
+        if (bb.IsVoid()) throw std::runtime_error("applyMachining: P-family side gap on an empty piece");
+        double xmin, ymin, zmin, xmax, ymax, zmax; bb.Get(xmin, ymin, zmin, xmax, ymax, zmax);
         const double over = 1e-3;
-        const double R = std::max(a, c) / 2.0 + over;              // past every outer face
+        const double R = std::max({std::abs(xmin), std::abs(xmax), std::abs(zmin), std::abs(zmax)}) + over;   // past every outer face
         TopoDS_Shape knife = makeBox(R, gapLength + over, 2.0 * R);  // x in [-R/2, R/2] before shift
         knife = translate_shape(knife, (xCoord > 0 ? R : -R) / 2.0,  // x in [0, R] on the gap's side
                                 yCoord + (yCoord > 0 ? -over : over) / 2.0, 0.0);
