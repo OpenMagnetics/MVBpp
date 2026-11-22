@@ -210,15 +210,27 @@ static bool is_litz_in_rectangular_cell(const MAS::Wire& wire, const MAS::Turn& 
            *turn.get_cross_sectional_shape() == MAS::TurnCrossSectionalShape::RECTANGULAR;
 }
 
+// A litz bundle MKF FLATTENED to make the winding fit (MKF Coil::wind, Wire::flattened_litz_sides: a stadium of
+// the round bundle's area, its short side k x the outer diameter): its turns carry crossSectionalShape oval and
+// the stadium's two sides as their dimensions.
+static bool is_flattened_litz(const MAS::Wire& wire, const MAS::Turn& turn) {
+    return wire.get_type() == MAS::WireType::LITZ && turn.get_cross_sectional_shape() &&
+           *turn.get_cross_sectional_shape() == MAS::TurnCrossSectionalShape::OVAL;
+}
+
 static std::pair<double, double> get_wire_dimensions(const MAS::Wire& wire, const MAS::Turn& turn,
                                                      bool paintCoating) {
-    if (!paintCoating && is_litz_in_rectangular_cell(wire, turn)) {
+    if (!paintCoating && (is_litz_in_rectangular_cell(wire, turn) || is_flattened_litz(wire, turn))) {
         // The strands fill the cell inside the serving, which is as thick as on the round
         // bundle: the cell less the round bundle's outer-to-bare difference on each axis.
+        // The same holds for a FLATTENED bundle (ABT #2511): its copper is the turn's own outline taken in by the
+        // serving, never the undeformed bare bundle -- which is wider than the flattened wire's short side as soon
+        // as the flattening exceeds the serving (T 50/30/15, Litz 270x0.16 flattened 1 %: 3.7228 mm of "copper" in
+        // a 3.7179 mm wire, 2.4 um inside the core every first-layer turn touches).
         auto td = turn.get_dimensions();
         if (!td || td->size() < 2) {
             throw std::runtime_error("get_wire_dimensions: litz turn '" + turn.get_name() +
-                                     "' is rectangular but carries no dimensions");
+                                     "' is deformed (rectangular or oval) but carries no dimensions");
         }
         const double bare = get_conducting_dimensions(wire).first;
         const double outer = OpenMagnetics::Wire::calculate_outer_diameter(OpenMagnetics::Wire(wire));
