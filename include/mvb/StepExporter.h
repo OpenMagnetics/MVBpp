@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mvb/NamedShape.h"
+#include <set>
 
 #include <TopoDS_Shape.hxx>
 #include <string>
@@ -23,6 +24,15 @@ struct StepExportOptions {
     // poles, and BOPAlgo then finds sporadic self-intersections on faceted revolves (ABT #1111).
     // The conversion is exact (a conic is a rational B-spline); it moves no point.
     bool nurbsPeriodicSolids = false;
+    // The shapes (by name) whose PLANAR faces that pass leaves as planes (ABT #2465). A plane carries no periodicity
+    // flag, so converting it serves nothing gmsh reads -- but on a welded FACETED conductor it is almost every face
+    // (two_switch_forward's litz Primary: 22,346 of 26,306), and with them B-splines the mesher's booleans cost five
+    // times the memory (clipping it to the air box: 5.8 GB against 1.25 GB) and leave slivers inside the conductor
+    // (120 tets below gamma 0.01 against 3). It is a list and not a rule because the same choice HURTS a stack of
+    // foils: their broad faces, as true planes, take surface meshes that lie node on node across the 25 um air layer
+    // between two sheets, and the layer fills with flat tets (65 -> 1,230 below 0.01, same design). The mesher names
+    // its round-wire conductors here; every other shape is converted whole, as before.
+    std::set<std::string> planarFacesStayPlanarIn;
 };
 
 bool exportSTEP(const std::vector<NamedShape>& shapes,

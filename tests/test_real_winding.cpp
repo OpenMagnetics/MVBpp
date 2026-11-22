@@ -41,6 +41,8 @@
 #include <gp_Circ.hxx>
 #include <gp_Torus.hxx>
 #include "mvb/WireAssembler.h"
+#include <BRepAlgoAPI_Cut.hxx>
+#include <BRepPrimAPI_MakeSphere.hxx>
 #include "mvb/PortPlane.h"
 #include "mvb/NamedShape.h"
 #include <gp_Dir.hxx>
@@ -2825,4 +2827,64 @@ TEST_CASE("Draw-time lead routes are MKF's real-winding plan", "[realwinding][le
     CHECK(routesUnder(std::nullopt) == realPlan);
     // The policy restores the caller's setting when it ends.
     CHECK_FALSE(settings.get_coil_use_real_winding_geometry());
+}
+
+// The assembler's general fuse may leave a piece out of the boolean when the piece lies entirely inside the copper before
+// it (A u B = A). That is only safe on proof. On 13_current_sense (ABT #1278) a cut that came back EMPTY was taken as the
+// proof for a 2.1 mm dragback descent against a 0.06 mm bend, and the descent vanished from the conductor: an open circuit
+// in a STEP that still looked whole from the outside. mvb::pieceLiesInside asks three measures to agree (box, vertices,
+// cut). The cut is the only measure a healthy boolean needs -- the bar across the C below is caught by nothing else -- and
+// the box and the vertices are what stands when the boolean is the thing that failed.
+TEST_CASE("Assembler: a piece is absorbed only when it is proven to lie inside the copper before it (ABT #1278)",
+          "[realwinding][absorb]") {
+    const double mm = 1e-3;
+    const auto box = [&](double x0, double y0, double z0, double x1, double y1, double z1) -> TopoDS_Shape {
+        return BRepPrimAPI_MakeBox(gp_Pnt(x0 * mm, y0 * mm, z0 * mm), gp_Pnt(x1 * mm, y1 * mm, z1 * mm)).Shape();
+    };
+    const auto volumeOf = [](const TopoDS_Shape& sh) {
+        GProp_GProps g;
+        BRepGProp::VolumeProperties(sh, g);
+        return g.Mass();
+    };
+    const auto inside = [&](const TopoDS_Shape& piece, const TopoDS_Shape& host) {
+        return mvb::pieceLiesInside(piece, volumeOf(piece), host);
+    };
+    const TopoDS_Shape slab = box(0, 0, 0, 3, 3, 1);
+
+    SECTION("a piece strictly inside is inside") { CHECK(inside(box(1, 1, 0.25, 2, 2, 0.75), slab)); }
+    SECTION("a piece flush with the host's faces is inside") { CHECK(inside(box(0, 0, 0, 1, 1, 1), slab)); }
+    SECTION("the host is inside itself") { CHECK(inside(slab, slab)); }
+    SECTION("a long piece through a small host is not inside it") {
+        // the sizes of 13_current_sense's case: a 2.1 mm descent of a 0.1 mm wire, a bend 0.12 mm across
+        const TopoDS_Shape bend = box(0, 0, 0, 0.12, 0.12, 0.12);
+        const TopoDS_Shape descent = box(-2.1, 0.01, 0.01, 0.06, 0.11, 0.11);
+        CHECK_FALSE(inside(descent, bend));
+        CHECK(volumeOf(descent) > 10.0 * volumeOf(bend));   // the fixture is the case: the piece dwarfs its host
+    }
+    SECTION("a piece within the host's box with a corner in the open is not inside") {
+        const TopoDS_Shape ball = BRepPrimAPI_MakeSphere(gp_Pnt(0, 0, 0), 1.0 * mm).Shape();
+        CHECK_FALSE(inside(box(0.6, 0.6, 0.6, 0.7, 0.7, 0.7), ball));   // far corner 1.21 mm from the centre
+        CHECK(inside(box(0.3, 0.3, 0.3, 0.5, 0.5, 0.5), ball));         // far corner 0.87 mm from the centre
+    }
+    SECTION("a bar across the opening of a C is not inside the C, though its box and every vertex are") {
+        BRepAlgoAPI_Cut notch(slab, box(1, 1, 0, 2, 3, 1));
+        REQUIRE(notch.IsDone());
+        const TopoDS_Shape c = notch.Shape();
+        REQUIRE(volumeOf(c) == Catch::Approx(7.0 * mm * mm * mm).epsilon(1e-9));
+        const TopoDS_Shape bar = box(0.5, 2, 0.25, 2.5, 2.5, 0.75);   // ends in the two arms, middle over the opening
+        size_t vertices = 0;
+        BRepClass3d_SolidClassifier in(c);
+        for (TopExp_Explorer ex(bar, TopAbs_VERTEX); ex.More(); ex.Next(), ++vertices) {
+            in.Perform(BRep_Tool::Pnt(TopoDS::Vertex(ex.Current())), Precision::Confusion());
+            CHECK(in.State() == TopAbs_IN);
+        }
+        REQUIRE(vertices > 0);
+        CHECK_FALSE(inside(bar, c));
+        CHECK(inside(box(0.25, 2, 0.25, 0.75, 2.5, 0.75), c));   // the same bar cut down to one arm
+    }
+    SECTION("nothing is proven about a null shape or a piece of no volume") {
+        CHECK_FALSE(mvb::pieceLiesInside(TopoDS_Shape(), 1.0, slab));
+        CHECK_FALSE(mvb::pieceLiesInside(box(1, 1, 0.25, 2, 2, 0.75), 1.0, TopoDS_Shape()));
+        CHECK_FALSE(mvb::pieceLiesInside(box(1, 1, 0.25, 2, 2, 0.75), 0.0, slab));
+    }
 }

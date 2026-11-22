@@ -22,6 +22,7 @@
 // Tags: [stepvalidity] everywhere, plus [slow] on the designs that take minutes. The default
 // run covers the cheap designs; `./mvb_tests "[stepvalidity]"` from the repo ROOT runs them all.
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 
 #include "mvb/MagneticBuilder.h"
 #include "mvb/StepExporter.h"
@@ -34,6 +35,7 @@
 #include <BRepAdaptor_Curve.hxx>
 #include <BOPAlgo_ArgumentAnalyzer.hxx>
 #include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopoDS_Edge.hxx>
 #include <cstdlib>
@@ -41,6 +43,11 @@
 #include <BRepGProp.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <gp_Ax2.hxx>
+#include <Geom_Surface.hxx>
+#include <Geom_Plane.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepAlgoAPI_Fuse.hxx>
 #include <Bnd_Box.hxx>
 #include <Interface_Static.hxx>
 #include <STEPControl_Controller.hxx>
@@ -327,6 +334,70 @@ TEST_CASE("Real-winding fixtures: every solid manifold and self-intersection fre
         CHECK(copperSolids > 0);
         CHECK(solids == copperSolids);
     }
+}
+
+// The FEM product's B-spline pass is for PERIODIC surfaces: gmsh reads the periodicity flag off the underlying
+// surface and sends such a face to its fragile periodic mesher. A plane has no such flag, and it stays a plane
+// (ABT #2465): a welded conductor is one solid with thousands of planar facets beside a few bends, and with every one
+// of them rewritten as a B-spline the mesher's booleans cost five times the memory (two_switch_forward: clipping the
+// 26,306-face Primary to the air box, 5.8 GB with its 22,346 planes converted, 1.25 GB with them kept).
+TEST_CASE("The FEM product's B-spline pass leaves planar faces planar where asked, and no surface periodic", "[stepvalidity][nurbs]") {
+    // a faceted run welded to a rounded one, in metres: a 2 x 2 x 6 mm bar with half a 1 mm-radius rod standing on its
+    // end. Half a rod, because its wall is the case the pass is for: a panel of a periodic surface that does not wrap
+    // (a rod that closes on itself is periodic in fact, and stays so).
+    BRepAlgoAPI_Fuse weld(BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), gp_Pnt(2e-3, 2e-3, 6e-3)).Shape(),
+                          BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(1e-3, 1e-3, 5e-3), gp_Dir(0, 0, 1)), 1e-3, 4e-3, M_PI).Shape());
+    REQUIRE(weld.IsDone());
+    const TopoDS_Shape body = weld.Shape();
+    REQUIRE(BRepCheck_Analyzer(body).IsValid());
+    const auto census = [](const TopoDS_Shape& shape) {
+        struct { int faces = 0, planes = 0, periodic = 0; } c;
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(shape, TopAbs_FACE, faces);
+        for (int k = 1; k <= faces.Extent(); ++k) {
+            Handle(Geom_Surface) surface = BRep_Tool::Surface(TopoDS::Face(faces(k)));
+            ++c.faces;
+            if (!Handle(Geom_Plane)::DownCast(surface).IsNull()) ++c.planes;
+            if (surface->IsUPeriodic() || surface->IsVPeriodic()) ++c.periodic;
+        }
+        return c;
+    };
+    const auto before = census(body);
+    REQUIRE(before.planes >= 8);     // the bar's faces, the half rod's free cap and its flat side
+    REQUIRE(before.periodic == 1);   // the half rod's wall: what the pass exists for
+
+    std::error_code ec;
+    const auto dir = std::filesystem::temp_directory_path(ec) / "mvb_stepvalidity";
+    std::filesystem::create_directories(dir, ec);
+    const std::string path = (dir / "planes_stay_planes.step").string();
+    mvb::StepExportOptions opts;
+    opts.nurbsPeriodicSolids = true;
+    opts.planarFacesStayPlanarIn = {"Primary parallel 0"};
+    REQUIRE(mvb::exportSTEP({mvb::NamedShape{body, "Primary parallel 0"}}, path, opts));
+    const auto readBack = mvb::importSTEP(path);
+    REQUIRE(readBack.size() == 1);
+    REQUIRE(BRepCheck_Analyzer(readBack.front().shape).IsValid());
+    const auto after = census(readBack.front().shape);
+    CHECK(after.faces == before.faces);
+    CHECK(after.planes == before.planes);   // every plane is still a plane
+    CHECK(after.periodic == 0);             // and nothing periodic is left for gmsh to find
+    // a shape that is not named keeps the pass as it was: converted whole, every face a B-spline. That is what a foil
+    // stack needs (its broad faces as true planes take surface meshes that lie node on node across a 25 um layer).
+    opts.planarFacesStayPlanarIn.clear();
+    const std::string pathWhole = (dir / "planes_converted.step").string();
+    REQUIRE(mvb::exportSTEP({mvb::NamedShape{body, "Secondary parallel 0"}}, pathWhole, opts));
+    const auto whole = mvb::importSTEP(pathWhole);
+    REQUIRE(whole.size() == 1);
+    REQUIRE(BRepCheck_Analyzer(whole.front().shape).IsValid());
+    const auto afterWhole = census(whole.front().shape);
+    CHECK(afterWhole.planes == 0);
+    CHECK(afterWhole.periodic == 0);
+    // no copper lost or invented: both volumes integrated adaptively to 1e-9 (the default rule is a fixed number of
+    // Gauss points per span, and a rational B-spline wall has few spans); the file is in millimetres
+    GProp_GProps vIn, vOut;
+    BRepGProp::VolumeProperties(body, vIn, 1e-9);
+    BRepGProp::VolumeProperties(readBack.front().shape, vOut, 1e-9);
+    CHECK(vOut.Mass() == Catch::Approx(vIn.Mass() * 1e9).epsilon(1e-6));
 }
 
 // OCCT's STEP length unit is one process-wide static, and gmsh's Geometry.OCCTargetUnit "M" sets

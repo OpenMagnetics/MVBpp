@@ -24,6 +24,61 @@ namespace mvb::mesh {
 namespace gf = gmsh::model::mesh::field;
 namespace go = gmsh::option;
 
+double wire_scale_target(double surface_radius) {
+    if (!(surface_radius > 0.0)) throw std::invalid_argument("wire_scale_target: the surface radius must be > 0");
+    return 1.2 * surface_radius;
+}
+
+double foil_scale_target(double thickness) {
+    if (!(thickness > 0.0)) throw std::invalid_argument("foil_scale_target: the foil thickness must be > 0");
+    return 2.0 * thickness;
+}
+
+std::optional<std::string> winding_of_conductor_region(const std::string& region) {
+    if (region.rfind("winding_", 0) == 0) return region.substr(8);
+    if (region.rfind("turn_", 0) == 0) {
+        const auto last = region.rfind('_');
+        if (last > 5) return region.substr(5, last - 5);
+    }
+    return std::nullopt;
+}
+
+std::map<std::string, double> automatic_conductor_targets(const std::vector<std::string>& conductor_regions,
+                                                          const std::map<std::string, double>& wire_target_by_winding) {
+    std::map<std::string, double> targets;
+    for (const auto& region : conductor_regions) {
+        const auto winding = winding_of_conductor_region(region);
+        if (!winding) continue;
+        const auto it = wire_target_by_winding.find(*winding);
+        if (it == wire_target_by_winding.end())
+            throw std::runtime_error("mesh sizing: conductor region '" + region + "' belongs to no winding of the coil's "
+                                     "functional description; it has no wire to be sized from");
+        targets["winding_" + *winding] = it->second;
+    }
+    return targets;
+}
+
+bool corridor_binds(double bound, double target_a, double target_b) { return bound < std::max(target_a, target_b); }
+
+double chord_bound(double radius, double gap) {
+    if (!(radius > 0.0)) throw std::invalid_argument("chord_bound: the radius of curvature must be > 0");
+    if (!(gap >= 0.0)) throw std::invalid_argument("chord_bound: the gap must be >= 0");
+    return 0.8 * std::sqrt(4.0 * radius * gap);
+}
+
+double widest_binding_gap(double radius, double target) {
+    if (!(radius > 0.0)) throw std::invalid_argument("widest_binding_gap: the radius of curvature must be > 0");
+    if (!(target > 0.0)) throw std::invalid_argument("widest_binding_gap: the target must be > 0");
+    return std::min((target / 0.8) * (target / 0.8) / (4.0 * radius), radius / 0.32);
+}
+
+bool surfaces_face(double cos_normals, double radius, double target) {
+    if (!(radius > 0.0)) throw std::invalid_argument("surfaces_face: the radius of curvature must be > 0");
+    if (!(target > 0.0)) throw std::invalid_argument("surfaces_face: the target must be > 0");
+    const double alpha = std::acos(std::clamp(-cos_normals, -1.0, 1.0));   // 0 between the parallel walls of a gap
+    return alpha < std::min(target / (2.0 * radius), 0.5 * std::numbers::pi);
+}
+
 double skin_depth(double f_hz, double sigma, double mur) {
     if (!(f_hz > 0.0))  throw std::invalid_argument("skin_depth: frequency must be > 0");
     if (!(sigma > 0.0)) throw std::invalid_argument("skin_depth: conductivity must be > 0");
@@ -314,6 +369,21 @@ static int fork_attempt(int dim, int algo, const std::string& algo_opt, bool esc
 // forwarded to the real stdout only when OMFEM_GMSH_VERBOSE asked for it, so a default run prints
 // exactly what it printed before plus the rate lines on stderr. Anything else that writes to
 // stdout during the generate step is captured too -- the mesher writes its own logs to stderr.
+//
+// It needs a second thread, and the single-threaded WASM build has none: there std::thread's constructor
+// throws "Resource temporarily unavailable", which made EVERY 3D mesh in the browser fail (found 2026-11-22
+// by meshing in the built module; the quick WASM suite meshes nothing). Without threads the rate cannot be
+// read while generate() runs, so that build says so once and meshes unmonitored.
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+class RefinementRateMonitor {
+public:
+    RefinementRateMonitor() {
+        std::fprintf(stderr, "[mesh] 3D refinement rate: not monitored, this build has no threads\n");
+    }
+    RefinementRateMonitor(const RefinementRateMonitor&) = delete;
+    RefinementRateMonitor& operator=(const RefinementRateMonitor&) = delete;
+};
+#else
 class RefinementRateMonitor {
 public:
     RefinementRateMonitor() {
@@ -333,7 +403,17 @@ public:
         close(fds[1]);
         _readEnd = fds[0];
         go::setNumber("General.Terminal", 1);
-        _reader = std::thread([this] { read_loop(); });
+        try {
+            _reader = std::thread([this] { read_loop(); });
+        } catch (const std::exception& e) {
+            // The destructor does not run for a constructor that throws: give stdout back here.
+            go::setNumber("General.Terminal", _terminalWas);
+            std::fflush(stdout);
+            dup2(_savedStdout, STDOUT_FILENO);
+            close(_savedStdout);
+            close(_readEnd);
+            throw std::runtime_error(std::string("refinement-rate monitor: no reader thread: ") + e.what());
+        }
     }
     ~RefinementRateMonitor() {
         go::setNumber("General.Terminal", _terminalWas);
@@ -407,6 +487,7 @@ private:
     long _iterations = 0, _firstIt = 0, _windowIt = 0;
     double _firstTime = 0, _windowTime = 0, _lastTime = 0, _lastRadius = 0;
 };
+#endif
 
 int generate_robust(int dim, const std::vector<int>& chain) {
     const std::string algo_opt = (dim == 3) ? "Mesh.Algorithm3D" : "Mesh.Algorithm";

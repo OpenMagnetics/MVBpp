@@ -15,6 +15,8 @@
 #include <vector>
 #include <BRepTools_Modifier.hxx>
 #include <BRepTools_NurbsConvertModification.hxx>
+#include <Geom_RectangularTrimmedSurface.hxx>
+#include <Geom_Plane.hxx>
 #include <TopTools_MapOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <Geom2d_Curve.hxx>
@@ -162,7 +164,7 @@ private:
 // the face's parameter space, and on a face that degenerates towards a revolve's axis (flyback_transformer_complete at
 // 12 segments: a 0.018 mm2 cone patch of a litz bend whose 12-gon stands 22 nm off the bend's axis) the converted
 // surface's parameters no longer close a wire that closes on the cone. Which faces, and how much of them, is said.
-TopoDS_Shape nurbsConvertOneSolid(const TopoDS_Shape& solid, const std::string& name) {
+TopoDS_Shape nurbsConvertOneSolid(const TopoDS_Shape& solid, const std::string& name, bool planesStay) {
     TopTools_IndexedMapOfShape facesBefore;
     TopExp::MapShapes(solid, TopAbs_FACE, facesBefore);
     // A CONE REVOLVED THROUGH ITS OWN APEX stays a cone. A faceted bend revolves the wire's polygon about the bend's
@@ -172,7 +174,26 @@ TopoDS_Shape nurbsConvertOneSolid(const TopoDS_Shape& solid, const std::string& 
     // longer reads closed (flyback_transformer_complete, 'Secondary parallel 0', 0.018 mm2), or the conversion itself
     // throws on the collapsed curve ('Secondary parallel 1': "Knots interval values too close").
     // Only where the plain conversion fails: a solid that converts whole is converted whole, as it always was.
-    std::vector<Standard_Integer> keep;
+    // WHERE ASKED, A PLANE STAYS A PLANE (ABT #2465; StepExportOptions::planarFacesStayPlanarIn says where and why).
+    // The conversion exists to take the periodicity flag off surfaces that have one; a plane has none. A welded
+    // conductor is ONE solid, so the "only solids that carry a periodic face" rule above no longer spares its facets:
+    // two_switch_forward's litz Primary went in with 22,346 planar faces of 26,306 and came out with 26,306 B-spline
+    // faces and 61,368 B-spline edges. The planar faces, their edges' curves and those edges' pcurves on them are left
+    // as they are; the faces beside them are converted as before, with their own pcurves of the shared edges.
+    std::vector<Standard_Integer> keep;       // faces left analytic: the planes, and whatever the retry below adds
+    std::vector<Standard_Integer> beyondPlanes;   // ... of which those that are not planes (what the log reports)
+    for (Standard_Integer k = 1; planesStay && k <= facesBefore.Extent(); ++k) {
+        Handle(Geom_Surface) surface = BRep_Tool::Surface(TopoDS::Face(facesBefore(k)));
+        if (Handle(Geom_RectangularTrimmedSurface) trimmed = Handle(Geom_RectangularTrimmedSurface)::DownCast(surface); !trimmed.IsNull())
+            surface = trimmed->BasisSurface();
+        if (!Handle(Geom_Plane)::DownCast(surface).IsNull()) keep.push_back(k);
+    }
+    std::vector<char> kept(static_cast<size_t>(facesBefore.Extent()) + 1, 0);
+    for (Standard_Integer k : keep) kept[static_cast<size_t>(k)] = 1;
+    auto keepToo = [&](Standard_Integer k) {
+        if (kept[static_cast<size_t>(k)]) return;
+        kept[static_cast<size_t>(k)] = 1; keep.push_back(k); beyondPlanes.push_back(k);
+    };
     auto keepApexCones = [&]() {
         for (Standard_Integer k = 1; k <= facesBefore.Extent(); ++k) {
             const TopoDS_Face face = TopoDS::Face(facesBefore(k));
@@ -185,7 +206,7 @@ TopoDS_Shape nurbsConvertOneSolid(const TopoDS_Shape& solid, const std::string& 
             const double r0 = cone->RefRadius() + v0 * std::sin(cone->SemiAngle());
             const double r1 = cone->RefRadius() + v1 * std::sin(cone->SemiAngle());
             const double least = (r0 < 0.0) != (r1 < 0.0) ? 0.0 : std::min(std::abs(r0), std::abs(r1));
-            if (least <= BRep_Tool::Tolerance(face) && std::find(keep.begin(), keep.end(), k) == keep.end()) keep.push_back(k);
+            if (least <= BRep_Tool::Tolerance(face)) keepToo(k);
         }
     };
     auto bad = [](const BRepCheck_Analyzer& verdict, const TopoDS_Shape& sub) {
@@ -218,13 +239,13 @@ TopoDS_Shape nurbsConvertOneSolid(const TopoDS_Shape& solid, const std::string& 
     };
     auto say = [&](const char* why) {
         double area = 0.0;
-        for (Standard_Integer k : keep) {
+        for (Standard_Integer k : beyondPlanes) {
             GProp_GProps g;
             BRepGProp::SurfaceProperties(facesBefore(k), g);
             area += std::abs(g.Mass());
         }
-        std::cerr << "[nurbs] '" << name << "': " << keep.size() << " face(s), " << area << " mm2 in all, stay analytic ("
-                  << why << "); every other face of the solid is a B-spline\n";
+        std::cerr << "[nurbs] '" << name << "': " << beyondPlanes.size() << " face(s), " << area << " mm2 in all, stay analytic ("
+                  << why << "); every other face of the solid that is not a plane is a B-spline\n";
     };
     const bool wasValid = BRepCheck_Analyzer(solid).IsValid();
     TopoDS_Shape converted;
@@ -248,27 +269,27 @@ TopoDS_Shape nurbsConvertOneSolid(const TopoDS_Shape& solid, const std::string& 
         TopExp::MapShapes(converted, TopAbs_FACE, facesAfter);
         if (facesBefore.Extent() == facesAfter.Extent())
             for (Standard_Integer k = 1; k <= facesBefore.Extent(); ++k) {
-                if (std::find(keep.begin(), keep.end(), k) != keep.end()) continue;
+                if (kept[static_cast<size_t>(k)]) continue;
                 const TopoDS_Shape& after = facesAfter(k);
                 bool faceBad = bad(verdict, after);
                 for (TopExp_Explorer wx(after, TopAbs_WIRE); wx.More() && !faceBad; wx.Next()) faceBad = bad(verdict, wx.Current());
-                if (faceBad) keep.push_back(k);
+                if (faceBad) keepToo(k);
             }
     }
-    if (keep.empty()) {
+    if (beyondPlanes.empty()) {
         if (!threw.empty())
             throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name + "' threw: " + threw);
-        return converted;   // nothing to leave out: the caller refuses the invalid conversion
+        return converted;   // nothing more to leave out: the caller refuses the invalid conversion
     }
     TopoDS_Shape retried;
     try {
         retried = convert();
     } catch (const Standard_Failure& e) {
-        throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name + "' threw: " + (threw.empty() ? std::string() : threw + "; and, with " + std::to_string(keep.size()) + " face(s) left analytic: ") + e.GetMessageString());
+        throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name + "' threw: " + (threw.empty() ? std::string() : threw + "; and, with " + std::to_string(beyondPlanes.size()) + " more face(s) left analytic: ") + e.GetMessageString());
     }
     if (retried.IsNull() || !BRepCheck_Analyzer(retried).IsValid()) {
         if (!threw.empty())
-            throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name + "' threw: " + threw + "; with " + std::to_string(keep.size()) + " face(s) left analytic it gives an invalid solid");
+            throw std::runtime_error("exportSTEP: the B-spline conversion of '" + name + "' threw: " + threw + "; with " + std::to_string(beyondPlanes.size()) + " more face(s) left analytic it gives an invalid solid");
         return converted;
     }
     say(threw.empty() ? "cones revolved through their own apex, and faces whose converted wire no longer reads valid"
@@ -277,7 +298,7 @@ TopoDS_Shape nurbsConvertOneSolid(const TopoDS_Shape& solid, const std::string& 
 }
 }   // namespace
 
-TopoDS_Shape nurbsConvertPeriodicSolidsMm(const TopoDS_Shape& shapeMm, const std::string& name) {
+TopoDS_Shape nurbsConvertPeriodicSolidsMm(const TopoDS_Shape& shapeMm, const std::string& name, bool planesStay) {
     auto hasPeriodicFace = [](const TopoDS_Shape& s) {
         for (TopExp_Explorer fx(s, TopAbs_FACE); fx.More(); fx.Next()) {
             Handle(Geom_Surface) srf = BRep_Tool::Surface(TopoDS::Face(fx.Current()));
@@ -296,14 +317,14 @@ TopoDS_Shape nurbsConvertPeriodicSolidsMm(const TopoDS_Shape& shapeMm, const std
             for (TopoDS_Iterator it(shapeMm); it.More(); it.Next()) {
                 const TopoDS_Shape& child = it.Value();
                 if (hasPeriodicFace(child)) {
-                    rb.Add(rebuilt, nurbsConvertOneSolid(child, name));
+                    rb.Add(rebuilt, nurbsConvertOneSolid(child, name, planesStay));
                 } else {
                     rb.Add(rebuilt, child);
                 }
             }
             out = rebuilt;
         } else {
-            out = nurbsConvertOneSolid(shapeMm, name);
+            out = nurbsConvertOneSolid(shapeMm, name, planesStay);
         }
         if (out.IsNull()) return shapeMm;
         // Conversion is exact, so both volume and validity must survive it. Anything else is OCC
@@ -677,7 +698,7 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
         // and render better, and a viewer never meets gmsh. MVB_NO_NURBS=1 disables it for
         // comparison.
         if (options.nurbsPeriodicSolids && !std::getenv("MVB_NO_NURBS"))
-            shapeMm = nurbsConvertPeriodicSolidsMm(shapeMm, ns.name);
+            shapeMm = nurbsConvertPeriodicSolidsMm(shapeMm, ns.name, options.planarFacesStayPlanarIn.count(ns.name) > 0);
         // Every product: the file's B-splines are parametrised in the millimetres it is
         // written in (see UnitParametrisation). MVB_NO_REPARAM=1 disables it for comparison.
         if (!std::getenv("MVB_NO_REPARAM")) shapeMm = unitParametrised(shapeMm, ns.name);

@@ -1,6 +1,8 @@
 #pragma once
 #include <cstddef>
 
+#include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -38,6 +40,46 @@ struct SizingPolicy {
     // 3.64M / 3.58M / 4.17M; 1.3 (grade above) gave 4 at 5.38M on 07, over the corpus size limit.
     double cond_grade_3d = 3.0;
 };
+
+// THE WIRE-SCALE RULE: a conductor's surface is meshed at 1.2 x its own emitted surface radius [m] (half the thin side
+// of a rectangular wire). Throws std::invalid_argument on a non-positive radius (no fallback).
+double wire_scale_target(double surface_radius);
+// THE FOIL RULE: a foil's surface is meshed at twice its emitted thickness [m]. A foil has no radius to resolve, and
+// the wire-scale rule on half its thickness asks for elements its width cannot afford. Chosen by Alf (2026-11-21) from
+// two_switch_forward (0.2 mm foil, 11 GB): 0.6 x and 1 x thickness ran out of memory; 2 x meshed with 150 tets below
+// gamma 0.01; 4 x meshed with 2,024; at 8 x the foil's facets intersected. Throws on a non-positive thickness.
+double foil_scale_target(double thickness);
+
+// EVERY WINDING IS SIZED FROM ITS OWN WIRE. The automatic conductor target of each conductor region, keyed
+// "winding_<name>": the target of the winding the region belongs to, from `wire_target_by_winding` (winding name ->
+// wire_scale_target or foil_scale_target of its own wire). Region names are the 3D mesher's: "winding_<name>" (one
+// continuous conductor), "turn_<name>_<index>" (per-turn solids) and the lumped "winding", which belongs to no single
+// winding and gets no entry. A conductor region whose winding is not in the map throws std::runtime_error: it has no
+// wire to be sized from.
+std::map<std::string, double> automatic_conductor_targets(const std::vector<std::string>& conductor_regions,
+                                                          const std::map<std::string, double>& wire_target_by_winding);
+// THE CHORD BOUND [m]. A facet of size h on a surface whose radius of curvature is `radius` sags h^2 / (8 radius) off
+// it; held to 0.32 of the gap the surface faces, h = 0.8 sqrt(4 radius gap). The radius is the wire's own for a round
+// wire, and for any other conductor the radius of curvature of the face itself (a foil's wrap radius, a corner fillet).
+// A flat face has no radius and no bound. Throws on a non-positive radius or a negative gap.
+double chord_bound(double radius, double gap);
+// The widest gap [m] in which a surface of that radius can need elements finer than `target`: where the chord bound
+// reaches the target, (target / 0.8)^2 / (4 radius) -- and never more than radius / 0.32, because a surface of radius
+// rho cannot sag more than rho whatever the facet, so a gap wider than that keeps its share untouched.
+double widest_binding_gap(double radius, double target);
+// Whether a surface of that radius and a surface it sees along its normal FACE each other closely enough for a
+// target-size facet to reach across. `cos_normals` is the cosine between their outward normals (-1: parallel walls of
+// a gap). Along a facet of size t the surface falls away by t^2 / (2 radius) while a wall inclined by alpha opens by
+// t alpha, so the facet can only cross when alpha < t / (2 radius); beyond a right angle nothing faces anything.
+// This is what tells a gap between two turns from the re-entrant corner where two faces of one body meet.
+bool surfaces_face(double cos_normals, double radius, double target);
+
+// The winding a conductor region belongs to ("winding_<name>" -> name, "turn_<name>_<index>" -> name), or none.
+std::optional<std::string> winding_of_conductor_region(const std::string& region);
+
+// A corridor's chord bound binds the COARSER of the two surfaces it lies between: it needs local refinement when it is
+// under the larger of their two targets [m].
+bool corridor_binds(double bound, double target_a, double target_b);
 
 // Skin depth [m]: delta = 1 / sqrt(pi * f * mu0 * mur * sigma). Copper ~ 66.1/sqrt(f[Hz]) mm.
 // Throws std::invalid_argument on non-positive f / sigma (no fallback).

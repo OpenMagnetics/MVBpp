@@ -461,6 +461,41 @@ async function main() {
             assert(/^[0-9a-f]{40}(-dirty)?$/.test(rev[k]), `${k} revision: ${rev[k]}`);
     });
 
+    // A REAL 3D mesh in the module. Without it the suite meshed nothing, and the refinement-rate
+    // monitor's reader thread made every 3D mesh in the browser fail ("thread constructor failed:
+    // Resource temporarily unavailable" -- the module is single-threaded) while all tests passed.
+    // ETD49 with 5 turns is the smallest fixture here that real winding accepts: ~40 s, ~14 k nodes.
+    test('meshMagnetic meshes a magnetic in 3D: core, winding and air tets, ports, sidecars', () => {
+        const recipe = { air: { target_m: 0.01 }, core: { target_m: 0.003 },
+                         geometry: { no_bobbin: true, weld_all: true }, mesher: { algo3d_chain: '1,10' } };
+        const r = JSON.parse(mvbpp.meshMagnetic(loadMagneticJson('ETD49_N87_10uH_5T.json'),
+                                                JSON.stringify(recipe), 'msh2', 'm', '{}'));
+        const names = {};
+        const pn = /\$PhysicalNames\n\d+\n([\s\S]*?)\$EndPhysicalNames/.exec(r.mesh);
+        assert(pn, 'the mesh has no $PhysicalNames section');
+        for (const l of pn[1].trim().split('\n')) {
+            const m = /^(\d+) (\d+) "(.*)"$/.exec(l);
+            assert(m, `physical name line: ${l}`);
+            names[m[3]] = { dim: +m[1], tag: +m[2] };
+        }
+        for (const region of ['air', 'core', 'winding_Primary'])
+            assert(names[region] && names[region].dim === 3, `no 3D region '${region}' in ${Object.keys(names)}`);
+        for (const surface of ['outer', 'term0', 'term1'])
+            assert(names[surface] && names[surface].dim === 2, `no surface '${surface}' in ${Object.keys(names)}`);
+        const nodes = +/\$Nodes\n(\d+)/.exec(r.mesh)[1];
+        assert(nodes > 1000, `only ${nodes} nodes`);
+        const tets = {};
+        const el = /\$Elements\n\d+\n([\s\S]*?)\$EndElements/.exec(r.mesh)[1];
+        for (const l of el.split('\n')) {
+            const f = l.split(' ');
+            if (f[1] === '4') tets[f[3]] = (tets[f[3]] || 0) + 1;
+        }
+        for (const region of ['air', 'core', 'winding_Primary'])
+            assert(tets[names[region].tag] > 100, `region '${region}' has ${tets[names[region].tag] || 0} tets`);
+        for (const suffix of ['.path', '.leads.json', '.recipe.json'])
+            assert(typeof r.sidecars[suffix] === 'string' && r.sidecars[suffix].length > 0, `no sidecar ${suffix}`);
+    });
+
     // ── error handling ────────────────────────────────────────────────────────
 
     console.log('\nmvbpp WASM — error handling');

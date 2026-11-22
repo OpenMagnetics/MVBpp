@@ -1003,6 +1003,57 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
         "' (unknown kind " + std::to_string(static_cast<int>(pr.kind)) + ")");
 }
 
+// A piece lies inside a host only on PROOF, from three measures that must agree: the piece's box lies within the host's,
+// every vertex of the piece classifies in or on the host, and what the piece keeps outside the host (a cut) is under a
+// hundredth of the piece. A cut alone is no proof: on 13_current_sense it came back EMPTY for a 2.1 mm dragback descent
+// against a 0.06 mm bend -- a boolean that failed quietly -- and the descent was dropped from the conductor, an open
+// circuit. The box and the vertices alone are no proof either: a bar whose ends sit in the two arms of a C lies in the
+// C's box with every vertex in copper, and crosses the opening. (No common: on the riser junctions this serves, OCC's
+// common returns empty for a piece that is inside; the ladder's own finding.)
+bool pieceLiesInside(const TopoDS_Shape& piece, double pieceVolume, const TopoDS_Shape& host) {
+    if (piece.IsNull() || host.IsNull() || !(pieceVolume > 0.0)) return false;
+    Bnd_Box bx, by;
+    BRepBndLib::AddOptimal(host, bx, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+    BRepBndLib::AddOptimal(piece, by, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+    if (bx.IsVoid() || by.IsVoid()) return false;
+    double x0, y0, z0, x1, y1, z1, u0, v0, w0, u1, v1, w1;
+    bx.Get(x0, y0, z0, x1, y1, z1);
+    by.Get(u0, v0, w0, u1, v1, w1);
+    const double slack = Precision::Confusion();   // the kernel's own resolution of a point
+    if (!(u0 >= x0 - slack && v0 >= y0 - slack && w0 >= z0 - slack && u1 <= x1 + slack && v1 <= y1 + slack &&
+          w1 <= z1 + slack))
+        return false;
+    try {
+        BRepClass3d_SolidClassifier in(host);
+        size_t vertices = 0;
+        for (TopExp_Explorer ex(piece, TopAbs_VERTEX); ex.More(); ex.Next(), ++vertices) {
+            in.Perform(BRep_Tool::Pnt(TopoDS::Vertex(ex.Current())), slack);
+            if (in.State() != TopAbs_IN && in.State() != TopAbs_ON) return false;
+        }
+        if (vertices == 0) return false;
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+    for (double fuzzy : {0.0, 1e-7, 1e-6}) {
+        try {
+            BRepAlgoAPI_Cut cut;
+            TopTools_ListOfShape cargs, ctools;
+            cargs.Append(piece);
+            ctools.Append(host);
+            cut.SetArguments(cargs);
+            cut.SetTools(ctools);
+            if (fuzzy > 0) cut.SetFuzzyValue(fuzzy);
+            cut.Build();
+            if (!cut.IsDone() || cut.Shape().IsNull()) continue;
+            GProp_GProps outside;
+            BRepGProp::VolumeProperties(cut.Shape(), outside);
+            return outside.Mass() <= 0.01 * pieceVolume;
+        } catch (const Standard_Failure&) {
+        }
+    }
+    return false;
+}
+
 // Fuse all solids of a conductor's compound into as FEW bodies as possible, in ONE general
 // boolean (BRepAlgoAPI_Fuse over the whole set via SetArguments/SetTools). A single BOP with
 // OBB culling is both far faster than N sequential pairwise fuses (which is O(N) booleans on
@@ -5036,58 +5087,15 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
                     }
                 // A piece that lies ENTIRELY inside the argument before it (a dragback's straight between two bends at
                 // the wire's own radius; 4 of 5 10_emi bump risers): A u B = A when B is inside A, and OCC's fuse is
-                // sick on exactly these (the ladder's own finding). It is absorbed only on PROOF, from three measures
-                // that must agree: y's box lies within x's, every vertex of y classifies in or on x, and what y keeps
-                // outside x (a cut) is under a hundredth of y. A cut alone is no proof: on 13_current_sense it came
-                // back empty for a 2.1 mm dragback descent against a 0.06 mm bend -- a boolean that failed quietly --
-                // and the descent was dropped from the conductor, an open circuit. (No common: on the riser junctions
-                // this serves, OCC's common returns empty for a piece that is inside; the ladder's own finding.)
-                const bool yInsideX = [&]() {
-                    Bnd_Box bx, by;
-                    BRepBndLib::AddOptimal(x.shape, bx, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
-                    BRepBndLib::AddOptimal(y.shape, by, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
-                    if (bx.IsVoid() || by.IsVoid()) return false;
-                    double x0, y0, z0, x1, y1, z1, u0, v0, w0, u1, v1, w1;
-                    bx.Get(x0, y0, z0, x1, y1, z1);
-                    by.Get(u0, v0, w0, u1, v1, w1);
-                    const double slack = Precision::Confusion();   // the kernel's own resolution of a point
-                    if (!(u0 >= x0 - slack && v0 >= y0 - slack && w0 >= z0 - slack && u1 <= x1 + slack && v1 <= y1 + slack &&
-                          w1 <= z1 + slack))
-                        return false;
-                    try {
-                        BRepClass3d_SolidClassifier in(x.shape);
-                        size_t vertices = 0;
-                        for (TopExp_Explorer ex(y.shape, TopAbs_VERTEX); ex.More(); ex.Next(), ++vertices) {
-                            in.Perform(BRep_Tool::Pnt(TopoDS::Vertex(ex.Current())), slack);
-                            if (in.State() != TopAbs_IN && in.State() != TopAbs_ON) return false;
-                        }
-                        return vertices > 0;
-                    } catch (const Standard_Failure&) {
-                        return false;
-                    }
-                }();
-                for (double fuzzy : {0.0, 1e-7, 1e-6}) {
-                    if (!yInsideX) break;
-                    try {
-                        BRepAlgoAPI_Cut cut;
-                        TopTools_ListOfShape cargs, ctools;
-                        cargs.Append(y.shape);
-                        ctools.Append(x.shape);
-                        cut.SetArguments(cargs);
-                        cut.SetTools(ctools);
-                        if (fuzzy > 0) cut.SetFuzzyValue(fuzzy);
-                        cut.Build();
-                        if (!cut.IsDone() || cut.Shape().IsNull()) continue;
-                        if (volumeOf(cut.Shape()) > 0.01 * y.volume) break;
-                        out = x;
-                        out.last = y.last;
-                        ++generalFuses;
-                        if (std::getenv("MVB_WELD_DEBUG"))
-                            std::cerr << "[glue-fuse] piece " << y.first << " ('" << ptrs[y.first]->label
-                                      << "') lies inside the pieces before it; absorbed\n";
-                        return out;
-                    } catch (const Standard_Failure&) {
-                    }
+                // sick on exactly these (the ladder's own finding). Absorbed only on pieceLiesInside's proof.
+                if (pieceLiesInside(y.shape, y.volume, x.shape)) {
+                    out = x;
+                    out.last = y.last;
+                    ++generalFuses;
+                    if (std::getenv("MVB_WELD_DEBUG"))
+                        std::cerr << "[glue-fuse] piece " << y.first << " ('" << ptrs[y.first]->label
+                                  << "') lies inside the pieces before it; absorbed\n";
+                    return out;
                 }
                 return out;
             };

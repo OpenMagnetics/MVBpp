@@ -4,6 +4,7 @@
 
 #include "mvb/mesh/MeshSupport.h"
 #include "mvb/mesh/SizeField.h"
+#include "mvb/mesh/SurfaceCorridors.h"
 #include <cctype>
 #include <cerrno>
 #include <cstring>
@@ -28,6 +29,10 @@
 #include <nlohmann/json.hpp>
 #include <dlfcn.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <gmsh.h>
 #include <mmg/mmg3d/libmmg3d.h>
 #include "mvb/MagneticBuilder.h"
@@ -120,6 +125,41 @@ static void write_cad_edges(const std::string& out) {
 
 namespace {
 
+// WHERE THE MEMORY GOES (ABT #1723). The resident set of this process after a phase, printed with the phase log: on
+// two_switch_forward 9.3 GB of a 10.5 GB peak was held before meshing started (2.8 GB after the STEP import, 6.4 GB
+// after clipping the Primary to the air box, 9.3 GB after the fragment), which no element size can change -- and
+// nothing in the log said so. Read from /proc/self/statm; where that file does not exist (not Linux) nothing is
+// printed.
+// The geometry phases are booleans and a STEP read over tens of thousands of faces: they allocate gigabytes and free
+// most of them, and the C library keeps what was freed for itself. `release` hands it back to the system (glibc's
+// malloc_trim) and the line says how much came back, so that what stays resident is what the model holds.
+std::optional<double> resident_mb() {
+    std::FILE* f = std::fopen("/proc/self/statm", "r");
+    if (!f) return std::nullopt;
+    long pagesTotal = 0, pagesResident = 0;
+    const int got = std::fscanf(f, "%ld %ld", &pagesTotal, &pagesResident);
+    std::fclose(f);
+    if (got != 2) throw std::runtime_error("mesh3d: /proc/self/statm could not be parsed");
+    return static_cast<double>(pagesResident) * static_cast<double>(sysconf(_SC_PAGESIZE)) / 1048576.0;
+}
+void log_resident(const char* phase, bool release = false) {
+    const auto held = resident_mb();
+    if (!held) return;
+#ifdef __GLIBC__
+    if (release) {
+        malloc_trim(0);
+        const auto kept = resident_mb();
+        std::fprintf(stderr, "[mesh3d] memory: %.0f MB resident after %s, %.0f MB once the freed heap is returned to the system\n",
+                     *held, phase, kept ? *kept : *held);
+        return;
+    }
+#else
+    (void)release;
+#endif
+    std::fprintf(stderr, "[mesh3d] memory: %.0f MB resident after %s\n", *held, phase);
+}
+
+
 // ---- LOCAL CHORD-BOUND REFINEMENT FROM THE BUILT 3D CENTRELINES -----------------------------------
 // A tight corridor is where two conductor surfaces come closer than the design-wide conductor size can
 // resolve: a facet of size h on a wire of radius r sags h^2/8r into the gap, so the gap d needs
@@ -131,7 +171,7 @@ namespace {
 // conductor, and of its own conductor further than half a wrap away along the wire.
 struct ChordPoints {
     std::vector<double> x, y, z, h, reach;
-    size_t samples = 0, close = 0;
+    size_t samples = 0, close = 0, surface = 0;   // surface: candidates measured on rectangular conductors' faces
     double hmin = 1e30, dmin = 1e30; std::array<double, 3> at{0, 0, 0};
     static long long key(long long i, long long j, long long k) {
         return (i & 0x1FFFFF) | ((j & 0x1FFFFF) << 21) | ((k & 0x1FFFFF) << 42);
@@ -235,13 +275,32 @@ struct ChordPoints {
 };
 
 template <class Paths>
-ChordPoints chord_points_3d(const Paths& paths, double condT) {
+// `surfaceCorridors`: the corridors measured on the built surfaces of the rectangular conductors
+// (surface_corridor_points), which the centreline model below does not locate; they are deduplicated with its own.
+// `pathTarget`: each conductor's own target (same order as `paths`), or empty for one design-wide `condT`. A corridor
+// binds the COARSER of the two surfaces it lies between, so a pair is kept when its bound is under the larger of the
+// two targets, and `condT` is then the largest target of all (what the kept points grade back to).
+ChordPoints chord_points_3d(const Paths& paths, double condT, const std::vector<double>& pathTarget = {},
+                            const std::vector<mvb::mesh::CorridorCandidate>& surfaceCorridors = {}) {
+    if (!pathTarget.empty() && pathTarget.size() != paths.size())
+        throw std::runtime_error("chord bound: " + std::to_string(pathTarget.size()) + " conductor targets for " +
+                                 std::to_string(paths.size()) + " conductors");
+    auto targetOf = [&](int c) { return pathTarget.empty() ? condT : pathTarget[static_cast<size_t>(c)]; };
     struct Seg { double a[3], b[3]; int c; double s0, s1, r; };
     struct Smp { double p[3]; int c; double s, r; };
     std::vector<Seg> segs; std::vector<Smp> smp;
     double rmin = 1e30, rmax = 0.0, segMax = 0.0;
     int ci = 0;
+    // A RECTANGULAR CONDUCTOR IS NOT LOCATED BY THIS MODEL. Every conductor here is a tube of radius wireRadius about
+    // its centreline, and the bound h = 0.8 sqrt(4 r d) is the chord sagitta of a surface of that radius. A foil or a
+    // rectangular wire is neither: wireRadius is half its THIN side, its broad faces are flat across the section, and
+    // its copper reaches half its width from the centreline -- two_switch_forward's 0.2 mm foils (26 mm wide, with
+    // their axial leads) put a "corridor point" 191 um inside their own copper, and 20 of 03_buck's 36 points lay
+    // under the copper skin. Their corridors are measured on their built surfaces instead (surface_corridor_points)
+    // and arrive here as `surfaceCorridors`.
+    size_t rectangular = 0;
     for (const auto& pl : paths) {
+        if (pl.isRectangular) { ++rectangular; ++ci; continue; }
         const double r = pl.wireRadius;
         if (!(r > 0.0)) throw std::runtime_error("chord bound: conductor '" + pl.name + "' has no positive wire radius");
         rmin = std::min(rmin, r); rmax = std::max(rmax, r);
@@ -264,21 +323,47 @@ ChordPoints chord_points_3d(const Paths& paths, double condT) {
         ++ci;
     }
     ChordPoints out; out.samples = smp.size();
-    if (segs.empty()) throw std::runtime_error("chord bound: the real-winding centrelines have no segments");
+    if (rectangular)
+        std::fprintf(stderr, "[mesh3d] chord points: %zu of %zu conductor(s) are rectangular (foil / rectangular wire): their "
+                     "corridors are measured on their built surfaces, %zu candidate point(s)\n", rectangular,
+                     static_cast<size_t>(paths.size()), surfaceCorridors.size());
+    if (segs.empty() && rectangular != paths.size())
+        throw std::runtime_error("chord bound: the real-winding centrelines have no segments");
     const auto chordT0 = std::chrono::steady_clock::now();
+    // dedupe the corridor points on a grid of half the target: one point (the finest) per cell
+    const double dcell = 0.5 * condT;
+    std::unordered_map<long long, int> kept;
+    auto cellOf = [&](const double* p, double c, long long& i, long long& j, long long& k) {
+        i = static_cast<long long>(std::floor(p[0] / c)); j = static_cast<long long>(std::floor(p[1] / c)); k = static_cast<long long>(std::floor(p[2] / c)); };
+    auto keep = [&](const double* mid, double bestH, double bestD) {
+        ++out.close;
+        if (bestH < out.hmin) { out.hmin = bestH; out.dmin = bestD; out.at = {mid[0], mid[1], mid[2]}; }
+        long long a2, b2, c2; cellOf(mid, dcell, a2, b2, c2);
+        const long long kk = ChordPoints::key(a2, b2, c2);
+        const auto it = kept.find(kk);
+        if (it != kept.end() && out.h[it->second] <= bestH) return;
+        if (it == kept.end()) {
+            kept[kk] = static_cast<int>(out.h.size());
+            out.x.push_back(mid[0]); out.y.push_back(mid[1]); out.z.push_back(mid[2]); out.h.push_back(bestH); out.reach.push_back(1.5 * bestH);
+        } else {
+            const int i = it->second;
+            out.x[i] = mid[0]; out.y[i] = mid[1]; out.z[i] = mid[2]; out.h[i] = bestH; out.reach[i] = 1.5 * bestH;
+        }
+    };
+    for (const auto& c : surfaceCorridors) keep(c.p, c.h, c.gap);
+    out.surface = surfaceCorridors.size();
+    if (segs.empty()) {   // every conductor is rectangular: the surface corridors are all there is
+        out.build_tree(condT);
+        return out;
+    }
     // the widest gap whose bound can still bind the target, for the thinnest wire
     const double dmax = (condT / 0.8) * (condT / 0.8) / (4.0 * rmin);
     const double R = 2.0 * rmax + dmax + 0.5 * segMax;         // candidate segment midpoints within R
     std::unordered_map<long long, std::vector<int>> sg;
-    auto cellOf = [&](const double* p, double c, long long& i, long long& j, long long& k) {
-        i = static_cast<long long>(std::floor(p[0] / c)); j = static_cast<long long>(std::floor(p[1] / c)); k = static_cast<long long>(std::floor(p[2] / c)); };
     for (size_t i = 0; i < segs.size(); ++i) {
         double m[3]; for (int d = 0; d < 3; ++d) m[d] = 0.5 * (segs[i].a[d] + segs[i].b[d]);
         long long a, b, c; cellOf(m, R, a, b, c); sg[ChordPoints::key(a, b, c)].push_back(static_cast<int>(i));
     }
-    // dedupe the corridor points on a grid of half the target: one point (the finest) per cell
-    const double dcell = 0.5 * condT;
-    std::unordered_map<long long, int> kept;
     for (const auto& q : smp) {
         long long a, b, c; cellOf(q.p, R, a, b, c);
         double bestH = 1e30, bestD = 0.0, mid[3] = {0, 0, 0};
@@ -290,32 +375,23 @@ ChordPoints chord_points_3d(const Paths& paths, double condT) {
                 double ab[3], ap[3]; for (int d = 0; d < 3; ++d) { ab[d] = g.b[d] - g.a[d]; ap[d] = q.p[d] - g.a[d]; }
                 const double L2 = ab[0]*ab[0] + ab[1]*ab[1] + ab[2]*ab[2];
                 const double t = std::clamp((ap[0]*ab[0] + ap[1]*ab[1] + ap[2]*ab[2]) / L2, 0.0, 1.0);
-                if (g.c == q.c && std::fabs(g.s0 + t * (g.s1 - g.s0) - q.s) < M_PI * (q.r + g.r + dmax)) continue;  // own wire, nearby
+                // the pair's own target and the widest gap whose bound can still bind it
+                const double tPair = std::max(targetOf(q.c), targetOf(g.c));
+                const double dmaxPair = (tPair / 0.8) * (tPair / 0.8) / (4.0 * std::min(q.r, g.r));
+                if (g.c == q.c && std::fabs(g.s0 + t * (g.s1 - g.s0) - q.s) < M_PI * (q.r + g.r + dmaxPair)) continue;  // own wire, nearby
                 double cq[3], dv[3]; for (int d = 0; d < 3; ++d) { cq[d] = g.a[d] + t * ab[d]; dv[d] = cq[d] - q.p[d]; }
                 const double c2c = std::sqrt(dv[0]*dv[0] + dv[1]*dv[1] + dv[2]*dv[2]);
                 const double gap = c2c - q.r - g.r;
                 if (gap <= 1e-7 || !(c2c > 0.0)) continue;   // touching / overlapping: the layout check owns those
                 const double h = 0.8 * std::sqrt(4.0 * std::min(q.r, g.r) * gap);
-                if (h >= condT || h >= bestH) continue;
+                if (!mvb::mesh::corridor_binds(h, targetOf(q.c), targetOf(g.c)) || h >= bestH) continue;
                 bestH = h; bestD = gap;
                 const double f = (q.r + 0.5 * gap) / c2c;
                 for (int d = 0; d < 3; ++d) mid[d] = q.p[d] + f * dv[d];
             }
         }
         if (bestH >= 1e29) continue;
-        ++out.close;
-        if (bestH < out.hmin) { out.hmin = bestH; out.dmin = bestD; out.at = {mid[0], mid[1], mid[2]}; }
-        long long a2, b2, c2; cellOf(mid, dcell, a2, b2, c2);
-        const long long kk = ChordPoints::key(a2, b2, c2);
-        const auto it = kept.find(kk);
-        if (it != kept.end() && out.h[it->second] <= bestH) continue;
-        if (it == kept.end()) {
-            kept[kk] = static_cast<int>(out.h.size());
-            out.x.push_back(mid[0]); out.y.push_back(mid[1]); out.z.push_back(mid[2]); out.h.push_back(bestH); out.reach.push_back(1.5 * bestH);
-        } else {
-            const int i = it->second;
-            out.x[i] = mid[0]; out.y[i] = mid[1]; out.z[i] = mid[2]; out.h[i] = bestH; out.reach[i] = 1.5 * bestH;
-        }
+        keep(mid, bestH, bestD);
     }
     const auto chordT1 = std::chrono::steady_clock::now();
     out.build_tree(condT);
@@ -607,6 +683,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         double size;        // element size the chord bound demands there [m]
         double reach;       // how far along/around the channel that size must carry [m]
         std::string turnA, turnB;   // the two turns that bound it (named in every refusal)
+        double coarsest = 0.0;      // the coarser of its two turns' automatic targets (1.2 x surface radius) [m]
     };
     struct LayoutSizing {
         double rsmin = std::numeric_limits<double>::max();  // smallest emitted surface radius [m]
@@ -616,12 +693,16 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         double worst_overlap = 0.0;
         std::vector<TurnCorridor> corridors;      // measurable corridors, tightest first
         std::vector<std::array<double,2>> turn_xy;  // every turn centre, layout coords [m]
+        // each winding's own wire-scale target [m]: 1.2 x its surface radius, or twice its thickness for a foil
+        std::map<std::string, double> target_by_winding;
+        std::set<std::string> rectangular_windings;   // rectangular wire and foil: located on their built surfaces
+        double tmin = std::numeric_limits<double>::max();   // the finest of those: the design-wide automatic target
     };
     auto compute_layout_sizing = [&]() -> LayoutSizing {
         // Radii per winding: rc = copper, rs = the EMITTED surface (the coating shell when
         // coating solids are emitted, bare copper otherwise) -- the clearance that bounds the
         // mesh is between the surfaces gmsh actually triangulates.
-        struct WDim { double rc, ro, rs; };
+        struct WDim { double rc, ro, rs; bool rect = false; bool foil = false; };
         std::map<std::string, WDim> wdims;
         OpenMagnetics::Coil coilW = enriched.get_coil();  // mutable copy: resolve_wire is non-const
         const auto& fdW = coilW.get_functional_description();
@@ -679,7 +760,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
             if (!(rs > 0.0))
                 throw std::runtime_error("mesh3d auto-sizing: winding '" + wname +
                                          "' resolved to a non-positive wire radius");
-            wdims[wname] = {rc, ro, rs};
+            wdims[wname] = {rc, ro, rs, !cd && cw && ch, wire.get_type() == MAS::WireType::FOIL};
         }
         // When only the COPPER is emitted, the tightest real air corridor around it is one
         // coating thickness: the wire's outer surface is what rests on the bobbin and on
@@ -697,13 +778,21 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         if (!tdW || tdW->empty())
             throw std::runtime_error("mesh3d auto-sizing: enriched MAS has no turnsDescription -- "
                                      "set OMFEM_COND_TARGET explicitly");
-        struct TP { double x, y, rs; std::string name, layer; };
+        struct TP { double x, y, rs; std::string name, layer; bool rect = false; double target = 0.0; };
         std::vector<TP> tps;
+        // EACH WINDING'S OWN TARGET. A round or rectangular wire is meshed at 1.2 x its surface radius (half the thin
+        // side of a rectangle). A FOIL is meshed at twice its thickness (Alf, 2026-11-21, measured on
+        // two_switch_forward's 0.2 mm foil under the 11 GB cap: 0.12 mm and 0.2 mm ran out of memory; 0.4 mm meshed
+        // with 150 tets below gamma 0.01; 0.8 mm meshed with 2,024; at 1.6 mm the foil's facets cut into each other).
+        std::map<std::string, double> wireTarget;
+        for (const auto& [wn, wd] : wdims)
+            wireTarget[wn] = wd.foil ? mvb::mesh::foil_scale_target(2.0 * wd.rs) : mvb::mesh::wire_scale_target(wd.rs);
         for (const auto& t : *tdW) {
             const auto it = wdims.find(t.get_winding());
             if (it == wdims.end()) continue;
             const auto& c = t.get_coordinates();
-            tps.push_back({c.at(0), c.at(1), it->second.rs, t.get_name(), t.get_layer() ? *t.get_layer() : std::string()});
+            tps.push_back({c.at(0), c.at(1), it->second.rs, t.get_name(), t.get_layer() ? *t.get_layer() : std::string(),
+                           it->second.rect, wireTarget.at(t.get_winding())});
         }
         // TOUCHING ACROSS LAYERS, FROM MKF's LAYER DATA (Alf 2026-09-25, ABT #1402). Two turns in DIFFERENT layers with
         // nothing between those layers -- no layer at all, or only zero-thickness (virtual) ones -- are placed by MKF to
@@ -754,15 +843,22 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         };
         LayoutSizing ls;
         ls.coat_corridor = gmin0;
-        for (const auto& [wn, wd] : wdims) { (void)wn; ls.rsmin = std::min(ls.rsmin, wd.rs); }
+        for (const auto& [wn, wd] : wdims) {
+            ls.rsmin = std::min(ls.rsmin, wd.rs);
+            ls.tmin = std::min(ls.tmin, wireTarget.at(wn));
+            if (wd.rect) ls.rectangular_windings.insert(wn);
+        }
+        ls.target_by_winding = wireTarget;
         // A pair only ever matters if its bound could bind SOME target we would plausibly ask
         // for; 1.2 * rsmin (wire-scale elements) is the coarsest conductor target this mesher
         // ever uses, so a pair whose bound is above it constrains nothing and is not stored.
         // That keeps the corridor list a NEAR-NEIGHBOUR list (O(turns)), not the O(turns^2) pair
         // list: a bound below 1.2 rs means a clearance below 0.56 rs.
-        const double keep_below = 1.2 * ls.rsmin;
+        // PER PAIR (Alf, 2026-11-21: every winding is sized from its own wire): the pair's bound is held against the
+        // coarser of its two surfaces' own targets. Between two turns of the thinnest wire it is the old 1.2 * rsmin.
         for (size_t i = 0; i < tps.size(); ++i)
             for (size_t j = i + 1; j < tps.size(); ++j) {
+                const double keep_below = std::max(tps[i].target, tps[j].target);
                 const double dx = tps[j].x - tps[i].x, dy = tps[j].y - tps[i].y;
                 const double c2c = std::hypot(dx, dy);
                 const double d = c2c - tps[i].rs - tps[j].rs;
@@ -780,12 +876,16 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                 const double reff = std::min(tps[i].rs, tps[j].rs);
                 const double h = 0.8 * std::sqrt(4.0 * reff * d);
                 if (h >= keep_below || !(c2c > 0.0)) continue;
+                // a foil / rectangular turn is not a circle of radius rs in this section: its corridors are measured on
+                // its built surfaces (surface_corridor_points); touching and overlap above are still counted
+                if (tps[i].rect || tps[j].rect) continue;
                 TurnCorridor tc;
                 const double f = (tps[i].rs + 0.5 * d) / c2c;   // the channel's narrowest point
                 tc.x = tps[i].x + f * dx;
                 tc.y = tps[i].y + f * dy;
                 tc.clearance = d;
                 tc.size = h;
+                tc.coarsest = keep_below;
                 // Reach. Offset s along the channel from its narrowest point, the two surfaces
                 // separate as d + s^2/reff (each curving away by s^2/2reff), so at s = 1.5 h =
                 // 2.4 sqrt(reff d) they are ~6.8 d apart and the LOCAL bound there is already
@@ -837,7 +937,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
     // their measured copper-to-copper clearance was 2x-70x larger).
     auto compute_auto_cond_target = [&](bool contact_floor) -> double {
         const LayoutSizing& ls = layout_sizing();
-        double t = 1.2 * ls.rsmin;                    // wire-scale elements
+        double t = ls.tmin;                           // wire-scale elements: the finest winding's own target
         if (contact_floor && ls.coat_corridor < 1e30)
             t = std::min(t, 0.8 * std::sqrt(4.0 * ls.rsmin * ls.coat_corridor));
         if (!(t >= 2e-5))
@@ -1203,6 +1303,8 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
     // The conductors' own solids, as built: the chord bound's air check classifies its corridor points against these
     // first (one classifier per solid, built once), and asks gmsh only about a point one of them holds.
     std::vector<TopoDS_Shape> conductorSolids;
+    std::vector<std::string> conductorSolidWinding;   // parallel to conductorSolids: the winding each belongs to
+    std::vector<std::string> conductorSolidName;      // ... and the built conductor it is ("Secondary parallel 0")
     {
         std::vector<std::pair<std::string, const TopoDS_Shape*>> bodies;   // conductor + solder bodies
         for (const auto& ns : named) {
@@ -1211,7 +1313,11 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
             const std::string role = classify(ns.name, w, ix, nctx3d);
             if (role == "winding" || role == "solder" || role == "turn") bodies.push_back({ns.name, &ns.shape});
             if (role == "winding" || role == "turn")
-                for (TopExp_Explorer ex(ns.shape, TopAbs_SOLID); ex.More(); ex.Next()) conductorSolids.push_back(ex.Current());
+                for (TopExp_Explorer ex(ns.shape, TopAbs_SOLID); ex.More(); ex.Next()) {
+                    conductorSolids.push_back(ex.Current());
+                    conductorSolidWinding.push_back(w);
+                    conductorSolidName.push_back(ns.name);
+                }
         }
         // A FOIL parallel is ONE body (ABT #1907, Alf 2026-10-19): MVB++ fuses its sheet, its two axial leads and the
         // weld strips MKF lays between them, and caps only the lead tips (MKF's AxialLead::end), so its two caps are its
@@ -1274,6 +1380,23 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         // The FEM product's periodic-face -> B-spline pass runs inside the exporter, on the mm
         // geometry (MVB++ StepExportOptions; ABT #1111).
         mvb::StepExportOptions xo; xo.nurbsPeriodicSolids = continuous;
+        // The facets of a ROUND-wire conductor stay planes through that pass; a rectangular wire or a foil is
+        // converted whole, as before (StepExportOptions::planarFacesStayPlanarIn has the measurements for both).
+        {
+            OpenMagnetics::Coil coilX = enriched.get_coil();   // mutable copy: resolve_wire is non-const
+            const auto& fdX = coilX.get_functional_description();
+            std::set<std::string> rectangularWinding;
+            for (size_t i = 0; i < fdX.size(); ++i) {
+                auto wire = coilX.resolve_wire(i);
+                if (!wire.get_conducting_diameter() && wire.get_conducting_width() && wire.get_conducting_height())
+                    rectangularWinding.insert(fdX[i].get_name());
+            }
+            for (const auto& ns : forStep) {
+                std::string w; int ix = 0;
+                const std::string role = classify(ns.name, w, ix, nctx3d);
+                if ((role == "winding" || role == "turn") && !rectangularWinding.count(w)) xo.planarFacesStayPlanarIn.insert(ns.name);
+            }
+        }
         const bool ok = mvb::exportSTEP(forStep, step_path, xo);
         std::cout.rdbuf(old);
         if (!ok) throw std::runtime_error("mesh3d_from_mas: exportSTEP failed");
@@ -1341,6 +1464,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
     gmsh::option::setString("Geometry.OCCTargetUnit", "M");
     gmsh::model::occ::importShapes(step_path, imported);
     gmsh::model::occ::synchronize();
+    log_resident("the STEP import", /*release=*/true);
 
     // Classify each imported volume by nearest recorded centroid (geometry, not labels).
     // label = the STEP PRODUCT the volume came from ("Shapes/Primary parallel 1"), read back through gmsh's
@@ -1680,6 +1804,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
             for (auto& r : res) clippedTags.push_back(r.second);
             for (size_t j = 1; j < res.size(); ++j) extraSolids.emplace_back(res[j].second, im.region);
             ++nclip;
+            log_resident(("clipping '" + im.region + "' to the air box").c_str(), /*release=*/true);
         }
         // Extra pieces from a multi-solid clip must stay in the region list, or they lose their
         // material and silently become air.
@@ -1823,6 +1948,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         std::fprintf(stderr, "[mesh3d] fragment: %.0f s (%s; %d certified-disjoint conductor(s) as one argument)\n",
                      std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - tFrag0,
                      fragParallel ? "OCCT parallel" : "one thread", nDisjoint);
+        log_resident("the fragment", /*release=*/true);
         if (!done)
             throw std::runtime_error("mesh3d_from_mas: fragment failed at every boolean "
                                      "tolerance [" + ferrs + "]");
@@ -2229,6 +2355,23 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                             perW[item.substr(0, eq)] = t;
                         }
                     }
+                    // EVERY WINDING IS SIZED FROM ITS OWN WIRE (Alf, 2026-11-21: "different automatic sizes for each
+                    // winding, and make this compulsory for all designs, as it would be a common case to have larger
+                    // wires with few turns together with small wires with many turns"). With the conductor target
+                    // automatic and no per-winding list given, each winding's target is the wire-scale rule on its own
+                    // emitted surface radius, 1.2 x r -- the rule that used to be applied to the whole design from its
+                    // THINNEST wire (two_switch_forward: a 0.2 mm foil put 0.12 mm elements on the 26,306 faces of a
+                    // 0.7 mm litz primary, tens of millions of tetrahedra, no mesh). An explicit design-wide target
+                    // (conductor.target_m) stays design-wide.
+                    const bool perWAuto = perW.empty() && opt.conductor_target == 0.0;
+                    if (perWAuto) {
+                        std::vector<std::string> conductorRegions;
+                        for (const auto& [gname, gvs] : groups) {
+                            (void)gvs;
+                            if (gname.rfind("winding", 0) == 0 || gname.rfind("turn_", 0) == 0) conductorRegions.push_back(gname);
+                        }
+                        perW = mvb::mesh::automatic_conductor_targets(conductorRegions, layout_sizing().target_by_winding);
+                    }
                     double perWmin = 0.0;
                     for (const auto& [g, t] : perW) perWmin = perWmin > 0.0 ? std::min(perWmin, t) : t;
                     const double perWscale = perW.empty() ? 1.0 : cond_t / perWmin;
@@ -2241,8 +2384,9 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                         // i.e. no skin/proximity physics at all. Match the "winding" prefix too.
                         if (name.rfind("winding", 0) != 0 && name.rfind("turn_", 0) != 0) continue;
                         std::vector<double>* into = &cond_faces;
-                        if (!perW.empty() && name.rfind("winding_", 0) == 0) {
-                            const auto it = perW.find(name);
+                        const auto ownWinding = perWAuto ? mvb::mesh::winding_of_conductor_region(name) : std::optional<std::string>();
+                        if (!perW.empty() && (name.rfind("winding_", 0) == 0 || ownWinding)) {
+                            const auto it = perW.find(ownWinding ? "winding_" + *ownWinding : name);
                             if (it == perW.end())
                                 throw std::runtime_error("mesh3d: conductor group '" + name + "' has no entry in "
                                                          "OMFEM_COND_TARGET_WINDINGS");
@@ -2341,102 +2485,159 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                     if (!std::getenv("OMFEM_CHORD_GLOBAL")) {
                         const LayoutSizing& ls = layout_sizing();
                         std::vector<TurnCorridor> tight;
+                        // a corridor binds the coarser of its two surfaces: under per-winding targets that is the
+                        // pair's own coarsest target (scaled as the targets are), not the design's finest
                         for (const auto& c : ls.corridors)
-                            if (c.size < cond_t) tight.push_back(c);
-                        if (!tight.empty() && continuous) {
+                            if (c.size < (perWAuto ? c.coarsest * perWscale : cond_t)) tight.push_back(c);
+                        // a rectangular conductor's corridors are not in the layout list (its turns are not circles):
+                        // they are looked for on its built surfaces whenever the design has one
+                        bool rectangularConductors = false;
+                        for (const auto& wn : conductorSolidWinding) rectangularConductors = rectangularConductors || ls.rectangular_windings.count(wn) > 0;
+                        if ((!tight.empty() || rectangularConductors) && continuous) {
                             // REAL WINDING: the corridors are located on the built 3D centrelines
                             // (chord_points_3d), not by revolving the layout -- MVB++'s turns are
                             // helices/stadiums, and the circle mapping below refused 17_cllc, both
                             // pushpulls and isolated_buck ("cannot locate layout").
                             if (!realPaths)
                                 throw std::runtime_error("mesh3d: " + std::to_string(tight.size()) + " layout corridor(s) "
-                                    "are tighter than the conductor target but the real-winding centrelines that "
+                                    "are tighter than the conductor target" + (rectangularConductors ? " and the design has "
+                                    "rectangular conductors," : "") + " but the real-winding centrelines that "
                                     "place their refinement could not be built: " + realPathsError);
-                            auto cp = std::make_shared<const ChordPoints>(chord_points_3d(*realPaths, cond_t));
-                            if (cp->h.empty())
+                            std::vector<double> pathTarget;
+                            double chordT = cond_t;
+                            if (perWAuto) {
+                                for (const auto& pl : *realPaths) {
+                                    std::optional<double> t;
+                                    for (const auto& [wn, wt] : ls.target_by_winding)
+                                        if (pl.name.rfind(wn + " parallel ", 0) == 0) t = wt * perWscale;
+                                    if (!t) throw std::runtime_error("mesh3d: the built conductor '" + pl.name + "' belongs to no "
+                                                                     "winding of the coil's functional description");
+                                    pathTarget.push_back(*t);
+                                    chordT = std::max(chordT, *t);
+                                }
+                            }
+                            // RECTANGULAR CONDUCTORS: their corridors, measured on the solids themselves (ABT #2460)
+                            std::vector<mvb::mesh::CorridorCandidate> surfaceCorridors;
+                            if (rectangularConductors) {
+                                std::vector<mvb::mesh::ConductorSolid> csolids;
+                                for (size_t i = 0; i < conductorSolids.size(); ++i) {
+                                    const std::string& wn = conductorSolidWinding[i];
+                                    const auto it = ls.target_by_winding.find(wn);
+                                    if (it == ls.target_by_winding.end())
+                                        throw std::runtime_error("mesh3d: the conductor solid of '" + wn + "' belongs to no winding "
+                                                                 "of the coil's functional description");
+                                    csolids.push_back({conductorSolids[i], conductorSolidName[i], wn, ls.rectangular_windings.count(wn) > 0,
+                                                       perWAuto ? it->second * perWscale : cond_t});
+                                }
+                                std::vector<mvb::mesh::RoundCentreline> rounds;
+                                {
+                                    size_t pi = 0;
+                                    for (const auto& pl : *realPaths) {
+                                        const double t = pathTarget.empty() ? cond_t : pathTarget[pi];
+                                        ++pi;
+                                        if (pl.isRectangular) continue;
+                                        rounds.push_back({pl.name, pl.wireRadius, t, pl.prims});
+                                    }
+                                }
+                                mvb::mesh::SurfaceCorridors sc = mvb::mesh::surface_corridor_points(csolids, rounds);
+                                std::fprintf(stderr, "[mesh3d] surface corridors: %zu rectangular conductor solid(s), %zu curved face(s), "
+                                             "%zu sample(s) (%zu more too gently curved to bind) -> %zu saw a surface, %zu of them "
+                                             "inclined away, %zu corridor point(s) (%zu between turns of one conductor); %zu round-wire "
+                                             "sample(s) near them -> %zu corridor point(s); %.1f s\n", sc.rectangularSolids,
+                                             sc.curvedFaces, sc.samples, sc.unbound, sc.hits, sc.inclined,
+                                             sc.points.size() - sc.roundHits, sc.ownHits, sc.roundSamples, sc.roundHits, sc.seconds);
+                                surfaceCorridors = std::move(sc.points);
+                            }
+                            auto cp = std::make_shared<const ChordPoints>(chord_points_3d(*realPaths, chordT, pathTarget, surfaceCorridors));
+                            if (cp->h.empty() && !tight.empty())
                                 throw std::runtime_error("mesh3d: the layout has " + std::to_string(tight.size()) +
                                     " corridor(s) tighter than the conductor target (tightest " +
                                     std::to_string(tight.front().size * 1e3) + " mm) but the built centrelines "
                                     "have none: layout and geometry disagree");
-                            // VERIFICATION -- a corridor point is AIR. One inside copper means the
-                            // centrelines or radii disagree with the solids that will be meshed.
-                            std::vector<int> cvols;
-                            for (auto& [gname, gvs] : groups)
-                                if (gname.rfind("winding", 0) == 0 || gname.rfind("turn_", 0) == 0)
-                                    for (int v : gvs) cvols.push_back(v);
-                            const size_t nck = std::min<size_t>(cp->h.size(), 256), stride = std::max<size_t>(1, cp->h.size() / nck);
-                            // HOW FAR inside decides it. A corridor point sits gap/2 from two centreline-derived
-                            // surfaces, and the solids differ from those by the centreline's own chord sagitta: in
-                            // a corridor a few microns wide the point can land a micron under the copper skin
-                            // (flyback_transformer_complete: 1.09 um inside the Primary, in an 11 um corridor
-                            // between two of its turns) while its refinement ball, 1.5 h wide, still covers the
-                            // whole gap. It is a disagreement only when the point is deeper than the size h it
-                            // asks for -- then the ball no longer reaches the corridor it was placed for.
-                            size_t skinDeep = 0; double deepest = 0.0;
-                            const auto verifyT0 = std::chrono::steady_clock::now();
-                            // WHICH POINTS ARE ASKED (ABT #1278). gmsh's isInside builds a fresh solid classifier at every
-                            // call, over every face of the volume: 13_current_sense's 257 points against its welded
-                            // 80-turn Secondary took 2931 s, longer than the mesh itself. A point inside a meshed
-                            // conductor volume is inside the conductor solid it was imported from (the port clip only
-                            // removes copper), so each point is first classified against those solids -- one classifier
-                            // per solid, loaded once -- and only a point one of them holds (in or on) goes to gmsh,
-                            // whose answer and depth decide as before.
-                            std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> inSolid;
-                            for (const auto& cs : conductorSolids) inSolid.push_back(std::make_unique<BRepClass3d_SolidClassifier>(cs));
-                            size_t askedGmsh = 0;
-                            for (size_t i = 0; i < cp->h.size(); i += stride) {
-                                bool held = inSolid.empty();   // no solids to ask: every point goes to gmsh
-                                for (auto& c : inSolid) {
-                                    c->Perform(gp_Pnt(cp->x[i], cp->y[i], cp->z[i]), Precision::Confusion());
-                                    if (c->State() == TopAbs_IN || c->State() == TopAbs_ON) { held = true; break; }
-                                }
-                                if (!held) continue;
-                                ++askedGmsh;
-                                for (int v : cvols) {
-                                    if (gmsh::model::isInside(3, v, {cp->x[i], cp->y[i], cp->z[i]}) <= 0) continue;
-                                    const double px = cp->x[i], py = cp->y[i], pz = cp->z[i];
-                                    double depth = std::numeric_limits<double>::max();
-                                    gmsh::vectorpair bd; gmsh::model::getBoundary({{3, v}}, bd, false, false, false);
-                                    for (auto& dt : bd) {
-                                        double a0, b0, c0, a1, b1, c1;
-                                        gmsh::model::getBoundingBox(2, std::abs(dt.second), a0, b0, c0, a1, b1, c1);
-                                        const double dx = std::max({a0 - px, 0.0, px - a1}), dy = std::max({b0 - py, 0.0, py - b1}),
-                                                     dz = std::max({c0 - pz, 0.0, pz - c1});
-                                        if (std::sqrt(dx * dx + dy * dy + dz * dz) >= depth) continue;   // cannot be nearer
-                                        std::vector<double> cpt, par;
-                                        gmsh::model::getClosestPoint(2, std::abs(dt.second), {px, py, pz}, cpt, par);
-                                        depth = std::min(depth, std::sqrt((cpt[0] - px) * (cpt[0] - px) + (cpt[1] - py) * (cpt[1] - py) +
-                                                                          (cpt[2] - pz) * (cpt[2] - pz)));
+                            if (cp->h.empty())
+                                std::fprintf(stderr, "[mesh3d] local chord-bound refinement: no corridor of this design binds its "
+                                             "conductor targets\n");
+                            else {
+                                // VERIFICATION -- a corridor point is AIR. One inside copper means the
+                                // centrelines or radii disagree with the solids that will be meshed.
+                                std::vector<int> cvols;
+                                for (auto& [gname, gvs] : groups)
+                                    if (gname.rfind("winding", 0) == 0 || gname.rfind("turn_", 0) == 0)
+                                        for (int v : gvs) cvols.push_back(v);
+                                const size_t nck = std::min<size_t>(cp->h.size(), 256), stride = std::max<size_t>(1, cp->h.size() / nck);
+                                // HOW FAR inside decides it. A corridor point sits gap/2 from two centreline-derived
+                                // surfaces, and the solids differ from those by the centreline's own chord sagitta: in
+                                // a corridor a few microns wide the point can land a micron under the copper skin
+                                // (flyback_transformer_complete: 1.09 um inside the Primary, in an 11 um corridor
+                                // between two of its turns) while its refinement ball, 1.5 h wide, still covers the
+                                // whole gap. It is a disagreement only when the point is deeper than the size h it
+                                // asks for -- then the ball no longer reaches the corridor it was placed for.
+                                size_t skinDeep = 0; double deepest = 0.0;
+                                const auto verifyT0 = std::chrono::steady_clock::now();
+                                // WHICH POINTS ARE ASKED (ABT #1278). gmsh's isInside builds a fresh solid classifier at every
+                                // call, over every face of the volume: 13_current_sense's 257 points against its welded
+                                // 80-turn Secondary took 2931 s, longer than the mesh itself. A point inside a meshed
+                                // conductor volume is inside the conductor solid it was imported from (the port clip only
+                                // removes copper), so each point is first classified against those solids -- one classifier
+                                // per solid, loaded once -- and only a point one of them holds (in or on) goes to gmsh,
+                                // whose answer and depth decide as before.
+                                std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> inSolid;
+                                for (const auto& cs : conductorSolids) inSolid.push_back(std::make_unique<BRepClass3d_SolidClassifier>(cs));
+                                size_t askedGmsh = 0;
+                                for (size_t i = 0; i < cp->h.size(); i += stride) {
+                                    bool held = inSolid.empty();   // no solids to ask: every point goes to gmsh
+                                    for (auto& c : inSolid) {
+                                        c->Perform(gp_Pnt(cp->x[i], cp->y[i], cp->z[i]), Precision::Confusion());
+                                        if (c->State() == TopAbs_IN || c->State() == TopAbs_ON) { held = true; break; }
                                     }
-                                    if (depth > cp->h[i])
-                                        throw std::runtime_error("mesh3d: chord-bound corridor point (" +
-                                            std::to_string(px * 1e3) + ", " + std::to_string(py * 1e3) + ", " +
-                                            std::to_string(pz * 1e3) + ") mm lies " + std::to_string(depth * 1e6) +
-                                            " um inside conductor volume " + std::to_string(v) + ", deeper than the " +
-                                            std::to_string(cp->h[i] * 1e6) + " um size it asks for: the centrelines "
-                                            "disagree with the solids");
-                                    ++skinDeep; deepest = std::max(deepest, depth);
+                                    if (!held) continue;
+                                    ++askedGmsh;
+                                    for (int v : cvols) {
+                                        if (gmsh::model::isInside(3, v, {cp->x[i], cp->y[i], cp->z[i]}) <= 0) continue;
+                                        const double px = cp->x[i], py = cp->y[i], pz = cp->z[i];
+                                        double depth = std::numeric_limits<double>::max();
+                                        gmsh::vectorpair bd; gmsh::model::getBoundary({{3, v}}, bd, false, false, false);
+                                        for (auto& dt : bd) {
+                                            double a0, b0, c0, a1, b1, c1;
+                                            gmsh::model::getBoundingBox(2, std::abs(dt.second), a0, b0, c0, a1, b1, c1);
+                                            const double dx = std::max({a0 - px, 0.0, px - a1}), dy = std::max({b0 - py, 0.0, py - b1}),
+                                                         dz = std::max({c0 - pz, 0.0, pz - c1});
+                                            if (std::sqrt(dx * dx + dy * dy + dz * dz) >= depth) continue;   // cannot be nearer
+                                            std::vector<double> cpt, par;
+                                            gmsh::model::getClosestPoint(2, std::abs(dt.second), {px, py, pz}, cpt, par);
+                                            depth = std::min(depth, std::sqrt((cpt[0] - px) * (cpt[0] - px) + (cpt[1] - py) * (cpt[1] - py) +
+                                                                              (cpt[2] - pz) * (cpt[2] - pz)));
+                                        }
+                                        if (depth > cp->h[i])
+                                            throw std::runtime_error("mesh3d: chord-bound corridor point (" +
+                                                std::to_string(px * 1e3) + ", " + std::to_string(py * 1e3) + ", " +
+                                                std::to_string(pz * 1e3) + ") mm lies " + std::to_string(depth * 1e6) +
+                                                " um inside conductor volume " + std::to_string(v) + ", deeper than the " +
+                                                std::to_string(cp->h[i] * 1e6) + " um size it asks for: the centrelines "
+                                                "disagree with the solids");
+                                        ++skinDeep; deepest = std::max(deepest, depth);
+                                    }
                                 }
+                                std::fprintf(stderr, "[mesh3d] chord bound: corridor points checked against %zu conductor solid(s) in %.1f s "
+                                             "(%zu held by one and asked of gmsh's %zu volume(s))\n", inSolid.size(),
+                                             std::chrono::duration<double>(std::chrono::steady_clock::now() - verifyT0).count(), askedGmsh,
+                                             cvols.size());
+                                if (skinDeep)
+                                    std::fprintf(stderr, "[mesh3d] chord bound: %zu checked corridor point(s) lie under the copper "
+                                                 "skin, at most %.3g um deep (each within the size it asks for)\n",
+                                                 skinDeep, deepest * 1e6);
+                                const double ct = cond_t;
+                                gmsh::model::mesh::setSizeCallback([cp, ct](int, int, double x, double y, double z, double lc) {
+                                    (void) ct; return cp->size_below(x, y, z, lc);
+                                });
+                                cmin = std::min(cmin, cp->hmin);
+                                std::fprintf(stderr, "[mesh3d] local chord-bound refinement (3D centrelines): %zu corridor "
+                                             "point(s) from %zu of %zu centreline samples; tightest %.4g mm (gap %.4g um) "
+                                             "at (%.3f, %.3f, %.3f) mm; design target %.4g mm; %zu checked in air\n",
+                                             cp->h.size(), cp->close, cp->samples, cp->hmin * 1e3, cp->dmin * 1e6,
+                                             cp->at[0] * 1e3, cp->at[1] * 1e3, cp->at[2] * 1e3, cond_t * 1e3,
+                                             (cp->h.size() + stride - 1) / stride);
                             }
-                            std::fprintf(stderr, "[mesh3d] chord bound: corridor points checked against %zu conductor solid(s) in %.1f s "
-                                         "(%zu held by one and asked of gmsh's %zu volume(s))\n", inSolid.size(),
-                                         std::chrono::duration<double>(std::chrono::steady_clock::now() - verifyT0).count(), askedGmsh,
-                                         cvols.size());
-                            if (skinDeep)
-                                std::fprintf(stderr, "[mesh3d] chord bound: %zu checked corridor point(s) lie under the copper "
-                                             "skin, at most %.3g um deep (each within the size it asks for)\n",
-                                             skinDeep, deepest * 1e6);
-                            const double ct = cond_t;
-                            gmsh::model::mesh::setSizeCallback([cp, ct](int, int, double x, double y, double z, double lc) {
-                                (void) ct; return cp->size_below(x, y, z, lc);
-                            });
-                            cmin = std::min(cmin, cp->hmin);
-                            std::fprintf(stderr, "[mesh3d] local chord-bound refinement (3D centrelines): %zu corridor "
-                                         "point(s) from %zu of %zu centreline samples; tightest %.4g mm (gap %.4g um) "
-                                         "at (%.3f, %.3f, %.3f) mm; design target %.4g mm; %zu checked in air\n",
-                                         cp->h.size(), cp->close, cp->samples, cp->hmin * 1e3, cp->dmin * 1e6,
-                                         cp->at[0] * 1e3, cp->at[1] * 1e3, cp->at[2] * 1e3, cond_t * 1e3,
-                                         (cp->h.size() + stride - 1) / stride);
                         } else if (!tight.empty()) {
                             const char axis = std::getenv("OMFEM_AXIS")
                                             ? std::getenv("OMFEM_AXIS")[0] : 'Y';
@@ -2863,6 +3064,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
       gmsh::model::mesh::getElements(et, en, ev, 3);
       for (size_t i=0;i<et.size();++i) if (et[i]==4) ntet = en[i].size(); }
     std::fprintf(stderr, "[mesh3d] %zu tets  (mesh generation = %.1fs)\n", ntet, mesh_secs);
+    log_resident("mesh generation");
     gmsh::option::setNumber("Mesh.MshFileVersion", 2.2);
     write_cad_edges(opt.out_msh);
     write_mesh_atomically(opt.out_msh);

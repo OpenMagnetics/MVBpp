@@ -3,11 +3,26 @@
 // format rules (ids, order, region names, units, refusals); the real meshes are round-tripped by
 // tools/mvbpp_mesh_roundtrip on OMFEM's reference outputs.
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "mvb/mesh/Mesh2d.h"
 #include "mvb/mesh/MeshSupport.h"
 #include "mvb/mesh/Mesher.h"
+#include "mvb/mesh/SizeField.h"
+#include "mvb/mesh/SurfaceCorridors.h"
+
+#include <BRepAlgoAPI_Fuse.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakePolygon.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepPrimAPI_MakeRevol.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopoDS_Shape.hxx>
+#include <gp_Ax1.hxx>
+#include <gp_Ax2.hxx>
+#include <gp_Pnt.hxx>
 
 #include <algorithm>
 #include <array>
@@ -16,8 +31,11 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <optional>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <unistd.h>
 
 using namespace mvb::mesh;
@@ -222,6 +240,203 @@ TEST_CASE("Writers refuse a structurally broken mesh", "[mesh-io]") {
     m = cell();
     m.regions[2].tag = 1;
     REQUIRE_THROWS_WITH(exportMesh(m, "msh2", "m"), ContainsSubstring("tag 1 used twice"));
+}
+
+// Every winding is meshed at its own automatic size (Alf, 2026-11-21). two_switch_forward's 0.2 mm foil used to put its
+// 0.12 mm on a 0.79 mm litz primary; a thick few-turn winding beside a thin many-turn one is the common case.
+TEST_CASE("Each winding's automatic conductor target comes from its own wire", "[mesh-api][sizing]") {
+    // a 0.79 mm litz bundle and a 0.2 mm foil (two_switch_forward's two wires) and a 0.355 mm round wire
+    const std::map<std::string, double> target{{"Primary", wire_scale_target(0.3943e-3)},
+                                               {"Secondary", foil_scale_target(0.2e-3)},
+                                               {"Reset Winding", wire_scale_target(0.1775e-3)}};
+    CHECK(wire_scale_target(0.1e-3) == 1.2 * 0.1e-3);
+    CHECK(foil_scale_target(0.2e-3) == 2.0 * 0.2e-3);
+    CHECK(foil_scale_target(0.2e-3) > 3.3 * wire_scale_target(0.1e-3));   // a foil is not sized as a wire of half its thickness
+    REQUIRE_THROWS_AS(wire_scale_target(0.0), std::invalid_argument);
+    REQUIRE_THROWS_AS(foil_scale_target(0.0), std::invalid_argument);
+    REQUIRE_THROWS_AS(foil_scale_target(-1e-4), std::invalid_argument);
+
+    const auto t = automatic_conductor_targets({"winding_Primary", "winding_Secondary", "winding_Reset Winding"}, target);
+    REQUIRE(t.size() == 3);
+    CHECK(t.at("winding_Primary") == target.at("Primary"));
+    CHECK(t.at("winding_Secondary") == target.at("Secondary"));
+    CHECK(t.at("winding_Reset Winding") == target.at("Reset Winding"));
+    CHECK(t.at("winding_Primary") > 2.2 * t.at("winding_Reset Winding"));   // the thick winding is not sized by the thin one
+    // per-turn regions are sized by the winding they belong to; the lumped region belongs to none
+    const auto turns = automatic_conductor_targets({"turn_Primary_0", "turn_Primary_17", "turn_Reset Winding_3", "winding"}, target);
+    REQUIRE(turns.size() == 2);
+    CHECK(turns.at("winding_Primary") == t.at("winding_Primary"));
+    CHECK(turns.at("winding_Reset Winding") == t.at("winding_Reset Winding"));
+    CHECK(winding_of_conductor_region("turn_Reset Winding_3") == std::optional<std::string>("Reset Winding"));
+    CHECK_FALSE(winding_of_conductor_region("winding").has_value());
+    CHECK_FALSE(winding_of_conductor_region("core").has_value());
+    // no wire, no size: neither a default nor the design's thinnest
+    REQUIRE_THROWS_WITH(automatic_conductor_targets({"winding_Auxiliary"}, target), ContainsSubstring("no wire to be sized from"));
+    // a corridor binds the coarser of its two surfaces
+    CHECK(corridor_binds(0.3e-3, t.at("winding_Primary"), t.at("winding_Reset Winding")));               // under the primary's 0.47 mm
+    CHECK_FALSE(corridor_binds(0.3e-3, t.at("winding_Reset Winding"), t.at("winding_Reset Winding")));   // over the reset wire's 0.21 mm
+    CHECK_FALSE(corridor_binds(0.5e-3, t.at("winding_Primary"), t.at("winding_Secondary")));
+}
+
+// The chord bound, as rules (ABT #2460). One bound for every conductor: a facet of size h on a surface of radius rho sags
+// h^2 / 8 rho, held to 0.32 of the gap.
+TEST_CASE("The chord bound, the widest gap it can bind and what counts as facing", "[mesh-api][sizing]") {
+    // a 0.5 mm wire 1.733 um from its neighbour (03_buck's tightest), and the sag that size leaves: 0.32 of the gap
+    const double h = chord_bound(0.25e-3, 1.733e-6);
+    CHECK(h == Catch::Approx(0.8 * std::sqrt(4.0 * 0.25e-3 * 1.733e-6)).epsilon(1e-12));
+    CHECK(h * h / (8.0 * 0.25e-3) == Catch::Approx(0.32 * 1.733e-6).epsilon(1e-12));
+    CHECK(chord_bound(1e-3, 0.0) == 0.0);
+    REQUIRE_THROWS_AS(chord_bound(0.0, 1e-6), std::invalid_argument);
+    REQUIRE_THROWS_AS(chord_bound(1e-3, -1e-9), std::invalid_argument);
+    // the widest binding gap is where the bound reaches the target ...
+    const double wide = widest_binding_gap(10.2e-3, 0.4e-3);   // a foil wrap of 10.2 mm, meshed at 0.4 mm
+    CHECK(wide == Catch::Approx(6.127e-6).epsilon(1e-3));
+    CHECK(chord_bound(10.2e-3, wide) == Catch::Approx(0.4e-3).epsilon(1e-12));
+    // ... and never more than the surface can sag at all: a 50 um fillet under a 0.4 mm target stops at rho / 0.32
+    CHECK(widest_binding_gap(50e-6, 0.4e-3) == Catch::Approx(50e-6 / 0.32).epsilon(1e-12));
+    CHECK(widest_binding_gap(50e-6, 0.4e-3) < (0.4e-3 / 0.8) * (0.4e-3 / 0.8) / (4.0 * 50e-6));
+    // a round wire at its own 1.2 r target never reaches that cap: 0.5625 r
+    CHECK(widest_binding_gap(0.25e-3, wire_scale_target(0.25e-3)) == Catch::Approx(0.5625 * 0.25e-3).epsilon(1e-12));
+    REQUIRE_THROWS_AS(widest_binding_gap(0.0, 1e-3), std::invalid_argument);
+    REQUIRE_THROWS_AS(widest_binding_gap(1e-3, 0.0), std::invalid_argument);
+    // facing: parallel walls always; a wall inclined by more than target / (2 radius) never; nothing past a right angle
+    CHECK(surfaces_face(-1.0, 10.2e-3, 0.4e-3));
+    CHECK(surfaces_face(-std::cos(0.019), 10.2e-3, 0.4e-3));         // limit 0.4 / 20.4 = 0.0196 rad
+    CHECK_FALSE(surfaces_face(-std::cos(0.020), 10.2e-3, 0.4e-3));
+    CHECK_FALSE(surfaces_face(-0.5, 1e-3, 0.4e-3));                  // a 60 degree re-entrant corner, limit 0.2 rad
+    CHECK(surfaces_face(-std::cos(1.5), 50e-6, 0.4e-3));             // a small fillet: anything short of a right angle
+    CHECK_FALSE(surfaces_face(0.0, 50e-6, 0.4e-3));
+    CHECK_FALSE(surfaces_face(1.0, 50e-6, 0.4e-3));
+    REQUIRE_THROWS_AS(surfaces_face(-1.0, 0.0, 1e-3), std::invalid_argument);
+}
+
+namespace {
+// a foil layer about the Z axis: a rectangle [rIn, rOut] x [0, height] revolved through `angle`
+TopoDS_Shape foilLayer(double rIn, double rOut, double height, double angle) {
+    BRepBuilderAPI_MakePolygon section(gp_Pnt(rIn, 0, 0), gp_Pnt(rOut, 0, 0), gp_Pnt(rOut, 0, height), gp_Pnt(rIn, 0, height), true);
+    return BRepPrimAPI_MakeRevol(BRepBuilderAPI_MakeFace(section.Wire(), true).Face(),
+                                 gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), angle).Shape();
+}
+TopoDS_Shape plate(double x0, double y0, double z0, double x1, double y1, double z1) {
+    return BRepPrimAPI_MakeBox(gp_Pnt(x0, y0, z0), gp_Pnt(x1, y1, z1)).Shape();
+}
+}  // namespace
+
+// A rectangular wire or a foil has no radius of its own: its corridors are measured on its built surfaces, with the
+// radius of curvature of the face that sees the gap (ABT #2460). The round-tube model it replaces put its refinement
+// points inside the copper (two_switch_forward: 191 um inside a foil; 03_buck: 20 of 36 under the skin).
+TEST_CASE("Rectangular conductors: corridors come from the curvature and the gaps of their built surfaces",
+          "[mesh-api][corridors]") {
+    const double mm = 1e-3, um = 1e-6, target = 0.4 * mm;
+
+    SECTION("two foil layers about a column: the bound is the wrap radius's, the point is in the gap") {
+        const double rOut = 10.2 * mm, gap = 2.0 * um;   // under the 6.13 um a 10.2 mm wrap can bind at 0.4 mm
+        const std::vector<ConductorSolid> foils{{foilLayer(10.0 * mm, rOut, 5 * mm, 4.7), "Secondary parallel 0", "Secondary", true, target},
+                                                {foilLayer(rOut + gap, rOut + gap + 0.2 * mm, 5 * mm, 4.7), "Secondary parallel 1", "Secondary", true, target}};
+        const SurfaceCorridors sc = surface_corridor_points(foils, {});
+        CHECK(sc.rectangularSolids == 2);
+        CHECK(sc.curvedFaces == 4);
+        REQUIRE(sc.points.size() > 1000);
+        CHECK(sc.ownHits == 0);
+        CHECK(sc.inclined == 0);
+        CHECK(sc.roundHits == 0);
+        for (const auto& c : sc.points) {
+            const double r = std::hypot(c.p[0], c.p[1]);
+            REQUIRE(r == Catch::Approx(rOut + 0.5 * gap).margin(1e-9));          // mid-gap: in air, never in copper
+            REQUIRE(c.gap == Catch::Approx(gap).margin(1e-9));
+            // seen from the inner layer's outer face (10.2 mm) or the outer layer's inner face (10.202 mm)
+            REQUIRE(c.h >= chord_bound(rOut, c.gap) * (1.0 - 1e-9));
+            REQUIRE(c.h <= chord_bound(rOut + gap, c.gap) * (1.0 + 1e-9));
+            REQUIRE(c.h < target);
+        }
+        // not the round-tube bound: half the 0.2 mm thickness would ask for 23 um here, the wrap radius asks for 229 um
+        CHECK(sc.points.front().h > 9.0 * chord_bound(0.1 * mm, gap));
+    }
+    SECTION("the same layers 10 um apart bind nothing: the wrap is too gently curved") {
+        const double rOut = 10.2 * mm, gap = 10.0 * um;
+        const std::vector<ConductorSolid> foils{{foilLayer(10.0 * mm, rOut, 5 * mm, 4.7), "Secondary parallel 0", "Secondary", true, target},
+                                                {foilLayer(rOut + gap, rOut + gap + 0.2 * mm, 5 * mm, 4.7), "Secondary parallel 1", "Secondary", true, target}};
+        const SurfaceCorridors sc = surface_corridor_points(foils, {});
+        CHECK(sc.samples > 1000);   // the faces were measured
+        CHECK(sc.points.empty());
+    }
+    SECTION("two turns of ONE foil body are seen as a gap between turns") {
+        const double rOut = 10.2 * mm, gap = 2.0 * um;
+        BRepAlgoAPI_Fuse bridge(foilLayer(10.0 * mm, rOut, 5 * mm, 4.7), plate(10.1 * mm, -0.3 * mm, 0, 10.3 * mm, 0, 5 * mm));
+        REQUIRE(bridge.IsDone());
+        BRepAlgoAPI_Fuse body(bridge.Shape(), foilLayer(rOut + gap, rOut + gap + 0.2 * mm, 5 * mm, 4.7));
+        REQUIRE(body.IsDone());
+        size_t solids = 0;
+        for (TopExp_Explorer ex(body.Shape(), TopAbs_SOLID); ex.More(); ex.Next()) ++solids;
+        REQUIRE(solids == 1);
+        const SurfaceCorridors sc = surface_corridor_points({{body.Shape(), "Secondary parallel 0", "Secondary", true, target}}, {});
+        REQUIRE(sc.points.size() > 1000);
+        CHECK(sc.ownHits == sc.points.size());
+        for (const auto& c : sc.points) REQUIRE(std::hypot(c.p[0], c.p[1]) == Catch::Approx(rOut + 0.5 * gap).margin(1e-9));
+    }
+    SECTION("flat faces 2 um apart have no sag and ask for nothing") {
+        const std::vector<ConductorSolid> plates{{plate(0, 0, 0, 5 * mm, 5 * mm, 0.2 * mm), "A parallel 0", "A", true, target},
+                                                 {plate(0, 0, 0.2 * mm + 2 * um, 5 * mm, 5 * mm, 0.4 * mm + 2 * um), "B parallel 0", "B", true, target}};
+        const SurfaceCorridors sc = surface_corridor_points(plates, {});
+        CHECK(sc.rectangularSolids == 2);
+        CHECK(sc.curvedFaces == 0);
+        CHECK(sc.samples == 0);
+        CHECK(sc.points.empty());
+    }
+    SECTION("a re-entrant corner of one body is not a gap") {
+        // a 2 mm lead sunk half its radius into a sheet, the body meshed at 2 mm: where they meet, the lead's surface
+        // leaves the sheet at 60 degrees. The normals of the lead's first row of samples reach the sheet 0.85 mm away --
+        // within the 1.56 mm a 1 mm radius can bind at that target, and the bound there (1.47 mm) is under the target --
+        // but a wall inclined by 74 degrees is past the 57 degrees a 2 mm facet turns through: a corner, not a corridor.
+        const double coarse = 2.0 * mm;
+        BRepAlgoAPI_Fuse body(plate(-3 * mm, -3 * mm, -0.2 * mm, 3 * mm, 3 * mm, 0),
+                              BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(-2 * mm, 0, 0.5 * mm), gp_Dir(1, 0, 0)), 1.0 * mm, 4 * mm).Shape());
+        REQUIRE(body.IsDone());
+        const SurfaceCorridors sc = surface_corridor_points({{body.Shape(), "Secondary parallel 0", "Secondary", true, coarse}}, {});
+        CHECK(sc.curvedFaces >= 1);
+        REQUIRE(sc.hits > 0);               // normals near the junction do reach the sheet
+        CHECK(sc.inclined == sc.hits);      // and every one of them meets it inclined
+        CHECK(sc.points.empty());
+        CHECK(chord_bound(1.0 * mm, 0.848 * mm) < coarse);   // the bound alone would have asked for refinement there
+    }
+    SECTION("a round wire over a foil: the wire's radius bounds the gap, measured to the foil's real face") {
+        const double r = 0.25 * mm, gap = 5.0 * um, wireTarget = wire_scale_target(r);
+        const std::vector<ConductorSolid> foil{{plate(0, 0, -0.2 * mm, 10 * mm, 5 * mm, 0), "Secondary parallel 0", "Secondary", true, target}};
+        // along x over the foil's broad face, 3 mm in from its edges; and the same wire 1 mm above
+        const std::vector<RoundCentreline> near{{"Primary parallel 0", r, wireTarget, {{{3 * mm, 2.5 * mm, r + gap}, {7 * mm, 2.5 * mm, r + gap}}}}};
+        const std::vector<RoundCentreline> far{{"Primary parallel 0", r, wireTarget, {{{3 * mm, 2.5 * mm, r + 1 * mm}, {7 * mm, 2.5 * mm, r + 1 * mm}}}}};
+        const SurfaceCorridors sc = surface_corridor_points(foil, near);
+        CHECK(sc.curvedFaces == 0);
+        REQUIRE(sc.roundHits == 32);        // 4 mm of wire sampled every half radius
+        REQUIRE(sc.points.size() == 32);
+        for (const auto& c : sc.points) {
+            REQUIRE(c.p[2] == Catch::Approx(0.5 * gap).margin(1e-10));   // mid-gap, under the wire
+            REQUIRE(c.p[1] == Catch::Approx(2.5 * mm).margin(1e-10));
+            REQUIRE(c.gap == Catch::Approx(gap).margin(1e-10));
+            REQUIRE(c.h == Catch::Approx(chord_bound(r, gap)).epsilon(1e-6));
+        }
+        CHECK(surface_corridor_points(foil, far).points.empty());
+        // the foil's OWN lead is part of its body: its centreline lies a radius from its own surface, and that is not a gap
+        const std::vector<RoundCentreline> ownLead{{"Secondary parallel 0 exit lead", r, target, {{{3 * mm, 2.5 * mm, r + gap}, {7 * mm, 2.5 * mm, r + gap}}}}};
+        const SurfaceCorridors own = surface_corridor_points(foil, ownLead);
+        CHECK(own.roundSamples == 0);
+        CHECK(own.points.empty());
+        // ... a lead of another parallel of the same winding is not
+        const std::vector<RoundCentreline> otherLead{{"Secondary parallel 10 exit lead", r, target, {{{3 * mm, 2.5 * mm, r + gap}, {7 * mm, 2.5 * mm, r + gap}}}}};
+        CHECK(surface_corridor_points(foil, otherLead).points.size() == 32);
+    }
+    SECTION("no rectangular conductor, no work; no target, no size") {
+        const TopoDS_Shape wire = BRepPrimAPI_MakeCylinder(0.25 * mm, 5 * mm).Shape();
+        const SurfaceCorridors none = surface_corridor_points({{wire, "Primary parallel 0", "Primary", false, target}}, {});
+        CHECK(none.rectangularSolids == 0);
+        CHECK(none.samples == 0);
+        CHECK(none.points.empty());
+        REQUIRE_THROWS_WITH(surface_corridor_points({{plate(0, 0, 0, 1 * mm, 1 * mm, 1 * mm), "Secondary parallel 0", "Secondary", true, 0.0}}, {}),
+                            ContainsSubstring("no positive target"));
+        REQUIRE_THROWS_WITH(surface_corridor_points({{plate(0, 0, 0, 1 * mm, 1 * mm, 1 * mm), "Secondary parallel 0", "Secondary", true, target}},
+                                                    {{"Primary parallel 0", 0.0, target, {}}}),
+                            ContainsSubstring("no positive radius"));
+    }
 }
 
 // meshMagnetic takes every knob from its recipe: an ambient OMFEM_*/MVB_* is refused before any

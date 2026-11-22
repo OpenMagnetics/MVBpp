@@ -323,4 +323,9 @@ bool primEdgeGrowsAnalytically(const Primitive& pr);
 bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius);
 TopoDS_Shape pruneDegenerateSolids(const TopoDS_Shape& shape, double wireRadius);
 
+// True when `piece` (of volume `pieceVolume`) is proven to lie inside `host`: its box within the host's, every vertex in
+// or on the host, and a cut leaving under a hundredth of it outside. The assembler absorbs a piece into the copper before
+// it only on this proof; a refused or failed measure is "not inside".
+bool pieceLiesInside(const TopoDS_Shape& piece, double pieceVolume, const TopoDS_Shape& host);
+
 } // namespace mvb
