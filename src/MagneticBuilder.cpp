@@ -922,8 +922,18 @@ TopoDS_Shape buildWoundLegBobbins(const CoilT& coil, const MAS::MagneticCore& co
             frame = c.get_wound_column_frame_for_section(leg.section);
         }
         else {
-            throw std::runtime_error("buildWoundLegBobbins: the former on a lateral leg is MKF's wound column frame, which "
-                                     "only an MKF-wound OpenMagnetics::Coil carries");
+            // ABT #2489: a processed MAS document is drawn from its MAS::Coil (buildAllNamed skips the autocomplete).
+            // MKF's frame reads that coil's stored sections and the core it is wound on, both transient on an
+            // OpenMagnetics::Coil: give it them, and wind nothing.
+            const auto processedCore = core.get_processed_description();
+            if (!processedCore) {
+                throw std::runtime_error("buildWoundLegBobbins: section '" + leg.section + "' is wound on a lateral leg "
+                                         "but the core has no processedDescription to give that leg's column");
+            }
+            OpenMagnetics::Coil c(coil, /*windInConstructor=*/false);
+            c.set_core_columns(processedCore->get_columns());
+            c.set_core_geometry(OpenMagnetics::Core(core));
+            frame = c.get_wound_column_frame_for_section(leg.section);
         }
         if (std::abs(frame.axisX - std::abs(leg.spec.axisX)) > 1e-12 ||
             std::abs(frame.columnWidth - leg.spec.halfWidth) > 1e-12 ||

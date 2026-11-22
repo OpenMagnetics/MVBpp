@@ -10,9 +10,11 @@
 // sit at x = -13.6 mm (window side) and -22.5 mm (outer side) of the leg.
 #include <catch2/catch_test_macros.hpp>
 #include "mvb/MagneticBuilder.h"
+#include "mvb/Utils.h"
 #include "MAS.hpp"
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
+#include <TopExp_Explorer.hxx>
 #include <fstream>
 #include <nlohmann/json.hpp>
 
@@ -39,7 +41,7 @@ TEST_CASE("Lateral-column turns wrap their wound column, main-column turns stay 
     REQUIRE(f.is_open());
     json j;
     f >> j;
-    MAS::Magnetic magnetic = j.get<MAS::Magnetic>();
+    MAS::Magnetic magnetic = mvb::magnetic_from_json(j);
     REQUIRE(magnetic.get_coil().has_value());
     REQUIRE(magnetic.get_core().has_value());
     const MAS::Coil coil = *magnetic.get_coil();            // by-value optional getters:
@@ -76,4 +78,38 @@ TEST_CASE("Lateral-column turns wrap their wound column, main-column turns stay 
     }
     CHECK(nPrimary == 24);
     CHECK(nSecondary == 12);
+}
+
+// ABT #2489: d3fc7fe gave a design wound on a lateral leg that leg's own former, and refused to build it from a
+// MAS::Coil. A processed MAS document (one carrying a geometricalDescription) is drawn from exactly that type, so
+// the idealised export of every such design threw instead of drawing.
+TEST_CASE("A processed MAS magnetic wound on a lateral leg exports with that leg's former",
+          "[bobbin][multicolumn][abt2489]") {
+    std::ifstream f(std::string(MAS_COMPLETE_DIR) + "/multicolumn_e42_transformer.json");
+    REQUIRE(f.is_open());
+    json j;
+    f >> j;
+    MAS::Magnetic magnetic = mvb::magnetic_from_json(j);    // a full MAS document, read as the bindings do
+    const MAS::MagneticCore core = magnetic.get_core().value();
+    REQUIRE(core.get_geometrical_description().has_value());    // the path that skips MKF's autocomplete
+
+    mvb::MagneticBuilder builder;
+    const std::vector<mvb::NamedShape> all = builder.buildAllNamed(magnetic);
+
+    const double lateralAxisX = -0.0180625;  // core columns[2] axis (E42, MAS metres)
+    int formers = 0, onLateralLeg = 0, onMainColumn = 0;
+    for (const auto& ns : all) {
+        if (ns.role != mvb::Role::Bobbin) continue;
+        for (TopExp_Explorer it(ns.shape, TopAbs_SOLID); it.More(); it.Next()) {
+            const BBox b = bbox_of(it.Current());
+            const double cx = 0.5 * (b.xmin + b.xmax);
+            INFO(ns.name << "  x=[" << b.xmin << "," << b.xmax << "]");
+            ++formers;
+            if (std::abs(cx - lateralAxisX) < 1e-3) ++onLateralLeg;
+            if (std::abs(cx) < 1e-3) ++onMainColumn;
+        }
+    }
+    INFO(formers << " former solid(s)");
+    CHECK(onLateralLeg > 0);    // the Secondary's leg
+    CHECK(onMainColumn > 0);    // the Primary's column
 }
