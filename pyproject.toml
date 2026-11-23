@@ -6,7 +6,7 @@ build-backend = "scikit_build_core.build"
 # (OpenMagnetics/MVB, last release 0.6.12) from 1.0.0 on; the module it installs is `mvbpp`.
 [project]
 name            = "OpenMagneticsVirtualBuilder"
-version         = "1.0.4"
+version         = "1.0.5"
 description     = "MVB++ Python bindings — OpenMagnetics 3-D geometry builder (STEP/STL and drawings from MAS)"
 readme          = "README.md"
 requires-python = ">=3.10"
