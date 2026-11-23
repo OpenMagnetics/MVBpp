@@ -372,6 +372,24 @@ TEST_CASE("Real winding: an interleaved N-filar design builds CERTIFIED CLEAR (c
     REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
 }
 
+// ABT #2489 (the web's 3D viewer, which draws the wire at its outer diameter): on this E 16/12/5 design the Primary's
+// first turn rejoins its climb through a slope change of 0.61 degrees. Rounded at MKF's wire bend radius -- the coated
+// radius, which a wire drawn at its outer diameter cannot be swept round -- that bend was cut back into two tangent
+// straights 2 um long, and the assembler refused the drawing: "1 mitred corner(s) did not abut". The fixture is the
+// `magnetic` of WebFrontend tests/fixtures/e16_contiguous_two_windings.json, unchanged.
+TEST_CASE("Real winding drawn at the outer diameter: a slight row kink stays the one mitre it is (e16 contiguous, ABT #2489)",
+          "[realwinding][abt2489]") {
+    auto magneticJson = loadFixture("abt2489_e16_contiguous_two_windings.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    mvb::DrawConfig cfg{"step", /*includeBobbin=*/true, /*scale=*/1.0, /*symmetryPlanes=*/0};
+    cfg.useRealWindingGeometry = true;
+    cfg.paintCoating = true;    // the display drawing
+    REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
+    cfg.paintCoating = false;   // the copper, judged by the gate: its row bend stays round
+    REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
+}
+
 TEST_CASE("Real winding: rect-column conductor fuses into ONE connected solid",
           "[realwinding][connectivity]") {
     auto magneticJson = loadFixture("realwinding_e138_rectcolumn.json");  // E 13/7/4, 6 turns, 0.4 mm round
