@@ -441,6 +441,34 @@ TEST_CASE("Rectangular conductors: corridors come from the curvature and the gap
 
 // meshMagnetic takes every knob from its recipe: an ambient OMFEM_*/MVB_* is refused before any
 // work, and a recipe the table rejects leaves no knob behind in the environment.
+TEST_CASE("The outer box faces' surface algorithm meshes a fine zone that lies strictly inside a coarse face",
+          "[mesh-api][sizing]") {
+    using namespace mvb::mesh;
+    // 128 mm2 at 0.67 mm is about 330 nodes; the algorithm the mesher gives its outer faces has to find them.
+    const std::size_t found = nodes_in_enclosed_fine_zone(outer_face_algorithm_2d());
+    INFO("nodes in the zone with the outer faces' algorithm: " << found);
+    CHECK(found > 200);
+    // What the choice rests on: gmsh's default (6, Frontal-Delaunay) never sees the zone -- 0 nodes of its own in
+    // it (measured 2026-11-22, fork om-4.15.2). If a later gmsh fixes that, this fails and the choice can be
+    // revisited; until then an outer face left on the default is isolated_buck's 180 tets below gamma 0.01.
+    const std::size_t missed = nodes_in_enclosed_fine_zone(6);
+    INFO("nodes in the zone with Frontal-Delaunay: " << missed);
+    CHECK(missed < 20);
+}
+
+TEST_CASE("A faceted wire's surface algorithm leaves no flat wedge under the ridges of a bend",
+          "[mesh-api][sizing]") {
+    using namespace mvb::mesh;
+    const std::size_t flat = flat_tets_in_faceted_bend(faceted_wire_face_algorithm_2d());
+    INFO("tets below gamma 0.1 with the faceted-wire algorithm: " << flat);
+    CHECK(flat == 0);
+    // What the choice rests on: gmsh's default (6, Frontal-Delaunay) builds them on the same bend (5, measured
+    // 2026-11-22, fork om-4.15.2, one thread). If a later gmsh stops, this fails and the choice can be revisited.
+    const std::size_t withDefault = flat_tets_in_faceted_bend(6);
+    INFO("tets below gamma 0.1 with Frontal-Delaunay: " << withDefault);
+    CHECK(withDefault >= 3);
+}
+
 TEST_CASE("meshMagnetic refuses knobs from the environment and leaves none behind", "[mesh-api]") {
     const nlohmann::json magnetic = {{"core", nlohmann::json::object()}, {"coil", nlohmann::json::object()}};
     for (const char* var : {"OMFEM_NO_BOBBIN", "MVB_WELD_ALL"}) {
@@ -451,6 +479,8 @@ TEST_CASE("meshMagnetic refuses knobs from the environment and leaves none behin
     // A known knob next to an unknown one: the table sets the first, then throws on the second.
     const nlohmann::json bad = {{"air", {{"target_m", 0.006}}}, {"air_typo", {{"x", 1}}}};
     REQUIRE_THROWS_WITH(meshMagnetic(magnetic, bad), ContainsSubstring("unknown key"));
+    const nlohmann::json emptyTypo = {{"air_typo", nlohmann::json::object()}};   // an unknown section with nothing in it
+    REQUIRE_THROWS_WITH(meshMagnetic(magnetic, emptyTypo), ContainsSubstring("unknown key(s): air_typo"));
     REQUIRE(std::getenv("OMFEM_AIR_TARGET") == nullptr);
     REQUIRE_THROWS_WITH(meshMagnetic(nlohmann::json::array(), nlohmann::json::object()),
                         ContainsSubstring("expects a MAS magnetic"));
@@ -458,6 +488,40 @@ TEST_CASE("meshMagnetic refuses knobs from the environment and leaves none behin
 
 // The mesher opens and closes its own gmsh session; nothing it leaves behind may call gmsh after
 // the close (gmsh reports "Gmsh has not been initialized" on stderr, ABT #1659).
+TEST_CASE("meshMagnetic refuses a mesh holding a tet below the recipe's quality floor", "[mesh-api]") {
+    std::ifstream f(MAS_EXAMPLES_DIR "/000_debug.json");
+    REQUIRE(f);
+    const auto mas = nlohmann::json::parse(f);
+    // No real mesh is regular throughout: a floor of 0.9 is below every mesh's worst tet. One attempt, so the
+    // refusal is the mesh's own and not the last of a ladder of retries.
+    const nlohmann::json strict = {{"mesher", {{"quality_floor", 0.9}, {"retries", 0}}}};
+    REQUIRE_THROWS_WITH(meshMagnetic(mas.at("magnetic"), strict),
+                        ContainsSubstring("below the quality floor 0.9") && ContainsSubstring("the worst has gamma"));
+    const nlohmann::json negative = {{"mesher", {{"quality_floor", -1.0}, {"retries", 0}}}};
+    REQUIRE_THROWS_WITH(meshMagnetic(mas.at("magnetic"), negative), ContainsSubstring("mesher.quality_floor must be a number >= 0"));
+}
+
+TEST_CASE("meshMagnetic meshes again in the same process after a mesh and after a refusal", "[mesh-api]") {
+    std::ifstream f(MAS_EXAMPLES_DIR "/000_debug.json");
+    REQUIRE(f);
+    const auto mas = nlohmann::json::parse(f);
+    const auto tetsOf = [](const MeshResult& r) {
+        std::size_t n = 0;
+        for (const auto& b : r.mesh.blocks)
+            if (b.type == ElementType::Tet4) n += b.ids.size();
+        return n;
+    };
+    // The mesher pinned the lead tips to the port plane through an environment variable it never took back, so the
+    // second call found "its caller's" environment set and refused to start. Same recipe, same mesh, both times;
+    // and a refusal in between (a mesh below an impossible quality floor) leaves nothing behind either.
+    const std::size_t first = tetsOf(meshMagnetic(mas.at("magnetic"), nlohmann::json::object()));
+    REQUIRE(first > 0);
+    const nlohmann::json strict = {{"mesher", {{"quality_floor", 0.9}, {"retries", 0}}}};
+    REQUIRE_THROWS_WITH(meshMagnetic(mas.at("magnetic"), strict), ContainsSubstring("below the quality floor"));
+    const std::size_t second = tetsOf(meshMagnetic(mas.at("magnetic"), nlohmann::json::object()));
+    CHECK(second == first);
+}
+
 TEST_CASE("meshMagnetic calls no gmsh after closing the session it opened", "[mesh-api]") {
     std::ifstream f(MAS_EXAMPLES_DIR "/000_debug.json");
     REQUIRE(f);

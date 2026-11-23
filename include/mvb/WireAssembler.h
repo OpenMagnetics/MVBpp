@@ -179,6 +179,13 @@ struct Primitive {
     // for that fillet, e.g. a rect column, where the fan does not run): filletDeferredLeadCorners bends them once the
     // terminal fillet has taken its share of the attach leg.
     bool deferredCorners = false;
+    // A dragback's end straight on a radial step that is ALL BEND (it rises no more than its two quarter bends are
+    // deep, ABT #2474): the radius its two bends share -- the end fillet on the wrap's circle and the step's own
+    // corner -- so that they meet with no straight between them. filletHelixCorners solves it and draws the fillet;
+    // filletInteriorCornersOf draws the corner at the leg's end / start. Empty: MKF's radius, and the straight is
+    // whatever the two bends leave.
+    std::optional<double> endBendRadius;
+    std::optional<double> startBendRadius;
     // An inter-layer link (MKF's blue ConnectionReservedSpace box): the straight radial
     // step that carries the wire from one concentric layer out to the next. Like a lead it
     // meets its neighbouring wraps at 90-degree corners, so it is isolated into its own run

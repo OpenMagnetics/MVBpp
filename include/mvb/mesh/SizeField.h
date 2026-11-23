@@ -190,6 +190,30 @@ std::vector<int> algorithm_chain_3d();
 // 7 = BAMG only when an anisotropic / boundary-layer metric is requested.
 std::vector<int> algorithm_chain_2d(bool boundary_layer = false);
 
+// The surface algorithm (Mesh.Algorithm id) of the outer air-box faces: 5, Delaunay. gmsh's default, 6
+// (Frontal-Delaunay), leaves a fine zone of the size field unmeshed when the zone lies strictly inside a face whose
+// boundary is coarse -- which is what a box face is wherever the box comes close to the component (ABT #2475).
+int outer_face_algorithm_2d();
+
+// The gmsh behaviour that choice rests on, measured: a 45 x 45 mm plane face under a 10 mm ceiling, with a zone of
+// the size field at 0.67 mm strictly inside it (within 5.35 mm of a 16 mm line 3.64 mm under the face's centre --
+// isolated_buck's top box face over its secondary), meshed by `algorithm2d`. Returns the number of mesh nodes of the
+// face inside that zone (|x| < 4 mm, |y| < 8 mm): about 300 when the zone is meshed at its size, a handful when the
+// mesher never saw it. Opens and closes its own gmsh session; throws when one is already open.
+std::size_t nodes_in_enclosed_fine_zone(int algorithm2d);
+
+// The surface algorithm of the faces of a faceted (round) wire: 5, Delaunay (ABT #2274). On a faceted wire meshed
+// coarser than its facets are wide, Frontal-Delaunay lays the facets' own nodes where the wedge under a ridge edge
+// comes out flat -- worst on the outside of a bend, where the ridge's chord sags into the little the facet dips.
+// Rectangular wires and foils have no facets and keep gmsh's own algorithm (Mesh3d.cpp has the measurements).
+int faceted_wire_face_algorithm_2d();
+
+// The gmsh behaviour that choice rests on, measured on a bend alone: a 12-gon wire of radius 0.3767 mm, a vertex on
+// the bend's outer equator (radius 1.835 mm), a quarter bend between two 6 mm straights, meshed at 0.48 mm with every
+// face by `algorithm2d`. Returns the number of tetrahedra below gamma 0.1. Opens and closes its own gmsh session;
+// throws when one is already open.
+std::size_t flat_tets_in_faceted_bend(int algorithm2d);
+
 // Generate a `dim`-D mesh trying each algorithm in `chain` until one yields a non-empty mesh.
 // Sets Mesh.Algorithm (2D) / Mesh.Algorithm3D (3D) per attempt, catches gmsh failures, escalates
 // Mesh.ToleranceInitialDelaunay on retry. Returns the algorithm id that succeeded. Throws
@@ -205,5 +229,11 @@ void validate_regions_nonempty(int topdim);
 // Run gmsh mesh optimisation (Mesh.Optimize, + Netgen for 3D) to repair slivers before writing.
 // Best-effort: logs but does not throw (the region gate is the hard check).
 void optimize_mesh(int topdim);
+
+// THE QUALITY FLOOR (mesher.quality_floor, ABT #2475). Throws when the mesh holds a tetrahedron whose gamma (3 x
+// inscribed / circumscribed radius, 1 = regular) is below the floor, naming how many, the worst and where it is.
+// A flat tet makes the solver's element matrices singular to rounding; the floor is where a mesh stops being one to
+// solve on. 0 accepts every mesh. Reads the floor from the recipe's environment (default 1e-6).
+void require_tet_quality();
 
 }  // namespace mvb::mesh

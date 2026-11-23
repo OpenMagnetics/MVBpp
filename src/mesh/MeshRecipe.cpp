@@ -1,4 +1,5 @@
 #include "mvb/mesh/MeshRecipe.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
@@ -43,7 +44,7 @@ const std::vector<RecipeKnob>& mesh_recipe_knobs() {
         {"mesher", "insert_volume_floor", "OMFEM_MESH_INSERT_VFLOOR", "number", "x lmax^3", "1e-6",
          "Delaunay refinement refuses a point whose new tets would fall below this volume times their longest edge "
          "cubed (a point coplanar with a cavity face up to rounding: 12_boost min gamma 1e-28); 0 inserts every point"},
-        {"mesher", "quality_floor", "OMFEM_MESH_QMIN", "number", "-", "1e-6", "minimum accepted tet quality (gamma) before the mesh is refused"},
+        {"mesher", "quality_floor", "OMFEM_MESH_QMIN", "number", "-", "1e-6", "a mesh holding a tet below this quality (gamma: 3 x inscribed / circumscribed radius) is refused; 0 accepts every mesh"},
         {"mesher", "optimize_netgen", "OMFEM_MESH_NETGEN", "number", "0|1", "0",
          "run the Netgen optimiser before gmsh's own (serial, and it refines: 15_gan +65 % tets, +70-90 s, worst gamma 1e-6 -> 1e-3)"},
         {"mesher", "fragment_tolerance_m", "OMFEM_FRAG_TOL", "number", "m", "0", "OCC fuzzy value for the solid fragment (0 = exact)"},
@@ -98,6 +99,8 @@ std::vector<std::string> apply_mesh_recipe(const std::string& path) {
         const std::string sec = it.key();
         if (sec == "recipe_version" || sec == "provenance" || sec == "_doc" || sec == "name" || sec == "notes") continue;
         if (!it.value().is_object()) { unknown.push_back(sec); continue; }
+        // a section no knob lives in is unknown even when it is empty (it used to pass: nothing in it to look up)
+        if (std::none_of(K.begin(), K.end(), [&](const RecipeKnob& kk) { return sec == kk.section; })) { unknown.push_back(sec); continue; }
         for (auto jt = it.value().begin(); jt != it.value().end(); ++jt) {
             const std::string key = jt.key();
             if (key == "_doc" || key == "default") continue;

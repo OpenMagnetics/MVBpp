@@ -20906,6 +20906,8 @@ smoothLinksOf(p, pi);
                 jn.toLabel = p.prims[j].label;
                 jn.fromKind = p.prims[j - 1].kind;
                 jn.toKind = p.prims[j].kind;
+                if (jn.fromKind == Primitive::ARC3) jn.fromArcRadius = p.prims[j - 1].arc.v0.Modulus();
+                if (jn.toKind == Primitive::ARC3) jn.toArcRadius = p.prims[j].arc.v0.Modulus();
                 jn.angle = junctionAngle(p.prims[j - 1], p.prims[j], p.wireRadius);
                 jn.verdict = junctionVerdict(jn.angle, jn.fromKind, jn.toKind, p.wireRadius);
                 pl.junctions.push_back(std::move(jn));

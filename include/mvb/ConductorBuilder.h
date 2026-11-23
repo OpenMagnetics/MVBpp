@@ -278,6 +278,7 @@ public:
             std::string fromLabel, toLabel;
             int fromKind = 0, toKind = 0;
             double angle = 0.0;   // radians
+            double fromArcRadius = 0.0, toArcRadius = 0.0;   // the piece's bend radius where it is an ARC3, else 0
             JunctionVerdict verdict = JunctionVerdict::Tangent;
         };
         std::vector<Junction> junctions;

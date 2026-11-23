@@ -596,7 +596,16 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
     // TERMINALS ON ONE PLANE (ABT #1155): the FEM port is a planar box face, so every lead tip
     // of a winding's parallels must lie on it -- MVB++ pins the concentric fan and (2026-09-11)
     // the toroidal lead tips to that plane under this switch. Same mode as the Ansys batches.
-    setenv("MVB_FAN_TERMINALS_ON_PLANE", "1", 0);
+    // Set for this call only: left behind, it made the NEXT meshMagnetic in the same process refuse to start ("the
+    // process environment already sets MVB_FAN_TERMINALS_ON_PLANE") -- after a mesh that threw and after one that
+    // succeeded alike, so a library user or the WASM module could mesh once per process.
+    struct FanOnPlane {
+        const bool mine = std::getenv("MVB_FAN_TERMINALS_ON_PLANE") == nullptr;
+        FanOnPlane() { if (mine) setenv("MVB_FAN_TERMINALS_ON_PLANE", "1", 0); }
+        ~FanOnPlane() { if (mine) unsetenv("MVB_FAN_TERMINALS_ON_PLANE"); }
+        FanOnPlane(const FanOnPlane&) = delete;
+        FanOnPlane& operator=(const FanOnPlane&) = delete;
+    } fanOnPlane;
     // CENTRELINE SIDECAR (<out>.path, metres): the conductors' real centrelines, one polyline per
     // primitive, for omfem_skinlayer's wire tangent (round wire has no perpendicular faces to
     // derive it from). Written for the continuous (real-winding) build only.
@@ -2140,6 +2149,14 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                                      "boundary is incomplete (a fragmented box face failed the on-plane test?)");
     }
     if (!outer.empty()) { gmsh::model::addPhysicalGroup(2, outer, pg); gmsh::model::setPhysicalName(2, pg, "outer"); ++pg; }
+    // THE OUTER BOX FACES ARE MESHED BY 2D DELAUNAY (ABT #2475), not by gmsh's default Frontal-Delaunay. A box face has
+    // a coarse boundary (its edges are far from the copper) and, wherever the box comes close to the component, a fine
+    // zone of the size field strictly inside it. Frontal-Delaunay does not find such a zone (see
+    // outer_face_algorithm_2d): isolated_buck's top face -- 45 x 45 mm, 3.6 mm above the secondary, where the field
+    // asks 0.67 mm -- got 94 nodes, none within 8 mm of its centre, and 17-19 mm triangles under a 10 mm ceiling. The
+    // 3D refinement cannot split a boundary triangle, so it piled 52 air nodes 0.6-47 um under that face: 175 of the
+    // design's 180 tets below gamma 0.01, and the worst tet of 02_flyback (3e-8) and 06_llc (1e-6).
+    for (int f : outer) gmsh::model::mesh::setAlgorithm(2, f, mvb::mesh::outer_face_algorithm_2d());
 
     // ---- PORT TERMINAL faces: tag the meshed winding-boundary face nearest each collected terminal
     // cap centre as 'term<2*port+k>' (the A-V solver's current-injection surfaces). Match by centre-of-
@@ -2376,6 +2393,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                     for (const auto& [g, t] : perW) perWmin = perWmin > 0.0 ? std::min(perWmin, t) : t;
                     const double perWscale = perW.empty() ? 1.0 : cond_t / perWmin;
                     std::map<double, std::vector<double>> faces_by_target;   // per-winding targets only
+                    std::vector<int> faceted_faces;                          // the faces of round (faceted) wires
                     for (auto& [name, vs] : groups) {
                         // Region names: "winding" (level-set), "turn_<w>_<i>" (per-turn solids) and
                         // "winding_<name>" (REAL/continuous conductor, OMFEM_CONTINUOUS). The last one
@@ -2392,9 +2410,19 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                                                          "OMFEM_COND_TARGET_WINDINGS");
                             into = &faces_by_target[it->second * perWscale];
                         }
+                        // a round wire is drawn as a faceted prism; a rectangular wire or a foil has no facets
+                        const auto wireOf = mvb::mesh::winding_of_conductor_region(name);
+                        if (wireOf && !layout_sizing().target_by_winding.empty() && layout_sizing().target_by_winding.count(*wireOf) == 0)
+                            throw std::runtime_error("mesh3d: conductor region '" + name + "' belongs to no winding of the "
+                                                     "coil's functional description; its wire shape is unknown");
+                        const bool faceted = wireOf && layout_sizing().target_by_winding.count(*wireOf) > 0 &&
+                                             layout_sizing().rectangular_windings.count(*wireOf) == 0;
                         for (int v : vs) {
                             gmsh::vectorpair bd; gmsh::model::getBoundary({{3, v}}, bd, false, false, false);
-                            for (auto& dt : bd) if (dt.first == 2) into->push_back(std::abs(dt.second));
+                            for (auto& dt : bd) if (dt.first == 2) {
+                                into->push_back(std::abs(dt.second));
+                                if (faceted) faceted_faces.push_back(std::abs(dt.second));
+                            }
                         }
                     }
                     // Halo: how far the conductor-target refinement reaches into the surrounding air,
@@ -2463,6 +2491,23 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                         sizer.add_distance_refinement(faces, t, fr, graded_max(t, fr), 100);
                         cmin = std::min(cmin, t);
                     }
+                    // THE FACES OF A FACETED WIRE ARE MESHED BY 2D DELAUNAY (ABT #2274), not by gmsh's default
+                    // Frontal-Delaunay. A round wire's facets are narrower than the mesh is coarse (a 12-gon of radius
+                    // 0.38 mm: 0.19 mm against a 0.48 mm target), so every cell of a facet strip gets one node of its own,
+                    // and under each ridge edge the tetrahedraliser builds a wedge of that edge and the two facet nodes
+                    // beside it. The facet dips 26 um there; on the outside of a bend the ridge's own chord takes most of
+                    // that (multicolumn_e42's turn corners, ridge radius 1.8 mm: 15 um), and where Frontal-Delaunay lays
+                    // the facet nodes the wedge is 10 um thick: 428 tets below gamma 0.01, every one at a turn corner.
+                    // Delaunay lays them so that it is not: 2 below 0.01 on the same design, 1 % fewer nodes
+                    // (flat_tets_in_faceted_bend has the behaviour on a bend alone).
+                    // ONLY THEM. A rectangular wire or a foil has no facets and no such wedge, and Delaunay on its faces
+                    // costs: it lines the nodes of the four faces up on one cross-section, whose four corners are then
+                    // one flat tet (18_stacked, 1.0 x 0.62 mm wire at 0.6 mm: one per turn, 4 -> 42 below gamma 0.01),
+                    // and on two_switch_forward's foils it gave 5 % more nodes and 55 % more tets below 0.1.
+                    for (int f : faceted_faces) gmsh::model::mesh::setAlgorithm(2, f, mvb::mesh::faceted_wire_face_algorithm_2d());
+                    std::fprintf(stderr, "[mesh3d] faceted-wire faces meshed by 2D algorithm %d: %zu of %zu conductor face(s)\n",
+                                 mvb::mesh::faceted_wire_face_algorithm_2d(), faceted_faces.size(),
+                                 cond_faces.size() + [&] { size_t n = 0; for (const auto& [t, fs] : faces_by_target) n += fs.size(); return n; }());
                     // ---- LOCAL CHORD-BOUND REFINEMENT --------------------------------------
                     // Everything above is the design-wide conductor size. THIS is where the tight
                     // corridors -- and only they -- get the finer size their clearance demands.
@@ -2949,6 +2994,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
                 mvb::mesh::generate_robust(3, skinMapped ? std::vector<int>{1} : mvb::mesh::algorithm_chain_3d());
                 if (!skinMapped) mvb::mesh::optimize_mesh(3);
                 mvb::mesh::validate_regions_nonempty(3);   // throw if any volume region is empty
+                mvb::mesh::require_tet_quality();          // throw if a tet is below mesher.quality_floor (ABT #2475)
                 // MANIFOLD CHECK (ABT #1154). gmsh can return a mesh it considers finished whose
                 // topology is invalid: common_mode_choke_complete produced 1060597 tets with a
                 // triangular face shared by THREE tetrahedra, and nothing upstream noticed. The CAD

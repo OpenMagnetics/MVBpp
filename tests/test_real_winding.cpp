@@ -2561,6 +2561,111 @@ TEST_CASE("Assembler: a faceted bend is revolved exactly at every phase of its s
     REQUIRE(built == 12);
 }
 
+// ABT #1278. A layer change's radial step of one wire diameter, bent at half a diameter at both ends, is all bend: on
+// a flat face its two bends would meet. On the wrap's circle the end fillet stops the circle's sagitta short, and that
+// residue used to stand as a straight between the two bends -- 0.59 to 0.69 um long on 13_current_sense's four layer
+// changes, shorter than the mesher's own snapping distance. The step's corner now starts where the end fillet stops,
+// so the fillet hands over to a bend, never to a straight, at both ends of every layer change.
+TEST_CASE("Real winding: a layer change that is all bend has no straight between its end fillet and its corner -- "
+          "13_current_sense (ABT #1278)",
+          "[realwinding][abt1278]") {
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/13_current_sense_er95_n87.json");
+    REQUIRE(f.good());
+    json j = json::parse(f);
+    auto magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE_FALSE(paths.empty());
+    const auto ofDragback = [](const std::string& label) { return label.find("(dragback) ") != std::string::npos; };
+    const auto wrapFillet = [&](const std::string& label) {
+        return label.find("fillet arc") != std::string::npos && !ofDragback(label);
+    };
+    size_t starts = 0, ends = 0, straightStarts = 0, straightEnds = 0;
+    std::ostringstream straights;
+    for (const auto& path : paths)
+        for (const auto& jn : path.junctions) {
+            if (wrapFillet(jn.fromLabel) && ofDragback(jn.toLabel)) {
+                ++starts;
+                if (jn.toKind != mvb::Primitive::ARC3) {
+                    ++straightStarts;
+                    straights << "\n  " << path.name << ": '" << jn.fromLabel << "' -> '" << jn.toLabel << "'";
+                }
+            }
+            if (ofDragback(jn.fromLabel) && wrapFillet(jn.toLabel)) {
+                ++ends;
+                if (jn.fromKind != mvb::Primitive::ARC3) {
+                    ++straightEnds;
+                    straights << "\n  " << path.name << ": '" << jn.fromLabel << "' -> '" << jn.toLabel << "'";
+                }
+            }
+        }
+    // The filter matched: the Secondary's 80 turns lie in five layers, four layer changes, each with both ends.
+    REQUIRE(starts == 4);
+    REQUIRE(ends == 4);
+    INFO("end fillets meeting a straight:" << straights.str());
+    CHECK(straightStarts == 0);
+    CHECK(straightEnds == 0);
+}
+
+// ABT #2474. 06_llc's Primary changes layer five times per parallel, each by a radial step of one wire diameter out and
+// one ride over a wire back in, bent at half a diameter at both ends. At exactly MKF's radius the fillet on the wrap's
+// circle and the step's corner left 3.2 - 7.9 um of straight between them (10 micron-long solids per parallel in the
+// STEP, and the mesh's shortest edges): the circle's sagitta over one bend, plus, on the lanes the next layer's ride was
+// not sized for, that ride's excess. Shorter than the wire's coating (17 um), such a straight is no straight: the two
+// bends share one radius, 0.6 - 1.5 % above MKF's, at which they meet.
+TEST_CASE("Real winding: the two bends of a one-diameter layer step share the radius at which they meet -- 06_llc "
+          "(ABT #2474)",
+          "[realwinding][abt2474]") {
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/06_llc_xfmr_eq4128_3c97.json");
+    REQUIRE(f.good());
+    json j = json::parse(f);
+    auto magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE_FALSE(paths.empty());
+    const auto ofDragback = [](const std::string& label) { return label.find("(dragback) ") != std::string::npos; };
+    const auto wrapFillet = [&](const std::string& label, int kind) {
+        return kind == mvb::Primitive::ARC3 && label.find("fillet") != std::string::npos && !ofDragback(label);
+    };
+    const auto stepBend = [&](const std::string& label, int kind) {
+        return kind == mvb::Primitive::ARC3 && label.find("(dragback) bend") != std::string::npos;
+    };
+    size_t steps = 0, withStraight = 0;
+    double least = std::numeric_limits<double>::max(), most = 0.0, widestMismatch = 0.0, mkf = 0.0;
+    std::ostringstream straights;
+    for (const auto& path : paths) {
+        if (path.name.rfind("Primary", 0) != 0) continue;
+        for (const auto& jn : path.junctions) {
+            // a step's two bends in travel order: fillet then bend (stepping out), or bend then fillet (stepping in)
+            const bool out = wrapFillet(jn.fromLabel, jn.fromKind) && ofDragback(jn.toLabel);
+            const bool in = ofDragback(jn.fromLabel) && wrapFillet(jn.toLabel, jn.toKind);
+            if (!out && !in) continue;
+            ++steps;
+            if (!(out ? stepBend(jn.toLabel, jn.toKind) : stepBend(jn.fromLabel, jn.fromKind))) {
+                ++withStraight;
+                straights << "\n  " << path.name << ": '" << jn.fromLabel << "' -> '" << jn.toLabel << "'";
+                continue;
+            }
+            least = std::min({least, jn.fromArcRadius, jn.toArcRadius});
+            most = std::max({most, jn.fromArcRadius, jn.toArcRadius});
+            widestMismatch = std::max(widestMismatch, std::abs(jn.fromArcRadius - jn.toArcRadius));
+        }
+        mkf = path.wireRadius;
+    }
+    // The filter matched: three parallels, five layer changes each, a step out and a step in per change.
+    REQUIRE(steps == 30);
+    INFO("steps whose fillet meets a straight:" << straights.str());
+    CHECK(withStraight == 0);
+    // One radius per step (the solve closes to 1e-14 m), above the copper's own radius, and all thirty within 2 % of
+    // each other (measured 0.268628 to 0.270973 mm against MKF's 0.267).
+    INFO("bend radii from " << least * 1e3 << " to " << most * 1e3 << " mm; widest fillet/corner mismatch " << widestMismatch * 1e9 << " nm");
+    CHECK(widestMismatch < 1e-11);
+    CHECK(least > mkf);
+    CHECK(most < 1.02 * least);
+}
+
 // The manifold gate, on shapes whose defect is certain by construction: a solid holding the same
 // closed shell twice uses every edge four times (non-manifold). A single box passes.
 // (Self-intersection is not a draw-time check any more -- see the [stepvalidity] tests.)

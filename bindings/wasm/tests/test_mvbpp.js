@@ -494,6 +494,16 @@ async function main() {
             assert(tets[names[region].tag] > 100, `region '${region}' has ${tets[names[region].tag] || 0} tets`);
         for (const suffix of ['.path', '.leads.json', '.recipe.json'])
             assert(typeof r.sidecars[suffix] === 'string' && r.sidecars[suffix].length > 0, `no sidecar ${suffix}`);
+        // The module can be asked again. The mesher used to leave MVB_FAN_TERMINALS_ON_PLANE in the module's
+        // environment, and every later call was refused before it read its recipe ("the process environment already
+        // sets ..."). A recipe with an unknown key is refused for THAT reason when the call gets as far as reading it.
+        let second = '';
+        try {
+            mvbpp.meshMagnetic(loadMagneticJson('ETD49_N87_10uH_5T.json'), JSON.stringify({ no_such_section: { x: 1 } }), 'msh2', 'm', '{}');
+        } catch (e) {
+            second = String(e.message || e);
+        }
+        assert(/unknown key/.test(second) && !/environment already sets/.test(second), `second call: ${second}`);
     });
 
     // ── error handling ────────────────────────────────────────────────────────

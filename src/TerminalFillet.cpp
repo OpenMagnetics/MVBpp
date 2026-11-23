@@ -837,6 +837,7 @@ size_t filletInteriorCornersOf(std::vector<Primitive>& prims, double bend, doubl
             return turn < 1e-9 ? 0.0 : wireRadius * std::tan(0.5 * turn);
         };
         std::vector<double> takenAtStart(m, 0.0), takenAtEnd(m, 0.0), tanLen(m, 0.0);
+        std::vector<double> cornerRadius(m, bend);   // corner k's radius: MKF's bend, or that plus an end fillet's residue
         takenAtStart.front() = mitreAt(true);
         takenAtEnd.back() = mitreAt(false);
         std::vector<size_t> order;
@@ -876,9 +877,42 @@ size_t filletInteriorCornersOf(std::vector<Primitive>& prims, double bend, doubl
             // differs only by floating-point round-off (17_cllc: 0.00098225 vs 0.00098225 m). A few ulps, no length.
             auto fits = [](double nd, double rm) { return nd <= rm + 8.0 * std::numeric_limits<double>::epsilon() * std::max(std::abs(nd), std::abs(rm)); };
             if (fits(need, roomBefore) && fits(need, roomAfter)) {
-                tanLen[k] = need;
-                takenAtEnd[k - 1] = need;
-                takenAtStart[k] = need;
+                // TWO BENDS THAT MEET BY PLAN MEET (ABT #2474). A radial step of one wire diameter, bent at half a
+                // diameter at both ends, has no room for a straight; drawn at exactly MKF's radius its end fillet on
+                // the wrap's CIRCLE stops a few micrometres short of where a flat face would put it, and that residue
+                // stood as a 3-9 um straight between the two bends (06_llc: 10 micron-long solids per parallel).
+                // filletHelixCorners solved the one radius at which the fillet and this corner meet; the corner is
+                // drawn at it, starting where the fillet stops.
+                double take = need;
+                const std::optional<double> rBefore = k == 1 ? prims[i0].endBendRadius : std::optional<double>();
+                const std::optional<double> rAfter = k + 1 == m ? prims[i1].startBendRadius : std::optional<double>();
+                if (rBefore.has_value() != rAfter.has_value()) {
+                    const double rest = rBefore ? roomBefore : roomAfter, other = rBefore ? roomAfter : roomBefore;
+                    const double shared = rBefore ? *rBefore : *rAfter;
+                    // The solve closed the leg to 1e-14 m; a corner that does not agree with it to 10 pm was solved
+                    // on another leg than the one drawn here.
+                    if (std::abs(rest - shared * halfTan[k]) > 1e-11) {
+                        std::ostringstream msg;
+                        msg << "TerminalFillet: the all-bend step at '" << prims[i0 + k].label << "' of " << who
+                            << " does not close: its end fillet leaves " << rest * 1e6 << " um, the corner at the shared radius "
+                            << shared * 1e3 << " mm needs " << shared * halfTan[k] * 1e6 << " um.";
+                        throw std::runtime_error(msg.str());
+                    }
+                    if (!fits(rest, other)) {
+                        std::ostringstream msg;
+                        msg << "TerminalFillet: the all-bend step at '" << prims[i0 + k].label << "' of " << who
+                            << " takes " << rest * 1e6 << " um of the next straight, which has only " << other * 1e6 << " um.";
+                        throw std::runtime_error(msg.str());
+                    }
+                    take = rest;
+                    cornerRadius[k] = take / halfTan[k];
+                    if (std::getenv("MVB_FILLET_DIAG"))
+                        std::fprintf(stderr, "[bend90] '%s' corner %zu meets its end fillet: radius %.6f -> %.6f mm (shared %.6f mm)\n",
+                                     prims[i0 + k].label.c_str(), k, bend * 1e3, cornerRadius[k] * 1e3, shared * 1e3);
+                }
+                tanLen[k] = take;
+                takenAtEnd[k - 1] = take;
+                takenAtStart[k] = take;
                 continue;
             }
             const gp_Pnt at = prims[i0 + k].seg.a;
@@ -936,7 +970,7 @@ size_t filletInteriorCornersOf(std::vector<Primitive>& prims, double bend, doubl
             const gp_Pnt tA(b0.XYZ() - d * tanLen[k + 1]);
             Primitive pr = prims[i0 + k];
             pr.kind = Primitive::ARC3;
-            pr.arc.c = gp_Pnt(tA.XYZ() + normal * bend);
+            pr.arc.c = gp_Pnt(tA.XYZ() + normal * cornerRadius[k + 1]);
             pr.arc.axis = axis / axis.Modulus();
             pr.arc.v0 = tA.XYZ() - pr.arc.c.XYZ();
             pr.arc.sweep = std::acos(cosT);
@@ -1050,7 +1084,7 @@ static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, 
         // search. When the stub is shorter than L the cut continues into the same helix's neighbouring piece. When
         // neither the helix nor the leg has the room, the corner stays sharp and says so.
         {
-            const double R = minBend;
+            double R = minBend;   // MKF's radius; an all-bend step's shared radius once that is solved (below)
             const bool nbOk = dragbackEnds ? false
                                            : exitCorner ? (i > 0 && sameHelix(prims[i - 1], prims[i]))
                                                         : (i + 2 < prims.size() && sameHelix(prims[i + 1], prims[i + 2]));
@@ -1060,6 +1094,33 @@ static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, 
             Primitive& lg = prims[leadIdx];
             gp_Pnt farEnd = entranceCorner ? lg.seg.a : lg.seg.b;
             double L = R * std::tan(0.5 * theta);
+            // TWO BENDS THAT MEET BY PLAN (ABT #2474). A dragback's radial step is one ride over a wire: one diameter,
+            // bent at half a diameter at both ends, so on a flat face its two bends would meet. On the wrap's circle,
+            // both at MKF's radius, they leave the circle's sagitta over one bend between them (R^2 / 2r: 3-4 um on
+            // 06_llc), and a lane that is not the one the next layer's ride was sized for leaves that ride's excess too
+            // (another 3-4 um). Such a step is drawn with ONE radius for both bends, the one at which they meet (solved
+            // below): a little above MKF's, never below it. What counts as "such a step" is measured, not assumed: the
+            // straight the leg would keep at MKF's radius is shorter than the wire's coating is thick, so the bend's
+            // inner radius -- the coating, by MKF's rule -- grows by less than half of itself. A longer straight is a
+            // straight, and stays.
+            bool stepAllBend = false;
+            gp_Vec stepNextDir;   // the straight beyond the leg's far corner, in travel direction
+            const double coating = minBend - wireRadius;
+            if (dragbackEnds && coating > 0.0) {
+                const long kNext = exitCorner ? static_cast<long>(leadIdx) + 1 : static_cast<long>(leadIdx) - 1;
+                if (kNext >= 0 && kNext < static_cast<long>(prims.size()) && isDragbackSeg(prims[static_cast<size_t>(kNext)])) {
+                    const Primitive& nx = prims[static_cast<size_t>(kNext)];
+                    gp_Vec tNext(nx.seg.a, nx.seg.b);
+                    if (tNext.Magnitude() > 1e-12) {
+                        const double turn = tSeg.Angle(tNext);
+                        if (turn > 1e-9 && turn < 170.0 * kPi / 180.0) {
+                            stepAllBend = true;
+                            stepNextDir = tNext.Normalized();
+                        }
+                    }
+                }
+            }
+            std::optional<double> stepBendRadius;
             double Lv = L;   // the tangent length V was placed at: Q uses the same, so the arc is exactly symmetric
             double azC = azJoint;
             bool intoNb = false, ok = true;
@@ -1071,7 +1132,9 @@ static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, 
             // (the general method below, for skew lines) tilted 06_llc's dragback steps by 0.15 mrad, which turned
             // their next bend 2 nm into the sibling lane.
             bool exact = false;
-            {
+            auto solveExact = [&]() {
+                exact = false;
+                L = R * std::tan(0.5 * theta);
                 auto cutPoint = [&](double Ltry, gp_Pnt& P, gp_Vec& t, double& az, bool& nb) {
                     const double dAz = Ltry / std::max(atJoint.dsdaz, 1e-18);
                     if (dAz <= 0.98 * span0) {
@@ -1125,7 +1188,8 @@ static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, 
                         exact = true;
                     }
                 }
-            }
+            };
+            solveExact();
             // SKEW LINES (a pitched helix against a vertical lead): no planar bend keeps the leg's line, so the leg is
             // re-aimed. When its far end is the end of the lead's own round corner, it is re-aimed about that corner's
             // VERTEX and the corner is rebuilt at its new angle (same radius, same pieces): re-aiming about the arc's
@@ -1169,7 +1233,10 @@ static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, 
                     lanePlaneNormal = nrm;
                 }
             }
-            for (int pass = 0; pass < 4 && ok && !exact; ++pass) {
+            auto solveSkew = [&]() {
+              ok = true;
+              L = R * std::tan(0.5 * theta);
+              for (int pass = 0; pass < 4 && ok; ++pass) {
                 auto cutAt = [&](double dAzTry, gp_Pnt& P, gp_Vec& t, double& az, bool& nb) {
                     if (dAzTry <= 0.98 * span0) {
                         nb = false;
@@ -1231,6 +1298,63 @@ static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, 
                 if (Lnew + farTl >= legLen) { ok = false; break; }
                 if (std::abs(Lnew - L) < 1e-12) { L = Lnew; break; }
                 L = Lnew;
+              }
+            };
+            const bool planar = exact;   // which of the two methods this corner is solved by
+            auto solveBend = [&]() {
+                if (planar) {
+                    solveExact();
+                    ok = exact;
+                } else {
+                    solveSkew();
+                }
+            };
+            if (!planar) solveSkew();
+            if (stepAllBend && ok) {
+                // left(R): what the leg keeps between this fillet and its far corner's bend, both drawn at the radius
+                // the fillet really has (the skew method's last step leaves it a hair off the R it was asked for).
+                double drawn = 0.0;
+                auto left = [&](double Rtry, double& out) {
+                    R = Rtry;
+                    solveBend();
+                    if (!ok) return false;
+                    const double th = exitCorner ? tc.Angle(d) : d.Angle(tc);
+                    drawn = Lv / std::tan(0.5 * th);
+                    out = V.Distance(farEnd) - Lv - drawn * std::tan(0.5 * d.Angle(stepNextDir));
+                    return true;
+                };
+                double r0 = minBend, h0 = 0.0;
+                const bool measured = left(r0, h0);
+                if (std::getenv("MVB_FILLET_DIAG") && measured)
+                    std::fprintf(stderr, "[bend90] step at '%s': %.4f um between its bends at MKF's radius %.6f mm; coating %.4f um\n",
+                                 sp.label.c_str(), h0 * 1e6, minBend * 1e3, coating * 1e6);
+                if (measured && h0 > 0.0 && h0 < coating) {
+                    const double atMkf = h0;
+                    double r1 = minBend + h0 / (std::tan(0.5 * d.Angle(stepNextDir)) + std::tan(0.5 * theta)), h1 = 0.0;
+                    bool solved = left(r1, h1);
+                    for (int it = 0; solved && it < 60 && std::abs(h1) > 1e-14; ++it) {
+                        if (std::abs(h1 - h0) < 1e-300) { solved = false; break; }
+                        const double r2 = r1 - h1 * (r1 - r0) / (h1 - h0);
+                        r0 = r1; h0 = h1; r1 = r2;
+                        if (!(r1 >= minBend) || !left(r1, h1)) solved = false;
+                    }
+                    if (!solved || std::abs(h1) > 1e-14) {
+                        std::ostringstream msg;
+                        msg << "TerminalFillet: the all-bend step of " << who << " at '" << sp.label << "' leaves "
+                            << atMkf * 1e6 << " um between its two bends at MKF's radius " << minBend * 1e3
+                            << " mm, and no shared radius at or above it closes them.";
+                        throw std::runtime_error(msg.str());
+                    }
+                    stepBendRadius = drawn;
+                    if (std::getenv("MVB_FILLET_DIAG"))
+                        std::fprintf(stderr, "[bend90] all-bend step at '%s' (%s): %.4f um between its bends at MKF's radius "
+                                     "%.6f mm -> both at %.6f mm (+%.3f %%), nothing between\n", sp.label.c_str(),
+                                     planar ? "level" : "pitched", atMkf * 1e6, minBend * 1e3, drawn * 1e3,
+                                     (drawn / minBend - 1.0) * 100.0);
+                } else {
+                    R = minBend;   // nothing to close (or the two bends do not fit at all): MKF's radius, as planned
+                    solveBend();
+                }
             }
             if (ok) {
                 // Equal tangent lengths from V on both lines: the circle is tangent to the helix at Pc and to the
@@ -1243,6 +1367,7 @@ static size_t filletHelixCorners(std::vector<Primitive>& prims, double minBend, 
                 q.terminalFillet = isStub(sp);
                 q.terminal = lg.terminal;
                 if (exitCorner) lg.seg.a = Q; else lg.seg.b = Q;
+                if (stepBendRadius) (exitCorner ? lg.endBendRadius : lg.startBendRadius) = stepBendRadius;
                 if (farCorner && !exact) {
                     // Rebuild the lead's round corner at the re-aimed leg's angle, about the same vertex.
                     Primitive& ca = prims[static_cast<size_t>(kArc)];
