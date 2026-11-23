@@ -12,6 +12,7 @@
 #include "mvb/MagneticBuilder.h"
 #include "mvb/Utils.h"
 #include "MAS.hpp"
+#include "constructive_models/Magnetic.h"
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
 #include <TopExp_Explorer.hxx>
@@ -184,3 +185,43 @@ TEST_CASE("Formers of two wound columns in one window have flanges as wide, on e
         CHECK(std::abs((flange.zmax - tube.zmax) - room) < 1e-7);
     }
 }
+
+// ABT #2492 (ABT #2489, regression 2). Primary on the main column, Secondary on the left leg. MKF sent every terminal
+// lead to winding window 0's border, so the Secondary's lead ran from its leg across the main column and the Primary;
+// the drawing was refused ("the run would fold back"). Each lead now leaves by its own window. And every conductor's
+// leads finish on ONE tip plane: the Secondary's stopped 1 mm short of the Primary's, inside the clearance the
+// Primary's port needs ("0.317 mm inside its port plane").
+TEST_CASE("Real winding on the main column and a lateral leg draws certified, every lead ending on one tip plane",
+          "[realwinding][multicolumn][abt2492]") {
+    std::ifstream f(std::string(MAS_COMPLETE_DIR) + "/multicolumn_e42_transformer.json");
+    REQUIRE(f.is_open());
+    json j;
+    f >> j;
+    const auto enriched = mvb::magnetic_autocomplete_safe(j.at("magnetic"), /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    std::vector<mvb::NamedShape> named;
+    // The enamel gate and the port-plane rule run inside the build: a clean build is the certificate.
+    REQUIRE_NOTHROW(named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                                  mvb::DEFAULT_WIRE_POLYGON_SEGMENTS, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                                  /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                                  /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                                  /*useRealWindingGeometry=*/true, /*femReady=*/false));
+    std::vector<double> tips;
+    double mainColumnHalfWidth = 0.0;
+    for (const auto& ns : named) {
+        if (ns.name.find("parallel") == std::string::npos || ns.name.find("terminal") != std::string::npos) continue;
+        Bnd_Box box;
+        BRepBndLib::AddOptimal(ns.shape, box, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+        double x0, y0, z0, x1, y1, z1;
+        box.Get(x0, y0, z0, x1, y1, z1);
+        INFO(ns.name << ": x " << x0 * 1e3 << " .. " << x1 * 1e3 << " mm, lead tips at z = " << z0 * 1e3 << " mm");
+        tips.push_back(z0);
+        // The Secondary wraps the left leg (axis -18.06 mm): none of its copper reaches the main column's side of x = 0.
+        if (ns.name.find("Secondary") != std::string::npos) CHECK(x1 < 0.0);
+        if (ns.name.find("Primary") != std::string::npos) mainColumnHalfWidth = std::max(mainColumnHalfWidth, x1);
+    }
+    REQUIRE(tips.size() == 2);
+    CHECK(mainColumnHalfWidth > 0.0);
+    CHECK(std::abs(tips[0] - tips[1]) < 1e-9);
+}
+

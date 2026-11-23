@@ -11769,6 +11769,22 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         }
         return bobbinOuterX;
     };
+    // THE TIP PLANE IS ONE PLANE FOR EVERY CONDUCTOR (ABT #2492). Its radius in a conductor's own frame is the larger
+    // of the common base (the winding, its lifts and rides) and that conductor's bobbin reach; in depth it stands
+    // conductorZoff further out. On one column every conductor has the same reach and the same offset, so they agree.
+    // A winding on a lateral leg has neither: on multicolumn_e42 (Primary on the main column, Secondary on the left
+    // leg) the Secondary's leads stopped 1 mm short of the Primary's tips, inside the clearance the Primary's port
+    // needs ("0.317 mm inside its port plane, against the 0.509 mm the port needs"). Every conductor's leads finish at
+    // the deepest of the conductors' planes; with one column that is each conductor's own, to the last bit.
+    auto commonTipRadiusFor = [&](size_t ciQ, double raise) {
+        auto ownTipRadius = [&](size_t k) {
+            return std::max(commonTipBase + raise + maxRideAll, bobbinOuterXFor(k) + 2.0 * commonTipWireRadius);
+        };
+        double radius = ownTipRadius(ciQ);
+        for (size_t k = 0; k < conductors.size(); ++k)
+            radius = std::max(radius, ownTipRadius(k) + (conductorZoff[k] - conductorZoff[ciQ]));
+        return radius;
+    };
     // yLo/yHi: the axial band the return's copper occupies (its chain's band widened by its coated
     // radius), so the tip plane's column stacks only returns that really meet (tallestRealStack).
     // levelRadius: the radius of the MKF ride level the return belongs to (ConnectionRideLevel::radius).
@@ -12718,8 +12734,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         auto tipRadiusFor = [&](size_t ciQ) {
             const double raise =
                 std::max(fanRaiseNow(), fanRaiseAt(std::numeric_limits<double>::infinity(), 0.0));
-            return std::max(commonTipBase + raise + maxRideAll,
-                            bobbinOuterXFor(ciQ) + 2.0 * commonTipWireRadius);
+            return commonTipRadiusFor(ciQ, raise);
         };
         // The exact helix of the wrap LEAVING station R.station (a wrap's two rows describe one
         // helix; the leaving row carries it): anchored at the plane, y = R.y + adv*(az - plane)/2pi,
@@ -15468,8 +15483,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             };
             const PlanePt s0 = station(turns[0]);
             const double R = s0.x;
-            const double tipRadius = std::max(commonTipBase + fanMaxRaise + maxRideAll,
-                                              bobbinOuterXFor(ci) + 2.0 * commonTipWireRadius);
+            const double tipRadius = commonTipRadiusFor(ci, fanMaxRaise);
             const double tipZ = zSign * -(tipRadius + zoff);   // builder z of the tip plane
             const gp_Pnt centre(0.0, s0.y, 0.0);
             auto pushSeg = [&](const gp_Pnt& a, const gp_Pnt& b, const std::string& what, int terminal) {
@@ -17580,9 +17594,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         // this tip plane, so the two must compute it identically.
         // commonTipBase / commonTipWireRadius are window-global (see above), and fanMaxRaise
         // and maxRideAll are too, so every conductor lands on the SAME plane.
-        const double leadTipRadius =
-            std::max(commonTipBase + fanMaxRaise + maxRideAll,
-                     bobbinOuterXFor(ci) + 2.0 * commonTipWireRadius);
+        const double leadTipRadius = commonTipRadiusFor(ci, fanMaxRaise);
 
         auto pushPlaneSegs = [&](std::vector<PlanePt> wp, const std::string& what,
                                  size_t ordinal, bool stationAtFront, double liftRaise = 0.0,
