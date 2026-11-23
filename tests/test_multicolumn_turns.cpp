@@ -225,3 +225,32 @@ TEST_CASE("Real winding on the main column and a lateral leg draws certified, ev
     CHECK(std::abs(tips[0] - tips[1]) < 1e-9);
 }
 
+// ABT #2489: the same design as the web's 3D view draws it -- the wire at its outer diameter, with its formers. A wire
+// drawn at its outer diameter cannot be swept round MKF's bend (the coated radius), so the bend is drawn as the corner
+// of its two tangent straights. Left as two pieces one wire radius long, each one's mitre took all of it, and the
+// abutment check read the Primary's entrance bend as one wedge inside the other: "1 mitred corner(s) did not abut ...
+// overlaps by 0.245447 mm^3" (pi r^3, a whole wedge). The straights now run to the corner as part of their neighbours.
+TEST_CASE("Real winding on the main column and a lateral leg draws at the outer diameter with its formers",
+          "[realwinding][multicolumn][abt2489]") {
+    std::ifstream f(std::string(MAS_COMPLETE_DIR) + "/multicolumn_e42_transformer.json");
+    REQUIRE(f.is_open());
+    json j;
+    f >> j;
+    const auto enriched = mvb::magnetic_autocomplete_safe(j.at("magnetic"), /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    std::vector<mvb::NamedShape> named;
+    REQUIRE_NOTHROW(named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                                  mvb::DEFAULT_WIRE_POLYGON_SEGMENTS, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                                  /*paintCoating=*/true, /*emitCoatingShells=*/false,
+                                                  /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                                  /*useRealWindingGeometry=*/true, /*femReady=*/false));
+    bool primary = false, secondary = false;
+    for (const auto& ns : named) {
+        if (ns.name.find("terminal") != std::string::npos) continue;
+        if (ns.name.find("Primary parallel 0") != std::string::npos) primary = true;
+        if (ns.name.find("Secondary parallel 0") != std::string::npos) secondary = true;
+    }
+    CHECK(primary);
+    CHECK(secondary);
+}
+

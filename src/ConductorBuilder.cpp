@@ -4118,9 +4118,40 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
                     a.kind = b.kind = Primitive::SEG;
                     a.seg = Seg{p0, x};
                     b.seg = Seg{x, p1};
-                    mitred.push_back(a);
-                    mitred.push_back(b);
-                    mitredFrom.insert(mitredFrom.end(), {k, k});
+                    // ABT #2489 (the web's E 42 with a winding on a lateral leg, drawn at the outer diameter): each
+                    // tangent straight is R tan(sweep/2) long and its mitre at the corner takes wireRadius tan(sweep/2)
+                    // of it -- all of it, R being the wire radius. Left as a piece of its own it is a wedge whose inner
+                    // edge has no length, and the abutment check's boolean read the two wedges of the Primary's entrance
+                    // bend as one inside the other (0.245447 mm^3 = pi r^3, a whole wedge) though they share one face.
+                    // Where the bend's neighbour is the straight this one continues, the two are ONE straight to the
+                    // corner: the same copper, a mitre between two full pieces. The cutting tool keeps its pieces as
+                    // they were (they are united, and a production drawing's bobbin is cut by them).
+                    auto continues = [](const Seg& first, const Seg& second) {
+                        if (first.b.Distance(second.a) > Precision::Confusion()) return false;
+                        const gp_XYZ d0 = first.b.XYZ() - first.a.XYZ(), d1 = second.b.XYZ() - second.a.XYZ();
+                        const double l0 = d0.Modulus(), l1 = d1.Modulus();
+                        return l0 > Precision::Confusion() && l1 > Precision::Confusion() &&
+                               d0.Crossed(d1).Modulus() <= 1e-9 * l0 * l1 && d0.Dot(d1) > 0.0;
+                    };
+                    const bool joinStraights = tlsDisplayOnly && !cutterOnly;
+                    if (joinStraights && !mitred.empty() && mitredFrom.back() + 1 == k &&
+                        mitred.back().kind == Primitive::SEG && continues(mitred.back().seg, a.seg)) {
+                        mitred.back().seg.b = x;
+                    } else {
+                        mitred.push_back(a);
+                        mitredFrom.push_back(k);
+                    }
+                    if (joinStraights && k + 1 < path.prims.size() && path.prims[k + 1].kind == Primitive::SEG &&
+                        continues(b.seg, path.prims[k + 1].seg)) {
+                        Primitive next = path.prims[k + 1];
+                        next.seg.a = x;
+                        mitred.push_back(next);
+                        mitredFrom.push_back(k + 1);
+                        ++k;
+                    } else {
+                        mitred.push_back(b);
+                        mitredFrom.push_back(k);
+                    }
                     continue;
                 }
                 mitred.push_back(pr);
