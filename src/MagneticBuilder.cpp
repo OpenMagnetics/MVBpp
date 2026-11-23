@@ -1,6 +1,8 @@
 #include "mvb/MagneticBuilder.h"
 #include <cstdio>
 #include <cstdlib>
+#include <numeric>
+#include <optional>
 #include "mvb/StepExporter.h"
 #include "mvb/Symmetry.h"
 #include "mvb/Utils.h"
@@ -634,61 +636,45 @@ static void checkPinRailCollisions(const std::vector<OpenMagnetics::Bobbin::PinR
     }
 }
 
-// A former as placed: the axis (x) of the column it wraps and its tube's outer half width along x.
-struct PlacedFormer {
-    TopoDS_Shape shape;
+// A wound column as its former sees it: the column's axis (x) and its tube's outer half width along x.
+struct WoundColumn {
     double axisX;
     double tubeHalfWidth;
 };
 
-template<typename CoilT>
-std::vector<PlacedFormer> buildWoundLegBobbins(const CoilT& coil, const MAS::MagneticCore& core,
-                                               const MAS::CoreBobbinProcessedDescription& bobbinPd,
-                                               double flangeThickness, int polygonSegments, bool& mainWound);
-
-// ABT #2489 (Alf, 2026-11-22, formers = B): each former's flange is built as wide as its winding window, so two wound
-// columns that share a window would each fill it. Between two such formers the flanges stop halfway between the two
-// tubes. The plane never cuts a tube: it lies between them, and tubes that overlap are refused.
-TopoDS_Shape stopFlangesBetweenTubes(std::vector<PlacedFormer> formers) {
-    std::sort(formers.begin(), formers.end(),
-              [](const PlacedFormer& a, const PlacedFormer& b) { return a.axisX < b.axisX; });
-    TopoDS_Compound comp;
-    BRep_Builder bld;
-    bld.MakeCompound(comp);
-    for (std::size_t i = 0; i < formers.size(); ++i) {
-        Bnd_Box bounds;
-        BRepBndLib::Add(formers[i].shape, bounds);
-        double x0, y0, z0, x1, y1, z1;
-        bounds.Get(x0, y0, z0, x1, y1, z1);
-        const auto planeBetween = [&](const PlacedFormer& left, const PlacedFormer& right) {
-            const double leftWall = left.axisX + left.tubeHalfWidth;
-            const double rightWall = right.axisX - right.tubeHalfWidth;
-            if (leftWall > rightWall) {
-                throw std::runtime_error("stopFlangesBetweenTubes: the former tubes on the columns at x = " +
-                                         std::to_string(left.axisX * 1e3) + " and " + std::to_string(right.axisX * 1e3) +
-                                         " mm overlap by " + std::to_string((leftWall - rightWall) * 1e3) + " mm");
-            }
-            return 0.5 * (leftWall + rightWall);
-        };
-        double lo = x0, hi = x1;
-        if (i > 0) lo = std::max(lo, planeBetween(formers[i - 1], formers[i]));
-        if (i + 1 < formers.size()) hi = std::min(hi, planeBetween(formers[i], formers[i + 1]));
-        TopoDS_Shape shape = formers[i].shape;
-        if (lo > x0 || hi < x1) {
-            const double margin = std::max({x1 - x0, y1 - y0, z1 - z0});
-            const TopoDS_Shape keep = BRepPrimAPI_MakeBox(gp_Pnt(lo > x0 ? lo : x0 - margin, y0 - margin, z0 - margin),
-                                                          gp_Pnt(hi < x1 ? hi : x1 + margin, y1 + margin, z1 + margin)).Shape();
-            BRepAlgoAPI_Common common(shape, keep);
-            if (!common.IsDone() || common.Shape().IsNull()) {
-                throw std::runtime_error("stopFlangesBetweenTubes: cutting the former on the column at x = " +
-                                         std::to_string(formers[i].axisX * 1e3) + " mm failed");
-            }
-            shape = common.Shape();
+// ABT #2489 (Alf, 2026-11-23, on the builder STEP of flanges cut at the midplane: "the flanges have to have all the
+// width (in X and Z axis) of the minimum of all the sizes (the interior part, the ones that almost collide with the
+// other). More than that doesn't make sense"). A former's flanges stand out from its tube by its winding window's
+// width; where two wound columns share a window each would fill it (multicolumn_e42: 607 mm^3 of one former in the
+// other). The room a former has towards a neighbouring wound column is half the gap between the two tubes, and its
+// flanges take the smallest room it has on EVERY side. Returns that limit per column, none for a column with no wound
+// neighbour; tubes that overlap are refused.
+std::vector<std::optional<double>> flangeOverhangLimits(const std::vector<WoundColumn>& columns) {
+    std::vector<std::size_t> order(columns.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::sort(order.begin(), order.end(),
+              [&](std::size_t a, std::size_t b) { return columns[a].axisX < columns[b].axisX; });
+    std::vector<std::optional<double>> limits(columns.size());
+    for (std::size_t k = 0; k + 1 < order.size(); ++k) {
+        const WoundColumn& left = columns[order[k]];
+        const WoundColumn& right = columns[order[k + 1]];
+        const double gap = (right.axisX - right.tubeHalfWidth) - (left.axisX + left.tubeHalfWidth);
+        if (!(gap > 0.0)) {
+            throw std::runtime_error("flangeOverhangLimits: the former tubes on the columns at x = " +
+                                     std::to_string(left.axisX * 1e3) + " and " + std::to_string(right.axisX * 1e3) +
+                                     " mm leave no room between them (" + std::to_string(gap * 1e3) + " mm)");
         }
-        bld.Add(comp, shape);
+        for (const std::size_t i : {order[k], order[k + 1]}) {
+            limits[i] = limits[i] ? std::min(*limits[i], 0.5 * gap) : 0.5 * gap;
+        }
     }
-    return comp;
+    return limits;
 }
+
+template<typename CoilT>
+TopoDS_Shape buildWoundLegBobbins(const CoilT& coil, const MAS::MagneticCore& core,
+                                  const MAS::CoreBobbinProcessedDescription& bobbinPd, double flangeThickness,
+                                  int polygonSegments, bool& mainWound, std::optional<double>& mainFlangeOverhangLimit);
 
 // Internal bobbin builder. Public surface goes through buildBobbinNamed().
 template<typename CoilT>
@@ -724,16 +710,21 @@ TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& c
     // ABT #2274: a multi-column design wound on its lateral legs draws MKF's former on each wound leg, and the
     // main column's only when a section is wound there (buildWoundLegBobbins).
     bool mainWound = true;
-    std::vector<PlacedFormer> formers = buildWoundLegBobbins(coil, core, bobbinPd, flangeThickness, polygonSegments, mainWound);
-    if (formers.empty()) {
+    std::optional<double> mainFlangeOverhangLimit;
+    TopoDS_Shape legFormers = buildWoundLegBobbins(coil, core, bobbinPd, flangeThickness, polygonSegments, mainWound,
+                                                   mainFlangeOverhangLimit);
+    if (legFormers.IsNull()) {
         return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments,
                                           getPinRails(coil));   // ABT #1249
     }
-    if (mainWound) {
-        formers.push_back({BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments, {}),
-                           0.0, bobbinPd.get_column_width().value()});
-    }
-    return stopFlangesBetweenTubes(std::move(formers));
+    if (!mainWound) return legFormers;
+    TopoDS_Compound comp;
+    BRep_Builder bld;
+    bld.MakeCompound(comp);
+    bld.Add(comp, BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments, {},
+                                             mainFlangeOverhangLimit));
+    bld.Add(comp, legFormers);
+    return comp;
 }
 
 // ---- Multi-column placement resolution -------------------------------------------------------
@@ -921,14 +912,15 @@ std::map<std::string, TurnBuilder::WoundColumnSpec> resolveWoundColumnsPerSectio
 // the leg's MAS x. The main-column former is drawn only when a section is wound there (mainWound). A design whose
 // sections all wrap the main column returns a null shape and keeps the single-former path unchanged.
 template<typename CoilT>
-std::vector<PlacedFormer> buildWoundLegBobbins(const CoilT& coil, const MAS::MagneticCore& core,
-                                               const MAS::CoreBobbinProcessedDescription& bobbinPd,
-                                               double flangeThickness, int polygonSegments, bool& mainWound) {
+TopoDS_Shape buildWoundLegBobbins(const CoilT& coil, const MAS::MagneticCore& core,
+                                  const MAS::CoreBobbinProcessedDescription& bobbinPd, double flangeThickness,
+                                  int polygonSegments, bool& mainWound, std::optional<double>& mainFlangeOverhangLimit) {
     mainWound = false;
+    mainFlangeOverhangLimit.reset();
     auto sectionsOpt = coil.get_sections_description();
     if (!sectionsOpt) {
         mainWound = true;
-        return {};
+        return TopoDS_Shape();
     }
     const WoundColumnResolver resolver(coil, core, bobbinPd);
     struct Leg { int64_t window; std::string section; TurnBuilder::WoundColumnSpec spec; };
@@ -955,13 +947,13 @@ std::vector<PlacedFormer> buildWoundLegBobbins(const CoilT& coil, const MAS::Mag
         }
         if (!known) legs.push_back({window, section.get_name(), *spec});
     }
-    if (legs.empty()) return {};
+    if (legs.empty()) return TopoDS_Shape();
     if (!getPinRails(coil).empty()) {
         throw std::runtime_error("buildWoundLegBobbins: MKF's pin rails hang from the main former's bottom flange; a "
                                  "multi-column design wound on lateral legs carries rails no lateral former is drawn for");
     }
     const auto& windows = bobbinPd.get_winding_windows();
-    std::vector<PlacedFormer> formers;
+    std::vector<OpenMagnetics::WoundColumnFrame> frames;
     for (const auto& leg : legs) {
         OpenMagnetics::WoundColumnFrame frame;
         if constexpr (std::is_same_v<CoilT, OpenMagnetics::Coil>) {
@@ -996,6 +988,28 @@ std::vector<PlacedFormer> buildWoundLegBobbins(const CoilT& coil, const MAS::Mag
             throw std::runtime_error("buildWoundLegBobbins: section '" + leg.section + "' is in winding window " +
                                      std::to_string(leg.window) + " but the bobbin states " + std::to_string(windows.size()));
         }
+        frames.push_back(frame);
+    }
+    // Every wound column's room towards its wound neighbours (flangeOverhangLimits): the legs, and the main column
+    // when a section is wound there.
+    std::vector<WoundColumn> columns;
+    for (std::size_t i = 0; i < legs.size(); ++i) columns.push_back({legs[i].spec.axisX, frames[i].columnWidth});
+    if (mainWound) {
+        const auto mainHalfWidth = bobbinPd.get_column_width();
+        if (!mainHalfWidth) {
+            throw std::runtime_error("buildWoundLegBobbins: the bobbin states no column width, so the room between the main "
+                                     "former and a lateral leg's is unknown");
+        }
+        columns.push_back({0.0, *mainHalfWidth});
+    }
+    const std::vector<std::optional<double>> limits = flangeOverhangLimits(columns);
+    if (mainWound) mainFlangeOverhangLimit = limits.back();
+    TopoDS_Compound comp;
+    BRep_Builder bld;
+    bld.MakeCompound(comp);
+    for (std::size_t i = 0; i < legs.size(); ++i) {
+        const auto& leg = legs[i];
+        const OpenMagnetics::WoundColumnFrame& frame = frames[i];
         auto legPd = bobbinPd;
         legPd.set_column_shape(frame.shape);
         legPd.set_column_width(frame.columnWidth);
@@ -1004,7 +1018,7 @@ std::vector<PlacedFormer> buildWoundLegBobbins(const CoilT& coil, const MAS::Mag
             legPd.set_column_corner_radius(frame.cornerRadius);
         }
         legPd.set_winding_windows({windows[static_cast<std::size_t>(leg.window)]});
-        TopoDS_Shape former = BobbinBuilder::buildBobbin(legPd, flangeThickness, true, polygonSegments, {});
+        TopoDS_Shape former = BobbinBuilder::buildBobbin(legPd, flangeThickness, true, polygonSegments, {}, limits[i]);
         if (former.IsNull()) {
             throw std::runtime_error("buildWoundLegBobbins: the former of section '" + leg.section + "' built empty");
         }
@@ -1015,9 +1029,9 @@ std::vector<PlacedFormer> buildWoundLegBobbins(const CoilT& coil, const MAS::Mag
                       << windows[static_cast<std::size_t>(leg.window)].get_width().value_or(-1) * 1e3 << " x "
                       << windows[static_cast<std::size_t>(leg.window)].get_height().value_or(-1) * 1e3 << " mm\n";
         }
-        formers.push_back({translate_shape(former, leg.spec.axisX, 0.0, 0.0), leg.spec.axisX, frame.columnWidth});
+        bld.Add(comp, translate_shape(former, leg.spec.axisX, 0.0, 0.0));
     }
-    return formers;
+    return comp;
 }
 
 // Internal turns builder. Public surface goes through buildTurnsNamed() or

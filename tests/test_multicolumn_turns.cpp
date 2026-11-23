@@ -117,9 +117,12 @@ TEST_CASE("A processed MAS magnetic wound on a lateral leg exports with that leg
     CHECK(onMainColumn > 0);    // the Primary's column
 }
 
-// ABT #2489 (Alf, 2026-11-22, formers = B): where two wound columns share a winding window, each former's flange stops
-// halfway between the two former tubes. Each used to fill the whole window, 607 mm^3 of one former inside the other.
-TEST_CASE("Formers of two wound columns in one window stop halfway between their tubes",
+// ABT #2489. Where two wound columns share a winding window each former's flanges used to fill it: 607 mm^3 of one
+// former inside the other. Alf, 2026-11-23, on the builder STEP of flanges cut at the midplane: "the flanges have to
+// have all the width (in X and Z axis) of the minimum of all the sizes (the interior part, the ones that almost
+// collide with the other). More than that doesn't make sense". A flange stands out from its tube by the same width on
+// every side, x and z, and that width is the room towards the neighbouring former: half the gap between the tubes.
+TEST_CASE("Formers of two wound columns in one window have flanges as wide, on every side, as half the gap between their tubes",
           "[bobbin][multicolumn][abt2489]") {
     std::ifstream f(std::string(MAS_COMPLETE_DIR) + "/multicolumn_e42_transformer.json");
     REQUIRE(f.is_open());
@@ -134,7 +137,7 @@ TEST_CASE("Formers of two wound columns in one window stop halfway between their
         if (ns.role != mvb::Role::Bobbin) continue;
         for (TopExp_Explorer it(ns.shape, TopAbs_SOLID); it.More(); it.Next()) solids.push_back(it.Current());
     }
-    REQUIRE(solids.size() >= 2);
+    REQUIRE(solids.size() == 6);   // two formers: a tube and two flanges each
 
     double overlap = 0.0;
     for (std::size_t i = 0; i < solids.size(); ++i) {
@@ -149,15 +152,35 @@ TEST_CASE("Formers of two wound columns in one window stop halfway between their
     INFO("former in former: " << overlap * 1e9 << " mm^3");
     CHECK(overlap < 1e-13);    // 1e-4 mm^3
 
-    // Main tube wall at -6.975 mm, the leg's at -14.05 mm: they meet at -10.5125 mm.
-    const double meetingX = -0.0105125;
-    double legReach = -1.0, mainReach = 1.0;
+    // The tubes are the two tall solids; every other solid is a flange of the tube it is centred on. The boxes are
+    // the exact ones: Bnd_Box's default pads each face by its tolerance (0.15 um here), which is what is measured.
+    const auto exactBox = [](const TopoDS_Shape& s) {
+        Bnd_Box b;
+        BRepBndLib::AddOptimal(s, b, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+        BBox r{};
+        b.Get(r.xmin, r.ymin, r.zmin, r.xmax, r.ymax, r.zmax);
+        return r;
+    };
+    std::vector<BBox> tubes, flanges;
     for (const auto& solid : solids) {
-        const BBox b = bbox_of(solid);
-        if (0.5 * (b.xmin + b.xmax) < meetingX) legReach = std::max(legReach, b.xmax);
-        else mainReach = std::min(mainReach, b.xmin);
+        const BBox b = exactBox(solid);
+        ((b.ymax - b.ymin) > 0.01 ? tubes : flanges).push_back(b);
     }
-    INFO("leg former to " << legReach * 1e3 << " mm, main former from " << mainReach * 1e3 << " mm");
-    CHECK(std::abs(legReach - meetingX) < 1e-5);
-    CHECK(std::abs(mainReach - meetingX) < 1e-5);
+    REQUIRE(tubes.size() == 2);
+    REQUIRE(flanges.size() == 4);
+    std::sort(tubes.begin(), tubes.end(), [](const BBox& a, const BBox& b) { return a.xmin < b.xmin; });
+    // Leg tube wall at -14.05 mm, main tube wall at -6.975 mm: 7.075 mm between them, 3.5375 mm for each former.
+    const double room = 0.5 * (tubes[1].xmin - tubes[0].xmax);
+    INFO("half the gap between the tubes: " << room * 1e3 << " mm");
+    CHECK(std::abs(room - 0.0035375) < 1e-9);
+    for (const BBox& flange : flanges) {
+        const BBox& tube = 0.5 * (flange.xmin + flange.xmax) < 0.5 * (tubes[0].xmax + tubes[1].xmin) ? tubes[0] : tubes[1];
+        INFO("flange x " << flange.xmin * 1e3 << " .. " << flange.xmax * 1e3 << " mm, z " << flange.zmin * 1e3 << " .. "
+                         << flange.zmax * 1e3 << " mm round the tube x " << tube.xmin * 1e3 << " .. " << tube.xmax * 1e3
+                         << " mm, z " << tube.zmin * 1e3 << " .. " << tube.zmax * 1e3 << " mm");
+        CHECK(std::abs((tube.xmin - flange.xmin) - room) < 1e-7);
+        CHECK(std::abs((flange.xmax - tube.xmax) - room) < 1e-7);
+        CHECK(std::abs((tube.zmin - flange.zmin) - room) < 1e-7);
+        CHECK(std::abs((flange.zmax - tube.zmax) - room) < 1e-7);
+    }
 }

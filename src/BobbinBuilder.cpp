@@ -112,7 +112,8 @@ std::vector<NamedShape> BobbinBuilder::buildPinRailsNamed(const std::vector<Open
 }
 
 TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescription& bobbin, double flangeThickness, bool axisIsY, int polygonSegments,
-                                        const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails) {
+                                        const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails,
+                                        std::optional<double> flangeOverhangLimit) {
     if (flangeThickness < 0.0 || std::isnan(flangeThickness)) {
         throw std::invalid_argument("BobbinBuilder: flangeThickness is invalid");
     }
@@ -144,6 +145,13 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
 
     double height = wwHeight;
     if (height <= 0.0) return TopoDS_Shape();
+    // How far the flanges stand out from the tube, on every side: the window's width, or the room a neighbouring
+    // wound column's former leaves when that is less (flangeOverhangLimit).
+    if (flangeOverhangLimit && !(*flangeOverhangLimit > 0.0)) {
+        throw std::invalid_argument("BobbinBuilder: the flange overhang limit must be > 0, got " +
+                                    std::to_string(*flangeOverhangLimit) + " m");
+    }
+    const double flangeOverhang = flangeOverhangLimit ? std::min(wwWidth, *flangeOverhangLimit) : wwWidth;
 
     TopoDS_Shape bobbinShape;
 
@@ -176,7 +184,7 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         }
 
         if (hasFlanges) {
-            double flangeOuterR = outerR + wwWidth;
+            double flangeOuterR = outerR + flangeOverhang;
             double holeHeight = flangeThickness * 1.2;
             double holeMargin = (holeHeight - flangeThickness) / 2.0;
 
@@ -266,8 +274,8 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         checkIsDone(bodyCut, "rect body hollow");
 
         if (hasFlanges) {
-            double flangeWidth = 2.0 * (colWidth + wwWidth);
-            double flangeDepth = 2.0 * (colDepth + wwWidth);
+            double flangeWidth = 2.0 * (colWidth + flangeOverhang);
+            double flangeDepth = 2.0 * (colDepth + flangeOverhang);
             double holeEps = flangeThickness * 0.1;
             const double rFlange = roundCorners ? 0.25 * std::min(flangeWidth, flangeDepth) : 0.0;
 

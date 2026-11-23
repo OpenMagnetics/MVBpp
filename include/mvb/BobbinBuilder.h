@@ -5,6 +5,7 @@
 #include "Utils.h"
 #include "NamedShape.h"
 #include <TopoDS_Shape.hxx>
+#include <optional>
 
 namespace mvb {
 
@@ -26,11 +27,16 @@ public:
     // separate solids that start on the rails' underside (touching, not overlapping), so the pin
     // cutters of the bobbin cut leave the rails intact. Needs axisIsY (only a Y-axis former has a
     // bottom flange in MKF's frame). Empty: exactly the former without rails.
+    // flangeOverhangLimit (ABT #2489): the flanges stand out from the tube by the winding window's width, on every
+    // side. Where another wound column's former stands closer than that, the caller gives the room there is and the
+    // flanges stand out by the smaller of the two -- still on every side, x and z alike (Alf, 2026-11-23: "the
+    // flanges have to have all the width (in X and Z axis) of the minimum of all the sizes").
     static TopoDS_Shape buildBobbin(const MAS::CoreBobbinProcessedDescription& bobbin,
                                     double flangeThickness,
                                     bool axisIsY = false,
                                     int polygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
-                                    const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails = {});
+                                    const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails = {},
+                                    std::optional<double> flangeOverhangLimit = std::nullopt);
 
     // The rail blocks as OCCT boxes in MKF's bobbin frame, named "<bobbinName> <block name>".
     static std::vector<NamedShape> buildPinRailsNamed(const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails,
