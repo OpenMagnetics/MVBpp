@@ -222,6 +222,9 @@ WeldMode weldModeFromEnv();
 // The collision debug drawing (--skip-collision-check): a mitred corner that does not abut is reported as a FINDING
 // and the copper kept as built, instead of refusing the build. Thread-local; off by default.
 void setAbutmentFinding(bool on);
+// A display drawing (the wire at its outer diameter, a picture of the winding): while set on this thread, the
+// assembler does not judge whether its mitred corners abut (ABT #2489).
+void setDisplayDrawing(bool on);
 // "off" | "auto" | "all"; anything else throws std::invalid_argument naming it.
 WeldMode parseWeldMode(const std::string& name);
 const char* weldModeName(WeldMode mode);

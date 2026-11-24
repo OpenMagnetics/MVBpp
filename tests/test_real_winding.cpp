@@ -373,21 +373,42 @@ TEST_CASE("Real winding: an interleaved N-filar design builds CERTIFIED CLEAR (c
 }
 
 // ABT #2489 (the web's 3D viewer, which draws the wire at its outer diameter): on this E 16/12/5 design the Primary's
-// first turn rejoins its climb through a slope change of 0.61 degrees. Rounded at MKF's wire bend radius -- the coated
-// radius, which a wire drawn at its outer diameter cannot be swept round -- that bend was cut back into two tangent
-// straights 2 um long, and the assembler refused the drawing: "1 mitred corner(s) did not abut". The fixture is the
-// `magnetic` of WebFrontend tests/fixtures/e16_contiguous_two_windings.json, unchanged.
-TEST_CASE("Real winding drawn at the outer diameter: a slight row kink stays the one mitre it is (e16 contiguous, ABT #2489)",
+// first turn rejoins its climb through a slope change of 0.61 degrees, rounded at MKF's wire bend radius. A wire drawn at
+// its outer diameter cannot be swept round that bend, so the display drawing draws it as the corner of its tangent
+// straights; its pieces must not share copper there. (1.0.5 refused the drawing over two 2 um straights whose corner did
+// not abut; 1.0.6 left the kink unrounded and butted, 0.00039 mm^3 shared.) The fixture is the `magnetic` of WebFrontend
+// tests/fixtures/e16_contiguous_two_windings.json, unchanged.
+TEST_CASE("Real winding drawn at the outer diameter: no two consecutive pieces share copper at a slight row kink (e16 contiguous, ABT #2489)",
           "[realwinding][abt2489]") {
     auto magneticJson = loadFixture("abt2489_e16_contiguous_two_windings.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
     mvb::MagneticBuilder builder;
     mvb::DrawConfig cfg{"step", /*includeBobbin=*/true, /*scale=*/1.0, /*symmetryPlanes=*/0};
     cfg.useRealWindingGeometry = true;
-    cfg.paintCoating = true;    // the display drawing
-    REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
     cfg.paintCoating = false;   // the copper, judged by the gate: its row bend stays round
     REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
+    // The display drawing is not judged by the assembler (ABT #2489, 2026-11-24), so it is measured here: no two
+    // consecutive pieces of the Primary share a volume, by the measure the assembler applies to copper (1e-6 mm^3).
+    const auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                             mvb::DEFAULT_WIRE_POLYGON_SEGMENTS, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                             /*paintCoating=*/true, /*emitCoatingShells=*/false,
+                                             /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                             /*useRealWindingGeometry=*/true, /*femReady=*/false);
+    gp_Trsf toMm;
+    toMm.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+    int pairs = 0;
+    for (const auto& ns : named) {
+        if (ns.name != "Primary parallel 0") continue;
+        std::vector<TopoDS_Shape> pieces;
+        for (TopExp_Explorer ex(ns.shape, TopAbs_SOLID); ex.More(); ex.Next())
+            pieces.push_back(BRepBuilderAPI_Transform(ex.Current(), toMm).Shape());
+        REQUIRE(pieces.size() == ns.partNames.size());
+        for (size_t k = 0; k + 1 < pieces.size(); ++k, ++pairs) {
+            INFO("'" << ns.partNames[k] << "' -> '" << ns.partNames[k + 1] << "'");
+            CHECK(commonVolume(pieces[k], pieces[k + 1]) <= 1e-6);
+        }
+    }
+    CHECK(pairs > 10);
 }
 
 TEST_CASE("Real winding: rect-column conductor fuses into ONE connected solid",

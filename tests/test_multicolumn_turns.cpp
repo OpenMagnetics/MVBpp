@@ -244,14 +244,22 @@ TEST_CASE("Real winding on the main column and a lateral leg draws at the outer 
                                                   /*paintCoating=*/true, /*emitCoatingShells=*/false,
                                                   /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
                                                   /*useRealWindingGeometry=*/true, /*femReady=*/false));
-    bool primary = false, secondary = false;
+    // The display drawing is not judged by the assembler (ABT #2489, 2026-11-24), so the bend is read here: each
+    // conductor's lead bends are the corner of two full straights -- no piece of its own for a bend's tangent stub.
+    int conductors = 0;
     for (const auto& ns : named) {
-        if (ns.name.find("terminal") != std::string::npos) continue;
-        if (ns.name.find("Primary parallel 0") != std::string::npos) primary = true;
-        if (ns.name.find("Secondary parallel 0") != std::string::npos) secondary = true;
+        if (ns.name != "Primary parallel 0" && ns.name != "Secondary parallel 0") continue;
+        ++conductors;
+        REQUIRE(ns.partNames.size() > 4);
+        for (const auto& part : ns.partNames) {
+            INFO(ns.name << " piece '" << part << "'");
+            CHECK(part.find("junction fillet") == std::string::npos);
+        }
+        INFO(ns.name << " starts with '" << ns.partNames[0] << "', '" << ns.partNames[1] << "'");
+        CHECK(ns.partNames[0].find("entrance lead seg 0") != std::string::npos);
+        CHECK(ns.partNames[1].find("turn 0") != std::string::npos);
     }
-    CHECK(primary);
-    CHECK(secondary);
+    CHECK(conductors == 2);
 }
 
 // ABT #2489: the turns and the core rest against the bobbin and take nothing out of it, so they are not cut out of it.

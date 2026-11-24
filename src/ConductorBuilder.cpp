@@ -144,8 +144,8 @@ static thread_local bool tlsCollisionDiagnostic = false;
 static thread_local bool tlsDisplayOnly = false;
 struct DisplayOnlyScope {
     bool previous;
-    explicit DisplayOnlyScope(bool on) : previous(tlsDisplayOnly) { tlsDisplayOnly = on; }
-    ~DisplayOnlyScope() { tlsDisplayOnly = previous; }
+    explicit DisplayOnlyScope(bool on) : previous(tlsDisplayOnly) { tlsDisplayOnly = on; setDisplayDrawing(on); }
+    ~DisplayOnlyScope() { tlsDisplayOnly = previous; setDisplayDrawing(previous); }
 };
 static bool collisionDiagnostic() { return tlsCollisionDiagnostic || tlsDisplayOnly; }
 
@@ -19589,18 +19589,14 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                                    (i == 0 && rectRowStartRoute) ? *rectRowStartRoute->rowEndHeight : kNaN);
                     // The row start's / row end's piece rejoins the turn's climb through a round bend (roundRowKink).
                     // The end first: its indices do not move when the start's bend is inserted after it.
-                    // NOT IN A DISPLAY DRAWING (ABT #2489, e16_contiguous_two_windings). The bend is at MKF's wire bend
-                    // radius, the coated radius, and a wire drawn at its outer diameter cannot be swept round it (a horn
-                    // torus): emitConductor cuts it back into its two tangent straights, which meet in a mitre. For a slope
-                    // change of 0.61 degrees that is the kink's own mitre again plus two pieces 2 um long, each losing
-                    // those 2 um to the mitre on its inner side, and the assembler's corner test refused them (the sides
-                    // overlap by 0.000195 mm^3 instead of sharing the bisector face). The kink stays the one mitre it is.
-                    if (!tlsDisplayOnly) {
-                        if (!ret && rowEnd && path.prims.size() >= primsBeforeWrap + 2)
-                            roundRowKink(path.prims, path.prims.size() - 2, wireBendOf(path.winding), path.name);
-                        if (!ret && i == 0 && rectRowStartRoute && path.prims.size() >= primsBeforeWrap + 2)
-                            roundRowKink(path.prims, primsBeforeWrap, wireBendOf(path.winding), path.name);
-                    }
+                    // A display drawing rounds it too and then, as with every bend the outer-diameter wire cannot be swept
+                    // round, draws it as the corner of its tangent straights (emitConductor). Left unrounded there (ABT #2489,
+                    // 1.0.6) the kink was butted flat: on e16_contiguous_two_windings' 0.61 degrees the two pieces shared
+                    // 0.00039 mm^3.
+                    if (!ret && rowEnd && path.prims.size() >= primsBeforeWrap + 2)
+                        roundRowKink(path.prims, path.prims.size() - 2, wireBendOf(path.winding), path.name);
+                    if (!ret && i == 0 && rectRowStartRoute && path.prims.size() >= primsBeforeWrap + 2)
+                        roundRowKink(path.prims, primsBeforeWrap, wireBendOf(path.winding), path.name);
                     if (tangentStartHere)
                         requireAtDeparture(path.prims.at(primsBeforeWrap).seg.a, *tangentIn, "first");
                     if (tangentEndHere)

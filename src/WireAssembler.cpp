@@ -3119,6 +3119,8 @@ size_t requireManifoldCopper(const TopoDS_Shape& shape, const std::string& condu
 // (set for the build by ConductorBuilder's diagnostic scope); a part refuses it.
 static thread_local bool tlsAbutmentFinding = false;
 void setAbutmentFinding(bool on) { tlsAbutmentFinding = on; }
+static thread_local bool tlsDisplayDrawing = false;
+void setDisplayDrawing(bool on) { tlsDisplayDrawing = on; }
 
 WeldMode weldModeFromEnv() {
     return std::getenv("MVB_WELD_ALL") != nullptr ? WeldMode::All : WeldMode::Auto;
@@ -4561,6 +4563,9 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         const double tolPrevBefore = (tolDiag() && !prevBuilt.IsNull()) ? maxSubShapeTolerance(prevBuilt) : 0.0;
         if (i > 0 && (bentS || (exactTangent(angS) && dpS <= 1e-9))) {
             if (capsProvablyShared) ++abutChecked;   // verdict: shared face, zero lens, by construction
+            // ABT #2489 (Alf, 2026-11-24): a display drawing is a picture and its corners are not judged. The check is two
+            // booleans a corner, 71 % of a 200-turn drum's drawing (100 s with it, 29 s without).
+            else if (tlsDisplayDrawing) {}
             else checkMitredAbutment(prevBuilt, solid,
                                 std::string(bentS ? "" : "tangent ") + "'" + ptrs[i - 1]->label +
                                     "' -> '" + ptrs[i]->label + "'");
