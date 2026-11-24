@@ -17,6 +17,11 @@
 #include <Bnd_Box.hxx>
 #include <TopExp_Explorer.hxx>
 #include <BRepAlgoAPI_Common.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
+#include <gp_Trsf.hxx>
+#include <map>
+#include <regex>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
 #include <fstream>
@@ -316,3 +321,60 @@ TEST_CASE("The winding and the core leave the bobbin as it is built", "[bobbin][
     }
 }
 
+
+// ABT #2489: a wound turn on a round column is swept as two halves, so that the cut at each of its ends is far from the
+// other end. A part's copper has the halves fused back into one solid, and every piece measured to prove the fuse lost
+// nothing. A display drawing is tessellated and looked at: it keeps the two halves as they are, meeting on one flush
+// section. The fuse and its measure were 7 of the 17 s the copper of this drawing took to build.
+TEST_CASE("A display drawing draws each closed turn as its two abutting halves", "[realwinding][display][abt2489]") {
+    std::ifstream f(std::string(MAS_COMPLETE_DIR) + "/single_switch_forward_transformer_complete.json");
+    REQUIRE(f.is_open());
+    json j;
+    f >> j;
+    const auto enriched = mvb::magnetic_autocomplete_safe(j.at("magnetic"), /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    // As the web's 3D view asks for it: the wire at its outer diameter, an exact circle.
+    const auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                             /*wirePolygonSegments=*/0, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                             /*paintCoating=*/true, /*emitCoatingShells=*/false,
+                                             /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                             /*useRealWindingGeometry=*/true, /*femReady=*/false);
+    const mvb::NamedShape* conductor = nullptr;
+    for (const auto& ns : named)
+        if (ns.name == "Primary parallel 0") conductor = &ns;
+    REQUIRE(conductor != nullptr);
+    std::vector<TopoDS_Shape> solids;
+    for (TopExp_Explorer ex(conductor->shape, TopAbs_SOLID); ex.More(); ex.Next()) solids.push_back(ex.Current());
+    REQUIRE(solids.size() == conductor->partNames.size());
+    // A conductor's solids are named after the piece of the route they draw; solids that share a piece are numbered
+    // "[k/n]". A whole revolution is the plain piece "turn A -> turn B".
+    const std::regex numbered(R"( \[\d+/\d+\]$)");
+    const std::regex wholeTurn(R"(^.* / turn \d+ -> turn \d+$)");
+    std::map<std::string, std::vector<size_t>> solidsOfPiece;
+    for (size_t k = 0; k < solids.size(); ++k)
+        solidsOfPiece[std::regex_replace(conductor->partNames[k], numbered, "")].push_back(k);
+    gp_Trsf toMillimetres;
+    toMillimetres.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+    int halvedTurns = 0, judged = 0;
+    for (const auto& [piece, indices] : solidsOfPiece) {
+        if (!std::regex_match(piece, wholeTurn) || indices.size() != 2) continue;
+        ++halvedTurns;
+        if (judged >= 6) continue;   // the exact check is slow; six turns show the seam
+        ++judged;
+        const TopoDS_Shape a = BRepBuilderAPI_Transform(solids[indices[0]], toMillimetres, Standard_True).Shape();
+        const TopoDS_Shape b = BRepBuilderAPI_Transform(solids[indices[1]], toMillimetres, Standard_True).Shape();
+        BRepExtrema_DistShapeShape apart(a, b);
+        REQUIRE(apart.IsDone());
+        INFO("the halves of '" << piece << "' are " << apart.Value() << " mm apart");
+        CHECK(apart.Value() < 1e-6);   // the halves touch
+        BRepAlgoAPI_Common shared(a, b);
+        REQUIRE(shared.IsDone());
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(shared.Shape(), props);
+        INFO("the halves of '" << piece << "' share " << props.Mass() << " mm^3");
+        CHECK(props.Mass() <= 1e-6);   // and no copper is drawn twice
+    }
+    INFO(halvedTurns << " whole revolutions are drawn as two solids");
+    CHECK(halvedTurns > 10);
+    CHECK(judged == 6);
+}

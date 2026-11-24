@@ -4354,7 +4354,16 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
             }
         }
         if (!prismDone) solid = parts.empty() ? TopoDS_Shape() : parts.front();
-        if (parts.size() > 1) {
+        if (parts.size() > 1 && tlsDisplayDrawing) {
+            // A display drawing is tessellated and looked at, never meshed: the halves of a closed revolution abut on
+            // one flush disc and are drawn as the two solids they are. Fusing them back, and measuring every piece to
+            // prove the fuse lost no copper, buys a drawing nothing (ABT #2489).
+            TopoDS_Compound halves;
+            BRep_Builder halvesBuilder;
+            halvesBuilder.MakeCompound(halves);
+            for (const auto& part : parts) halvesBuilder.Add(halves, part);
+            solid = halves;
+        } else if (parts.size() > 1) {
             // Fuse the halves back: both corners are cut, so the closed revolution is safe again.
             gp_Trsf up, down;
             up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
