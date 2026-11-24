@@ -180,8 +180,28 @@ async function main() {
         const coating = rawDrawMagnetic(etdJson, ...STL_3D, true,  undefined, undefined);
         const copper  = rawDrawMagnetic(etdJson, ...STL_3D, false, undefined, undefined);
         assert(coating.length > 0 && copper.length > 0, 'both outputs non-empty');
-        assert(coating.length !== copper.length,
-            `copper geometry (${copper.length}) must differ from coating (${coating.length})`);
+        // The drawn solid is measured, not the size of the file: the same turns at two diameters
+        // triangulate into the same number of facets, so the byte counts are equal (they differed
+        // only while the turns imprinted the bobbin, ABT #2489).
+        const stlVolume = (u8) => {
+            const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+            const triangles = view.getUint32(80, true);
+            assert(u8.length === 84 + 50 * triangles, 'binary STL');
+            let sixVolumes = 0.0;
+            for (let t = 0; t < triangles; ++t) {
+                const p = [];
+                for (let k = 0; k < 9; ++k) p.push(view.getFloat32(84 + 50 * t + 12 + 4 * k, true));
+                sixVolumes += p[0] * (p[4] * p[8] - p[5] * p[7])
+                            - p[1] * (p[3] * p[8] - p[5] * p[6])
+                            + p[2] * (p[3] * p[7] - p[4] * p[6]);
+            }
+            return sixVolumes / 6.0;
+        };
+        const coatingVolume = stlVolume(coating);
+        const copperVolume  = stlVolume(copper);
+        assert(coatingVolume > 0.0 && copperVolume > 0.0, 'both drawings enclose a volume');
+        assert(copperVolume < coatingVolume * (1.0 - 1e-4),
+            `the copper drawing (${copperVolume}) must be smaller than the coating one (${coatingVolume})`);
     });
 
     test('paintCoating=undefined defaults to coating (frontend default)', () => {
