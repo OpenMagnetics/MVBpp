@@ -254,3 +254,57 @@ TEST_CASE("Real winding on the main column and a lateral leg draws at the outer 
     CHECK(secondary);
 }
 
+// ABT #2489: the turns and the core rest against the bobbin and take nothing out of it, so they are not cut out of it.
+// They used to be handed to the kernel as "touching" tools, eight a cut: that removed no volume from any bobbin (the glue
+// option does not intersect a tool that enters), split the bobbin's faces along every contact line, and intersected the
+// conductors with each other -- 275 s of this drawing's 330 s. The bobbin now leaves the builder as it is built.
+TEST_CASE("The winding and the core leave the bobbin as it is built", "[bobbin][realwinding][abt2489]") {
+    std::ifstream f(std::string(MAS_COMPLETE_DIR) + "/single_switch_forward_transformer_complete.json");
+    REQUIRE(f.is_open());
+    json j;
+    f >> j;
+    const auto enriched = mvb::magnetic_autocomplete_safe(j.at("magnetic"), /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto built = builder.buildBobbinNamed(enriched.get_coil(), enriched.get_core());
+    REQUIRE(!built.shape.IsNull());
+    // The web's 3D view: the wire at its outer diameter, with the bobbin.
+    const auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                             mvb::DEFAULT_WIRE_POLYGON_SEGMENTS, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                             /*paintCoating=*/true, /*emitCoatingShells=*/false,
+                                             /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                             /*useRealWindingGeometry=*/true, /*femReady=*/false);
+    const mvb::NamedShape* drawn = nullptr;
+    for (const auto& ns : named)
+        if (ns.name == built.name) drawn = &ns;
+    REQUIRE(drawn != nullptr);
+    struct Solid { double volume; int faces; double lo[3], hi[3]; };
+    auto solidsOf = [](const TopoDS_Shape& shape) {
+        std::vector<Solid> out;
+        for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next()) {
+            Solid s{};
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(ex.Current(), props);
+            s.volume = props.Mass();
+            for (TopExp_Explorer face(ex.Current(), TopAbs_FACE); face.More(); face.Next()) ++s.faces;
+            Bnd_Box box;
+            BRepBndLib::AddOptimal(ex.Current(), box, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+            box.Get(s.lo[0], s.lo[1], s.lo[2], s.hi[0], s.hi[1], s.hi[2]);
+            out.push_back(s);
+        }
+        return out;
+    };
+    const auto before = solidsOf(built.shape), after = solidsOf(drawn->shape);
+    REQUIRE(before.size() >= 1);
+    REQUIRE(after.size() == before.size());
+    for (size_t k = 0; k < before.size(); ++k) {
+        INFO("bobbin solid " << k << ": " << before[k].volume * 1e9 << " mm^3 and " << before[k].faces << " faces built, "
+                             << after[k].volume * 1e9 << " mm^3 and " << after[k].faces << " faces drawn");
+        CHECK(std::abs(after[k].volume - before[k].volume) <= 1e-9 * before[k].volume);
+        CHECK(after[k].faces == before[k].faces);
+        for (int a = 0; a < 3; ++a) {
+            CHECK(std::abs(after[k].lo[a] - before[k].lo[a]) < 1e-9);
+            CHECK(std::abs(after[k].hi[a] - before[k].hi[a]) < 1e-9);
+        }
+    }
+}
+

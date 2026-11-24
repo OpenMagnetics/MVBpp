@@ -206,7 +206,7 @@ TEST_CASE("cut_bobbin removes the flange volume a lead passes through", "[bobbin
         for (const double z : {12.1, 16.2})
             leads.push_back(BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x * mm, -12.122 * mm, z * mm), gp_Dir(0, 1, 0)), r, len).Shape());
     const double before = volume(flange);
-    const double after = volume(mvb::cut_bobbin(flange, /*touching=*/{}, /*piercing=*/leads));
+    const double after = volume(mvb::cut_bobbin(flange, /*piercing=*/leads));
     const double expected = leads.size() * std::numbers::pi * r * r * 1.5 * mm;
     // Each lead crosses the full 1.5 mm plate outside the opening: the cut removes all of it.
     CHECK(before - after == Catch::Approx(expected).epsilon(1e-3));

@@ -11,7 +11,6 @@
 #include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
-#include <BOPAlgo_GlueEnum.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -485,8 +484,7 @@ bool is_shape_usable(const TopoDS_Shape& shape) {
     return !bb.IsVoid();
 }
 
-TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Shape>& touching,
-                        const std::vector<TopoDS_Shape>& piercing) {
+TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Shape>& piercing) {
     if (std::getenv("MVB_NO_BOBBIN_CUT")) return bobbin;
     if (bobbin.IsNull()) return bobbin;
 
@@ -497,29 +495,28 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
     gp_Trsf down; down.SetScale(gp_Pnt(0, 0, 0), 1.0 / S);
 
     // Pre-scale tools once; reuse for every per-solid cut.
-    // `glue`: the tool only TOUCHES the bobbin (coincident or tangent faces), so OCCT's
-    // BOPAlgo_GlueShift holds and keeps the many contacts of a wound coil fast. A tool that
-    // PIERCES a solid (a pin, a shunt, a foil's axial lead through the flange) breaks glue's
-    // premise -- glue skips face/face intersections, and the glued cut returned the pierced
-    // flange untouched (two_switch_forward_transformer_complete: 1153.574471 mm^3 in and out,
-    // 8 copper/bobbin overlaps in the audit) -- so it is cut without glue. Unglued for every
-    // tool is correct but slow on the tangent contacts (14_dab: past the hour, in OCCT's
-    // micro-edge pass; 23_interleaved_llc 558 s -> 1842 s).
-    struct ScaledTool { TopoDS_Shape shape; Bnd_Box box; bool glue; };
+    // ABT #2489: only the tools that pass THROUGH a bobbin solid are cut out of it (a pin, a shunt, a foil's axial
+    // lead through the flange). What merely rests against the bobbin -- the core in its tube, the wound turns on it
+    // -- takes nothing out of it, and is no longer handed to the kernel. It used to be, eight tools a cut, with
+    // OCCT's glue option (BOPAlgo_GlueShift), and that bought nothing: glue does not compute the intersections of a
+    // tool that enters (a wire sunk 0.2 mm into a plate left the plate untouched, 1.79 mm^3 of it in copper), so
+    // over the 38 corpus designs its 266 cuts removed 0 mm^3 and only split the bobbins' faces along the contact
+    // lines (3172 faces where 1874 were built). And a cut intersects its tools with each other: a real-winding
+    // conductor is one tool of hundreds of solids lying against its neighbours along every turn, so on
+    // efd20_95_flyback_saturates (17 conductors, 205 turns, the wire at its outer diameter, one core as the WASM
+    // engine runs) the cut took 707 s of a 741 s drawing. Copper that does enter the bobbin other than through the
+    // tools named here is not cut out of it, as it was not before.
+    struct ScaledTool { TopoDS_Shape shape; Bnd_Box box; };
     std::vector<ScaledTool> scaledTools;
-    scaledTools.reserve(touching.size() + piercing.size());
-    auto addTools = [&](const std::vector<TopoDS_Shape>& tools, bool glue) {
-        for (const auto& tool : tools) {
-            if (tool.IsNull()) continue;
-            TopoDS_Shape s = BRepBuilderAPI_Transform(tool, up).Shape();
-            Bnd_Box tb;
-            BRepBndLib::Add(s, tb);
-            if (tb.IsVoid()) continue;
-            scaledTools.push_back({s, tb, glue});
-        }
-    };
-    addTools(touching, true);
-    addTools(piercing, false);
+    scaledTools.reserve(piercing.size());
+    for (const auto& tool : piercing) {
+        if (tool.IsNull()) continue;
+        TopoDS_Shape s = BRepBuilderAPI_Transform(tool, up).Shape();
+        Bnd_Box tb;
+        BRepBndLib::Add(s, tb);
+        if (tb.IsVoid()) continue;
+        scaledTools.push_back({s, tb});
+    }
     if (scaledTools.empty()) return bobbin;
 
     // Iterate solids in the bobbin. BobbinBuilder returns a compound of
@@ -557,14 +554,12 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
         Bnd_Box solidBox;
         BRepBndLib::Add(solidScaled, solidBox);
 
-        // Glued tools first, then the piercing ones; a batch never mixes the two.
-        std::vector<std::pair<TopoDS_Shape, bool>> relevant;
+        std::vector<TopoDS_Shape> relevant;
         relevant.reserve(scaledTools.size());
-        for (const bool glue : {true, false})
-            for (const auto& st : scaledTools) {
-                if (st.glue != glue || solidBox.IsOut(st.box)) continue;
-                relevant.emplace_back(st.shape, st.glue);
-            }
+        for (const auto& st : scaledTools) {
+            if (solidBox.IsOut(st.box)) continue;
+            relevant.push_back(st.shape);
+        }
         if (relevant.empty()) {
             cbld.Add(resultComp, solid);
             continue;
@@ -575,10 +570,9 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
         for (std::size_t i = 0; i < relevant.size();) {
             TopTools_ListOfShape args, batchTools;
             args.Append(current);
-            const bool glue = relevant[i].second;
             std::size_t end = i;
-            while (end < relevant.size() && end - i < BOP_TOOL_CHUNK && relevant[end].second == glue) {
-                batchTools.Append(relevant[end].first);
+            while (end < relevant.size() && end - i < BOP_TOOL_CHUNK) {
+                batchTools.Append(relevant[end]);
                 ++end;
             }
             i = end;
@@ -588,7 +582,6 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
             cutter.SetTools(batchTools);
             cutter.SetUseOBB(true);
             cutter.SetRunParallel(true);
-            if (glue) cutter.SetGlue(BOPAlgo_GlueShift);
             cutter.SetCheckInverted(false);
             cutter.SetNonDestructive(false);
             cutter.Build();

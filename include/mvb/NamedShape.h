@@ -85,7 +85,7 @@ struct NamedShape {
     Role role = Role::Core;
     // Set on a bobbin CUTTER that MKF routes THROUGH a bobbin solid rather than against it --
     // a foil's axial lead leaving through the end face (ConnectionRoute::axialLead). cut_bobbin
-    // cuts such a tool without the glue option, which only holds for tools that merely touch.
+    // cuts such a tool out of the bobbin; a conductor that only rests against it is not a tool.
     // Never exported; meaningless outside the cutter build.
     bool piercesBobbin = false;
 

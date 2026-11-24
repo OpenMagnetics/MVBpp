@@ -1309,9 +1309,6 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
         if (includeBobbin) {
             auto bobbin = buildBobbinNamed(coil, core, corePolygonSegments);
             if (!bobbin.shape.IsNull()) {
-                std::vector<TopoDS_Shape> cutters;
-                for (const auto& ns : all) cutters.push_back(ns.shape);
-                cutters.insert(cutters.end(), turnShapes.begin(), turnShapes.end());
                 {   // ABT #1249: rails vs core and copper, before the cut could hide an overlap.
                     std::vector<std::pair<std::string, TopoDS_Shape>> obstacles;
                     for (const auto& ns : all) obstacles.emplace_back(ns.name, ns.shape);
@@ -1320,14 +1317,15 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
                     checkPinRailCollisions(getPinRails(coil), bobbin.name, obstacles);
                 }
                 // ABT #1171: a pin owns the flange volume it passes through (see PinBuilder.h).
-                // Pins and shunts PIERCE the bobbin: cut without glue (see cut_bobbin).
+                // Pins and shunts PIERCE the bobbin and are cut out of it; the core and the turns rest against it
+                // and take nothing out (see cut_bobbin).
                 std::vector<TopoDS_Shape> piercing;
                 for (auto& pinShape : PinBuilder::buildPins(getBobbinProcessed(coil)))
                     piercing.push_back(std::move(pinShape));
                 // ABT #1176: a magnetic shunt owns the former volume it passes through.
                 for (auto& shunt : ShuntBuilder::buildShuntsNamed(magnetic))
                     piercing.push_back(std::move(shunt.shape));
-                bobbin.shape = cut_bobbin(bobbin.shape, cutters, piercing);
+                bobbin.shape = cut_bobbin(bobbin.shape, piercing);
                 if (!bobbin.shape.IsNull()) all.push_back(bobbin);
             }
         }
@@ -1454,8 +1452,6 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
     if (includeBobbin) {
         auto bobbin = buildBobbinNamed(magnetic.get_coil(), magnetic.get_core(), corePolygonSegments);
         if (!bobbin.shape.IsNull()) {
-            std::vector<TopoDS_Shape> cutters;
-            for (const auto& ns : all) cutters.push_back(ns.shape);
             {   // ABT #1249: rails vs core and copper, before the cut could hide an overlap.
                 std::vector<std::pair<std::string, TopoDS_Shape>> obstacles;
                 for (const auto& ns : all) obstacles.emplace_back(ns.name, ns.shape);
@@ -1472,8 +1468,9 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
             // (ro - rc), never zero and never a made-up margin. The cutter build runs in
             // DRAWING mode (femReady=false): a cutting tool needs no welds, no mitre
             // certification and may overlap itself, so the cheap per-run compound is enough.
-            // Tools that PIERCE the bobbin (pins, shunts, MKF's axial foil leads) are cut
-            // without glue; everything else only touches it (see cut_bobbin).
+            // The tools are the conductors MKF routes THROUGH a bobbin solid (its axial foil
+            // leads), the pins and the shunts; the core and every other conductor rest against
+            // the bobbin and take nothing out of it (see cut_bobbin).
             std::vector<TopoDS_Shape> piercing;
             if (!paintCoating && useRealWindingGeometry) {
                 for (auto& ns : buildRealWindingConductorsNamed(
@@ -1481,10 +1478,8 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                          /*paintCoating=*/true, /*emitCoatingShells=*/false,
                          /*femReady=*/false, /*diagnosticSkipCollisionCheck=*/false,
                          /*cutterOnly=*/true)) {
-                    (ns.piercesBobbin ? piercing : cutters).push_back(ns.shape);
+                    if (ns.piercesBobbin) piercing.push_back(ns.shape);
                 }
-            } else {
-                cutters.insert(cutters.end(), turnShapes.begin(), turnShapes.end());
             }
             // ABT #1171: a pin owns the flange volume it passes through (see PinBuilder.h).
             for (auto& pinShape : PinBuilder::buildPins(getBobbinProcessed(magnetic.get_coil())))
@@ -1492,7 +1487,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
             // ABT #1176: a magnetic shunt owns the former volume it passes through.
             for (auto& shunt : ShuntBuilder::buildShuntsNamed(magnetic))
                 piercing.push_back(std::move(shunt.shape));
-            bobbin.shape = cut_bobbin(bobbin.shape, cutters, piercing);
+            bobbin.shape = cut_bobbin(bobbin.shape, piercing);
             if (!bobbin.shape.IsNull()) all.push_back(bobbin);
         }
     }
