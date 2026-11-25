@@ -71,6 +71,8 @@
 #include <fstream>
 #include <sstream>
 #include <numbers>
+#include <BRepPrimAPI_MakeRevol.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
 #include <variant>
 
 using json = nlohmann::json;
@@ -3239,5 +3241,168 @@ TEST_CASE("Assembler: a piece is absorbed only when it is proven to lie inside t
         CHECK_FALSE(mvb::pieceLiesInside(TopoDS_Shape(), 1.0, slab));
         CHECK_FALSE(mvb::pieceLiesInside(box(1, 1, 0.25, 2, 2, 0.75), 1.0, TopoDS_Shape()));
         CHECK_FALSE(mvb::pieceLiesInside(box(1, 1, 0.25, 2, 2, 0.75), 0.0, slab));
+    }
+}
+
+// ABT #2547: a rectangular wire's MAS edgeRadius rounds its section in every path that draws it,
+// idealised and real, through TurnBuilder::sectionCornerRadius. The design is
+// realwinding_toroid_rect.json as it is (12 turns of 0.9 x 0.6 mm enamelled wire, which carries no
+// edgeRadius and so stays sharp); these tests give its wire a radius in memory, the fixture file is
+// unchanged.
+namespace {
+
+json with_edge_radius(json magneticJson, std::optional<double> radius) {
+    for (auto& winding : magneticJson.at("coil").at("functionalDescription")) {
+        auto& wire = winding.at("wire");
+        REQUIRE(wire.is_object());
+        REQUIRE(wire.at("type") == "rectangular");
+        if (radius) {
+            wire["edgeRadius"] = json{{"nominal", *radius}};
+        }
+        else {
+            wire.erase("edgeRadius");
+        }
+    }
+    return magneticJson;
+}
+
+double conductor_volume(const json& magneticJson, bool realWinding, mvb::EnamelGateVerdict* verdict = nullptr) {
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, realWinding);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       /*corePolygonSegments=*/0, /*paintCoating=*/false, false, false, 0.0,
+                                       realWinding, /*femReady=*/false, /*skipGeometryChecks=*/false, verdict);
+    double volume = 0;
+    for (const auto& shape : named) {
+        if (shape.role == mvb::Role::Turn) {
+            volume += shapeVolume(shape.shape);
+        }
+    }
+    REQUIRE(volume > 0.0);
+    return volume;
+}
+
+// Per Turn-role shape, its solids in build order.
+std::vector<std::vector<TopoDS_Shape>> turn_solids(const json& magneticJson, bool realWinding, bool paintCoating) {
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, realWinding);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       /*corePolygonSegments=*/0, paintCoating, false, false, 0.0, realWinding, /*femReady=*/false);
+    std::vector<std::vector<TopoDS_Shape>> turns;
+    for (const auto& shape : named) {
+        if (shape.role != mvb::Role::Turn) continue;
+        turns.emplace_back();
+        for (TopExp_Explorer e(shape.shape, TopAbs_SOLID); e.More(); e.Next()) turns.back().push_back(e.Current());
+    }
+    return turns;
+}
+
+}  // namespace
+
+TEST_CASE("A rounded rectangular wire's toroid turns: volume in the ratio of the sections", "[realwinding][edge-radius]") {
+    // 0.9 x 0.6 mm, r = 0.15 mm (a quarter of the thickness).
+    const double width = 0.0009, thickness = 0.0006, radius = 0.00015;
+    const double sectionRatio = (width * thickness - (4 - std::numbers::pi) * radius * radius) / (width * thickness);
+    const auto fixture = loadFixture("realwinding_toroid_rect.json");
+    SECTION("idealised turns") {
+        // The idealised toroid turn is its tubes and chord runs (prisms of the section) and four
+        // quarter-swept corners bent at half the wire's width about an axis its inner side lies on.
+        // A straight piece holds the rounded section: its volume is the sharp one's times the ratio
+        // of the sections. A corner keeps its two axis-side corners sharp (a rounded edge leaving the
+        // axis tangentially revolves into a horn, no solid): its volume is Pappus of that D-section,
+        // whose centroid lies inward of the rectangle's, so its ratio is (A_D x_D) / (A x).
+        const double halfWidth = width / 2, bend = halfWidth;   // the builder's bend: max(w, h) / 2
+        const double spandrel = (1 - std::numbers::pi / 4) * radius * radius;
+        const double spandrelOffset = (halfWidth - radius) + 2 * radius / (3 * (4 - std::numbers::pi));
+        const double areaD = width * thickness - 2 * spandrel;
+        const double centroidD = bend - 2 * spandrel * spandrelOffset / areaD;
+        const double cornerRatio = areaD * centroidD / (width * thickness * bend);
+        const auto rounded = turn_solids(with_edge_radius(fixture, radius), false, false);
+        const auto sharp = turn_solids(with_edge_radius(fixture, std::nullopt), false, false);
+        REQUIRE(rounded.size() == sharp.size());
+        REQUIRE(!rounded.empty());
+        for (size_t turn = 0; turn < rounded.size(); ++turn) {
+            REQUIRE(rounded[turn].size() == sharp[turn].size());
+            size_t corners = 0;
+            for (size_t piece = 0; piece < rounded[turn].size(); ++piece) {
+                INFO("turn " << turn << " piece " << piece);
+                CHECK(BRepCheck_Analyzer(rounded[turn][piece]).IsValid());
+                const double ratio = shapeVolume(rounded[turn][piece]) / shapeVolume(sharp[turn][piece]);
+                INFO("ratio " << ratio << " (section " << sectionRatio << ", corner " << cornerRatio << ")");
+                const bool straight = std::abs(ratio - sectionRatio) <= 1e-9 * sectionRatio;
+                const bool corner = std::abs(ratio - cornerRatio) <= 1e-9 * cornerRatio;
+                CHECK((straight || corner));
+                corners += corner ? 1 : 0;
+            }
+            CHECK(corners == 4);
+        }
+    }
+    SECTION("real winding, and the enamel gate still certifies it") {
+        mvb::EnamelGateVerdict roundedVerdict = mvb::EnamelGateVerdict::NotRun;
+        mvb::EnamelGateVerdict sharpVerdict = mvb::EnamelGateVerdict::NotRun;
+        const double rounded = conductor_volume(with_edge_radius(fixture, radius), true, &roundedVerdict);
+        const double sharp = conductor_volume(with_edge_radius(fixture, std::nullopt), true, &sharpVerdict);
+        INFO("rounded " << rounded << " m^3, sharp " << sharp << " m^3, section ratio " << sectionRatio);
+        // The real winding's leads and bends carry the same section as its wraps.
+        CHECK(rounded / sharp == Catch::Approx(sectionRatio).margin(1e-3));
+        CHECK(sharpVerdict == mvb::EnamelGateVerdict::Certified);
+        CHECK(roundedVerdict == mvb::EnamelGateVerdict::Certified);
+    }
+    SECTION("real winding drawn coated: the wrap corners turn about their own inner side") {
+        // MKF bends a flat wire edgewise at half its OUTER width, so the coated section's inner side lies on the
+        // bend axis of every wrap corner. With the edges rounded all round, each corner revolved into a horn and
+        // the conductor came out as 105 solids, 16 of them invalid, where the sharp one is one valid solid.
+        const auto rounded = turn_solids(with_edge_radius(fixture, radius), true, /*paintCoating=*/true);
+        const auto sharp = turn_solids(with_edge_radius(fixture, std::nullopt), true, /*paintCoating=*/true);
+        REQUIRE(rounded.size() == sharp.size());
+        REQUIRE(!rounded.empty());
+        double roundedVolume = 0.0, sharpVolume = 0.0;
+        for (size_t conductor = 0; conductor < rounded.size(); ++conductor) {
+            INFO("conductor " << conductor << ": " << rounded[conductor].size() << " solids rounded, " << sharp[conductor].size() << " sharp");
+            CHECK(rounded[conductor].size() == sharp[conductor].size());
+            size_t invalid = 0;
+            for (const auto& solid : rounded[conductor]) {
+                invalid += BRepCheck_Analyzer(solid).IsValid() ? 0 : 1;
+                roundedVolume += shapeVolume(solid);
+            }
+            CHECK(invalid == 0);
+            for (const auto& solid : sharp[conductor]) sharpVolume += shapeVolume(solid);
+        }
+        // The coated section is 0.98 x 0.68 mm with corners of 0.19 mm (the copper's and the coating): its straights
+        // carry the fully rounded section, its corners the one with the axis-side corners sharp, so the copper drawn
+        // lies between the two section ratios.
+        const double coatedWidth = 0.00098, coatedThickness = 0.00068, coatedRadius = 0.00019;
+        const double coatedSectionRatio = (coatedWidth * coatedThickness - (4 - std::numbers::pi) * coatedRadius * coatedRadius) /
+                                          (coatedWidth * coatedThickness);
+        INFO("rounded " << roundedVolume << " m^3, sharp " << sharpVolume << " m^3, fully rounded section ratio " << coatedSectionRatio);
+        CHECK(roundedVolume < sharpVolume);
+        CHECK(roundedVolume / sharpVolume > coatedSectionRatio - 1e-3);
+    }
+    SECTION("real winding: edges rounded almost to a half round still weld into one solid") {
+        // Flat winding wire is rolled with an edge radius close to half its thickness (4 x 1.06 mm: 0.5 mm, which
+        // leaves a side flat of 0.06 mm). Here 0.28 mm on the 0.6 mm thickness leaves a side flat of 0.04 mm down
+        // every straight. The union's sheet guard took that flat for a leftover of the boolean and refused both
+        // welds, so the conductor came out as its loose pieces where the sharp wire is one solid.
+        const double nearHalfRound = 0.00028;
+        CHECK(mvb::rectNarrowestFaceRatio(width, thickness, nearHalfRound) == Catch::Approx((thickness - 2 * nearHalfRound) / thickness));
+        CHECK(mvb::rectNarrowestFaceRatio(width, thickness, 0.0) == 1.0);
+        const auto rounded = turn_solids(with_edge_radius(fixture, nearHalfRound), true, /*paintCoating=*/false);
+        const auto sharp = turn_solids(with_edge_radius(fixture, std::nullopt), true, /*paintCoating=*/false);
+        REQUIRE(rounded.size() == sharp.size());
+        REQUIRE(!rounded.empty());
+        double roundedVolume = 0.0, sharpVolume = 0.0;
+        for (size_t conductor = 0; conductor < rounded.size(); ++conductor) {
+            INFO("conductor " << conductor << ": " << rounded[conductor].size() << " solids rounded, " << sharp[conductor].size() << " sharp");
+            REQUIRE(sharp[conductor].size() == 1);
+            CHECK(rounded[conductor].size() == 1);
+            for (const auto& solid : rounded[conductor]) {
+                CHECK(BRepCheck_Analyzer(solid).IsValid());
+                roundedVolume += shapeVolume(solid);
+            }
+            sharpVolume += shapeVolume(sharp[conductor].front());
+        }
+        const double nearHalfRoundRatio = (width * thickness - (4 - std::numbers::pi) * nearHalfRound * nearHalfRound) / (width * thickness);
+        INFO("rounded " << roundedVolume << " m^3, sharp " << sharpVolume << " m^3, section ratio " << nearHalfRoundRatio);
+        CHECK(roundedVolume / sharpVolume == Catch::Approx(nearHalfRoundRatio).margin(1e-3));
     }
 }

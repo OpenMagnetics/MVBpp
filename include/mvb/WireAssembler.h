@@ -320,17 +320,31 @@ TopoDS_Wire wireProfileWireSplit(const gp_Pnt& center, const gp_Dir& normal, dou
 inline double rectSectionArea(double width, double height, double cornerRadius) {
     return width * height - (4.0 - std::numbers::pi) * cornerRadius * cornerRadius;
 }
-// cornerRadius > 0 rounds the four corners (compressed litz); 0 is the sharp rectangle.
+// Which two corners of a rounded section stay sharp: those on one side of its width, the side towards a bend axis
+// that the section's side lies on. The width runs along tangent x axial (rectProfileWire).
+enum class SharpSide { None, MinusWidth, PlusWidth };
+// cornerRadius > 0 rounds the corners (compressed litz; a rectangular wire's MAS edgeRadius); 0 is the sharp rectangle.
+// A bend whose axis the section's inner side lies ON cannot take a rounded edge there: an edge that leaves the axis
+// tangentially revolves into a horn, which is no solid (the reason a round wire cannot bend at its own radius). Such a
+// corner piece's section keeps its two axis-side corners sharp (`sharp`) -- the inner edge turns about the axis as a
+// sharp wire's does -- and its two outer ones rounded (ABT #2547).
 TopoDS_Wire rectProfileWire(const gp_Pnt& center, const gp_Dir& tangent, const gp_Dir& axialAxis,
-                            double width, double height, double cornerRadius);
+                            double width, double height, double cornerRadius, SharpSide sharp = SharpSide::None);
 // Growth (overA/overB, in arc length) is folded into the pcurve for spirals that support it --
 // see primEdgeGrowsAnalytically. Everything else ignores it and is grown by the caller.
 TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA = 0.0,
                      double overB = 0.0);
 bool primEdgeGrowsAnalytically(const Primitive& pr);
 
+// The narrowest face of a flat wire's own section over the sharp section's narrowest (its thinner side): rounded
+// edges leave side flats of width - 2r and height - 2r and corner faces a quarter circle long. 1 for a sharp section.
+double rectNarrowestFaceRatio(double width, double height, double cornerRadius);
+
 // Post-checks on assembled copper.
-bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius);
+// narrowestFaceRatio (rectNarrowestFaceRatio) scales the sheet floor to the section the wire really has: a flat
+// wire whose edge radius is almost half its thickness keeps a side flat a few hundredths of a millimetre wide down
+// its whole length, which is the wire and not a leftover of the union (ABT #2547).
+bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius, double narrowestFaceRatio = 1.0);
 TopoDS_Shape pruneDegenerateSolids(const TopoDS_Shape& shape, double wireRadius);
 
 // True when `piece` (of volume `pieceVolume`) is proven to lie inside `host`: its box within the host's, every vertex in

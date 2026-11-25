@@ -625,7 +625,7 @@ TopoDS_Wire wireProfileWireSplit(const gp_Pnt& center, const gp_Dir& normal, dou
 // tangent; the RADIAL axis is tangent x axial. width spans radial, height spans axial -- matching
 // TurnBuilder::build_rect_profile so the real-winding section is consistent with the per-turn one.
 TopoDS_Wire rectProfileWire(const gp_Pnt& center, const gp_Dir& tangent, const gp_Dir& axialAxis,
-                            double width, double height, double cornerRadius) {
+                            double width, double height, double cornerRadius, SharpSide sharp) {
     gp_XYZ t = tangent.XYZ();
     gp_XYZ a = axialAxis.XYZ() - t * (axialAxis.XYZ().Dot(t));  // axial, ⊥ tangent
     if (a.Modulus() < 1e-9) {                                   // tangent ∥ axial: pick any ⊥ axis
@@ -651,27 +651,52 @@ TopoDS_Wire rectProfileWire(const gp_Pnt& center, const gp_Dir& tangent, const g
         poly.Close();
         return poly.Wire();
     }
-    // A ROUNDED RECTANGLE (compressed litz: MKF's Wire::compressed_litz_corner_radius): four sides
-    // and four quarter circles, counter-clockwise from the bottom side. A side the two corners use
-    // up entirely (a stadium) is left out rather than drawn zero long.
+    // A ROUNDED RECTANGLE (compressed litz: MKF's Wire::compressed_litz_corner_radius; a rectangular wire's MAS
+    // edgeRadius): four sides and four quarter circles, counter-clockwise from the bottom side. A side the two
+    // corners use up entirely (a stadium) is left out rather than drawn zero long.
     const double r = cornerRadius;
-    const double iu = std::max(hw - r, 0.0), iv = std::max(hh - r, 0.0);
     BRepBuilderAPI_MakeWire mw;
     auto side = [&](const gp_Pnt& p, const gp_Pnt& q) {
         if (p.Distance(q) > 1e-12) mw.Add(BRepBuilderAPI_MakeEdge(p, q).Edge());
     };
-    const std::array<std::array<double, 2>, 4> centres{{{iu, -iv}, {iu, iv}, {-iu, iv}, {-iu, -iv}}};
-    // corner k spans angles [-90 + 90 k, 90 k] degrees about its centre
-    for (int k = 0; k < 4; ++k) {
-        const double a0 = (k - 1) * std::numbers::pi / 2, a1 = k * std::numbers::pi / 2, am = 0.5 * (a0 + a1);
-        const auto& c = centres[k];
-        const gp_Pnt start = at(c[0] + r * std::cos(a0), c[1] + r * std::sin(a0));
-        if (k == 0) side(at(-iu, -hh), start);
-        mw.Add(BRepBuilderAPI_MakeEdge(GC_MakeArcOfCircle(start, at(c[0] + r * std::cos(am), c[1] + r * std::sin(am)),
-                                                          at(c[0] + r * std::cos(a1), c[1] + r * std::sin(a1))).Value()).Edge());
-        const auto& n = centres[(k + 1) % 4];
-        const double b0 = k * std::numbers::pi / 2;
-        if (k < 3) side(at(c[0] + r * std::cos(a1), c[1] + r * std::sin(a1)), at(n[0] + r * std::cos(b0), n[1] + r * std::sin(b0)));
+    if (sharp == SharpSide::None) {
+        const double iu = std::max(hw - r, 0.0), iv = std::max(hh - r, 0.0);
+        const std::array<std::array<double, 2>, 4> centres{{{iu, -iv}, {iu, iv}, {-iu, iv}, {-iu, -iv}}};
+        // corner k spans angles [-90 + 90 k, 90 k] degrees about its centre
+        for (int k = 0; k < 4; ++k) {
+            const double a0 = (k - 1) * std::numbers::pi / 2, a1 = k * std::numbers::pi / 2, am = 0.5 * (a0 + a1);
+            const auto& c = centres[k];
+            const gp_Pnt start = at(c[0] + r * std::cos(a0), c[1] + r * std::sin(a0));
+            if (k == 0) side(at(-iu, -hh), start);
+            mw.Add(BRepBuilderAPI_MakeEdge(GC_MakeArcOfCircle(start, at(c[0] + r * std::cos(am), c[1] + r * std::sin(am)),
+                                                              at(c[0] + r * std::cos(a1), c[1] + r * std::sin(a1))).Value()).Edge());
+            const auto& n = centres[(k + 1) % 4];
+            const double b0 = k * std::numbers::pi / 2;
+            if (k < 3) side(at(c[0] + r * std::cos(a1), c[1] + r * std::sin(a1)), at(n[0] + r * std::cos(b0), n[1] + r * std::sin(b0)));
+        }
+    } else {
+        // The two corners on the `sharp` side of the width are points; the other two are quarter circles.
+        // Corner k sits at (+,-), (+,+), (-,+), (-,-) of (width, height); it is entered along `into[k]` and left along
+        // `into[k + 1]`, the unit directions from its arc's centre to the arc's two ends.
+        const std::array<std::array<double, 2>, 4> signs{{{1, -1}, {1, 1}, {-1, 1}, {-1, -1}}};
+        const std::array<std::array<double, 2>, 5> into{{{0, -1}, {1, 0}, {0, 1}, {-1, 0}, {0, -1}}};
+        const double diagonal = std::sqrt(0.5);
+        const auto radiusOf = [&](int k) {
+            const bool onSharpSide = sharp == SharpSide::PlusWidth ? signs[k][0] > 0 : signs[k][0] < 0;
+            return onSharpSide ? 0.0 : r;
+        };
+        const auto pointOf = [&](int k, double du, double dv) {   // corner k's centre + its radius along (du, dv)
+            const double rk = radiusOf(k);
+            return at(signs[k][0] * std::max(hw - rk, 0.0) + rk * du, signs[k][1] * std::max(hh - rk, 0.0) + rk * dv);
+        };
+        for (int k = 0; k < 4; ++k) {
+            const int previous = (k + 3) % 4;
+            side(pointOf(previous, into[k][0], into[k][1]), pointOf(k, into[k][0], into[k][1]));
+            if (radiusOf(k) > 0.0)
+                mw.Add(BRepBuilderAPI_MakeEdge(GC_MakeArcOfCircle(pointOf(k, into[k][0], into[k][1]),
+                                                                  pointOf(k, signs[k][0] * diagonal, signs[k][1] * diagonal),
+                                                                  pointOf(k, into[k + 1][0], into[k + 1][1])).Value()).Edge());
+        }
     }
     if (!mw.IsDone()) {
         throw std::runtime_error("rectProfileWire: the rounded-rectangle section did not close");
@@ -1069,7 +1094,17 @@ bool pieceLiesInside(const TopoDS_Shape& piece, double pieceVolume, const TopoDS
 // its junction sphere) merge -- the thin "line/cone" sheets seen on a multilayer winding. A
 // genuine tube-wall face of the same extent has area ~ 2*pi*r*length, orders of magnitude
 // larger; end caps and short faces (diag <= a few radii) are exempt.
-bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius) {
+double rectNarrowestFaceRatio(double width, double height, double cornerRadius) {
+    if (!(cornerRadius > 0.0)) return 1.0;
+    double narrowest = 0.5 * std::numbers::pi * cornerRadius;   // a corner face, a quarter circle long
+    for (const double flat : {width - 2.0 * cornerRadius, height - 2.0 * cornerRadius}) {
+        // rectProfileWire leaves out a side its two corners use up entirely
+        if (flat > 1e-12) narrowest = std::min(narrowest, flat);
+    }
+    return std::min(1.0, narrowest / std::min(width, height));
+}
+
+bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius, double narrowestFaceRatio) {
     for (TopExp_Explorer fe(shape, TopAbs_FACE); fe.More(); fe.Next()) {
         Bnd_Box fb;
         BRepBndLib::Add(fe.Current(), fb);
@@ -1081,7 +1116,7 @@ bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius) {
         if (diag <= 4.0 * wireRadius) continue;
         GProp_GProps fp;
         BRepGProp::SurfaceProperties(fe.Current(), fp);
-        if (fp.Mass() < 0.2 * wireRadius * diag) return true;
+        if (fp.Mass() < 0.2 * wireRadius * narrowestFaceRatio * diag) return true;
     }
     return false;
 }

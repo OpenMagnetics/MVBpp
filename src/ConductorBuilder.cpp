@@ -2531,8 +2531,23 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, double corne
             // Revolve the section about the corner's bend axis: for round that is a torus segment,
             // for rect a clean annular wedge in the (radial x axial) bend plane (its section axis IS
             // the arc axis -- matching make_toroidal_quarter_swept_rectangle).
+            // A ROUNDED FLAT SECTION WHOSE INNER SIDE LIES ON THE BEND AXIS (ABT #2547). MKF plans a flat wire's
+            // edgewise bend at half its outer width (ABT #1172, #2004; Alf 2026-11-25: MKF stays as it is), so the
+            // coated section of a toroid wrap corner turns about its own inner side. A rounded edge there leaves the
+            // axis tangentially and revolves into a horn, which is no solid (16 invalid pieces of 105 on
+            // realwinding_toroid_rect drawn coated with a 0.15 mm edge radius). The corner piece keeps its two
+            // axis-side corners sharp -- the inner edge turns about the axis, as a sharp wire's does -- and its
+            // outer two rounded; the section is set with that side exactly on the axis. Off the axis (the copper,
+            // which the coating keeps clear of it) every corner is rounded: a ring torus, a solid like any other.
+            // The width runs along tangent x axis = the arc's radius vector (rectProfileWire), so the axis side is
+            // the MINUS-width side. "On the axis" is judged as toroWrapBendFits judges the bend itself.
+            const bool innerSideOnAxis = !round && corner > 0.0 && std::abs(r - 0.5 * w) <= 0.5 * w * 1e-9;
             TopoDS_Face face =
-                BRepBuilderAPI_MakeFace(profile(start, gp_Dir(tan), gp_Dir(pr.arc.axis))).Face();
+                innerSideOnAxis
+                    ? BRepBuilderAPI_MakeFace(rectProfileWire(gp_Pnt(pr.arc.c.XYZ() + pr.arc.v0 / r * (0.5 * w)), gp_Dir(tan),
+                                                              gp_Dir(pr.arc.axis), w, h, corner, SharpSide::MinusWidth))
+                          .Face()
+                    : BRepBuilderAPI_MakeFace(profile(start, gp_Dir(tan), gp_Dir(pr.arc.axis))).Face();
             gp_Dir revDir = pr.arc.sweep > 0 ? gp_Dir(pr.arc.axis) : gp_Dir(pr.arc.axis).Reversed();
             return BRepPrimAPI_MakeRevol(face, gp_Ax1(pr.arc.c, revDir), std::abs(pr.arc.sweep))
                 .Shape();
@@ -3133,6 +3148,8 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
     // 98%-of-the-copper loss sailed through into the mesher and the FEM solver, where it looked
     // like a solver bug (no azimuthal current, |I_net| ~ 3e-7 A). Never accept a union on topology
     // alone; measure the copper. (ABT #332)
+    // The sheet guard's floor follows the section the wire really has (a rounded flat wire's narrow side flat).
+    const double ownFaceRatio = round ? 1.0 : rectNarrowestFaceRatio(path.wireWidth, path.wireHeight, path.wireCornerRadius);
     auto acceptFused = [&](TopoDS_Shape fused, const char* how, bool* collapsed = nullptr) -> TopoDS_Shape {
         if (fused.IsNull()) return TopoDS_Shape();
         int nsol = 0, fusedFaces = 0;
@@ -3156,7 +3173,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         // detector already guards fuseAllSolids and the single-body sweep; the rect-column union
         // was the one path without it, so a slivered result was accepted and shipped downstream.
         // Rejecting here lets the PAIRWISE strategy (or the compound) be tried instead.
-        const bool okSliver = !hasDegenerateSheetFace(fused, path.wireRadius);
+        const bool okSliver = !hasDegenerateSheetFace(fused, path.wireRadius, ownFaceRatio);
         // SELF-INTERSECTION CHECK -- the missing acceptance criterion. BRepCheck_Analyzer tests
         // topological validity (closed shells, orientation, tolerances) and says nothing about
         // whether the body's own faces PASS THROUGH each other. A union of ~56 nearly-tangent
@@ -3678,7 +3695,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
                         int nsol = 0;
                         for (TopExp_Explorer e(f.Shape(), TopAbs_SOLID); e.More(); e.Next()) ++nsol;
                         if (nsol == 1 && gp.Mass() > 0.90 * expect &&
-                            !hasDegenerateSheetFace(f.Shape(), path.wireRadius) &&
+                            !hasDegenerateSheetFace(f.Shape(), path.wireRadius, ownFaceRatio) &&
                             BRepCheck_Analyzer(f.Shape()).IsValid()) {
                             BRep_Builder bb; TopoDS_Compound comp; bb.MakeCompound(comp);
                             bb.Add(comp, f.Shape());

@@ -38,6 +38,7 @@
 
 #include <vector>
 #include <cmath>
+#include <numbers>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -406,4 +407,98 @@ TEST_CASE("A planar board with a pcb is cut out at its coreCutoutClearance, else
         CHECK_THROWS_WITH(builder.buildAllNamed(magnetic, /*includeBobbin=*/false),
                           Catch::Matchers::ContainsSubstring("copper would hang off the board"));
     }
+}
+
+// ABT #2547: a rectangular wire's section has its MAS edgeRadius corners (an IEC 60317 wire is
+// rounded with about half its thickness, its conductingArea W t - (4 - pi) r^2). The idealised
+// turns drew a sharp W x t rectangle, so a 2-D section of them (OMFEM's winding-loss reference)
+// carried 4-10 % too much copper and square ends where the skin current crowds.
+namespace {
+
+MAS::Wire make_rectangular_wire(double width, double height, std::optional<double> edgeRadius, const std::string& name,
+                                double coatingPerSide = 0.0) {
+    MAS::Wire wire;
+    wire.set_type(MAS::WireType::RECTANGULAR);
+    wire.set_conducting_width(nominal_dim(width));
+    wire.set_conducting_height(nominal_dim(height));
+    wire.set_outer_width(nominal_dim(width + 2 * coatingPerSide));
+    wire.set_outer_height(nominal_dim(height + 2 * coatingPerSide));
+    if (edgeRadius) {
+        wire.set_edge_radius(nominal_dim(*edgeRadius));
+    }
+    wire.set_name(std::optional<std::string>(name));
+    return wire;
+}
+
+MAS::Magnetic make_magnetic_on_column(const MAS::Wire& wire, MAS::ColumnShape shape) {
+    auto magnetic = make_magnetic(wire);
+    auto coil = magnetic.get_coil().value();
+    auto bobbin = std::get<MAS::Bobbin>(coil.get_bobbin());
+    auto processed = bobbin.get_processed_description().value();
+    processed.set_column_shape(shape);
+    if (shape != MAS::ColumnShape::OBLONG) {
+        processed.set_column_depth(HALF_COL_WIDTH);
+    }
+    bobbin.set_processed_description(processed);
+    coil.set_bobbin(MAS::BobbinDataOrNameUnion(bobbin));
+    magnetic.set_coil(coil);
+    return magnetic;
+}
+
+double turn_volume(const MAS::Magnetic& magnetic, bool paintCoating = false) {
+    mvb::MagneticBuilder builder;
+    auto turns = builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value(), /*wirePolygonSegments=*/0, paintCoating);
+    REQUIRE(turns.size() == 1);
+    REQUIRE(!turns[0].shape.IsNull());
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(turns[0].shape, props);
+    return props.Mass();
+}
+
+}  // namespace
+
+TEST_CASE("Rectangular wire turns carry the wire's rounded edges", "[3d][turn][rectangular][edge-radius]") {
+    const double width = 0.0010;
+    const double thickness = 0.0004;
+    for (const double radius : {0.0001, 0.0002}) {  // rounded corners; a stadium (t / 2)
+        for (const auto shape : {MAS::ColumnShape::ROUND, MAS::ColumnShape::RECTANGULAR, MAS::ColumnShape::OBLONG}) {
+            DYNAMIC_SECTION("radius " << radius * 1e3 << " mm, column " << static_cast<int>(shape)) {
+                // The same turn with and without the edges: the path is the same, so the volumes are
+                // in the ratio of the sections (Pappus for the bends, the profile being symmetric).
+                const double rounded = turn_volume(make_magnetic_on_column(make_rectangular_wire(width, thickness, radius, "rounded"), shape));
+                const double sharp = turn_volume(make_magnetic_on_column(make_rectangular_wire(width, thickness, std::nullopt, "sharp"), shape));
+                const double sectionRatio = (width * thickness - (4 - std::numbers::pi) * radius * radius) / (width * thickness);
+                INFO("rounded " << rounded << " m^3, sharp " << sharp << " m^3, section ratio " << sectionRatio);
+                CHECK_THAT(rounded / sharp, WithinAbs(sectionRatio, 1e-6));
+            }
+        }
+    }
+}
+
+TEST_CASE("A coated rectangular wire's outline is rounded by its edge radius plus the coating", "[3d][turn][rectangular][edge-radius]") {
+    // paintCoating draws the coated envelope: the copper's outline offset by the coating on every
+    // side, so its corners are r + c round (W' t' - (4 - pi) (r + c)^2, W' = W + 2c, t' = t + 2c).
+    const double width = 0.0010, thickness = 0.0004, radius = 0.0001, coating = 0.00004;
+    const double rounded = turn_volume(make_magnetic_on_column(make_rectangular_wire(width, thickness, radius, "rounded", coating), MAS::ColumnShape::ROUND), true);
+    const double sharp = turn_volume(make_magnetic_on_column(make_rectangular_wire(width, thickness, std::nullopt, "sharp", coating), MAS::ColumnShape::ROUND), true);
+    const double outerWidth = width + 2 * coating, outerThickness = thickness + 2 * coating;
+    const double sectionRatio = (outerWidth * outerThickness - (4 - std::numbers::pi) * (radius + coating) * (radius + coating)) / (outerWidth * outerThickness);
+    INFO("rounded " << rounded << " m^3, sharp " << sharp << " m^3, section ratio " << sectionRatio);
+    CHECK_THAT(rounded / sharp, WithinAbs(sectionRatio, 1e-6));
+}
+
+TEST_CASE("A rectangular wire's edge radius above half its thickness throws", "[3d][turn][rectangular][edge-radius]") {
+    auto magnetic = make_magnetic_on_column(make_rectangular_wire(0.0010, 0.0004, 0.00021, "too round"), MAS::ColumnShape::ROUND);
+    mvb::MagneticBuilder builder;
+    CHECK_THROWS_AS(builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value(), 0), std::invalid_argument);
+    CHECK_THROWS_WITH(builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value(), 0),
+                      Catch::Matchers::ContainsSubstring("too round"));  // it names the wire
+}
+
+TEST_CASE("A rectangular wire whose outer thickness is under its conducting one throws", "[3d][turn][rectangular][edge-radius]") {
+    auto wire = make_rectangular_wire(0.0010, 0.0004, 0.0001, "inside out");
+    wire.set_outer_height(nominal_dim(0.00039));
+    auto magnetic = make_magnetic_on_column(wire, MAS::ColumnShape::ROUND);
+    mvb::MagneticBuilder builder;
+    CHECK_THROWS_AS(builder.buildTurnsNamed(magnetic.get_coil().value(), magnetic.get_core().value(), 0, /*paintCoating=*/true), std::invalid_argument);
 }
