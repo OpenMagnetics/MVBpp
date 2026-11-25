@@ -3175,14 +3175,18 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         // "overlapping facets on surface N surface N" downstream -- and note the e138 failure does
         // NOT trip it, which is itself the useful finding: that body is geometrically sound and the
         // fault is in DISCRETISING a seam remnant far thinner than the element size.
-        bool okSelfInt = true;
-        try {
-            BRepAlgoAPI_Check chk(fused, /*bRunParallel=*/Standard_False,
-                                  /*bTestSelfInt=*/Standard_True);
-            okSelfInt = chk.IsValid();
-        } catch (const Standard_Failure&) {
-            okSelfInt = false;   // the checker itself failing is not a pass
-        }
+        // It decides nothing, so it runs only where it is printed: with the rejection, under the
+        // diagnostic switch. Run on every candidate it was the largest single cost of a flat-wire
+        // weld (44 of 74 stack samples on a 47-turn toroid with rounded section corners).
+        auto selfInterferenceFree = [&]() {
+            try {
+                BRepAlgoAPI_Check chk(fused, /*bRunParallel=*/Standard_False,
+                                      /*bTestSelfInt=*/Standard_True);
+                return static_cast<bool>(chk.IsValid());
+            } catch (const Standard_Failure&) {
+                return false;   // the checker itself failing is not a pass
+            }
+        };
         bool valid = BRepCheck_Analyzer(fused).IsValid();
         // The fuse of the analytic per-primitive solids routinely lands ONE solid that BRepCheck
         // rejects over small tolerance/seam defects at the junctions. That is a REPAIRABLE shape,
@@ -3285,7 +3289,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         if (diag) std::cerr << "[rect-column] fuse REJECTED (" << how << "): nsol=" << nsol
                             << " notCollapsed=" << notCollapsed << " okVol=" << okVol
                             << " (v=" << v * 1e9 << "mm3 exp=" << expectedVol * 1e9 << "mm3)"
-                            << " okSliver=" << okSliver << " okSelfInt=" << okSelfInt
+                            << " okSliver=" << okSliver << " okSelfInt=" << selfInterferenceFree()
                             << " valid=" << valid << " round=" << round << " faces=" << fusedFaces
                             << "/" << compoundFaces
                             << (valid ? std::string() : "  BRepCheck:" + checkReport(fused)) << "\n";
