@@ -9135,6 +9135,20 @@ double toroWrapDepth(const ToroCross& c0, const ToroCross& c1, double /*bend*/) 
     return std::max(c0.tube, c1.tube);
 }
 
+// WHETHER A TOROID WRAP'S CORNERS CAN BE BENT AT MKF'S RADIUS (ABT #2274; flat wire: Alf, 2026-11-25, the T 48/28/16
+// wound with Rectangular 4x1.06 drawn as straight slabs with square corners). A wrap corner turns about the azimuthal
+// direction, so what the bend must clear is the section's reach in the poloidal plane, measured from the centreline:
+//   - a round wire's radius, and strictly more than it: at the radius itself the tube touches its own axis of
+//     revolution (a horn torus), which is no solid;
+//   - a flat wire's half WIDTH (the width is laid radially), and that itself is enough: the inner edge then turns about
+//     a point and the corner is a sector of a disc, a solid like any other. path.wireRadius is a flat wire's half
+//     DIAGONAL: it is no dimension of the bend, and judging by it refused MKF's own radius (half the outer width) on
+//     every flat wire, in the drawing and in the part alike.
+bool toroWrapBendFits(const ConductorPath& path, double bend) {
+    if (path.isRectangular) return bend >= 0.5 * path.wireWidth * (1.0 - 1e-9);
+    return bend > path.wireRadius;
+}
+
 void appendToroWrap(ConductorPath& path, const ToroCross& c0, const ToroCross& c1,
                     double bend, double bottomExtraDepth, const std::string& label,
                     size_t ordinal, bool mitreCorners,
@@ -9588,9 +9602,10 @@ void appendToroTransitionBand(ConductorPath& path, const ToroCross& c0, const To
         pushSeg(P(c1.pin, -rhbM), P(c1.pin, 0), "inner tube up to crossing");
         return;
     }
-    if (!(bend > path.wireRadius))
+    if (!toroWrapBendFits(path, bend))
         throw std::logic_error("appendToroTransitionBand: " + label + " has MKF's bend " + std::to_string(bend) +
-                               " m, not above its wire radius " + std::to_string(path.wireRadius) + " m");
+                               " m, which its section does not clear (" +
+                               std::to_string(path.isRectangular ? 0.5 * path.wireWidth : path.wireRadius) + " m)");
     const double bf = bend;
 
     // ---- source turn's top half (identical to a normal wrap's) ----
@@ -17659,11 +17674,12 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                 // MVB++'s own. One not above the wire radius cannot be swept round: the wraps are mitred
                 // (sharp) and reported.
                 const double toroBend = opts.effectiveBend(wireBendOf(ct.winding));
-                const bool toroBendSharp = !(toroBend > wireRadius);
+                const bool toroBendSharp = !toroWrapBendFits(path, toroBend);
                 if (toroBendSharp && i == 0)
                     std::cerr << "[ConductorBuilder] FINDING: MKF's wire bend for " << path.name << " is " << toroBend
-                              << " m, not above its wire radius " << wireRadius << " m; its toroid wrap corners are drawn "
-                              << "sharp (mitre)\n";
+                              << " m, which its section does not clear ("
+                              << (path.isRectangular ? 0.5 * path.wireWidth : wireRadius)
+                              << " m from the centreline in the bend's plane); its toroid wrap corners are drawn sharp (mitre)\n";
                 if (toroBendSharp && i == 0 && std::getenv("MVB_CORNER_LIST"))
                     std::fprintf(stderr, "[corner-list]\ttoroid-wrap\t%s\tall wraps\t-\t%.6f\t-\t%.6f\t-\n",
                                  path.name.c_str(), toroBend * 1e3, wireRadius * 1e3);

@@ -356,6 +356,55 @@ async function main() {
                'real-winding turns are byte-identical to the idealised ones');
     });
 
+    // ABT #2489: a whole 3D STL at the outer diameter is only looked at, so its real winding is triangulated
+    // straight from the wire's path: one closed skin per conductor. The same drawing at another scale works on the
+    // CAD solids, one closed skin per piece of wire. Both are drawings of one wire and enclose the same copper.
+    test('a real-winding 3D STL is one closed skin drawn from the path, with the copper of the solids', () => {
+        const skinOf = (u8, scale) => {
+            const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+            const triangles = view.getUint32(80, true);
+            const ids = new Map(), uses = new Map(), firstOn = new Map(), skin = [];
+            const skinOfTriangle = t => { while (skin[t] !== t) { skin[t] = skin[skin[t]]; t = skin[t]; } return t; };
+            let sixVolumes = 0.0;
+            for (let t = 0; t < triangles; ++t) {
+                const p = [], id = [];
+                for (let k = 0; k < 9; ++k) p.push(view.getFloat32(84 + 50 * t + 12 + 4 * k, true) / scale);
+                for (let v = 0; v < 3; ++v) {
+                    const key = [0, 1, 2].map(a => Math.round(p[3 * v + a] * 1e4)).join(',');   // welded at 0.1 um
+                    if (!ids.has(key)) ids.set(key, ids.size);
+                    id.push(ids.get(key));
+                }
+                sixVolumes += p[0] * (p[4] * p[8] - p[5] * p[7]) - p[1] * (p[3] * p[8] - p[5] * p[6])
+                            + p[2] * (p[3] * p[7] - p[4] * p[6]);
+                skin.push(-1);
+                if (id[0] === id[1] || id[1] === id[2] || id[0] === id[2]) continue;
+                skin[t] = t;
+                for (let v = 0; v < 3; ++v) {
+                    const a = id[v], b = id[(v + 1) % 3], edge = a < b ? a + ':' + b : b + ':' + a;
+                    uses.set(edge, (uses.get(edge) || 0) + 1);
+                    // Triangles that share an edge belong to one skin.
+                    if (firstOn.has(edge)) skin[skinOfTriangle(t)] = skinOfTriangle(firstOn.get(edge));
+                    else firstOn.set(edge, t);
+                }
+            }
+            let open = 0, crowded = 0, skins = 0;
+            for (const n of uses.values()) { if (n === 1) ++open; if (n > 2) ++crowded; }
+            for (let t = 0; t < triangles; ++t) if (skin[t] === t) ++skins;
+            return { triangles, volume: sixVolumes / 6.0, open, crowded, skins };
+        };
+        const picture = skinOf(rawDrawTurns(etdJson, '3D', 'XY', 0.0, 'stl', 1.0, 0, 'none', '', true, true, undefined), 1.0);   // exactly the 3D view's call
+        const solids  = skinOf(rawDrawTurns(etdJson, '3D', 'XY', 0.0, 'stl', 2.0, 0, 'none', '', true, true, undefined), 2.0);
+        assert(picture.triangles > 1000, `the picture has ${picture.triangles} triangles`);
+        assert(picture.open === 0 && picture.crowded === 0,
+            `the picture is not one closed skin: ${picture.open} open edges, ${picture.crowded} shared by more than two triangles`);
+        const conductors = JSON.parse(etdJson).coil.functionalDescription.reduce((n, w) => n + w.numberParallels, 0);
+        assert(picture.skins === conductors, `the picture has ${picture.skins} skins for ${conductors} conductors`);
+        assert(solids.open === 0 && solids.skins > picture.skins,
+            `the scaled drawing was expected to be the CAD solids, one closed skin per piece: ${solids.skins} skins, ${solids.open} open edges`);
+        assert(Math.abs(picture.volume - solids.volume) < 0.05 * solids.volume,
+            `the picture encloses ${picture.volume} mm3, the solids ${solids.volume} mm3`);
+    });
+
     test('drawTurns real winding refuses a bare turns array instead of silently idealising', () => {
         const enriched = mvbpp._enrichMagnetic(basicJson);
         const turnsJson = JSON.stringify(JSON.parse(enriched).coil.turnsDescription);

@@ -1953,6 +1953,38 @@ TEST_CASE("Real winding: a foil terminal is MKF's axial lead, welded to its shee
     CHECK(caps == 16);
 }
 
+// Alf, 2026-11-25 (a T 48/28/16 wound edge-on with Rectangular 4x1.06, real winding): "wrong corners" -- every turn
+// was straight slabs with square corners. A toroid wrap's corner is bent at MKF's radius when the wire's section clears
+// it; that was judged by the conductor's "radius", which for a flat wire is its half DIAGONAL, while MKF's bend for a
+// flat wire is half its outer width. So no flat wire ever passed, and every corner of every turn was mitred sharp, in
+// the drawing and in the part. What the bend has to clear is the section's half width in the bend's plane.
+TEST_CASE("Real winding: a flat wire's toroid wraps turn their corners at MKF's bend radius", "[realwinding][toroid][flatwire]") {
+    auto magneticJson = loadFixture("realwinding_toroid_rect.json");
+    const size_t turns = magneticJson.at("coil").at("functionalDescription").at(0).at("numberTurns").get<size_t>();
+    REQUIRE(turns > 3);
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    // The 3D view's drawing: the conductor is the tube along its path, one triangulated face per piece of the path, so
+    // the faces count the pieces. A wrap is the bore, the top face, the rim and the bottom face (two bore pieces: the
+    // crossing splits it), and between them its four corners.
+    builder.setDisplayTriangles(true);
+    const auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                             /*wirePolygonSegments=*/0, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                             /*paintCoating=*/true, /*emitCoatingShells=*/false,
+                                             /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                             /*useRealWindingGeometry=*/true, /*femReady=*/false);
+    size_t conductors = 0;
+    for (const auto& ns : named) {
+        if (ns.role != mvb::Role::Turn) continue;
+        ++conductors;
+        size_t pieces = 0;
+        for (TopExp_Explorer ex(ns.shape, TopAbs_FACE); ex.More(); ex.Next()) ++pieces;
+        INFO(ns.name << ": " << pieces << " pieces of path for " << turns << " turns");
+        CHECK(pieces >= 9 * (turns - 1));   // five straights and four corners a wrap; mitred sharp it was five
+    }
+    CHECK(conductors == 1);
+}
+
 // ABT #2564 (a user, 2026-11-25: "the engine doesn't label what solids are windings"). The builder names every piece
 // of a conductor after the stretch of the route it draws, and the STEP export writes each piece as its own product
 // under the conductor's. A toroid's conductor arrives as a compound of compounds, the export named only the direct
