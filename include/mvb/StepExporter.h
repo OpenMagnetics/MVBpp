@@ -64,9 +64,13 @@ bool exportSTL(const TopoDS_Shape& compound,
 //                     current units — pass e.g. 0.1 for mm-scaled geometry)
 // angularTolerance  : angular deflection for meshing (radians)
 // binary            : if true, produces binary STL; otherwise ASCII.
+// The turning angle one facet of a drawing spans [rad]: the tessellator's angular deflection, and the step a display
+// tube (mvb::displayTube) is drawn with, so that both halves of a picture are as fine.
+inline constexpr double kDrawingAngularStep = 0.2;
+
 std::string exportSTLToBytes(const std::vector<TopoDS_Shape>& shapes,
                              double toleranceMm      = 0.1,
-                             double angularTolerance = 0.2,
+                             double angularTolerance = kDrawingAngularStep,
                              bool binary             = true);
 
 // Read a STEP file written with XCAF labels back into a vector of named

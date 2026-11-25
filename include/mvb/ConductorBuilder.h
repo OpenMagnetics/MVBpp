@@ -135,6 +135,11 @@ public:
         // MKF lays turns at a pitch of one OD. At the conducting footprint the enamel that
         // pitch reserves becomes real air between the solids.
         bool paintCoating = false;
+        // A display drawing (paintCoating) asked for AS TRIANGLES (ABT #2489): every round or rectangular conductor
+        // is then a tube triangulated straight from its path (mvb::displayTube) instead of CAD solids. Only for an
+        // output that is triangles and is neither cut, meshed nor written as a part (the web's 3D view): the shapes
+        // carry no surfaces. Foil keeps its solids.
+        bool displayTriangles = false;
         // ONE corner style for every corner of a terminal lead (Alf, 2026-10-28: "make them all either
         // round or rectangular ... a setting that we can configure"): the joints of the lead polyline
         // (lead/connection segments) AND the terminal corner where the lead leaves its turn (the

@@ -125,6 +125,16 @@ void apply_scale(std::vector<mvb::NamedShape>& named, double scale) {
     }
 }
 
+// Whether a drawing is delivered as TRIANGLES THAT ARE ONLY LOOKED AT (ABT #2489): a whole 3D STL at its own scale, the
+// 3D view's picture. Its real-winding conductors, drawn at the outer diameter, are then triangulated straight from
+// their path (MagneticBuilder::setDisplayTriangles) instead of built as CAD solids. A STEP, a 2D section, a symmetry cut
+// and a scaled drawing all work on solids and keep them.
+bool onlyLookedAt(const std::string& mode, const std::string& format, double scale, const std::string& symmetry) {
+    std::string fmt = format;
+    std::transform(fmt.begin(), fmt.end(), fmt.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return upper(mode) == "3D" && fmt == "stl" && scale == 1.0 && mvb::parse_symmetry_spec(symmetry) == 0;
+}
+
 std::string slurp_file(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
     if (!f) throw std::runtime_error("mvbpp: failed to read " + p.string());
@@ -488,9 +498,10 @@ double now_ms() {
 
 std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygonSegments,
                                          bool paintCoating, bool useRealWindingGeometry = false,
-                                         bool femReady = false) {
+                                         bool femReady = false, bool trianglesOnly = false) {
     auto j = json::parse(json_str);
     mvb::MagneticBuilder b;
+    b.setDisplayTriangles(trianglesOnly && useRealWindingGeometry && paintCoating && !femReady);
     if (g_weldMode) b.setWeldMode(*g_weldMode);
     if (g_roundedLeadCorners) b.setRoundedLeadCorners(*g_roundedLeadCorners);
     if (useRealWindingGeometry) {
@@ -586,7 +597,7 @@ static int adaptive_wire_segments(int requested, std::size_t numTurns) {
 
 std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int polygonSegments,
                                             bool paintCoating, bool useRealWindingGeometry,
-                                            bool femReady = false) {
+                                            bool femReady = false, bool trianglesOnly = false) {
     auto j = json::parse(json_str);
     // Accept EITHER a bare `magnetic` object or a full MAS file that nests one, exactly as
     // tools/mvbpp_step_generator does. Without this, handing a full MAS file (masVersion/inputs/
@@ -602,6 +613,7 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
     mvb::MagneticBuilder b;
     if (g_weldMode) b.setWeldMode(*g_weldMode);
     if (g_roundedLeadCorners) b.setRoundedLeadCorners(*g_roundedLeadCorners);
+    b.setDisplayTriangles(trianglesOnly && useRealWindingGeometry && paintCoating && !femReady);
     // useRealWindingGeometry: replace the per-turn closed loops with ONE continuous copper body per
     // (winding, parallel). MKF must (re)wind, so re-enrich through the real-winding autocomplete.
     // Drawing (femReady false): the conductor cross-section stays an exact circle; polygonSegments
@@ -847,7 +859,7 @@ val _drawTurns(const std::string& json_str,
                val femReady) {
     auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating),
                              resolveUseRealWinding(useRealWindingGeometry),
-                             resolveFemReady(femReady));
+                             resolveFemReady(femReady), onlyLookedAt(mode, format, scale, symmetry));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     return makeUint8Array(data);
@@ -868,7 +880,7 @@ std::string _drawTurnsToPath(const std::string& json_str,
                              val femReady) {
     auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating),
                              resolveUseRealWinding(useRealWindingGeometry),
-                             resolveFemReady(femReady));
+                             resolveFemReady(femReady), onlyLookedAt(mode, format, scale, symmetry));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     write_bytes(path, data);
@@ -997,7 +1009,7 @@ val _drawMagnetic(const std::string& json_str,
                   val femReady) {
     auto named = build_magnetic(json_str, polygonSegments, resolvePaintCoating(paintCoating),
                                 resolveUseRealWinding(useRealWindingGeometry),
-                                resolveFemReady(femReady));
+                                resolveFemReady(femReady), onlyLookedAt(mode, format, scale, symmetry));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     return makeUint8Array(data);
@@ -1018,7 +1030,7 @@ std::string _drawMagneticToPath(const std::string& json_str,
                                 val femReady) {
     auto named = build_magnetic(json_str, polygonSegments, resolvePaintCoating(paintCoating),
                                 resolveUseRealWinding(useRealWindingGeometry),
-                                resolveFemReady(femReady));
+                                resolveFemReady(femReady), onlyLookedAt(mode, format, scale, symmetry));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     write_bytes(path, data);

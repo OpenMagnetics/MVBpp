@@ -1,5 +1,6 @@
 #include "mvb/ConductorBuilder.h"
 #include "mvb/WireAssembler.h"   // ABT #685: the centreline vocabulary + THE assembler
+#include "mvb/DisplayTube.h"
 #include "mvb/PortPlane.h"      // ABT #1400: the port-plane rule shared with OMFEM
 #include <mvb/TerminalFillet.h>
 #include "mvb/TurnBuilder.h"
@@ -2621,6 +2622,178 @@ TopoDS_Shape rectPrimSolid(const Primitive& pr, double w, double h, double corne
     }
 }
 
+// THE ELBOWS OF A TERMINAL LEAD, ONE DEFINITION for the solids and for the display tube (ABT #2274, #2489). A lead's
+// own bend is two isLead SEGs with no elbow between them: where MKF's lead radius fits the two legs, both are trimmed
+// back by R tan(angle / 2) and an ARC3 of radius R is planned between them; where it does not, the corner stays sharp
+// and is reported. `accept(elbow, bendAxis, R, trim)` is asked for every elbow that fits and may still turn it down
+// (the solid path does when the kernel builds no solid for it); only an accepted elbow trims its legs.
+struct RectLeadElbows {
+    std::vector<double> trimStart, trimEnd;   // per path piece: what its elbows take off each end [m]
+    std::vector<gp_Dir> axisAfter, axisBefore;   // per path piece: the bend axis of the elbow after / before it
+    std::vector<bool> hasAxisAfter, hasAxisBefore;
+    // A deque, not a vector: the solid path stores raw `const Primitive*` to these.
+    std::deque<Primitive> prims;   // the elbows, in path order
+    std::vector<gp_Dir> axis;      // the bend axis each elbow turns about
+    std::vector<size_t> after;     // the path piece each elbow follows
+};
+template <class Accept>
+RectLeadElbows planRectLeadElbows(const ConductorPath& path, Accept&& accept) {
+    RectLeadElbows plan;
+    plan.trimStart.assign(path.prims.size(), 0.0);
+    plan.trimEnd.assign(path.prims.size(), 0.0);
+    plan.axisAfter.assign(path.prims.size(), gp_Dir(0, 1, 0));
+    plan.axisBefore.assign(path.prims.size(), gp_Dir(0, 1, 0));
+    plan.hasAxisAfter.assign(path.prims.size(), false);
+    plan.hasAxisBefore.assign(path.prims.size(), false);
+    const double sampR = std::min(path.wireWidth, path.wireHeight) / 2.0;
+    auto entryDir = [&](const Primitive& p) {
+        auto pts = samplePrim(p, sampR);
+        return pts.size() >= 2 && (pts[1].XYZ() - pts[0].XYZ()).Modulus() > 1e-12
+                   ? gp_Dir(pts[1].XYZ() - pts[0].XYZ()) : gp_Dir(1, 0, 0);
+    };
+    auto exitDir = [&](const Primitive& p) {
+        auto pts = samplePrim(p, sampR);
+        size_t n = pts.size();
+        return n >= 2 && (pts[n - 1].XYZ() - pts[n - 2].XYZ()).Modulus() > 1e-12
+                   ? gp_Dir(pts[n - 1].XYZ() - pts[n - 2].XYZ()) : gp_Dir(1, 0, 0);
+    };
+    auto segLen = [](const Primitive& p) {
+        return p.kind == Primitive::SEG ? p.seg.a.Distance(p.seg.b) : 0.0;
+    };
+    for (size_t i = 0; i + 1 < path.prims.size(); ++i) {
+        const Primitive& A = path.prims[i];
+        const Primitive& B = path.prims[i + 1];
+        if (!(A.isLead && B.isLead)) continue;
+        gp_Dir dA = exitDir(A), dB = entryDir(B);
+        double ang = dA.Angle(dB);
+        if (ang < 0.05) continue;
+        gp_XYZ bendAxis = dA.XYZ().Crossed(dB.XYZ());
+        if (bendAxis.Modulus() < 1e-12) continue;
+        bendAxis.Normalize();
+        // ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"): a corner the lead was left sharp at is bent here
+        // at MKF's lead radius where its tangent fits the legs' space (the leg behind minus the previous elbow's trim,
+        // the whole leg ahead), else it stays sharp and is reported. No radius of MVB++'s own, no leg share.
+        if (!path.leadBendRadius) continue;
+        const double R = *path.leadBendRadius;
+        const double trim = R * std::tan(ang / 2.0);
+        if (trim > segLen(A) - plan.trimStart[i] || trim > segLen(B)) {
+            std::cerr << "[ConductorBuilder] FINDING: rect lead corner '" << A.label << " -> " << B.label << "' of "
+                      << path.name << " cannot hold MKF's bend of " << R << " m: its tangent length " << trim
+                      << " m against legs " << segLen(A) - plan.trimStart[i] << " and " << segLen(B)
+                      << " m left; it is drawn sharp\n";
+            if (std::getenv("MVB_CORNER_LIST")) {
+                const gp_Pnt at = primEndpoints(A).second;
+                std::fprintf(stderr, "[corner-list]\trect-lead\t%s\t%s\t%.6f,%.6f,%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n",
+                             path.name.c_str(), (A.label + " -> " + B.label).c_str(), at.X() * 1e3, at.Y() * 1e3,
+                             at.Z() * 1e3, R * 1e3, trim * 1e3, (segLen(A) - plan.trimStart[i]) * 1e3, segLen(B) * 1e3);
+            }
+            continue;
+        }
+        gp_Pnt P = primEndpoints(A).second;
+        gp_XYZ Ap = P.XYZ() - dA.XYZ() * trim;
+        gp_XYZ nA = dB.XYZ() - dA.XYZ() * dB.XYZ().Dot(dA.XYZ());  // dB perp to dA -> toward centre
+        if (nA.Modulus() < 1e-12) continue;
+        nA.Normalize();
+        Primitive elbow;
+        elbow.kind = Primitive::ARC3;
+        elbow.arc.c = gp_Pnt(Ap + nA * R);
+        elbow.arc.axis = bendAxis;
+        elbow.arc.v0 = Ap - (Ap + nA * R);  // centre -> Ap, magnitude R
+        elbow.arc.sweep = ang;
+        gp_XYZ Bp = P.XYZ() + dB.XYZ() * trim;
+        if (primEndpoints(elbow).second.Distance(gp_Pnt(Bp)) > 1e-6)
+            elbow.arc.axis = bendAxis * -1.0;
+        // It sits BETWEEN two lead segments, so it is lead copper: the wrap-only fuse strategy
+        // sorts pieces by this flag and, having no primitive for the elbows, used to drop them
+        // from the emitted compound altogether (ABT #373). The label is what MVB_RECT_TRACE and
+        // the "rectPrimSolid failed" refusal print, so give it a real one.
+        elbow.isLead = true;
+        elbow.turnOrdinal = A.turnOrdinal;
+        elbow.label = A.label + " -> " + B.label + " elbow";
+        if (!accept(elbow, bendAxis, R, trim)) continue;
+        plan.after.push_back(i);
+        plan.prims.push_back(elbow);
+        plan.axis.push_back(gp_Dir(bendAxis));
+        plan.trimEnd[i] = trim;
+        plan.trimStart[i + 1] = trim;
+        plan.axisAfter[i] = gp_Dir(elbow.arc.axis);
+        plan.hasAxisAfter[i] = true;
+        plan.axisBefore[i + 1] = gp_Dir(elbow.arc.axis);
+        plan.hasAxisBefore[i + 1] = true;
+    }
+    return plan;
+}
+
+// THE PIECES OF A CONDUCTOR AS ITS DISPLAY TUBE DRAWS THEM (ABT #2489): the path the solids are built from, with the
+// section laid as the solids lay it. A round section needs no orientation. A rectangular one keeps its height on the
+// column axis where the conductor is swept whole (a round column), and where it is built piece by piece (emitRectColumn)
+// follows that function's rule: a corner turns about its own bend axis, a straight meets each neighbouring corner on
+// that corner's axis, and a lead's own bends are the elbows of planRectLeadElbows.
+std::vector<TubePiece> displayPiecesOf(const ConductorPath& path) {
+    std::vector<TubePiece> pieces;
+    pieces.reserve(path.prims.size());
+    if (!path.useRectSolids) {
+        for (const auto& pr : path.prims) {
+            TubePiece piece;
+            piece.prim = pr;
+            piece.oriented = path.isRectangular;   // height along the column axis, the piece's default
+            piece.upright = true;                  // swept whole with the column axis as its fixed binormal
+            pieces.push_back(piece);
+        }
+        return pieces;
+    }
+    const RectLeadElbows plan =
+        planRectLeadElbows(path, [](const Primitive&, const gp_XYZ&, double, double) { return true; });
+    const auto axialFor = [&](const gp_Pnt& c) -> gp_Dir {
+        if (path.toroidal) {
+            gp_XYZ azimuthal(-c.Z(), 0.0, c.X());
+            if (azimuthal.Modulus() > 1e-9) return gp_Dir(azimuthal);
+        }
+        return gp_Dir(0, 1, 0);
+    };
+    const auto alignHemisphere = [](const gp_XYZ& axis, const gp_Dir& ref) {
+        gp_Dir a(axis);
+        return a.Dot(ref) >= 0.0 ? a : gp_Dir(a.Reversed());
+    };
+    size_t nextElbow = 0;
+    for (size_t i = 0; i < path.prims.size(); ++i) {
+        const Primitive& pr = path.prims[i];
+        TubePiece piece;
+        piece.prim = pr;
+        piece.oriented = path.isRectangular;
+        const auto [pa, pb] = primEndpoints(pr);
+        gp_Dir axialA = axialFor(pa), axialB = axialFor(pb);
+        if (pr.kind == Primitive::SEG) {
+            if (i > 0 && path.prims[i - 1].kind == Primitive::ARC3)
+                axialA = alignHemisphere(path.prims[i - 1].arc.axis, axialA);
+            if (i + 1 < path.prims.size() && path.prims[i + 1].kind == Primitive::ARC3)
+                axialB = alignHemisphere(path.prims[i + 1].arc.axis, axialB);
+            if (plan.hasAxisBefore[i]) axialA = alignHemisphere(plan.axisBefore[i].XYZ(), axialA);
+            if (plan.hasAxisAfter[i]) axialB = alignHemisphere(plan.axisAfter[i].XYZ(), axialB);
+            const double length = pa.Distance(pb);
+            if (length > 0.0 && (plan.trimStart[i] > 0.0 || plan.trimEnd[i] > 0.0)) {
+                const gp_XYZ along = (pb.XYZ() - pa.XYZ()) / length;
+                piece.prim.seg.a = gp_Pnt(pa.XYZ() + along * plan.trimStart[i]);
+                piece.prim.seg.b = gp_Pnt(pb.XYZ() - along * plan.trimEnd[i]);
+            }
+        } else if (pr.kind == Primitive::ARC3) {
+            axialA = axialB = alignHemisphere(pr.arc.axis, axialA);
+        }
+        piece.axialStart = axialA.XYZ();
+        piece.axialEnd = axialB.XYZ();
+        pieces.push_back(piece);
+        if (nextElbow < plan.after.size() && plan.after[nextElbow] == i) {
+            TubePiece elbow;
+            elbow.prim = plan.prims[nextElbow];
+            elbow.oriented = path.isRectangular;
+            elbow.axialStart = elbow.axialEnd = plan.axis[nextElbow].XYZ();
+            pieces.push_back(elbow);
+            ++nextElbow;
+        }
+    }
+    return pieces;
+}
+
 // Rect wire on a rect/oblong column: build every primitive as its own rect solid. When the turns
 // are SEPARATED (the conducting/copper footprint), consecutive primitives touch only along the
 // path, so fusing yields one clean spiral solid -- ideal for FEM. When the turns TOUCH (the outer/
@@ -2685,67 +2858,10 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
     // lead prisms back by R*tan(angle/2) and inserting an ARC3 of radius R. Only isLead<->isLead
     // corners qualify, so every winding corner is untouched. rotationAxis[i] carries the elbow's
     // bend axis so the trimmed lead prism aligns its section to it (flush, as the turns do).
-    std::vector<double> trimStart(path.prims.size(), 0.0), trimEnd(path.prims.size(), 0.0);
-    std::vector<gp_Dir> axisAfter(path.prims.size(), gp_Dir(0, 1, 0));
-    std::vector<gp_Dir> axisBefore(path.prims.size(), gp_Dir(0, 1, 0));
-    std::vector<bool> hasAxisAfter(path.prims.size(), false), hasAxisBefore(path.prims.size(), false);
     std::vector<TopoDS_Shape> leadElbows;
-    // An inserted elbow is a PRIMITIVE like any other, and the rebuild strategies below re-emit
-    // every piece from its primitive -- so the elbows need storage to point at (ABT #373).
-    // A deque, not a vector: splitArgs stores raw `const Primitive*`, and a vector would dangle
-    // every pointer already handed out the moment it reallocated.
-    std::deque<Primitive> leadElbowPrims;
-    std::vector<gp_Dir> leadElbowAxis;   // the bend axis each elbow was emitted on
-    for (size_t i = 0; i + 1 < path.prims.size(); ++i) {
-        const Primitive& A = path.prims[i];
-        const Primitive& B = path.prims[i + 1];
-        if (!(A.isLead && B.isLead)) continue;
-        gp_Dir dA = exitDir(A), dB = entryDir(B);
-        double ang = dA.Angle(dB);
-        if (ang < 0.05) continue;
-        gp_XYZ bendAxis = dA.XYZ().Crossed(dB.XYZ());
-        if (bendAxis.Modulus() < 1e-12) continue;
-        bendAxis.Normalize();
-        // ABT #2274 (Alf, 2026-11-13: "use round corners everywhere!"): a corner the lead was left sharp at is bent here
-        // at MKF's lead radius where its tangent fits the legs' space (the leg behind minus the previous elbow's trim,
-        // the whole leg ahead), else it stays sharp and is reported. No radius of MVB++'s own, no leg share.
-        if (!path.leadBendRadius) continue;
-        const double R = *path.leadBendRadius;
-        const double trim = R * std::tan(ang / 2.0);
-        if (trim > segLen(A) - trimStart[i] || trim > segLen(B)) {
-            std::cerr << "[ConductorBuilder] FINDING: rect lead corner '" << A.label << " -> " << B.label << "' of "
-                      << path.name << " cannot hold MKF's bend of " << R << " m: its tangent length " << trim
-                      << " m against legs " << segLen(A) - trimStart[i] << " and " << segLen(B)
-                      << " m left; it is drawn sharp\n";
-            if (std::getenv("MVB_CORNER_LIST")) {
-                const gp_Pnt at = primEndpoints(A).second;
-                std::fprintf(stderr, "[corner-list]\trect-lead\t%s\t%s\t%.6f,%.6f,%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n",
-                             path.name.c_str(), (A.label + " -> " + B.label).c_str(), at.X() * 1e3, at.Y() * 1e3,
-                             at.Z() * 1e3, R * 1e3, trim * 1e3, (segLen(A) - trimStart[i]) * 1e3, segLen(B) * 1e3);
-            }
-            continue;
-        }
-        gp_Pnt P = primEndpoints(A).second;
-        gp_XYZ Ap = P.XYZ() - dA.XYZ() * trim;
-        gp_XYZ nA = dB.XYZ() - dA.XYZ() * dB.XYZ().Dot(dA.XYZ());  // dB perp to dA -> toward centre
-        if (nA.Modulus() < 1e-12) continue;
-        nA.Normalize();
-        Primitive elbow;
-        elbow.kind = Primitive::ARC3;
-        elbow.arc.c = gp_Pnt(Ap + nA * R);
-        elbow.arc.axis = bendAxis;
-        elbow.arc.v0 = Ap - (Ap + nA * R);  // centre -> Ap, magnitude R
-        elbow.arc.sweep = ang;
-        gp_XYZ Bp = P.XYZ() + dB.XYZ() * trim;
-        if (primEndpoints(elbow).second.Distance(gp_Pnt(Bp)) > 1e-6)
-            elbow.arc.axis = bendAxis * -1.0;
-        // It sits BETWEEN two lead segments, so it is lead copper: the wrap-only fuse strategy
-        // sorts pieces by this flag and, having no primitive for the elbows, used to drop them
-        // from the emitted compound altogether (ABT #373). The label is what MVB_RECT_TRACE and
-        // the "rectPrimSolid failed" refusal print, so give it a real one.
-        elbow.isLead = true;
-        elbow.turnOrdinal = A.turnOrdinal;
-        elbow.label = A.label + " -> " + B.label + " elbow";
+    // The plan is shared with the display tube (planRectLeadElbows); here an elbow the kernel builds no solid for is
+    // turned down, so its legs stay whole and the corner sharp.
+    RectLeadElbows planned = planRectLeadElbows(path, [&](const Primitive& elbow, const gp_XYZ& bendAxis, double R, double trim) {
         TopoDS_Shape es = rectPrimSolid(elbow, path.wireWidth, path.wireHeight, path.wireCornerRadius, gp_Dir(bendAxis),
                                         gp_Dir(bendAxis), 0.0, 0.0, round, radius);
         if (es.IsNull()) {
@@ -2754,18 +2870,21 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
             if (std::getenv("MVB_CORNER_LIST"))
                 std::fprintf(stderr, "[corner-list]\trect-lead\t%s\t%s\t-\t%.6f\t%.6f\t-\t-\n", path.name.c_str(),
                              elbow.label.c_str(), R * 1e3, trim * 1e3);
-            continue;
+            return false;
         }
         leadElbows.push_back(es);
-        leadElbowPrims.push_back(elbow);
-        leadElbowAxis.push_back(gp_Dir(bendAxis));
-        trimEnd[i] = trim;
-        trimStart[i + 1] = trim;
-        axisAfter[i] = gp_Dir(elbow.arc.axis);
-        hasAxisAfter[i] = true;
-        axisBefore[i + 1] = gp_Dir(elbow.arc.axis);
-        hasAxisBefore[i + 1] = true;
-    }
+        return true;
+    });
+    std::vector<double>& trimStart = planned.trimStart;
+    std::vector<double>& trimEnd = planned.trimEnd;
+    std::vector<gp_Dir>& axisAfter = planned.axisAfter;
+    std::vector<gp_Dir>& axisBefore = planned.axisBefore;
+    std::vector<bool>& hasAxisAfter = planned.hasAxisAfter;
+    std::vector<bool>& hasAxisBefore = planned.hasAxisBefore;
+    // An inserted elbow is a PRIMITIVE like any other, and the rebuild strategies below re-emit
+    // every piece from its primitive -- so the elbows need storage to point at (ABT #373).
+    std::deque<Primitive>& leadElbowPrims = planned.prims;
+    std::vector<gp_Dir>& leadElbowAxis = planned.axis;   // the bend axis each elbow was emitted on
     std::vector<TopoDS_Shape> solids;
     solids.reserve(path.prims.size());
     // Everything needed to REBUILD each prim with a split profile if the union fails and the
@@ -21021,6 +21140,15 @@ smoothLinksOf(p, pi);
         // reconstructing it afterwards. Empty for the emission paths whose solids are not one
         // per primitive (single-body sweeps, rect fuses) — those keep the centroid match.
         std::vector<size_t> primIndexPerSolid;
+        // A display drawing asked for as triangles (Options::displayTriangles, ABT #2489): the conductor is the tube
+        // that follows its path, triangulated here, and none of the solid assembly below runs. Foil keeps its solids.
+        if (opts.displayTriangles && tlsDisplayOnly && !opts.cutterOnly && !p.isFoil) {
+            const std::vector<gp_XY> outline =
+                p.isRectangular ? rectTubeOutline(p.wireWidth, p.wireHeight, p.wireCornerRadius, kDrawingAngularStep)
+                                : roundTubeOutline(p.wireRadius, kDrawingAngularStep);
+            out.push_back({displayTube(displayPiecesOf(p), outline, kDrawingAngularStep), p.name, {}, Role::Turn});
+            continue;
+        }
         TopoDS_Shape cond =
             emitConductor(p, opts.wirePolygonSegments, &primIndexPerSolid, opts.cutterOnly,
                           weldMode);

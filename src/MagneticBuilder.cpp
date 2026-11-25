@@ -1716,6 +1716,7 @@ ConductorBuilder::Options MagneticBuilder::realWindingConductorOptions(
     copts.femReady = femReady;   // OM drawing -> fast compound; FEM export -> one-piece/conformal
     if (weldMode_) copts.weld = *weldMode_;
     if (roundedLeadCorners_) copts.roundedLeadCorners = *roundedLeadCorners_;
+    copts.displayTriangles = displayTriangles_;
     // Hand the CORE solids to the conductor builder so it can aim the terminal leads at
     // the true window opening (classified from the real geometry -- column metadata
     // under-describes cores like PQ whose plates wrap most of the perimeter; measured on
@@ -1937,6 +1938,7 @@ std::vector<ConductorBuilder::PathPolyline> MagneticBuilder::buildRealWindingPat
     copts.femReady = true;
     copts.paintCoating = false;   // centrelines + copper radius; coating handled by the consumer
     if (roundedLeadCorners_) copts.roundedLeadCorners = *roundedLeadCorners_;
+    copts.displayTriangles = displayTriangles_;
     auto cores = buildCoreNamed(magnetic.get_core(), DEFAULT_CORE_POLYGON_SEGMENTS);
     if (!toroidalCore) {
         for (const auto& ns : cores) copts.coreObstacles.push_back(ns.shape);

@@ -199,6 +199,7 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/ConductorBuilder.cpp
     ${REPO_ROOT}/src/TerminalFillet.cpp
     ${REPO_ROOT}/src/WireAssembler.cpp
+    ${REPO_ROOT}/src/DisplayTube.cpp
     ${REPO_ROOT}/src/BobbinBuilder.cpp
     ${REPO_ROOT}/src/shapes/ShapeBuilder.cpp
     ${REPO_ROOT}/src/shapes/ShapeDrum.cpp

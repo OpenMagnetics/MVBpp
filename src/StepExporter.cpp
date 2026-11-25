@@ -917,7 +917,8 @@ std::string exportSTLToBytes(const std::vector<TopoDS_Shape>& shapes,
     bool any = false;
     for (const auto& s : shapes) {
         if (s.IsNull()) continue;
-        b.Add(compound, BRepBuilderAPI_Transform(s, metresToMillimetres).Shape());
+        // The triangles a shape already carries are scaled with it (a display tube is triangles only, ABT #2489).
+        b.Add(compound, BRepBuilderAPI_Transform(s, metresToMillimetres, Standard_False, Standard_True).Shape());
         any = true;
     }
     if (!any) return {};

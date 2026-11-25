@@ -361,11 +361,17 @@ public:
     // a FINDING. The result may interpenetrate: a picture of the winding, never a part.
     void setDiagnosticSkipCollisionCheck(bool skip) { diagnosticSkipCollisionCheck_ = skip; }
     bool diagnosticSkipCollisionCheck() const { return diagnosticSkipCollisionCheck_; }
+    // Real-winding conductors of a display drawing (paintCoating) as triangles drawn straight from their path
+    // (ConductorBuilder::Options::displayTriangles): for a caller whose output is triangles that are only looked at.
+    // The conductors then carry no solids and no surfaces: they cannot be cut, meshed or written to a STEP file.
+    void setDisplayTriangles(bool triangles) { displayTriangles_ = triangles; }
+    bool displayTriangles() const { return displayTriangles_; }
 
   private:
     std::optional<WeldMode> weldMode_;
     std::optional<bool> roundedLeadCorners_;
     bool diagnosticSkipCollisionCheck_ = false;
+    bool displayTriangles_ = false;
     // Shared by buildRealWindingConductorsNamed and measureTerminalLeadLengths.
     ConductorBuilder::Options realWindingConductorOptions(
         const OpenMagnetics::Magnetic& magnetic, const std::vector<NamedShape>& coreShapes,

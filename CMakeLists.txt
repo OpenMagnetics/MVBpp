@@ -275,6 +275,7 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     # ABT #685: the ONE centreline -> copper assembler. Real-winding Coil geometry reaches
     # OCCT only through this TU (Alf's rule); the six chunk primitives emit centrelines.
     src/WireAssembler.cpp
+    src/DisplayTube.cpp
     src/BobbinBuilder.cpp
     src/shapes/ShapeBuilder.cpp
     src/shapes/ShapeDrum.cpp
@@ -368,6 +369,7 @@ add_executable(mvb_tests
     tests/test_bobbin_corner.cpp
     tests/test_piece_and_plate.cpp
     tests/test_multicolumn_turns.cpp
+    tests/test_display_tube.cpp
 )
 if(MVBPP_BUILD_MESH)
     target_sources(mvb_tests PRIVATE tests/test_mesh_io.cpp)
