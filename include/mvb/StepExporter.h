@@ -33,6 +33,15 @@ struct StepExportOptions {
     // between two sheets, and the layer fills with flat tets (65 -> 1,230 below 0.01, same design). The mesher names
     // its round-wire conductors here; every other shape is converted whole, as before.
     std::set<std::string> planarFacesStayPlanarIn;
+    // A file a person opens has every solid as a named product, so a shape's solids are handed over FLAT (ABT #2564).
+    // The mesher's transfer file is read back by the mesher alone, which names nothing below the shape; it keeps each
+    // shape as it was built (ABT #2571). A mounted toroid's welded conductor is a compound that holds its one solid, under
+    // the mounting's placement: flat, the solid alone is written, as a placed copy (geometry in the unmounted frame and
+    // a transformation), and the copper the mesher reads back differs from the built one in the last bits. gmsh then
+    // meshes it differently: 05_pfc_inductor_t4020_hf60 and 12_boost_inductor_t5026_26 keep a flat tetrahedron on a
+    // wire facet that the optimiser otherwise removes, and fail the quality floor (the other 36 corpus designs mesh
+    // either way). Same build, same MKF, 05_pfc: nested 2,128,445 tets, worst gamma 4.1e-4; flat 2,127,942, 2.0e-8.
+    bool keepShapeNesting = false;
 };
 
 bool exportSTEP(const std::vector<NamedShape>& shapes,

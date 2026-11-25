@@ -1203,6 +1203,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         // The FEM product's periodic-face -> B-spline pass runs inside the exporter, on the mm
         // geometry (MVB++ StepExportOptions; ABT #1111).
         mvb::StepExportOptions xo; xo.nurbsPeriodicSolids = continuous;
+        xo.keepShapeNesting = true;   // the mesher reads this file back itself (ABT #2571)
         const bool ok = mvb::exportSTEP(solids, opt.out_msh, xo);
         std::cout.rdbuf(old);
         if (!ok) throw std::runtime_error("mesh3d_from_mas(STEP_ONLY): exportSTEP failed");
@@ -1389,6 +1390,7 @@ std::string mesh3d_from_mas(json magnetic, const MeshOptions& opt) {
         // The FEM product's periodic-face -> B-spline pass runs inside the exporter, on the mm
         // geometry (MVB++ StepExportOptions; ABT #1111).
         mvb::StepExportOptions xo; xo.nurbsPeriodicSolids = continuous;
+        xo.keepShapeNesting = true;   // the mesher reads this file back itself (ABT #2571)
         // The facets of a ROUND-wire conductor stay planes through that pass; a rectangular wire or a foil is
         // converted whole, as before (StepExportOptions::planarFacesStayPlanarIn has the measurements for both).
         {

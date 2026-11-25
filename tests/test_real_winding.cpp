@@ -2044,6 +2044,83 @@ TEST_CASE("Real winding: every piece of a toroid's winding is a named product of
     CHECK(std::abs(readBack - built.Mass() * 1e9) < 1e-6 * built.Mass() * 1e9);
 }
 
+// ABT #2571: the file the mesher writes for itself keeps every shape as it was built. A mounted toroid's welded
+// conductor is a compound that holds its one solid, under the mounting's placement. Handed over flat (what a file for
+// a person gets, ABT #2564) the solid alone is written, as a placed copy: its geometry in the unmounted frame and a
+// transformation. The mesher reads its file back, applies the transformation, and meshes copper that differs from the
+// built one in the last bits: 05_pfc_inductor_t4020_hf60 and 12_boost_inductor_t5026_26 then keep a flat tetrahedron
+// the optimiser otherwise removes and fail the quality floor (1.0.7). Kept nested, the copper is written where it stands.
+TEST_CASE("Real winding: the mesher's STEP file writes a mounted toroid's conductor where it stands", "[realwinding][step][abt2571]") {
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/05_pfc_inductor_t4020_hf60.json");
+    REQUIRE(f.is_open());
+    json mas;
+    f >> mas;
+    auto enriched = mvb::magnetic_autocomplete_safe(mas.at("magnetic"), /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    // As the mesher builds it for the corpus: FEM-ready, every junction welded (the recipe's geometry.weld_all).
+    struct WeldAll {
+        const char* before = std::getenv("MVB_WELD_ALL");
+        const std::string kept = before ? before : "";
+        WeldAll() { setenv("MVB_WELD_ALL", "1", 1); }
+        ~WeldAll() { if (before) setenv("MVB_WELD_ALL", kept.c_str(), 1); else unsetenv("MVB_WELD_ALL"); }
+    };
+    std::vector<mvb::NamedShape> named;
+    {
+        WeldAll weldAll;
+        named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                      /*wirePolygonSegments=*/0, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                      /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                      /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                      /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    }
+    const mvb::NamedShape* conductor = nullptr;
+    for (const auto& ns : named)
+        if (ns.name == "Primary parallel 0") conductor = &ns;
+    REQUIRE(conductor != nullptr);
+    // The premise: one solid inside a compound, standing under a placement.
+    REQUIRE(conductor->shape.ShapeType() == TopAbs_COMPOUND);
+    size_t solids = 0;
+    bool placed = false;
+    for (TopExp_Explorer ex(conductor->shape, TopAbs_SOLID); ex.More(); ex.Next()) {
+        ++solids;
+        placed = placed || !ex.Current().Location().IsIdentity();
+    }
+    REQUIRE(solids == 1);
+    REQUIRE(placed);
+
+    const auto placedCopiesIn = [](const std::string& path) {
+        std::ifstream file(path);
+        REQUIRE(file.is_open());
+        std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        text.erase(std::remove_if(text.begin(), text.end(), [](char c) { return c == '\n' || c == '\r'; }), text.end());
+        const std::regex transformation(R"(=\s*ITEM_DEFINED_TRANSFORMATION\()");
+        return static_cast<size_t>(std::distance(std::sregex_iterator(text.begin(), text.end(), transformation), std::sregex_iterator()));
+    };
+    const std::vector<mvb::NamedShape> one{*conductor};
+    const std::string flatPath = outputPath("abt2571_toroid_flat.step");
+    const std::string nestedPath = outputPath("abt2571_toroid_nested.step");
+    mvb::StepExportOptions forPerson, forMesher;
+    forPerson.nurbsPeriodicSolids = forMesher.nurbsPeriodicSolids = true;   // the FEM product, as the mesher asks for it
+    forMesher.keepShapeNesting = true;
+    REQUIRE(mvb::exportSTEP(one, flatPath, forPerson));
+    REQUIRE(mvb::exportSTEP(one, nestedPath, forMesher));
+    const size_t flatCopies = placedCopiesIn(flatPath), nestedCopies = placedCopiesIn(nestedPath);
+    INFO("placed copies: " << flatCopies << " in the flat file, " << nestedCopies << " in the nested one");
+    CHECK(flatCopies > nestedCopies);   // flat, the solid is a placed copy
+    // Both files are the same copper.
+    double volumes[2] = {0.0, 0.0};
+    const std::string paths[2] = {flatPath, nestedPath};
+    for (int k = 0; k < 2; ++k)
+        for (const auto& ns : mvb::importSTEP(paths[k])) {
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(ns.shape, props);
+            volumes[k] += props.Mass();
+        }
+    INFO("flat " << volumes[0] << " mm^3, nested " << volumes[1] << " mm^3");
+    CHECK(volumes[0] > 0.0);
+    CHECK(std::abs(volumes[0] - volumes[1]) < 1e-9 * volumes[0]);
+}
+
 // ABT #2564: the same for the parts that have no piece names. A core piece and a bobbin are compounds of compounds;
 // the writer made a product called "COMPOUND" of every inner one, between the part and its solids (the bobbin's since
 // it is no longer cut by the turns, 88638be; a core piece's always).

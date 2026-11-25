@@ -733,7 +733,9 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
         // product of its own, called "COMPOUND", between the part and its solids. Flat, the pieces of a conductor are
         // its components, in the order their names are in, and a part without piece names is one product: its solid,
         // or the compound of its solids. A shape that holds anything outside a solid (a port face) is left as it is.
-        const bool solidsOnly = solidCount > 0 && !TopExp_Explorer(shapeMm, TopAbs_FACE, TopAbs_SOLID).More() &&
+        // The mesher's own transfer file keeps the nesting (StepExportOptions::keepShapeNesting has why).
+        const bool solidsOnly = !options.keepShapeNesting && solidCount > 0 &&
+                                !TopExp_Explorer(shapeMm, TopAbs_FACE, TopAbs_SOLID).More() &&
                                 !TopExp_Explorer(shapeMm, TopAbs_EDGE, TopAbs_FACE).More() &&
                                 !TopExp_Explorer(shapeMm, TopAbs_VERTEX, TopAbs_EDGE).More();
         if (solidsOnly && solidCount == 1) {
@@ -767,7 +769,8 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
             if (std::getenv("MVB_STEP_NAME_DIAG")) {
                 std::fprintf(stderr, "[step]   components=%d\n", components.Length());
             }
-            if (std::size_t(components.Length()) != ns.partNames.size())
+            // Kept nested, a shape's pieces are not its components: nothing reads their names in that file.
+            if (!options.keepShapeNesting && std::size_t(components.Length()) != ns.partNames.size())
                 throw std::runtime_error("exportSTEP: '" + ns.name + "' has " + std::to_string(ns.partNames.size()) +
                                          " named pieces but its assembly holds " + std::to_string(components.Length()) +
                                          " components; the pieces would be written without their names");
