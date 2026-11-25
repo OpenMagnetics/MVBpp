@@ -726,12 +726,36 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
         for (TopExp_Explorer e(shapeMm, TopAbs_SOLID); e.More(); e.Next()) ++solidCount;
         const bool nameParts = !ns.partNames.empty() && ns.partNames.size() == solidCount &&
                                solidCount > 1;
+        // A product's solids are handed over FLAT (ABT #2564). A shape can arrive as a compound of compounds (a
+        // toroid's conductor does, and so do a core piece and an uncut bobbin). Only the DIRECT children of an assembly
+        // become its components, so a nested conductor's assembly had no component to name and every piece of the
+        // winding went into the file as a product called "SOLID"; and the writer turns every inner compound into a
+        // product of its own, called "COMPOUND", between the part and its solids. Flat, the pieces of a conductor are
+        // its components, in the order their names are in, and a part without piece names is one product: its solid,
+        // or the compound of its solids. A shape that holds anything outside a solid (a port face) is left as it is.
+        const bool solidsOnly = solidCount > 0 && !TopExp_Explorer(shapeMm, TopAbs_FACE, TopAbs_SOLID).More() &&
+                                !TopExp_Explorer(shapeMm, TopAbs_EDGE, TopAbs_FACE).More() &&
+                                !TopExp_Explorer(shapeMm, TopAbs_VERTEX, TopAbs_EDGE).More();
+        if (solidsOnly && solidCount == 1) {
+            shapeMm = TopExp_Explorer(shapeMm, TopAbs_SOLID).Current();
+        } else if (solidsOnly) {
+            TopoDS_Compound flat;
+            BRep_Builder flatBuilder;
+            flatBuilder.MakeCompound(flat);
+            for (TopExp_Explorer e(shapeMm, TopAbs_SOLID); e.More(); e.Next()) flatBuilder.Add(flat, e.Current());
+            shapeMm = flat;
+        }
         // AddShape(isAssembly=false): register the shape as a free top-level
         // component so STEPCAFControl_Writer emits it as a discrete product
         // (with our name attached) rather than burying it in a compound.
         TDF_Label lab = shapeTool->AddShape(shapeMm, nameParts ? Standard_True : Standard_False);
         if (!ns.name.empty()) {
             TDataStd_Name::Set(lab, TCollection_ExtendedString(ns.name.c_str()));
+            // A shape that carries a placement (a core piece does) is registered as an occurrence of the shape
+            // without it; that one is a product of the file too, and it is the same part (ABT #2564).
+            TDF_Label placed;
+            if (shapeTool->GetReferredShape(lab, placed))
+                TDataStd_Name::Set(placed, TCollection_ExtendedString(ns.name.c_str()));
         }
         if (std::getenv("MVB_STEP_NAME_DIAG")) {
             std::fprintf(stderr, "[step] '%s': solids=%zu partNames=%zu nameParts=%d\n",
@@ -743,6 +767,10 @@ bool exportSTEP(const std::vector<NamedShape>& shapes,
             if (std::getenv("MVB_STEP_NAME_DIAG")) {
                 std::fprintf(stderr, "[step]   components=%d\n", components.Length());
             }
+            if (std::size_t(components.Length()) != ns.partNames.size())
+                throw std::runtime_error("exportSTEP: '" + ns.name + "' has " + std::to_string(ns.partNames.size()) +
+                                         " named pieces but its assembly holds " + std::to_string(components.Length()) +
+                                         " components; the pieces would be written without their names");
             for (Standard_Integer k = 1;
                  k <= components.Length() && std::size_t(k) <= ns.partNames.size(); ++k) {
                 const std::string& partName = ns.partNames[k - 1];

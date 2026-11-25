@@ -1,5 +1,7 @@
 // Real-winding geometry ([realwinding]): ONE continuous conductor per (winding, parallel)
 // replacing the per-turn closed loops, with every MKF turn position honoured exactly.
+#include <regex>
+#include <iterator>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 #include <filesystem>
@@ -1949,6 +1951,104 @@ TEST_CASE("Real winding: a foil terminal is MKF's axial lead, welded to its shee
     for (const auto& ns : named)
         if (ns.name.rfind("Secondary parallel ", 0) == 0 && ns.name.find(" terminal ") != std::string::npos) ++caps;
     CHECK(caps == 16);
+}
+
+// ABT #2564 (a user, 2026-11-25: "the engine doesn't label what solids are windings"). The builder names every piece
+// of a conductor after the stretch of the route it draws, and the STEP export writes each piece as its own product
+// under the conductor's. A toroid's conductor arrives as a compound of compounds, the export named only the direct
+// children of the conductor's assembly, found none, and every piece of the winding was written as a product called
+// "SOLID". The file is read as a viewer reads it: by its PRODUCT names.
+TEST_CASE("Real winding: every piece of a toroid's winding is a named product of the STEP file", "[realwinding][step][abt2564]") {
+    auto magneticJson = loadFixture("realwinding_toroid.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                             /*wirePolygonSegments=*/0, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                             /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                             /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                             /*useRealWindingGeometry=*/true, /*femReady=*/false);
+    const mvb::NamedShape* conductor = nullptr;
+    for (const auto& ns : named)
+        if (ns.name == "Primary parallel 0") conductor = &ns;
+    REQUIRE(conductor != nullptr);
+    size_t pieces = 0;
+    for (TopExp_Explorer ex(conductor->shape, TopAbs_SOLID); ex.More(); ex.Next()) ++pieces;
+    REQUIRE(pieces > 10);
+    REQUIRE(conductor->partNames.size() == pieces);
+
+    const std::string path = outputPath("abt2564_toroid_named_pieces.step");
+    REQUIRE(mvb::exportSTEP(named, path));
+    std::ifstream file(path);
+    REQUIRE(file.is_open());
+    std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    // Line ends mean nothing in a STEP file: the writer wraps at 72 columns, also in the middle of a long name.
+    text.erase(std::remove_if(text.begin(), text.end(), [](char c) { return c == '\n' || c == '\r'; }), text.end());
+    std::multiset<std::string> products;
+    const std::regex product(R"(PRODUCT\(\s*'([^']*)')");
+    for (auto it = std::sregex_iterator(text.begin(), text.end(), product); it != std::sregex_iterator(); ++it)
+        products.insert((*it)[1].str());
+    size_t namedPieces = 0;
+    for (const auto& part : conductor->partNames) {
+        INFO("piece '" << part << "'");
+        CHECK(products.count(part) == 1);
+        if (products.count(part) == 1) ++namedPieces;
+    }
+    CHECK(namedPieces == pieces);
+    // Nothing in the file is an anonymous product: the core is called by its name too.
+    INFO(products.count("SOLID") << " products are called SOLID, " << products.count("COMPOUND") << " COMPOUND");
+    CHECK(products.count("SOLID") == 0);
+    CHECK(products.count("COMPOUND") == 0);
+    // And the winding read back is the winding that was built (the file is in millimetres).
+    GProp_GProps built;
+    BRepGProp::VolumeProperties(conductor->shape, built);
+    double readBack = -1.0;
+    for (const auto& ns : mvb::importSTEP(path))
+        if (ns.name == "Primary parallel 0") {
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(ns.shape, props);
+            readBack = props.Mass();
+        }
+    INFO("built " << built.Mass() * 1e9 << " mm^3, read back " << readBack << " mm^3");
+    CHECK(std::abs(readBack - built.Mass() * 1e9) < 1e-6 * built.Mass() * 1e9);
+}
+
+// ABT #2564: the same for the parts that have no piece names. A core piece and a bobbin are compounds of compounds;
+// the writer made a product called "COMPOUND" of every inner one, between the part and its solids (the bobbin's since
+// it is no longer cut by the turns, 88638be; a core piece's always).
+TEST_CASE("Real winding: no part of the STEP file is an anonymous product", "[realwinding][step][abt2564]") {
+    auto magneticJson = loadFixture("realwinding_e138_rectcolumn.json");   // E 13/7/4 with its bobbin
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                             /*wirePolygonSegments=*/0, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                             /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                             /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                             /*useRealWindingGeometry=*/true, /*femReady=*/false);
+    size_t solids = 0, bobbinSolids = 0;
+    for (const auto& ns : named)
+        for (TopExp_Explorer ex(ns.shape, TopAbs_SOLID); ex.More(); ex.Next()) {
+            ++solids;
+            if (ns.role == mvb::Role::Bobbin) ++bobbinSolids;
+        }
+    REQUIRE(bobbinSolids > 1);   // the premise: a bobbin of several solids is in the drawing
+    const std::string path = outputPath("abt2564_e138_named_parts.step");
+    REQUIRE(mvb::exportSTEP(named, path));
+    std::ifstream file(path);
+    REQUIRE(file.is_open());
+    std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    text.erase(std::remove_if(text.begin(), text.end(), [](char c) { return c == '\n' || c == '\r'; }), text.end());
+    std::multiset<std::string> products;
+    const std::regex product(R"(PRODUCT\(\s*'([^']*)')");
+    for (auto it = std::sregex_iterator(text.begin(), text.end(), product); it != std::sregex_iterator(); ++it)
+        products.insert((*it)[1].str());
+    INFO(products.count("SOLID") << " products are called SOLID, " << products.count("COMPOUND") << " COMPOUND");
+    CHECK(products.count("SOLID") == 0);
+    CHECK(products.count("COMPOUND") == 0);
+    // And every solid that was built is read back.
+    size_t readBack = 0;
+    for (const auto& ns : mvb::importSTEP(path))
+        for (TopExp_Explorer ex(ns.shape, TopAbs_SOLID); ex.More(); ex.Next()) ++readBack;
+    CHECK(readBack == solids);
 }
 
 // ABT #1111 (2026-09-06). The FEM product's periodic-face -> B-spline pass used to run in
