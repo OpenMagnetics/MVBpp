@@ -1,7 +1,8 @@
 name: Build and publish the Python package
 
 # Builds the ONE Python package of MVB++ (PyPI: OpenMagneticsVirtualBuilder, module `mvbpp`)
-# for Linux, Windows and macOS, and publishes it.
+# for Linux, Windows and macOS, and publishes it. A release is the Linux and Windows wheels plus the
+# source distribution; the macOS wheels are added when their (slower) build succeeds.
 #   - a pushed tag vX.Y.Z -> PyPI (the tag must equal pyproject's version)
 #   - workflow_dispatch   -> TestPyPI, unless publish_to_pypi is ticked
 # Needs the secrets PYPI_API_TOKEN / TEST_PYPI_API_TOKEN, scoped to OpenMagneticsVirtualBuilder.
@@ -25,7 +26,6 @@ on:
 
 env:
   GIT_LFS_SKIP_SMUDGE: 1
-  OCCT_CACHE_KEY: occt-7.9.3-static-v1
 
 jobs:
   check_version:
@@ -46,75 +46,26 @@ jobs:
             echo "::error::tag v$tag does not match pyproject version $ver"; exit 1
           fi
 
-  # One job per OS builds every CPython version in turn, so OCCT (~20+ min) is built once per job
-  # and reused by every version (CMake reuses a complete OCCT install). On Windows and macOS the install is also
-  # cached across runs; on Linux it lives inside the manylinux container, which cibuildwheel does
-  # not copy back to the runner, so Linux builds it once per run.
+  # Linux and Windows are the release: it is published when these two and the source distribution
+  # are done. The build itself is wheels.yml, one call per runner.
   build_wheels:
-    name: Wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 360
+    if: github.event_name != 'workflow_dispatch' || inputs.os != 'macos-15'
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.os != 'all') && format('["{0}"]', inputs.os) || '["ubuntu-22.04","windows-2022","macos-15"]') }}
-    steps:
-      - uses: actions/checkout@v4
+        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.os != 'all') && format('["{0}"]', inputs.os) || '["ubuntu-22.04","windows-2022"]') }}
+    uses: ./.github/workflows/wheels.yml
+    with:
+      os: ${{ matrix.os }}
 
-      - name: Free disk space (Linux)
-        if: runner.os == 'Linux'
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      # MKF fetches Kirchhoff, whose PSMA submodules (RAS, SAS, TAS, AAS, ...) have SSH URLs; the
-      # runners have no SSH key, so clone them over HTTPS. (The Linux container sets the same
-      # rewrite in its before-all, since it does not see the runner's git config.)
-      - name: Clone GitHub submodules over HTTPS
-        shell: bash
-        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      # Restore and save are separate steps so a built OCCT is saved even when a later step fails
-      # (actions/cache saves only on job success, so every failed Windows job rebuilt OCCT, ~40 min).
-      - name: Restore OCCT install
-        id: occt_cache
-        if: runner.os != 'Linux'
-        uses: actions/cache/restore@v4
-        with:
-          path: .occt-install
-          key: ${{ env.OCCT_CACHE_KEY }}-${{ runner.os }}
-
-      - name: Point the build at the OCCT install
-        shell: bash
-        run: |
-          ws=$(python -c "import os;print(os.environ['GITHUB_WORKSPACE'].replace('\\\\','/'))")
-          echo "CIBW_ENVIRONMENT_LINUX=CMAKE_BUILD_PARALLEL_LEVEL=2 SKBUILD_CMAKE_DEFINE=\"OCCT_PREFIX=/opt/occt-install\"" >> "$GITHUB_ENV"
-          echo "CIBW_ENVIRONMENT_MACOS=MACOSX_DEPLOYMENT_TARGET=14.0 CMAKE_BUILD_PARALLEL_LEVEL=3 SKBUILD_CMAKE_DEFINE=\"OCCT_PREFIX=$ws/.occt-install\"" >> "$GITHUB_ENV"
-          echo "CIBW_ENVIRONMENT_WINDOWS=CMAKE_BUILD_PARALLEL_LEVEL=1 SKBUILD_CMAKE_DEFINE=\"OCCT_PREFIX=$ws/.occt-install\"" >> "$GITHUB_ENV"
-
-      - name: Build and test wheels
-        run: |
-          python -m pip install cibuildwheel==4.2.0
-          python -m cibuildwheel --output-dir wheelhouse
-
-      - name: Save OCCT install
-        # Only a complete install (the last toolkit in OCCT_ESSENTIAL_LIBS present), only on a cache miss.
-        if: always() && runner.os != 'Linux' && steps.occt_cache.outputs.cache-hit != 'true' && hashFiles('.occt-install/lib/*TKDEVRML*') != ''
-        uses: actions/cache/save@v4
-        with:
-          path: .occt-install
-          key: ${{ env.OCCT_CACHE_KEY }}-${{ runner.os }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.os }}
-          path: wheelhouse/*.whl
+  # macOS is built on every release and never waited for (Alf, 2026-11-26: "we dont care about
+  # macos", then "Build macOS, never wait for it"): its wheels are added to the release if and when
+  # this job succeeds, and its failure blocks nothing.
+  build_wheels_macos:
+    if: github.event_name != 'workflow_dispatch' || inputs.os == 'all' || inputs.os == 'macos-15'
+    uses: ./.github/workflows/wheels.yml
+    with:
+      os: macos-15
 
   build_sdist:
     name: Source distribution
@@ -136,14 +87,44 @@ jobs:
     name: Publish
     needs: [check_version, build_wheels, build_sdist]
     # check_version is skipped on workflow_dispatch; a skipped need still lets this run.
-    # A single-platform manual run never publishes: the release must carry every wheel.
+    # A single-platform manual run never publishes: the release must carry the Linux and Windows wheels.
     if: always() && needs.build_wheels.result == 'success' && needs.build_sdist.result == 'success' && needs.check_version.result != 'failure' && (github.event_name != 'workflow_dispatch' || inputs.os == 'all')
     runs-on: ubuntu-22.04
     steps:
+      # Everything built so far: the source distribution, Linux and Windows (and macOS, should it be done already).
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Publish to PyPI
+        if: github.event_name != 'workflow_dispatch' || inputs.publish_to_pypi
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+          packages-dir: dist/
+
+      - name: Publish to TestPyPI
+        if: github.event_name == 'workflow_dispatch' && !inputs.publish_to_pypi
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+          skip-existing: true
+          packages-dir: dist/
+
+  # The macOS wheels join a release that exists: only after Publish succeeded, only if they built.
+  publish_macos:
+    name: Publish the macOS wheels
+    needs: [publish, build_wheels_macos]
+    if: always() && needs.publish.result == 'success' && needs.build_wheels_macos.result == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-macos-15
+          path: dist
 
       - name: Publish to PyPI
         if: github.event_name != 'workflow_dispatch' || inputs.publish_to_pypi

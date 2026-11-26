@@ -33,7 +33,8 @@ LD_LIBRARY_PATH=build/occt-install/lib ./build/mvb_tests "[step]"
 
 The one Python package of MVB++ is published on PyPI as **OpenMagneticsVirtualBuilder**
 (from 1.0.0; earlier versions of that name were the old Python/FreeCAD MVB). Wheels are built
-for Linux (x86_64), Windows (AMD64) and macOS (arm64), CPython 3.10–3.14:
+for Linux (x86_64), Windows (AMD64) and macOS (arm64), CPython 3.10–3.14. A release is
+published with the Linux and Windows wheels; the macOS wheels follow when their build finishes:
 
 ```bash
 pip install OpenMagneticsVirtualBuilder
