@@ -7,6 +7,7 @@
 #include "mvb/shapes/ShapeDrumSemishielded.h"
 #include "mvb/shapes/ShapeE.h"
 #include "mvb/shapes/ShapeEp.h"
+#include "mvb/shapes/ShapeEpc.h"
 #include "mvb/shapes/ShapeLp.h"
 #include "mvb/shapes/ShapeEpx.h"
 #include "mvb/shapes/ShapeEr.h"
@@ -74,8 +75,9 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
             builder = std::make_unique<ShapeP>(); break;
         case MAS::CoreShapeFamily::PM:
             builder = std::make_unique<ShapePm>(subtype); break;
+        case MAS::CoreShapeFamily::EPC:  // an E-like core with a stadium pole, not an EP pot (ABT #2586)
+            builder = std::make_unique<ShapeEpc>(); break;
         case MAS::CoreShapeFamily::EP:
-        case MAS::CoreShapeFamily::EPC:  // ABT #270: EP derivatives share EP geometry
         case MAS::CoreShapeFamily::EPQ:  // ABT #268
         case MAS::CoreShapeFamily::EPW:  // ABT #269
         case MAS::CoreShapeFamily::EPT:  // ABT #271

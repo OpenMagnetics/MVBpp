@@ -285,6 +285,7 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/shapes/ShapeDrumSemishielded.cpp
     src/shapes/ShapeE.cpp
     src/shapes/ShapeEp.cpp
+    src/shapes/ShapeEpc.cpp
     src/shapes/ShapeEpx.cpp
     src/shapes/ShapeLp.cpp
     src/shapes/ShapeEc.cpp

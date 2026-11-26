@@ -127,6 +127,11 @@ static MAS::Magnetic make_simple_pq_magnetic() {
     dims["D"] = make_dim(0.0034);
     dims["E"] = make_dim(0.027);
     dims["F"] = make_dim(0.0135);
+    // The opening between the lateral legs, as the MAS record carries it since 92e8ac0 (19.0 mm
+    // minimum, Magnetics catalogue). The fixture had none, and the builder drew the legs at an
+    // angle made up from E and F; a PQ without G is now refused (ABT #1143; fixture change
+    // approved by Alf, 2026-11-26).
+    dims["G"] = make_dim(0.019);
     shape.set_dimensions(dims);
 
     MAS::CoreGeometricalDescriptionElement piece1, piece2;

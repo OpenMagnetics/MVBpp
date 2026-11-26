@@ -15,15 +15,14 @@ namespace mvb {
 namespace shapes {
 
 TopoDS_Shape ShapeEr::buildWindingWindow(const std::map<std::string, double>& dims) const {
-    double b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0, g = 0.0;
-    auto it = dims.find("B"); if (it != dims.end()) b = it->second;
-    it = dims.find("C"); if (it != dims.end()) c = it->second;
-    it = dims.find("D"); if (it != dims.end()) d = it->second;
-    it = dims.find("E"); if (it != dims.end()) e = it->second;
-    it = dims.find("F"); if (it != dims.end()) f = it->second;
-    it = dims.find("G"); if (it != dims.end()) g = it->second;
-
-    if (b == 0.0 || d == 0.0 || e == 0.0) return TopoDS_Shape();
+    const double b = required(dims, "B");
+    const double c = required(dims, "C");
+    const double d = required(dims, "D");
+    const double e = required(dims, "E");
+    const double f = required(dims, "F");
+    // G is the slot between the outer legs of an ER / EQ: an ETD or EER record has none, and MKF
+    // reads an absent or zero G the same way (no aperture).
+    const double g = featureDimension(dims, "G").value_or(0.0);
 
     double zCenter = b - d / 2.0;
 
@@ -36,9 +35,7 @@ TopoDS_Shape ShapeEr::buildWindingWindow(const std::map<std::string, double>& di
     TopoDS_Shape innerCyl = build_polygon_cylinder(d, f / 2.0, m_corePolygonSegments);
     innerCyl = translate_shape(innerCyl, 0.0, 0.0, zCenter - d / 2.0);
 
-    BRepAlgoAPI_Cut ringCut(outerCyl, innerCyl);
-    if (!ringCut.IsDone()) return TopoDS_Shape();
-    TopoDS_Shape ww = ringCut.Shape();
+    TopoDS_Shape ww = done(BRepAlgoAPI_Cut(outerCyl, innerCyl), "leaving the round column in the winding window");
 
     // ER/EQ variant: when G > F and C > F, add a rectangular slot of
     // (G × C × D) centred on the column, minus the central column cylinder,
@@ -46,11 +43,8 @@ TopoDS_Shape ShapeEr::buildWindingWindow(const std::map<std::string, double>& di
     if (g > f && c > f) {
         gp_Pnt boxCorner(-g / 2.0, -c / 2.0, zCenter - d / 2.0);
         TopoDS_Shape cube = BRepPrimAPI_MakeBox(boxCorner, g, c, d).Shape();
-        BRepAlgoAPI_Cut cubeMinus(cube, innerCyl);
-        if (cubeMinus.IsDone()) {
-            BRepAlgoAPI_Fuse fuser(ww, cubeMinus.Shape());
-            if (fuser.IsDone()) ww = fuser.Shape();
-        }
+        TopoDS_Shape slot = done(BRepAlgoAPI_Cut(cube, innerCyl), "leaving the round column in the G slot");
+        ww = done(BRepAlgoAPI_Fuse(ww, slot), "adding the G slot to the winding window");
     }
     return ww;
 }
@@ -68,10 +62,7 @@ TopoDS_Shape ShapeEr::applyMachining(const TopoDS_Shape& piece,
     double yCoord = coords[1];
 
     if (std::abs(xCoord) < 1e-12) {
-        double f = 0.0;
-        auto it = dims.find("F");
-        if (it != dims.end()) f = it->second;
-        if (f <= 0.0) return piece;
+        const double f = required(dims, "F");
 
         // Center column: polygon-faceted cylinder along Y axis, CENTERED on
         // yCoord. build_polygon_cylinder creates a base-at-z=0 prism along Z;

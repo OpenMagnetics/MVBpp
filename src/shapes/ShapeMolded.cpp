@@ -10,9 +10,8 @@ namespace shapes {
 // Build frame (pre intrinsic -90degX rotation): the block is extruded along Z from 0 to B by
 // ShapeBuilder::buildPiece, so Z is the coil axis here and the footprint lies in XY.
 TopoDS_Face ShapeMolded::buildProfile(const std::map<std::string, double>& dims) const {
-    double a = dims.count("A") ? dims.at("A") / 2.0 : 0.0;
-    double c = dims.count("C") ? dims.at("C") / 2.0 : 0.0;
-    if (a <= 0.0 || c <= 0.0) return TopoDS_Face();
+    const double a = required(dims, "A") / 2.0;
+    const double c = required(dims, "C") / 2.0;
 
     // A rectangular body footprint: A wide, C deep, centred on the axis. Moulded inductors
     // are plain blocks — the shaping is all internal.
@@ -26,22 +25,20 @@ TopoDS_Face ShapeMolded::buildProfile(const std::map<std::string, double>& dims)
 }
 
 TopoDS_Shape ShapeMolded::buildWindingWindow(const std::map<std::string, double>& dims) const {
-    double b = dims.count("B") ? dims.at("B") : 0.0;
-    double d = dims.count("D") ? dims.at("D") : 0.0;   // cavity height
-    double e = dims.count("E") ? dims.at("E") : 0.0;   // cavity outer diameter
-    double f = dims.count("F") ? dims.at("F") : 0.0;   // cavity inner diameter (the post)
-    if (b <= 0.0 || d <= 0.0 || e <= 0.0) return TopoDS_Shape();
-
+    const double b = required(dims, "B");
+    const double d = required(dims, "D");   // cavity height
+    const double e = required(dims, "E");   // cavity outer diameter
     // The cavity is the annulus the winding occupies: outer diameter E, inner diameter F,
-    // height D, centred on the body so the composite closes over and under the coil. F may
-    // legitimately be 0 (no post), in which case the cavity is a plain cylinder.
-    //
-    // Geometry validity (E > F, D < B, E inside A x C) is enforced upstream by MKF's
-    // CorePieceMolded, so an out-of-range record cannot reach here from a validated MAS.
-    // Drawing the bare block would be a visible defect rather than silent physics, so an
-    // incomplete record degrades to the solid body instead of aborting the render.
+    // height D, centred on the body so the composite closes over and under the coil. F is the
+    // post: a record without it (or with F = 0) has none, and the cavity is a plain cylinder.
+    const double f = featureDimension(dims, "F").value_or(0.0);
+
+    // A cavity that does not fit its body is refused: the solid block drawn (and meshed) in its
+    // place would be a core with no room for the coil inside it.
     if (e <= f || d >= b) {
-        return TopoDS_Shape();
+        throw std::runtime_error("shape '" + m_shapeName + "' has a cavity that does not fit: E = " + std::to_string(e) +
+                                 ", F = " + std::to_string(f) + ", D = " + std::to_string(d) + ", B = " + std::to_string(b) +
+                                 " (need E > F and D < B)");
     }
 
     double base = (b - d) / 2.0;
@@ -59,8 +56,7 @@ TopoDS_Shape ShapeMolded::buildWindingWindow(const std::map<std::string, double>
     TopoDS_Shape post = build_polygon_cylinder(d, f / 2.0, m_corePolygonSegments);
     post = translate_shape(post, 0.0, 0.0, base);
 
-    BRepAlgoAPI_Cut annulus(cavity, post);
-    return annulus.IsDone() ? annulus.Shape() : TopoDS_Shape();
+    return done(BRepAlgoAPI_Cut(cavity, post), "leaving the post in the cavity");
 }
 
 TopoDS_Shape ShapeMolded::applyExtras(const std::map<std::string, double>& dims,
@@ -75,10 +71,7 @@ TopoDS_Shape ShapeMolded::applyExtras(const std::map<std::string, double>& dims,
     //
     // Every other family here ends with this translation; ShapeMolded originally had no
     // applyExtras at all, which is how it was missed.
-    double b = dims.count("B") ? dims.at("B") : 0.0;
-    if (b <= 0.0) {
-        return piece;
-    }
+    const double b = required(dims, "B");
     return translate_shape(piece, 0.0, 0.0, -b / 2.0);
 }
 

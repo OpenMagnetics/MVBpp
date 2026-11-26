@@ -7,12 +7,11 @@ namespace mvb {
 namespace shapes {
 
 TopoDS_Face ShapeT::buildProfile(const std::map<std::string, double>& dims) const {
-    double a = 0.0; // outer diameter
-    double b = 0.0; // inner diameter
-    auto itA = dims.find("A");
-    auto itB = dims.find("B");
-    if (itA != dims.end()) a = itA->second / 2.0;
-    if (itB != dims.end()) b = itB->second / 2.0;
+    const double a = required(dims, "A") / 2.0; // outer diameter
+    const double b = required(dims, "B") / 2.0; // inner diameter
+    if (!(b < a)) {
+        throw std::runtime_error("shape '" + m_shapeName + "' has an inner diameter B that is not below its outer diameter A");
+    }
 
     TopoDS_Wire outer = build_polygon_circle(a, m_corePolygonSegments);
     // The bore holds the winding: circumscribe so faceting never bites into it.
@@ -26,9 +25,7 @@ TopoDS_Face ShapeT::buildProfile(const std::map<std::string, double>& dims) cons
 
 TopoDS_Shape ShapeT::applyExtras(const std::map<std::string, double>& dims,
                                  const TopoDS_Shape& piece) const {
-    double c = 0.0;
-    auto it = dims.find("C");
-    if (it != dims.end()) c = it->second;
+    const double c = required(dims, "C");
     return translate_shape(piece, 0.0, 0.0, -c / 2.0);
 }
 

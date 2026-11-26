@@ -18,20 +18,26 @@ namespace shapes {
 // Mirrors MVB.js URShape: 4 subtypes with rectangular profile + cylindrical
 // winding/lateral columns.
 TopoDS_Shape ShapeUr::buildPiece(const MAS::CoreShape& shapeData) const {
-    auto dimsOpt = shapeData.get_dimensions();
-    if (!dimsOpt) return TopoDS_Shape();
-    auto dims = flatten_dimensions(*dimsOpt);
+    const auto dims = dimensionsOf(shapeData);
 
-    double aFull = 0.0, b = 0.0, cFull = 0.0, d = 0.0, fFull = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) aFull = it->second;
-    it = dims.find("B"); if (it != dims.end()) b = it->second;
-    it = dims.find("C"); if (it != dims.end()) cFull = it->second;
-    it = dims.find("D"); if (it != dims.end()) d = it->second;
-    it = dims.find("F"); if (it != dims.end()) fFull = it->second;
+    // The subtype says which letters make the piece: 1 and 2 have a winding column of diameter C,
+    // 3 and 4 one of diameter F; 1 and 3 have a rectangular return leg H wide, 2 and 4 a round one.
+    if (!shapeData.get_family_subtype()) {
+        throw std::runtime_error("shape '" + m_shapeName + "' has no familySubtype; UR geometry is defined for types 1 to 4");
+    }
+    const std::string subtype = *shapeData.get_family_subtype();
+    if (subtype != "1" && subtype != "2" && subtype != "3" && subtype != "4") {
+        throw std::runtime_error("shape '" + m_shapeName + "' has familySubtype '" + subtype + "'; UR geometry is defined for types 1 to 4");
+    }
+    const bool columnIsF = subtype == "3" || subtype == "4";
+    const bool legIsBox = subtype == "1" || subtype == "3";
 
-    if (b == 0.0) return TopoDS_Shape();
-
-    std::string subtype = shapeData.get_family_subtype().value_or("1");
+    const double aFull = required(dims, "A");
+    const double b = required(dims, "B");
+    const double cFull = required(dims, "C");
+    const double d = required(dims, "D");
+    const double fFull = columnIsF ? required(dims, "F") : 0.0;
+    const double legWidth = legIsBox ? required(dims, "H") : 0.0;
     double c = cFull / 2.0;
 
     double windingColumnWidth = 0.0;
@@ -64,18 +70,15 @@ TopoDS_Shape ShapeUr::buildPiece(const MAS::CoreShape& shapeData) const {
     TopoDS_Shape piece = BRepPrimAPI_MakePrism(face, gp_Vec(0, 0, b)).Shape();
 
     // Winding window cutout: box(2A, 2C, D) at top
-    if (d > 0.0 && aFull > 0.0 && cFull > 0.0) {
+    {
         gp_Pnt corner(-aFull, -cFull, b - d);
         TopoDS_Shape ww = BRepPrimAPI_MakeBox(corner, 2.0 * aFull, 2.0 * cFull, d).Shape();
-        BRepAlgoAPI_Cut cut(piece, ww);
-        if (cut.IsDone()) piece = cut.Shape();
+        piece = done(BRepAlgoAPI_Cut(piece, ww), "cutting the winding window");
     }
 
     // Add winding & lateral columns
     auto fuse = [&](TopoDS_Shape& base, const TopoDS_Shape& add) {
-        if (add.IsNull()) return;
-        BRepAlgoAPI_Fuse f(base, add);
-        if (f.IsDone()) base = f.Shape();
+        base = done(BRepAlgoAPI_Fuse(base, add), "adding a column");
     };
 
     if (subtype == "1") {
@@ -83,9 +86,8 @@ TopoDS_Shape ShapeUr::buildPiece(const MAS::CoreShape& shapeData) const {
         wcCol = translate_shape(wcCol, 0.0, 0.0, b - d);
         fuse(piece, wcCol);
         // lateral box H × C × D at -(A - wcw/2 - H/2)
-        double h = 0.0;
-        auto itH = dims.find("H"); if (itH != dims.end()) h = itH->second;
-        if (h > 0.0) {
+        const double h = legWidth;
+        {
             double xOff = -(aFull - cFull / 2.0 - h / 2.0);
             gp_Pnt cn(xOff - h / 2.0, -cFull / 2.0, b - d);
             TopoDS_Shape latBox = BRepPrimAPI_MakeBox(cn, h, cFull, d).Shape();
@@ -101,9 +103,8 @@ TopoDS_Shape ShapeUr::buildPiece(const MAS::CoreShape& shapeData) const {
         TopoDS_Shape wcCol = BRepPrimAPI_MakeCylinder(fFull / 2.0, d).Shape();
         wcCol = translate_shape(wcCol, 0.0, 0.0, b - d);
         fuse(piece, wcCol);
-        double h = 0.0;
-        auto itH = dims.find("H"); if (itH != dims.end()) h = itH->second;
-        if (h > 0.0) {
+        const double h = legWidth;
+        {
             double xOff = -(aFull - fFull / 2.0 - h / 2.0);
             gp_Pnt cn(xOff - h / 2.0, -cFull / 2.0, b - d);
             TopoDS_Shape latBox = BRepPrimAPI_MakeBox(cn, h, cFull, d).Shape();
@@ -140,15 +141,8 @@ TopoDS_Shape ShapeUr::applyMachining(const TopoDS_Shape& piece,
 
     // Winding-column gap (xCoord == 0): cylindrical tool aligned with Y.
     if (std::abs(xCoord) < 1e-12) {
-        double radius = 0.0;
-        auto itF = dims.find("F");
-        if (itF != dims.end() && itF->second > 0.0) {
-            radius = itF->second / 2.0;
-        } else {
-            auto itC = dims.find("C");
-            if (itC != dims.end()) radius = itC->second / 2.0;
-        }
-        if (radius <= 0.0) return piece;
+        // The winding column's diameter: F where the record carries it (types 3 and 4), else C.
+        const double radius = featureDimension(dims, "F").value_or(required(dims, "C")) / 2.0;
 
         // Gap-cutting tool: circumscribe so no faceted ridge is left in the gap.
         TopoDS_Shape toolZ = build_polygon_cylinder(gapLength, radius,
@@ -166,10 +160,8 @@ TopoDS_Shape ShapeUr::applyMachining(const TopoDS_Shape& piece,
     }
 
     // Lateral-column gap: rectangular box across the lateral column.
-    double h = 0.0, c = 0.0;
-    auto itH = dims.find("H"); if (itH != dims.end()) h = itH->second;
-    auto itC = dims.find("C"); if (itC != dims.end()) c = itC->second;
-    if (h <= 0.0 || c <= 0.0) return piece;
+    const double h = required(dims, "H");
+    const double c = required(dims, "C");
 
     TopoDS_Shape tool = makeBox(h, gapLength, c);
     tool = translate_shape(tool, xCoord, yCoord, 0.0);

@@ -12,11 +12,12 @@ namespace shapes {
 TopoDS_Shape buildSemishieldedShell(const std::map<std::string, double>& dims,
                                     const TopoDS_Shape& drum,
                                     int /*corePolygonSegments*/) {
-    double j = dims.count("J") ? dims.at("J") : 0.0;
-    double k = dims.count("K") ? dims.at("K") : 0.0;
-    double l = dims.count("L") ? dims.at("L") : 0.0;
-    double b = dims.count("B") ? dims.at("B") : 0.0;
-    if (j <= 0.0 || k <= 0.0 || l <= 0.0) return TopoDS_Shape();
+    // The shell's envelope J x K x L around a drum B high: without any of them there is no shell.
+    const std::string part = "a semishielded drum's shell";
+    const double j = require_dimension(dims, "J", part);
+    const double k = require_dimension(dims, "K", part);
+    const double l = require_dimension(dims, "L", part);
+    const double b = require_dimension(dims, "B", part);
 
     // Same build frame as ShapeDrum: extruded along Z from 0 to B, so the envelope is centred
     // on the drum's own height rather than on the origin.
@@ -48,7 +49,10 @@ TopoDS_Shape buildSemishieldedShell(const std::map<std::string, double>& dims,
     // happen there or it subtracts a solid that is not where the drum actually is.
     TopoDS_Shape orientedEnvelope = rotate_shape(envelope, -std::numbers::pi / 2.0, 0.0, 0.0);
     BRepAlgoAPI_Cut shell(orientedEnvelope, drum);
-    return shell.IsDone() ? shell.Shape() : orientedEnvelope;
+    if (!shell.IsDone() || shell.Shape().IsNull()) {
+        throw std::runtime_error("a semishielded drum's shell: carving the drum out of the envelope did not complete (OCCT boolean failed)");
+    }
+    return shell.Shape();
 }
 
 } // namespace shapes

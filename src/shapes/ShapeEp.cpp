@@ -17,10 +17,12 @@ namespace shapes {
 // circular winding window on top half + rectangular cut-out on bottom +
 // optional G-slot above the central column. Mirrors MVB.js EPShape.
 TopoDS_Face ShapeEp::buildProfile(const std::map<std::string, double>& dims) const {
-    double a = 0.0, c = 0.0, k = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) a = it->second / 2.0;
-    it = dims.find("C"); if (it != dims.end()) c = it->second;
-    it = dims.find("K"); if (it != dims.end()) k = it->second;
+    const double a = required(dims, "A") / 2.0;
+    const double c = required(dims, "C");
+    // K places the post in the depth of the pot. A record without it has the post half its own
+    // diameter from the open face: MKF's rule for the same records (CorePieceEp, K = F / 2), so
+    // the core is drawn where MKF computed it.
+    const double k = featureDimension(dims, "K").value_or(required(dims, "F") / 2.0);
 
     double topC = c - k;
     double bottomC = k;
@@ -36,15 +38,14 @@ TopoDS_Face ShapeEp::buildProfile(const std::map<std::string, double>& dims) con
 }
 
 TopoDS_Shape ShapeEp::buildWindingWindow(const std::map<std::string, double>& dims) const {
-    double b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0, g = 0.0;
-    auto it = dims.find("B"); if (it != dims.end()) b = it->second;
-    it = dims.find("C"); if (it != dims.end()) c = it->second;
-    it = dims.find("D"); if (it != dims.end()) d = it->second;
-    it = dims.find("E"); if (it != dims.end()) e = it->second;
-    it = dims.find("F"); if (it != dims.end()) f = it->second;
-    it = dims.find("G"); if (it != dims.end()) g = it->second;
-
-    if (b == 0.0 || d == 0.0 || e == 0.0) return TopoDS_Shape();
+    const double b = required(dims, "B");
+    const double c = required(dims, "C");
+    const double d = required(dims, "D");
+    const double e = required(dims, "E");
+    const double f = required(dims, "F");
+    // G is the slot above the post; most EP records have none, and MKF reads an absent or zero G
+    // the same way (no aperture).
+    const double g = featureDimension(dims, "G").value_or(0.0);
 
     double zBase = b - d;
 
@@ -55,17 +56,13 @@ TopoDS_Shape ShapeEp::buildWindingWindow(const std::map<std::string, double>& di
     // Subtract central column
     TopoDS_Shape centralCol = BRepPrimAPI_MakeCylinder(f / 2.0, d).Shape();
     centralCol = translate_shape(centralCol, 0.0, 0.0, zBase);
-    {
-        BRepAlgoAPI_Cut cut(ww, centralCol);
-        if (cut.IsDone()) ww = cut.Shape();
-    }
+    ww = done(BRepAlgoAPI_Cut(ww, centralCol), "leaving the post in the winding window");
 
     // Top G-cube cutout (above the central column)
     if (g > 0.0) {
         gp_Pnt corner(-g / 2.0, f / 2.0, zBase);
         TopoDS_Shape topCube = BRepPrimAPI_MakeBox(corner, g, c, d).Shape();
-        BRepAlgoAPI_Fuse fuser(ww, topCube);
-        if (fuser.IsDone()) ww = fuser.Shape();
+        ww = done(BRepAlgoAPI_Fuse(ww, topCube), "adding the G slot to the winding window");
     }
 
     // Bottom rectangle E × C × D, minus central column (stays in WW set)
@@ -75,10 +72,8 @@ TopoDS_Shape ShapeEp::buildWindingWindow(const std::map<std::string, double>& di
         // Cut central column from this bottom box
         TopoDS_Shape centralCol2 = BRepPrimAPI_MakeCylinder(f / 2.0, d).Shape();
         centralCol2 = translate_shape(centralCol2, 0.0, 0.0, zBase);
-        BRepAlgoAPI_Cut cut(bottomCube, centralCol2);
-        if (cut.IsDone()) bottomCube = cut.Shape();
-        BRepAlgoAPI_Fuse fuser(ww, bottomCube);
-        if (fuser.IsDone()) ww = fuser.Shape();
+        bottomCube = done(BRepAlgoAPI_Cut(bottomCube, centralCol2), "leaving the post in the open side of the window");
+        ww = done(BRepAlgoAPI_Fuse(ww, bottomCube), "adding the open side to the winding window");
     }
 
     return ww;
@@ -100,7 +95,7 @@ TopoDS_Shape ShapeEp::applyMachining(const TopoDS_Shape& piece,
     const double xCoord = coords[0];
     if (std::abs(xCoord) >= 1e-12)
         return ShapeBuilder::applyMachining(piece, machining, dims);  // side column
-    const double f = dims.count("F") ? dims.at("F") : 0.0;
+    const double f = required(dims, "F");
     TopoDS_Shape tool = makeBox(f, gapLength, f);         // F (width) x gap x F (round depth)
     tool = translate_shape(tool, 0.0, coords[1], 0.0);
     BRepAlgoAPI_Cut cutter(piece, tool);
@@ -110,8 +105,7 @@ TopoDS_Shape ShapeEp::applyMachining(const TopoDS_Shape& piece,
 
 TopoDS_Shape ShapeEp::applyExtras(const std::map<std::string, double>& dims,
                                   const TopoDS_Shape& piece) const {
-    double b = 0.0;
-    auto it = dims.find("B"); if (it != dims.end()) b = it->second;
+    const double b = required(dims, "B");
     return translate_shape(piece, 0.0, 0.0, -b);
 }
 

@@ -12,10 +12,12 @@ namespace mvb {
 namespace shapes {
 
 TopoDS_Face ShapeU::buildProfile(const std::map<std::string, double>& dims) const {
-    double a = 0.0, c = 0.0, e = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) a = it->second;
-    it = dims.find("C"); if (it != dims.end()) c = it->second / 2.0;
-    it = dims.find("E"); if (it != dims.end()) e = it->second;
+    const double a = required(dims, "A");
+    const double c = required(dims, "C") / 2.0;
+    const double e = required(dims, "E");
+    if (!(e < a)) {
+        throw std::runtime_error("shape '" + m_shapeName + "' has a window E that is not narrower than its width A");
+    }
 
     // Coordinate origin sits INSIDE the winding column (one leg), not at the
     // core centre — this is the MAS/MKF convention the bobbin and turns are
@@ -39,21 +41,17 @@ TopoDS_Face ShapeU::buildProfile(const std::map<std::string, double>& dims) cons
 }
 
 TopoDS_Shape ShapeU::buildWindingWindow(const std::map<std::string, double>& dims) const {
-    double aFull = 0.0, b = 0.0, cFull = 0.0, d = 0.0, e = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) aFull = it->second;
-    it = dims.find("B"); if (it != dims.end()) b = it->second;
-    it = dims.find("C"); if (it != dims.end()) cFull = it->second;
-    it = dims.find("D"); if (it != dims.end()) d = it->second;
-    it = dims.find("E"); if (it != dims.end()) e = it->second;
-
-    if (b == 0.0 || d == 0.0) return TopoDS_Shape();
+    const double aFull = required(dims, "A");
+    const double b = required(dims, "B");
+    const double cFull = required(dims, "C");
+    const double d = required(dims, "D");
+    const double e = required(dims, "E");
 
     // The window occupies the gap between the winding column (centred at X=0,
     // inner edge at -windingColumnWidth/2) and the return leg, i.e.
     // X in [-(windingColumnWidth/2 + E), -windingColumnWidth/2]. The previous
     // -(wcw/2 + E/2) placed it half a window too far, cutting into the winding
     // column and leaving unequal legs.
-    (void)aFull;
     double windingColumnWidth = (aFull - e) / 2.0;
     gp_Pnt corner(-(windingColumnWidth / 2.0 + e), -cFull, b - d);
     TopoDS_Shape ww = BRepPrimAPI_MakeBox(corner, e, 2.0 * cFull, d).Shape();
@@ -62,9 +60,7 @@ TopoDS_Shape ShapeU::buildWindingWindow(const std::map<std::string, double>& dim
 
 TopoDS_Shape ShapeU::applyExtras(const std::map<std::string, double>& dims,
                                  const TopoDS_Shape& piece) const {
-    double b = 0.0;
-    auto it = dims.find("B");
-    if (it != dims.end()) b = it->second;
+    const double b = required(dims, "B");
     return translate_shape(piece, 0.0, 0.0, -b);
 }
 
@@ -81,10 +77,9 @@ TopoDS_Shape ShapeU::applyMachining(const TopoDS_Shape& piece,
     double xCoord = coords[0];
     double yCoord = coords[1];
 
-    double a = 0.0, c = 0.0, e = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) a = it->second;
-    it = dims.find("C"); if (it != dims.end()) c = it->second;
-    it = dims.find("E"); if (it != dims.end()) e = it->second;
+    const double a = required(dims, "A");
+    const double c = required(dims, "C");
+    const double e = required(dims, "E");
 
     double windingColumnWidth = (a - e) / 2.0;
     TopoDS_Shape tool = makeBox(windingColumnWidth, gapLength, c);

@@ -15,18 +15,14 @@ namespace shapes {
 // Mirrors MVB Python CadQueryBuilder.Ut: rectangle A×C profile, box WW,
 // then two asymmetric columns added on top.
 TopoDS_Shape ShapeUt::buildPiece(const MAS::CoreShape& shapeData) const {
-    auto dimsOpt = shapeData.get_dimensions();
-    if (!dimsOpt) return TopoDS_Shape();
-    auto dims = flatten_dimensions(*dimsOpt);
+    const auto dims = dimensionsOf(shapeData);
 
-    double a = 0.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, fdim = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) a = it->second;
-    it = dims.find("B"); if (it != dims.end()) b = it->second;
-    it = dims.find("C"); if (it != dims.end()) c = it->second;
-    it = dims.find("D"); if (it != dims.end()) d = it->second;
-    it = dims.find("E"); if (it != dims.end()) e = it->second;
-    it = dims.find("F"); if (it != dims.end()) fdim = it->second;
-    if (b == 0.0) return TopoDS_Shape();
+    const double a = required(dims, "A");
+    const double b = required(dims, "B");
+    const double c = required(dims, "C");
+    const double d = required(dims, "D");
+    const double e = required(dims, "E");
+    const double fdim = required(dims, "F");
 
     double ha = a / 2.0, hc = c / 2.0;
     BRepBuilderAPI_MakePolygon poly;
@@ -39,30 +35,30 @@ TopoDS_Shape ShapeUt::buildPiece(const MAS::CoreShape& shapeData) const {
     TopoDS_Shape piece = BRepPrimAPI_MakePrism(face, gp_Vec(0, 0, b)).Shape();
 
     // Cut WW: box(2A, 2C, D) translated to z = B/2 (centered at z=B/2)
-    if (d > 0.0) {
+    {
         gp_Pnt cn(-a, -c, b / 2.0 - d / 2.0);
         TopoDS_Shape ww = BRepPrimAPI_MakeBox(cn, 2.0 * a, 2.0 * c, d).Shape();
-        BRepAlgoAPI_Cut cut(piece, ww);
-        if (cut.IsDone()) piece = cut.Shape();
+        piece = done(BRepAlgoAPI_Cut(piece, ww), "cutting the winding window");
     }
 
     // Top column: F × C × D at x = -A/2 + F/2, z = B/2
-    if (fdim > 0.0 && d > 0.0) {
+    {
         double xc = -a / 2.0 + fdim / 2.0;
         gp_Pnt cn(xc - fdim / 2.0, -hc, b / 2.0 - d / 2.0);
         TopoDS_Shape topCol = BRepPrimAPI_MakeBox(cn, fdim, c, d).Shape();
-        BRepAlgoAPI_Fuse fuser(piece, topCol);
-        if (fuser.IsDone()) piece = fuser.Shape();
+        piece = done(BRepAlgoAPI_Fuse(piece, topCol), "adding the first column");
     }
 
     // Bottom column: (A-E-F) × C × D at x = A/2 - bcw/2, z = B/2
-    double bcw = a - e - fdim;
-    if (bcw > 0.0 && d > 0.0) {
+    const double bcw = a - e - fdim;
+    if (!(bcw > 0.0)) {
+        throw std::runtime_error("shape '" + m_shapeName + "' leaves no second column: A - E - F = " + std::to_string(bcw));
+    }
+    {
         double xc = a / 2.0 - bcw / 2.0;
         gp_Pnt cn(xc - bcw / 2.0, -hc, b / 2.0 - d / 2.0);
         TopoDS_Shape botCol = BRepPrimAPI_MakeBox(cn, bcw, c, d).Shape();
-        BRepAlgoAPI_Fuse fuser(piece, botCol);
-        if (fuser.IsDone()) piece = fuser.Shape();
+        piece = done(BRepAlgoAPI_Fuse(piece, botCol), "adding the second column");
     }
 
     piece = translate_shape(piece, 0.0, 0.0, -b);

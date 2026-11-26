@@ -11,21 +11,18 @@ namespace shapes {
 // flange at the base. The groove is cut as an annular band, exactly the ShapeP idiom.
 
 TopoDS_Face ShapeDrum::buildProfile(const std::map<std::string, double>& dims) const {
-    double flange = dims.count("A") ? dims.at("A") : 0.0;
-    if (dims.count("A2") && dims.at("A2") > 0.0) {
-        flange = std::max(flange, dims.at("A2"));
-    }
+    // A2 is the top flange's diameter where it differs from the bottom one's (A).
+    const double flange = std::max(required(dims, "A"), featureDimension(dims, "A2").value_or(0.0));
     TopoDS_Wire outer = build_polygon_circle(flange / 2.0, m_corePolygonSegments);
     BRepBuilderAPI_MakeFace face(outer);
     return face.Face();
 }
 
 TopoDS_Shape ShapeDrum::buildWindingWindow(const std::map<std::string, double>& dims) const {
-    double a = dims.count("A") ? dims.at("A") : 0.0;
-    double c = dims.count("C") ? dims.at("C") : 0.0;
-    double e = dims.count("E") ? dims.at("E") : 0.0;
-    double f = dims.count("F") ? dims.at("F") : 0.0;
-    if (a == 0.0 || c == 0.0 || e == 0.0) return TopoDS_Shape();
+    const double a = required(dims, "A");
+    const double c = required(dims, "C");
+    const double e = required(dims, "E");
+    const double f = required(dims, "F");
 
     // Annular groove: from the post surface out past the flange edge, spanning z in [F, F+E].
     TopoDS_Shape outerCyl = build_polygon_cylinder(e, a, m_corePolygonSegments);  // radius a: safely past any flange
@@ -33,18 +30,18 @@ TopoDS_Shape ShapeDrum::buildWindingWindow(const std::map<std::string, double>& 
     TopoDS_Shape post = build_polygon_cylinder(e, c / 2.0, m_corePolygonSegments);
     post = translate_shape(post, 0.0, 0.0, f);
 
-    BRepAlgoAPI_Cut cutter(outerCyl, post);
-    return cutter.IsDone() ? cutter.Shape() : TopoDS_Shape();
+    return done(BRepAlgoAPI_Cut(outerCyl, post), "leaving the post in the winding groove");
 }
 
 TopoDS_Shape ShapeDrum::applyExtras(const std::map<std::string, double>& dims,
                                     const TopoDS_Shape& piece) const {
-    double a = dims.count("A") ? dims.at("A") : 0.0;
-    double a2 = (dims.count("A2") && dims.at("A2") > 0.0) ? dims.at("A2") : a;
-    double b = dims.count("B") ? dims.at("B") : 0.0;
-    double d = dims.count("D") ? dims.at("D") : 0.0;
-    double f = dims.count("F") ? dims.at("F") : 0.0;
-    double h = dims.count("H") ? dims.at("H") : 0.0;
+    const double a = required(dims, "A");
+    const double a2 = featureDimension(dims, "A2").value_or(a);
+    const double b = required(dims, "B");
+    const double d = required(dims, "D");
+    const double f = required(dims, "F");
+    // H is the bore through the drum; a record without it is solid.
+    const double h = featureDimension(dims, "H").value_or(0.0);
 
     TopoDS_Shape result = piece;
 
@@ -59,19 +56,15 @@ TopoDS_Shape ShapeDrum::applyExtras(const std::map<std::string, double>& dims,
         trimOuter = translate_shape(trimOuter, 0.0, 0.0, bandBase);
         TopoDS_Shape trimInner = build_polygon_cylinder(bandHeight, smaller / 2.0, m_corePolygonSegments);
         trimInner = translate_shape(trimInner, 0.0, 0.0, bandBase);
-        BRepAlgoAPI_Cut ring(trimOuter, trimInner);
-        if (ring.IsDone()) {
-            BRepAlgoAPI_Cut trimmed(result, ring.Shape());
-            if (trimmed.IsDone()) result = trimmed.Shape();
-        }
+        TopoDS_Shape ring = done(BRepAlgoAPI_Cut(trimOuter, trimInner), "making the ring that trims the smaller flange");
+        result = done(BRepAlgoAPI_Cut(result, ring), "trimming the smaller flange");
     }
 
     // Bore through the whole piece.
     if (h > 0.0) {
         TopoDS_Shape bore =
             build_polygon_cylinder(b, h / 2.0, m_corePolygonSegments, /*circumscribed=*/true);
-        BRepAlgoAPI_Cut cutter(result, bore);
-        if (cutter.IsDone()) result = cutter.Shape();
+        result = done(BRepAlgoAPI_Cut(result, bore), "drilling the bore");
     }
 
     // Centre the single piece on the origin (open-shape cores are emitted as one CLOSED

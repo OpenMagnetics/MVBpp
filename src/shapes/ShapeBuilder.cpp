@@ -21,23 +21,57 @@
 namespace mvb {
 namespace shapes {
 
-TopoDS_Shape ShapeBuilder::buildPiece(const MAS::CoreShape& shapeData) const {
+std::map<std::string, double> ShapeBuilder::dimensionsOf(const MAS::CoreShape& shapeData) const {
+    m_shapeName = shapeData.get_name().value_or("<unnamed shape>");
     auto dimsOpt = shapeData.get_dimensions();
-    if (!dimsOpt) return TopoDS_Shape();
-    auto dims = flatten_dimensions(*dimsOpt);
-
-    // Build base profile and extrude
-    TopoDS_Face profile = buildProfile(dims);
-    double height = dims.count("B") ? dims.at("B") : 0.0;
-    if (isToroidal()) {
-        height = dims.count("C") ? dims.at("C") : height;
+    if (!dimsOpt) {
+        throw std::runtime_error("shape '" + m_shapeName + "' carries no dimensions at all");
     }
+    return flatten_dimensions(*dimsOpt);
+}
+
+double ShapeBuilder::required(const std::map<std::string, double>& dims, const std::string& key) const {
+    return require_dimension(dims, key, m_shapeName);
+}
+
+double ShapeBuilder::requiredSigned(const std::map<std::string, double>& dims, const std::string& key) const {
+    auto it = dims.find(key);
+    if (it == dims.end()) {
+        throw std::runtime_error("shape '" + m_shapeName + "' has no dimension " + key +
+                                 ", which its profile cannot be built without");
+    }
+    return it->second;
+}
+
+std::optional<double> ShapeBuilder::featureDimension(const std::map<std::string, double>& dims, const std::string& key) const {
+    auto it = dims.find(key);
+    if (it == dims.end() || it->second == 0.0) return std::nullopt;
+    if (it->second < 0.0) {
+        throw std::runtime_error("shape '" + m_shapeName + "' has dimension " + key + " = " + std::to_string(it->second) +
+                                 ", which is no size");
+    }
+    return it->second;
+}
+
+TopoDS_Shape ShapeBuilder::done(BRepAlgoAPI_BooleanOperation& operation, const char* step) const {
+    if (!operation.IsDone() || operation.Shape().IsNull()) {
+        throw std::runtime_error("shape '" + m_shapeName + "': " + step + " did not complete (OCCT boolean failed)");
+    }
+    return operation.Shape();
+}
+
+TopoDS_Shape ShapeBuilder::buildPiece(const MAS::CoreShape& shapeData) const {
+    const auto dims = dimensionsOf(shapeData);
+
+    // Build base profile and extrude: a toroid along its height C, every other family along B.
+    TopoDS_Face profile = buildProfile(dims);
+    const double height = required(dims, isToroidal() ? "C" : "B");
     TopoDS_Shape piece = extrude(profile, height);
 
     // Cut winding window
     TopoDS_Shape window = buildWindingWindow(dims);
     if (!window.IsNull()) {
-        piece = BRepAlgoAPI_Cut(piece, window).Shape();
+        piece = done(BRepAlgoAPI_Cut(piece, window), "cutting the winding window out of the extruded profile");
     }
 
     // Apply extras
@@ -63,13 +97,16 @@ TopoDS_Shape ShapeBuilder::applyMachining(const TopoDS_Shape& piece,
     double xCoord = coords[0];
     double yCoord = coords[1];
 
+    // This cutter is for a core with a rectangular centre column F wide and side legs out to A/2,
+    // C deep: without those letters there is no tool to build, and a tool built from zero cuts
+    // nothing. Families shaped otherwise bring their own cutter.
     TopoDS_Shape tool;
-    double f = dims.count("F") ? dims.at("F") : 0.0;
-    double c = dims.count("C") ? dims.at("C") : 0.0;
-    double a = dims.count("A") ? dims.at("A") : 0.0;
+    const double f = required(dims, "F");
+    const double c = required(dims, "C");
+    const double a = required(dims, "A");
     // For EFD cores the central column depth is F2 (not C). Use F2 when
     // available so the gap tool matches MVB Python's EFD.apply_machining.
-    double centerColumnDepth = dims.count("F2") ? dims.at("F2") : c;
+    const double centerColumnDepth = featureDimension(dims, "F2").value_or(c);
 
     if (std::abs(xCoord) < 1e-12) {
         // Center column: F (width) × gap × centerColumnDepth
@@ -85,7 +122,7 @@ TopoDS_Shape ShapeBuilder::applyMachining(const TopoDS_Shape& piece,
         // cuts: extend the tool beyond the leg in x and z, and away from the piece in y (nothing
         // is there to over-cut; the slab thickness on the piece's side is still exactly the gap).
         const double over = 1e-3;                             // 1 mm past every free face
-        double sideDepth = dims.count("F2") ? a : c;
+        double sideDepth = featureDimension(dims, "F2") ? a : c;
         const double sideW = a / 2.0 + over;                  // from x=0 out past A/2
         double sideX = (xCoord < 0) ? -sideW / 2.0 : sideW / 2.0;
         tool = makeBox(sideW, gapLength + over, sideDepth + 2.0 * over);

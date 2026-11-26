@@ -14,11 +14,10 @@ namespace shapes {
 // EPX (EP variant with elongated/stadium central column).
 // Mirrors MVB.js EPXShape.
 TopoDS_Face ShapeEpx::buildProfile(const std::map<std::string, double>& dims) const {
-    double a = 0.0, c = 0.0, k = 0.0, f = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) a = it->second / 2.0;
-    it = dims.find("C"); if (it != dims.end()) c = it->second;
-    it = dims.find("K"); if (it != dims.end()) k = it->second;
-    it = dims.find("F"); if (it != dims.end()) f = it->second;
+    const double a = required(dims, "A") / 2.0;
+    const double c = required(dims, "C");
+    const double k = required(dims, "K");   // the oblong post's length: what makes an EPX
+    const double f = required(dims, "F");
 
     double columnLength = k + f / 2.0;
     double topC = c - columnLength / 2.0;
@@ -34,15 +33,18 @@ TopoDS_Face ShapeEpx::buildProfile(const std::map<std::string, double>& dims) co
 }
 
 TopoDS_Shape ShapeEpx::buildWindingWindow(const std::map<std::string, double>& dims) const {
-    double b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0, g = 0.0, k = 0.0;
-    auto it = dims.find("B"); if (it != dims.end()) b = it->second;
-    it = dims.find("C"); if (it != dims.end()) c = it->second;
-    it = dims.find("D"); if (it != dims.end()) d = it->second;
-    it = dims.find("E"); if (it != dims.end()) e = it->second;
-    it = dims.find("F"); if (it != dims.end()) f = it->second;
-    it = dims.find("G"); if (it != dims.end()) g = it->second;
-    it = dims.find("K"); if (it != dims.end()) k = it->second;
-    if (b == 0.0 || d == 0.0 || e == 0.0) return TopoDS_Shape();
+    const double b = required(dims, "B");
+    const double c = required(dims, "C");
+    const double d = required(dims, "D");
+    const double e = required(dims, "E");
+    const double f = required(dims, "F");
+    const double k = required(dims, "K");
+    // G is the slot above the post; a record without it has none (MKF reads it the same way).
+    const double g = featureDimension(dims, "G").value_or(0.0);
+    if (!(k > f / 2.0)) {
+        throw std::runtime_error("shape '" + m_shapeName + "' has K = " + std::to_string(k) + " and F = " + std::to_string(f) +
+                                 ": an EPX post is oblong, K must exceed F / 2");
+    }
 
     double zBase = b - d;
     double rectangularPartWidth = k - f / 2.0;
@@ -57,19 +59,14 @@ TopoDS_Shape ShapeEpx::buildWindingWindow(const std::map<std::string, double>& d
         topCyl = translate_shape(topCyl, 0.0, rectangularPartWidth / 2.0, zBase);
         TopoDS_Shape botCyl = BRepPrimAPI_MakeCylinder(f / 2.0, d).Shape();
         botCyl = translate_shape(botCyl, 0.0, -rectangularPartWidth / 2.0, zBase);
-        BRepAlgoAPI_Fuse f1(rect, topCyl);
-        centralCol = f1.IsDone() ? f1.Shape() : rect;
-        BRepAlgoAPI_Fuse f2(centralCol, botCyl);
-        if (f2.IsDone()) centralCol = f2.Shape();
+        centralCol = done(BRepAlgoAPI_Fuse(rect, topCyl), "joining the oblong post's first end");
+        centralCol = done(BRepAlgoAPI_Fuse(centralCol, botCyl), "joining the oblong post's second end");
     }
 
     // Outer winding-window cylinder, offset by +rpw/2 in Y
     TopoDS_Shape ww = BRepPrimAPI_MakeCylinder(e / 2.0, d).Shape();
     ww = translate_shape(ww, 0.0, rectangularPartWidth / 2.0, zBase);
-    {
-        BRepAlgoAPI_Cut cut(ww, centralCol);
-        if (cut.IsDone()) ww = cut.Shape();
-    }
+    ww = done(BRepAlgoAPI_Cut(ww, centralCol), "leaving the post in the winding window");
 
     // Top G-slot cutout if applicable
     if (g > 0.0) {
@@ -79,8 +76,7 @@ TopoDS_Shape ShapeEpx::buildWindingWindow(const std::map<std::string, double>& d
         // Actually box spans Y = (yc - C/2, yc + C/2) where yc = C/2 + columnWidth/2.
         gp_Pnt cn2(-g / 2.0, columnWidth / 2.0, zBase);
         TopoDS_Shape topBox = BRepPrimAPI_MakeBox(cn2, g, c, d).Shape();
-        BRepAlgoAPI_Fuse fuser(ww, topBox);
-        if (fuser.IsDone()) ww = fuser.Shape();
+        ww = done(BRepAlgoAPI_Fuse(ww, topBox), "adding the G slot to the winding window");
     }
 
     // Bottom rectangle E × C × D, offset by -C/2 + rpw/2 in Y, minus central column
@@ -89,10 +85,8 @@ TopoDS_Shape ShapeEpx::buildWindingWindow(const std::map<std::string, double>& d
         // Y center = -C/2 + rpw/2; box spans Y = (-C + rpw/2, rpw/2)
         gp_Pnt cn(-e / 2.0, -c + rectangularPartWidth / 2.0, zBase);
         TopoDS_Shape bottomBox = BRepPrimAPI_MakeBox(cn, e, c, d).Shape();
-        BRepAlgoAPI_Cut cut(bottomBox, centralCol);
-        if (cut.IsDone()) bottomBox = cut.Shape();
-        BRepAlgoAPI_Fuse fuser(ww, bottomBox);
-        if (fuser.IsDone()) ww = fuser.Shape();
+        bottomBox = done(BRepAlgoAPI_Cut(bottomBox, centralCol), "leaving the post in the open side of the window");
+        ww = done(BRepAlgoAPI_Fuse(ww, bottomBox), "adding the open side to the winding window");
     }
 
     return ww;

@@ -14,9 +14,7 @@ namespace mvb {
 namespace shapes {
 
 TopoDS_Face ShapeP::buildProfile(const std::map<std::string, double>& dims) const {
-    double a = 0.0;
-    auto it = dims.find("A");
-    if (it != dims.end()) a = it->second / 2.0;
+    const double a = required(dims, "A") / 2.0;
 
     TopoDS_Wire outer = build_polygon_circle(a, m_corePolygonSegments);
     BRepBuilderAPI_MakeFace face(outer);
@@ -24,13 +22,10 @@ TopoDS_Face ShapeP::buildProfile(const std::map<std::string, double>& dims) cons
 }
 
 TopoDS_Shape ShapeP::buildWindingWindow(const std::map<std::string, double>& dims) const {
-    double b = 0.0, d = 0.0, e = 0.0, f = 0.0;
-    auto it = dims.find("B"); if (it != dims.end()) b = it->second;
-    it = dims.find("D"); if (it != dims.end()) d = it->second;
-    it = dims.find("E"); if (it != dims.end()) e = it->second;
-    it = dims.find("F"); if (it != dims.end()) f = it->second;
-
-    if (b == 0.0 || d == 0.0 || e == 0.0) return TopoDS_Shape();
+    const double b = required(dims, "B");
+    const double d = required(dims, "D");
+    const double e = required(dims, "E");
+    const double f = required(dims, "F");
 
     double zCenter = b - d / 2.0;
 
@@ -44,15 +39,12 @@ TopoDS_Shape ShapeP::buildWindingWindow(const std::map<std::string, double>& dim
     TopoDS_Shape innerCyl = build_polygon_cylinder(d, f / 2.0, m_corePolygonSegments);
     innerCyl = translate_shape(innerCyl, 0.0, 0.0, zCenter - d / 2.0);
 
-    BRepAlgoAPI_Cut cutter(outerCyl, innerCyl);
-    return cutter.IsDone() ? cutter.Shape() : TopoDS_Shape();
+    return done(BRepAlgoAPI_Cut(outerCyl, innerCyl), "leaving the centre post in the winding window");
 }
 
 TopoDS_Shape ShapeP::applyExtras(const std::map<std::string, double>& dims,
                                  const TopoDS_Shape& piece) const {
-    double b = 0.0;
-    auto it = dims.find("B");
-    if (it != dims.end()) b = it->second;
+    const double b = required(dims, "B");
     return translate_shape(piece, 0.0, 0.0, -b);
 }
 
@@ -65,10 +57,6 @@ TopoDS_Shape ShapeP::applyMachining(const TopoDS_Shape& piece,
     if (coords.size() < 2) return piece;
     double gapLength = machining.get_length();
     if (gapLength <= 0.0) return piece;
-
-    double f = 0.0;
-    auto it = dims.find("F"); if (it != dims.end()) f = it->second;
-    if (f <= 0.0) return piece;
 
     double xCoord = coords[0];
     double yCoord = coords[1];
@@ -93,9 +81,7 @@ TopoDS_Shape ShapeP::applyMachining(const TopoDS_Shape& piece,
         // without a functional gap: retype_residual_gaps turns MKF's 5 um residual gaps
         // (centre + one per side) into machined ones. The piece's bounding box is the outer
         // extent of whatever the family is, so no dimension is read for it at all.
-        const double e = dims.count("E") ? dims.at("E") : 0.0;
-        if (e <= 0.0)
-            throw std::runtime_error("applyMachining: P-family side gap needs dimension E (the winding window diameter)");
+        const double e = required(dims, "E");   // the winding window diameter
         Bnd_Box bb; BRepBndLib::Add(piece, bb);
         if (bb.IsVoid()) throw std::runtime_error("applyMachining: P-family side gap on an empty piece");
         double xmin, ymin, zmin, xmax, ymax, zmax; bb.Get(xmin, ymin, zmin, xmax, ymax, zmax);
@@ -120,6 +106,7 @@ TopoDS_Shape ShapeP::applyMachining(const TopoDS_Shape& piece,
     // Y = yCoord. Using default BRepPrimAPI_MakeCylinder orients along Z
     // and cuts a transverse slot through the column — same mistake Python
     // avoids by its coord system and ShapeEr handles via an explicit axis.
+    const double f = required(dims, "F");
     gp_Ax2 cylAxis(gp_Pnt(0.0, yCoord - gapLength / 2.0, 0.0), gp_Dir(0, 1, 0));
     TopoDS_Shape tool = BRepPrimAPI_MakeCylinder(cylAxis, f / 2.0, gapLength).Shape();
     BRepAlgoAPI_Cut cutter(piece, tool);

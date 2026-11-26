@@ -23,14 +23,17 @@ namespace shapes {
 // hole, then translates so the bottom is at Z = -B (matching ShapeP).
 TopoDS_Shape ShapePm::applyExtras(const std::map<std::string, double>& dims,
                                   const TopoDS_Shape& piece) const {
-    double a = 0.0, b = 0.0, c = 0.0, f = 0.0, h = 0.0, alpha = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) a = it->second / 2.0;
-    it = dims.find("B"); if (it != dims.end()) b = it->second;
-    it = dims.find("C"); if (it != dims.end()) c = it->second / 2.0;
-    it = dims.find("F"); if (it != dims.end()) f = it->second / 2.0;
-    it = dims.find("H"); if (it != dims.end()) h = it->second / 2.0;
-    it = dims.find("alpha"); if (it != dims.end()) alpha = it->second;
-    if (alpha <= 0.0) alpha = (familySubtype_ == "1") ? 120.0 : 90.0;
+    const double a = required(dims, "A") / 2.0;
+    const double b = required(dims, "B");
+    const double c = required(dims, "C") / 2.0;
+    const double f = required(dims, "F") / 2.0;
+    // H is the centre hole; a record without it has a solid post.
+    const double h = featureDimension(dims, "H").value_or(0.0) / 2.0;
+    // The opening angle of the two wedges, in degrees: every PM record carries it.
+    const double alpha = required(dims, "alpha");
+    if (!(alpha < 180.0)) {
+        throw std::runtime_error("shape '" + m_shapeName + "' has a wedge angle alpha of " + std::to_string(alpha) + " degrees; it must be below 180");
+    }
 
     double halfAlphaRad = (alpha / 2.0) * std::numbers::pi / 180.0;
     double wedgeLength = a * 1.5;
@@ -56,10 +59,7 @@ TopoDS_Shape ShapePm::applyExtras(const std::map<std::string, double>& dims,
 
     TopoDS_Shape topWedge = translate_shape(makeWedge(), 0.0, c, 0.0);
     TopoDS_Shape result = piece;
-    {
-        BRepAlgoAPI_Cut cut(result, topWedge);
-        if (cut.IsDone()) result = cut.Shape();
-    }
+    result = done(BRepAlgoAPI_Cut(result, topWedge), "cutting the first wedge opening");
 
     // Bottom wedge: rotate 180° around Z then translate to -c
     TopoDS_Shape bottomWedge = makeWedge();
@@ -69,23 +69,18 @@ TopoDS_Shape ShapePm::applyExtras(const std::map<std::string, double>& dims,
         bottomWedge = BRepBuilderAPI_Transform(bottomWedge, rot).Shape();
     }
     bottomWedge = translate_shape(bottomWedge, 0.0, -c, 0.0);
-    {
-        BRepAlgoAPI_Cut cut(result, bottomWedge);
-        if (cut.IsDone()) result = cut.Shape();
-    }
+    result = done(BRepAlgoAPI_Cut(result, bottomWedge), "cutting the second wedge opening");
 
     // Add central column at full height B
-    if (f > 0.0) {
+    {
         TopoDS_Shape column = BRepPrimAPI_MakeCylinder(f, b).Shape();
-        BRepAlgoAPI_Fuse fuser(result, column);
-        if (fuser.IsDone()) result = fuser.Shape();
+        result = done(BRepAlgoAPI_Fuse(result, column), "adding the centre post");
     }
 
     // Optional central hole H
     if (h > 0.0) {
         TopoDS_Shape hole = BRepPrimAPI_MakeCylinder(h, b).Shape();
-        BRepAlgoAPI_Cut cut(result, hole);
-        if (cut.IsDone()) result = cut.Shape();
+        result = done(BRepAlgoAPI_Cut(result, hole), "drilling the centre hole");
     }
 
     return translate_shape(result, 0.0, 0.0, -b);

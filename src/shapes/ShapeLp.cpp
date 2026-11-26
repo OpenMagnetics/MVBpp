@@ -9,9 +9,8 @@ namespace shapes {
 // LP shares EP's winding window topology (donut + top G-slot + bottom E-rect),
 // but uses a centered A × C rectangular profile (ER-like).
 TopoDS_Face ShapeLp::buildProfile(const std::map<std::string, double>& dims) const {
-    double a = 0.0, c = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) a = it->second / 2.0;
-    it = dims.find("C"); if (it != dims.end()) c = it->second / 2.0;
+    const double a = required(dims, "A") / 2.0;
+    const double c = required(dims, "C") / 2.0;
 
     BRepBuilderAPI_MakePolygon poly;
     poly.Add(gp_Pnt(-a,  c, 0.0));

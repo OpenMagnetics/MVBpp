@@ -45,37 +45,35 @@ static TopoDS_Shape buildLateralPiece(double a, double c, double e, double sin_g
 }
 
 TopoDS_Shape ShapePQ::buildPiece(const MAS::CoreShape& shapeData) const {
-    auto dimsOpt = shapeData.get_dimensions();
-    if (!dimsOpt) return TopoDS_Shape();
-    auto dims = flatten_dimensions(*dimsOpt);
+    const auto dims = dimensionsOf(shapeData);
 
-    double a = 0.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0, g = 0.0;
-    auto it = dims.find("A"); if (it != dims.end()) a = it->second / 2.0;
-    it = dims.find("B"); if (it != dims.end()) b = it->second;
-    it = dims.find("C"); if (it != dims.end()) c = it->second / 2.0;
-    it = dims.find("D"); if (it != dims.end()) d = it->second;
-    it = dims.find("E"); if (it != dims.end()) e = it->second / 2.0;
-    it = dims.find("F"); if (it != dims.end()) f = it->second / 2.0;
-    it = dims.find("G"); if (it != dims.end()) g = it->second;
-
-    if (b == 0.0) return TopoDS_Shape();
-
-    double l = (f * 2.0) + (c * 2.0 - f * 2.0) / 3.0;
-    auto itL = dims.find("L");
-    if (itL != dims.end()) l = itL->second;
-
-    double j = f;
-    auto itJ = dims.find("J");
-    if (itJ != dims.end()) j = itJ->second;
-
-    double g_angle = 0.0;
-    if (e > 0.0) {
-        if (g > 0.0 && g <= e * 2.0) {
-            g_angle = std::asin(g / (e * 2.0));
-        } else {
-            g_angle = std::asin((e + f) / (e * 2.0));
-        }
+    // Every one of these shapes the piece: an absent G used to build the lateral legs at an
+    // angle made up from E and F instead of the opening the record should have given
+    // (ABT #1143: PQ 32/12 had no G).
+    const double a = required(dims, "A") / 2.0;
+    const double b = required(dims, "B");
+    const double c = required(dims, "C") / 2.0;
+    const double d = required(dims, "D");
+    const double e = required(dims, "E") / 2.0;
+    const double f = required(dims, "F") / 2.0;
+    const double g = required(dims, "G");
+    if (!(g <= e * 2.0)) {
+        throw std::runtime_error("shape '" + m_shapeName + "' has an opening G = " + std::to_string(g) +
+                                 " wider than its window E = " + std::to_string(e * 2.0));
     }
+
+    // J and L describe the lateral legs' inner flank. Most PQ records lack both, and MKF then
+    // takes J = F / 2 and L = F + (C - F) / 3 (CorePiecePq, its documented approximation, the
+    // one its Ae and le are computed with). The core is drawn with MKF's flank, never another.
+    const auto recordJ = featureDimension(dims, "J");
+    const auto recordL = featureDimension(dims, "L");
+    if (recordJ.has_value() != recordL.has_value()) {
+        throw std::runtime_error("shape '" + m_shapeName + "' carries only one of J and L; the lateral flank needs both or neither");
+    }
+    const double j = recordJ.value_or(f);
+    const double l = recordL.value_or((f * 2.0) + (c * 2.0 - f * 2.0) / 3.0);
+
+    const double g_angle = std::asin(g / (e * 2.0));
     double sin_g = std::sin(g_angle);
     double cos_g = std::cos(g_angle);
 
@@ -97,8 +95,7 @@ TopoDS_Shape ShapePQ::buildPiece(const MAS::CoreShape& shapeData) const {
             gp_Trsf shift; shift.SetTranslation(gp_Vec(0, 0, yoke_h));
             column = BRepBuilderAPI_Transform(column, shift).Shape();
         }
-        BRepAlgoAPI_Fuse fconn(connector, column);
-        central = (yoke_h > 1e-9 && fconn.IsDone()) ? fconn.Shape() : connector;
+        central = yoke_h > 1e-9 ? done(BRepAlgoAPI_Fuse(connector, column), "joining the column to the yoke disk") : connector;
     }
 
     // Right lateral piece
@@ -110,19 +107,12 @@ TopoDS_Shape ShapePQ::buildPiece(const MAS::CoreShape& shapeData) const {
     TopoDS_Shape leftLateral = BRepBuilderAPI_Transform(rightLateral, mirror).Shape();
 
     // Fuse all three
-    BRepAlgoAPI_Fuse f1(central, rightLateral);
-    if (!f1.IsDone()) return central;
-    TopoDS_Shape fused = f1.Shape();
-
-    BRepAlgoAPI_Fuse f2(fused, leftLateral);
-    if (f2.IsDone()) fused = f2.Shape();
+    TopoDS_Shape fused = done(BRepAlgoAPI_Fuse(central, rightLateral), "joining the first lateral leg");
+    fused = done(BRepAlgoAPI_Fuse(fused, leftLateral), "joining the second lateral leg");
 
     // Apply winding window cut
     TopoDS_Shape window = buildWindingWindow(dims);
-    if (!window.IsNull()) {
-        BRepAlgoAPI_Cut cutter(fused, window);
-        if (cutter.IsDone()) fused = cutter.Shape();
-    }
+    fused = done(BRepAlgoAPI_Cut(fused, window), "cutting the winding window");
 
     // Apply extras (translate by -B)
     fused = applyExtras(dims, fused);

@@ -20,12 +20,8 @@ namespace shapes {
 // Then a donut-shaped winding window (E/2 outer, F/2 inner, height D) is cut
 // at the top. Optional central H hole through the full height.
 TopoDS_Shape ShapeRM::buildPiece(const MAS::CoreShape& shapeData) const {
-    const std::string shapeName = shapeData.get_name().value_or("RM");
-    auto dimsOpt = shapeData.get_dimensions();
-    if (!dimsOpt) {
-        throw std::runtime_error("shape '" + shapeName + "' carries no dimensions at all");
-    }
-    auto dims = flatten_dimensions(*dimsOpt);
+    const auto dims = dimensionsOf(shapeData);
+    const std::string& shapeName = m_shapeName;
 
     // Every one of these is load-bearing for the profile. Defaulting an absent
     // one to zero builds a degenerate solid instead of reporting the data gap
@@ -97,23 +93,22 @@ TopoDS_Shape ShapeRM::buildPiece(const MAS::CoreShape& shapeData) const {
     TopoDS_Shape piece = BRepPrimAPI_MakePrism(face, gp_Vec(0, 0, b)).Shape();
 
     // Donut winding window: outer cylinder E/2, inner column F/2, height D, top at z=B
-    if (d > 0.0 && e > 0.0 && f > 0.0 && f < e) {
+    if (!(f < e)) {
+        throw std::runtime_error("shape '" + shapeName + "' has a post F that is not inside its window E");
+    }
+    {
         TopoDS_Shape outerCyl = BRepPrimAPI_MakeCylinder(e, d).Shape();
         outerCyl = translate_shape(outerCyl, 0.0, 0.0, b - d);
         TopoDS_Shape innerCyl = BRepPrimAPI_MakeCylinder(f, d).Shape();
         innerCyl = translate_shape(innerCyl, 0.0, 0.0, b - d);
-        BRepAlgoAPI_Cut donut(outerCyl, innerCyl);
-        if (donut.IsDone()) {
-            BRepAlgoAPI_Cut cutter(piece, donut.Shape());
-            if (cutter.IsDone()) piece = cutter.Shape();
-        }
+        TopoDS_Shape donut = done(BRepAlgoAPI_Cut(outerCyl, innerCyl), "leaving the post in the winding window");
+        piece = done(BRepAlgoAPI_Cut(piece, donut), "cutting the winding window");
     }
 
     // Optional central H hole through the full height
     if (h > 0.0) {
         TopoDS_Shape hole = BRepPrimAPI_MakeCylinder(h, b).Shape();
-        BRepAlgoAPI_Cut cutter(piece, hole);
-        if (cutter.IsDone()) piece = cutter.Shape();
+        piece = done(BRepAlgoAPI_Cut(piece, hole), "drilling the centre hole");
     }
 
     piece = translate_shape(piece, 0.0, 0.0, -b);
