@@ -6905,8 +6905,8 @@ void appendFilletedPolyline(std::vector<Primitive>& out, const std::vector<gp_Pn
             const double need = bTarget * halfTan[i];
             const double roomBefore = len[i - 1] - takenAtStart[i - 1];
             const double roomAfter = len[i] - takenAtEnd[i];
-            // Equal is a fit (a leg MKF made exactly one tangent long): compared to a few ulps of round-off, no length.
-            auto fits = [](double nd, double rm) { return nd <= rm + 8.0 * std::numeric_limits<double>::epsilon() * std::max(std::abs(nd), std::abs(rm)); };
+            // Equal is a fit (a leg MKF made exactly one tangent long): kLegFitSlack, no length.
+            auto fits = [](double nd, double rm) { return nd <= rm + kLegFitSlack; };
             if (fits(need, roomBefore) && fits(need, roomAfter)) {
                 radius[i] = bTarget;
                 tanLen[i] = need;
@@ -7408,7 +7408,7 @@ size_t filletLeadJunctions(std::vector<Primitive>& prims, std::optional<double> 
         double radius = bend;
         // A slanted step is solved so its junction bend takes the slant exactly: equal is a fit, and the
         // straight left between the two arcs (none) is dropped below.
-        constexpr double kExact = 1e-12;
+        constexpr double kExact = kLegFitSlack;
         // Agent 46 (allotted space): a dragback's straight also has a corner at its FAR end, still sharp here
         // (filletDragbackInteriorCorners bends it later, if what is left holds MKF's bend). At the least that corner
         // is a mitre and takes wireRadius tan(turn/2) of the straight, so the junction fillet may not take that part

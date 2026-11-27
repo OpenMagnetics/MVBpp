@@ -22,6 +22,13 @@
 
 namespace mvb {
 
+// WHAT "EQUAL" MEANS FOR A LEG MKF MADE EXACTLY ONE TANGENT LONG: a picometre, three orders below the 1 nm grid MKF
+// ships its coordinates on, and far above the round-off of the sums a leg's room comes out of. The corner tests used
+// to allow 8 ulps of the larger number (3.3e-19 m on a 0.1835 mm leg); a room computed as leg - what the neighbour
+// took missed that by 13 and 26 ulps (3.5e-19 and 7.0e-19 m) on realwinding_interleaved_full_section_e16's Secondary,
+// and four corners MKF planned round (need 0.183500 mm, room 0.183500 mm) were drawn sharp and reported as findings.
+constexpr double kLegFitSlack = 1e-12;
+
 // Fillets every terminal corner in `prims` -- an exact-helix "(terminal stub)" SPIRAL adjacent to a
 // "lead seg" SEG, in either order -- in place. Returns how many corners were filleted. Throws,
 // naming the corner, when a fillet with radius >= minBend does not fit.

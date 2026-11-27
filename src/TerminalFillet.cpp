@@ -874,8 +874,8 @@ size_t filletInteriorCornersOf(std::vector<Primitive>& prims, double bend, doubl
             const double roomBefore = len[k - 1] - takenAtStart[k - 1];
             const double roomAfter = len[k] - takenAtEnd[k];
             // Equal is a fit: MKF makes a dragback's radial leg exactly one bend long, and need == room then
-            // differs only by floating-point round-off (17_cllc: 0.00098225 vs 0.00098225 m). A few ulps, no length.
-            auto fits = [](double nd, double rm) { return nd <= rm + 8.0 * std::numeric_limits<double>::epsilon() * std::max(std::abs(nd), std::abs(rm)); };
+            // differs only by floating-point round-off (17_cllc: 0.00098225 vs 0.00098225 m). kLegFitSlack, no length.
+            auto fits = [](double nd, double rm) { return nd <= rm + kLegFitSlack; };
             if (fits(need, roomBefore) && fits(need, roomAfter)) {
                 // TWO BENDS THAT MEET BY PLAN MEET (ABT #2474). A radial step of one wire diameter, bent at half a
                 // diameter at both ends, has no room for a straight; drawn at exactly MKF's radius its end fillet on
