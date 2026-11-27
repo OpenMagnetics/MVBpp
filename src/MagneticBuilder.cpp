@@ -9,6 +9,7 @@
 #include "mvb/shapes/ShapeBuilder.h"
 #include "mvb/shapes/ShapeSlab.h"   // ShapeRs (ABT #1443)
 #include "mvb/TurnBuilder.h"
+#include "mvb/Refusal.h"
 #include "mvb/ConductorBuilder.h"
 #include "mvb/BobbinBuilder.h"
 #include "mvb/SpacerBuilder.h"   // ABT #1170 (WP1)
@@ -831,7 +832,7 @@ public:
         }
         if (windowIndex == 0 && _windowColumn.empty()) return std::nullopt;   // no placement anywhere
         if (windowIndex < 0 || static_cast<std::size_t>(windowIndex) >= std::max<std::size_t>(_windowCount, 1)) {
-            throw std::runtime_error(
+            throw Refusal(RefusalReason::InconsistentMasData,
                 "WoundColumnResolver: '" + what + "' resolves to winding window "
                 + std::to_string(windowIndex) + " but the bobbin/core only defines "
                 + std::to_string(_windowCount) + " winding windows — inconsistent MAS placement data");
@@ -840,7 +841,7 @@ public:
         if (colIt == _windowColumn.end()) return std::nullopt;   // no column edge = main column
         int64_t columnIndex = colIt->second;
         if (columnIndex < 0 || static_cast<std::size_t>(columnIndex) >= _columns.size()) {
-            throw std::runtime_error(
+            throw Refusal(RefusalReason::InconsistentMasData,
                 "WoundColumnResolver: winding window " + std::to_string(windowIndex)
                 + " references column " + std::to_string(columnIndex) + " but the core has "
                 + std::to_string(_columns.size()) + " columns — inconsistent MAS placement data");

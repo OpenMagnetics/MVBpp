@@ -1,6 +1,7 @@
 #include "mvb/Utils.h"
 #include "mvb/ConductorBuilder.h"   // the bend policy MKF is told about (ABT #1172)
 #include "mvb/WireAssembler.h"
+#include "mvb/Refusal.h"
 #include "constructive_models/MasMigration.h"   // MKF's reader of older MAS files
 #include <algorithm>
 #include <vector>
@@ -394,14 +395,14 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
         // transformer sends the reader hunting a fit problem that does not exist (it cost
         // 09_planar_xfmr_er2510_3c94 a slot in the #869 fit class). Name the real reason.
         if (enriched.get_mutable_coil().is_planar()) {
-            throw std::runtime_error(
+            throw Refusal(RefusalReason::PlanarRealWindingUnsupported,
                 "magnetic_autocomplete_safe: real winding geometry was requested for a PLANAR "
                 "(PCB) construction, which MKF does not implement (ABT #492: leads, connection "
                 "blocking and lead routing are for wound magnetics only). This is not a fit "
                 "problem — the layout is fine; there is no real-winding model for it. Build it "
                 "without --real, or implement planar real winding in MKF first.");
         }
-        throw std::runtime_error(
+        throw Refusal(RefusalReason::MkfAppliedNoConnectionBlocking,
             "magnetic_autocomplete_safe: real winding geometry was requested but MKF did NOT "
             "apply connection blocking (the ideal wind does not fit its window — see MKF's "
             "coil log / MKF_BLOCKING_DIAG). The layout has turns inside the connection "
@@ -462,7 +463,7 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
                   << " turns total — the winding likely does not fit the bobbin "
                      "window. Refusing to return a magnetic with an empty "
                      "turnsDescription.";
-                throw std::runtime_error(s.str());
+                throw Refusal(RefusalReason::MkfProducedNoTurns, s.str());
             }
         }
     }

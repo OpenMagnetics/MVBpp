@@ -1,6 +1,7 @@
 #include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
 #include "mvb/WireAssembler.h"
+#include "mvb/Refusal.h"
 #include "constructive_models/Wire.h"
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
@@ -483,7 +484,7 @@ static TopoDS_Shape build_concentric_rect_column_turn(double radial_pos, double 
     // on the Z faces. This offset is MKF data and must never be adjusted here.
     double clearance = radial_pos - half_col_width;
     if (clearance <= 0.0) {
-        throw std::runtime_error(
+        throw Refusal(RefusalReason::InconsistentMasData,
             "build_concentric_rect_column_turn: turn radial position " + std::to_string(radial_pos)
             + " m lies inside the column (half-width " + std::to_string(half_col_width)
             + " m) — inconsistent MAS turn/bobbin data");

@@ -4,6 +4,7 @@
 #include "mvb/PortPlane.h"      // ABT #1400: the port-plane rule shared with OMFEM
 #include <mvb/TerminalFillet.h>
 #include "mvb/TurnBuilder.h"
+#include "mvb/Refusal.h"
 #include "mvb/Utils.h"
 #include "mvb/StepExporter.h"   // unitParametrised: the weld fuses in the STEP export's millimetre parametrisation (ABT #2262)
 #include <array>
@@ -163,7 +164,7 @@ struct CollisionDiagnosticScope {
 // build carries on with the copper as drawn.
 static void refuseCollision(const std::string& message) {
     if (tlsDisplayOnly) return;   // a display drawing is not judged
-    if (!collisionDiagnostic()) throw std::runtime_error(message);
+    if (!collisionDiagnostic()) throw Refusal(RefusalReason::ConductorCollision, message);
     std::cerr << "[ConductorBuilder] FINDING (collision allowed by --skip-collision-check / "
                  "MVB_SKIP_COLLISION_CHECK; copper left as drawn, not a part): "
               << message << std::endl;
@@ -3554,7 +3555,7 @@ TopoDS_Shape emitRectColumn(const ConductorPath& path) {
         std::set<size_t> roots;
         for (size_t i = 0; i < n; ++i) roots.insert(find(i));
         if (roots.size() > 1) {
-            throw std::runtime_error(
+            throw Refusal(RefusalReason::SingleBodySweepFailed,
                 "ConductorBuilder: real-winding FEM export for '" + path.name + "' produced " +
                 std::to_string(solids.size()) + " primitives forming " +
                 std::to_string(roots.size()) + " DISCONNECTED bodies (single-body sweep failed, "
@@ -4871,7 +4872,7 @@ TopoDS_Shape emitConductor(const ConductorPath& path, int wirePolygonSegments,
     // The per-run compound below sweeps ROUND profiles; a rectangular winding must come out of the
     // single-body path or not at all -- never a silently round-profiled body. Surface the failure.
     if (path.isRectangular) {
-        throw std::runtime_error(
+        throw Refusal(RefusalReason::SingleBodySweepFailed,
             "ConductorBuilder: rectangular-wire single-body sweep failed for '" + path.name +
             "' (fixed-binormal MakePipeShell did not close a valid solid); refusing to fall back to "
             "a round-profile compound");
@@ -5622,7 +5623,7 @@ splitTerminalGroups(const std::vector<const RSpace*>& terminalRects, const std::
                           rectIsVertical(*s, foilRadial) ? "V" : "H");
             dump += buf;
         }
-        throw std::runtime_error(
+        throw Refusal(RefusalReason::InconsistentMasData,
             "ConductorBuilder: expected 2 terminal lead groups (entrance, exit) for " + who +
             ", got " + std::to_string(groups.size()) +
             ". Terminal rects (w x h at (x,y), V=vertical):" + dump);
@@ -8081,7 +8082,7 @@ RectStation rectStation(const PlanePt& p, double halfW, double halfD, double min
                      who.c_str(), p.x, halfW, halfD, minBend, clearance);
     }
     if (clearance <= 0.0) {
-        throw std::runtime_error(
+        throw Refusal(RefusalReason::InconsistentMasData,
             "ConductorBuilder: crossing radial position " + std::to_string(p.x) +
             " m lies inside the column (half-width " + std::to_string(halfW) +
             " m) for " + who + " — inconsistent MAS turn/bobbin data");
@@ -10887,7 +10888,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
     if (!isToroidal && columnShape != MAS::ColumnShape::ROUND &&
         columnShape != MAS::ColumnShape::RECTANGULAR &&
         columnShape != MAS::ColumnShape::OBLONG) {
-        throw std::runtime_error(
+        throw Refusal(RefusalReason::UnsupportedColumnShape,
             "ConductorBuilder: unsupported column shape for real-winding conductors "
             "(only round/rectangular/oblong concentric columns and toroids are modelled)");
     }
@@ -10949,7 +10950,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             first = false;
             if (found != opts.woundColumnPerSection.end()) {
                 if (isToroidal) {
-                    throw std::runtime_error(
+                    throw Refusal(RefusalReason::InconsistentMasData,
                         "ConductorBuilder: section '" + sectionName +
                         "' carries multi-column placement on a toroidal core — a toroid has one "
                         "column, so this is inconsistent MAS placement data");
@@ -15524,7 +15525,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
         // by the local bend/spacing axis (column Y, or the toroid's azimuthal tangent). Only FOIL
         // (a single wide sheet, a different construction) still throws.
         if (wireType == MAS::WireType::FOIL && !foilWire) {
-            throw std::runtime_error(
+            throw Refusal(RefusalReason::FoilRealWindingUnsupported,
                 "ConductorBuilder: real-winding does not support FOIL wire (a single wide sheet "
                 "turn is a different construction) — winding '" + ct.winding + "'");
         }
@@ -16594,7 +16595,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
                     }
                 }
                 if (!routed)
-                    throw std::runtime_error(
+                    throw Refusal(RefusalReason::NoTerminalLeadRoute,
                         "ConductorBuilder: no clear terminal-lead route for '" + who +
                         "': the classic 90-degree route interferes with the winding by " +
                         std::to_string(-worstA) +
@@ -18566,7 +18567,7 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             // through) and may overlap itself, so there the lead is its enamelled envelope on
             // MKF's centreline.
             if (opts.paintCoating && !opts.cutterOnly)
-                throw std::runtime_error(
+                throw Refusal(RefusalReason::FoilLeadOnCopperCoated,
                     "ConductorBuilder: foil conductor '" + path.name + "': its leads are planned copper on copper "
                     "(ConnectionRoute::axialLead, tangent to the sheet), which a coated drawing cannot show without "
                     "putting the lead's enamel inside the sheet; draw it on copper (paintCoating off) (ABT #1907)");

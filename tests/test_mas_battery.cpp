@@ -28,6 +28,9 @@
 
 #include "constructive_models/Magnetic.h"
 #include "mvb/MagneticBuilder.h"
+#include "mvb/Refusal.h"
+#include "support/Exceptions.h"
+#include "support/Settings.h"
 #include "mvb/SectionDrawing.h"
 #include "mvb/StepExporter.h"
 #include "mvb/Utils.h"
@@ -154,6 +157,10 @@ struct CaseResult {
     std::string file;
     bool        passed = true;
     std::vector<std::string> errors;
+    // Why the build was refused, as the producer's own fixed value: MVB++'s RefusalReason by name, or MKF's
+    // ErrorCode by name. Empty for a throw that carries neither. The parent decides on these, never on `errors`.
+    std::string refusal;
+    std::string mkfCode;
 };
 
 double solid_volume(const TopoDS_Shape& s) {
@@ -732,6 +739,8 @@ CaseResult run_one_isolated(const fs::path& path, CaseResult (*runner)(const fs:
             json out = json::parse(buf);
             r.file   = out.value("file",   r.file);
             r.passed = out.value("passed", false);
+            r.refusal = out.value("refusal", std::string());
+            r.mkfCode = out.value("mkfCode", std::string());
             if (out.contains("errors"))
                 for (const auto& e : out["errors"])
                     r.errors.push_back(e.get<std::string>());
@@ -782,8 +791,23 @@ CaseResult run_one_realwinding(const fs::path& path) {
     // are the magnetic itself. Accept either, matching test_real_winding's loadFixture.
     json magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
 
+    // A fixture designed around an MKF setting is wound with it: abt2511_t50_flattened_litz is the litz that
+    // only fits flattened (ABT #2511), so MKF's litz deformation is on for it (Alf, 2026-11-27: "Draw it with litz
+    // flattening on"). This runs in the fixture's own child process, so the setting reaches no other fixture.
+    if (path.filename() == "abt2511_t50_flattened_litz.json")
+        OpenMagnetics::Settings::GetInstance().set_coil_litz_deformation(true);
+
+    // A refusal is carried by its reason (MVB++'s) or its code (MKF's); the message goes along for the reader.
+    auto refused = [&](const mvb::Refusal& e) { r.refusal = std::string(mvb::to_string(e.reason())); fail(e.what()); };
+    auto refusedByMkf = [&](const OpenMagnetics::OpenMagneticsException& e) {
+        r.mkfCode = OpenMagnetics::to_string(e.code());
+        fail(e.what());
+    };
+
     OpenMagnetics::Magnetic enriched;
     try { enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWinding=*/true); }
+    catch (const mvb::Refusal& e) { refused(e); return r; }
+    catch (const OpenMagnetics::OpenMagneticsException& e) { refusedByMkf(e); return r; }
     catch (const std::exception& e) { fail(e.what()); return r; }
 
     std::vector<mvb::NamedShape> all;
@@ -794,7 +818,10 @@ CaseResult run_one_realwinding(const fs::path& path) {
                                     mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/true,
                                     /*emitCoatingShells=*/false, /*includeInsulation=*/false,
                                     /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true);
-    } catch (const std::exception& e) { fail(e.what()); return r; }
+    }
+    catch (const mvb::Refusal& e) { refused(e); return r; }
+    catch (const OpenMagnetics::OpenMagneticsException& e) { refusedByMkf(e); return r; }
+    catch (const std::exception& e) { fail(e.what()); return r; }
 
     // A "Primary parallel 0"-style conductor must exist with a positive-volume solid.
     int conductors = 0;
@@ -831,6 +858,8 @@ struct BatteryChildMode {
             {"file",   r.file},
             {"passed", r.passed},
             {"errors", r.errors},
+            {"refusal", r.refusal},
+            {"mkfCode", r.mkfCode},
         };
         std::string s = out.dump();
         const char* p = s.data();
@@ -846,32 +875,34 @@ struct BatteryChildMode {
 };
 static BatteryChildMode batteryChildModeHook;
 
-// Category of a real-winding throw. Each is an UPSTREAM (MKF/data) gap or a declared limitation
-// that MVB++ surfaces loudly, NOT a silent-wrong-geometry bug. An unrecognised message is a real
-// failure (returns "UNRECOGNISED") so a new fault mode cannot hide.
-const char* realwinding_category(const std::string& msg) {
-    if (msg.find("collision between") != std::string::npos)        return "collision (ABT #240/#187)";
-    if (msg.find("no clear terminal-lead route") != std::string::npos)
-        return "no lead corridor (ABT #187)";   // routed-lead validation: layout reserves none
-    if (msg.find("NO outer-crossing azimuth exists") != std::string::npos)
-        return "no lead corridor (ABT #187)";   // MKF's chord-aware sweep exhausted in-section
-    if (msg.find("FOIL wire") != std::string::npos ||
-        msg.find("rectangular/planar/foil wire") != std::string::npos) return "foil wire (unsupported)";
-    // PLANAR (PCB) construction: MKF has no real-winding model for it (ABT #492 -- leads,
-    // connection blocking and lead routing are for wound magnetics only). A declared limitation
-    // like the foil case above, not an untriaged fault: refusing is the correct behaviour and the
-    // battery should categorise it rather than fail. Alf, 2026-08-26: "09_planar should be
-    // avoided, we are not implementing planar real windings YET." Drop this matcher the day
-    // planar real winding lands, so the fixture goes back to being a real failure if it breaks.
-    if (msg.find("PLANAR (PCB) construction") != std::string::npos)
-        return "planar real winding (not implemented, ABT #492)";
-    if (msg.find("produced 0 turns") != std::string::npos)         return "MKF 0 turns (doesn't fit window)";
-    if (msg.find("unsupported column shape") != std::string::npos) return "unsupported column shape";
-    if (msg.find("single-body sweep failed") != std::string::npos) return "rect-wire sweep (unsupported)";
-    if (msg.find("lies inside the column") != std::string::npos ||
-        msg.find("terminal lead groups") != std::string::npos ||
-        msg.find("inconsistent MAS") != std::string::npos)         return "inconsistent MAS data";
-    return "UNRECOGNISED";
+// Category of a real-winding refusal, by its REASON (mvb::RefusalReason, carried from the child by name). Each is
+// an UPSTREAM (MKF/data) gap or a declared limitation that MVB++ surfaces loudly, NOT a silent-wrong-geometry bug.
+// A throw with no reason, or with a reason this sweep does not accept, has no category (nullptr): a real failure, so
+// a new fault mode cannot hide. The message is never read here: it is for the person, and may change.
+const char* realwinding_category(const CaseResult& result) {
+    const auto reason = mvb::refusalReasonFromString(result.refusal);
+    if (!reason) return nullptr;
+    switch (*reason) {
+        case mvb::RefusalReason::ConductorCollision:           return "collision (ABT #240/#187)";
+        case mvb::RefusalReason::NoTerminalLeadRoute:          return "no lead corridor (ABT #187)";
+        case mvb::RefusalReason::FoilRealWindingUnsupported:   return "foil wire (unsupported)";
+        // The sweep draws every fixture coated. A foil whose leads are planned copper on copper cannot be shown
+        // coated without putting the lead's enamel inside the sheet (ABT #1907), so it is refused, by design;
+        // the same fixture is drawn on copper by the corpus and the STEP validity test (Alf, 2026-11-27:
+        // "Count it as a known refusal").
+        case mvb::RefusalReason::FoilLeadOnCopperCoated:       return "foil lead on copper, coated drawing (ABT #1907)";
+        // PLANAR (PCB) construction: MKF has no real-winding model for it (ABT #492). Alf, 2026-08-26:
+        // "09_planar should be avoided, we are not implementing planar real windings YET." Drop this case the day
+        // planar real winding lands, so the fixture goes back to being a real failure if it breaks.
+        case mvb::RefusalReason::PlanarRealWindingUnsupported: return "planar real winding (not implemented, ABT #492)";
+        case mvb::RefusalReason::MkfProducedNoTurns:           return "MKF 0 turns (doesn't fit window)";
+        case mvb::RefusalReason::UnsupportedColumnShape:       return "unsupported column shape";
+        case mvb::RefusalReason::SingleBodySweepFailed:        return "rect-wire sweep (unsupported)";
+        case mvb::RefusalReason::InconsistentMasData:          return "inconsistent MAS data";
+        // A wind MKF declined to block is a fixture that does not fit: never an accepted outcome of this sweep.
+        case mvb::RefusalReason::MkfAppliedNoConnectionBlocking: return nullptr;
+    }
+    return nullptr;
 }
 
 void run_directory(const fs::path& root, const std::string& label) {
@@ -943,11 +974,13 @@ void run_realwinding_battery(int minCleanBuilds) {
             continue;
         }
         std::string msg = r.errors.empty() ? "(no message — crash/kill)" : r.errors.front();
-        const char* cat = realwinding_category(msg);
-        categories[cat]++;
-        std::cerr << "throw: " << cat << "\n";
-        if (std::string(cat) == "UNRECOGNISED")
-            unrecognised.emplace_back(f.filename().string(), msg);
+        const char* cat = realwinding_category(r);
+        categories[cat ? cat : "UNRECOGNISED"]++;
+        std::cerr << "throw: " << (cat ? cat : "UNRECOGNISED") << "\n";
+        if (!cat)
+            unrecognised.emplace_back(f.filename().string(),
+                                      msg + (r.refusal.empty() ? "" : " [reason " + r.refusal + "]") +
+                                          (r.mkfCode.empty() ? "" : " [MKF code " + r.mkfCode + "]"));
     }
 
     std::cerr << "[realwinding-battery] built=" << built << "/" << files.size() << "\n";
