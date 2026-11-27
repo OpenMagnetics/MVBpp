@@ -397,9 +397,18 @@ TEST_CASE("A planar board with a pcb is cut out at its coreCutoutClearance, else
         check_board_clears_core(planar_magnetic("E 64/10/50", coreToLayerDistance,
                                                 pcb_with(0.0001, std::nullopt)), 0.0001);
     }
+    // MKF lays a pcb-carrying group out at coreToTrack, so a stated cut-out can only be at or
+    // inside it. The section used coreToTrack 0.1 mm with a cut-out of 0.2 mm, which since that
+    // MKF rule leaves the copper hanging off the board; Alf (2026-11-26) approved splitting it
+    // into a pcb whose cut-out fits and the refusal of the one that does not.
     SECTION("coreCutoutClearance") {
         check_board_clears_core(planar_magnetic("ER 32/6/25", coreToLayerDistance,
-                                                pcb_with(0.0001, 0.0002)), 0.0002);
+                                                pcb_with(0.0003, 0.0002)), 0.0002);
+    }
+    SECTION("a coreCutoutClearance wider than coreToTrack is refused") {
+        auto magnetic = planar_magnetic("ER 32/6/25", coreToLayerDistance, pcb_with(0.0001, 0.0002));
+        mvb::MagneticBuilder builder;
+        CHECK_THROWS_AS(builder.buildAllNamed(magnetic, /*includeBobbin=*/false), std::runtime_error);
     }
     SECTION("a clearance past the copper is refused") {
         auto magnetic = planar_magnetic("E 64/10/50", coreToLayerDistance, pcb_with(0.0001, 0.0004));

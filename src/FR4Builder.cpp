@@ -1,5 +1,6 @@
 #include "mvb/FR4Builder.h"
 
+#include <Precision.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
@@ -61,7 +62,12 @@ double FR4Builder::coreCutoutClearance(const MAS::Group& group, double columnFac
     // edges. Defaults to coreToTrack when absent (stated rule)."
     const auto stated = pcb->get_outline().get_core_cutout_clearance();
     const double clearance = stated ? *stated : pcb->get_design_rules().get_core_to_track();
-    if (clearance > groupInset) {
+    // MKF lays a pcb-carrying group out exactly AT coreToTrack, so the two are equal by
+    // construction and the inset, a difference of two coordinates, comes out a few ulp either
+    // side of it (0.005 - 0.0047 = 2.9999999999999992e-4 against 3e-4). A board edge within the
+    // kernel's own resolution of a point of the copper's inner edge is at it, not beyond it
+    // (ABT #1854).
+    if (clearance - groupInset > Precision::Confusion()) {
         throw std::runtime_error(
             "FR4Builder: the PCB's core cut-out clearance (" + std::to_string(clearance * 1e3) +
             " mm) puts the board edge beyond the printed group's inner edge (" +
