@@ -7468,6 +7468,30 @@ size_t filletLeadJunctions(std::vector<Primitive>& prims, std::optional<double> 
             }
         }
         const double tanLen = radius * halfTan;
+        // A bend so slight that its inner side is shorter than the distance at which OCCT's boolean engine takes two
+        // vertices for one (each vertex's tolerance and the engine's fuzzy value, Precision::Confusion() apiece) is
+        // no bend the weld can hold: the inner edge's two ends interfere, and the welded conductor is a
+        // self-interfering solid (realwinding_interleaved_full_section_e16's Secondary: a dragback's last straight
+        // meets its turn 0.99 deg off, MKF's bend of 0.1835 mm on a 0.17 mm copper radius leaves an inner side of
+        // 0.2335 um; BOPAlgo_ArgumentAnalyzer: SelfIntersect on its two vertices). Such a corner is the mitre it
+        // is to within the bend's own sagitta (radius (sec(turn / 2) - 1): 7 nm there). A bend at the wire's own
+        // radius has no inner side at all (an apex), and is not this case.
+        const double innerSide = (radius - wireRadius) * std::acos(cosT);
+        if (innerSide > 0.0 && innerSide < 3.0 * Precision::Confusion()) {
+            std::ostringstream m;
+            m.precision(9);
+            m << "the corner of '" << who << "' between '" << a.label << "' and '" << b.label << "' (at " << a.seg.b.X()
+              << ", " << a.seg.b.Y() << ", " << a.seg.b.Z() << " m) turns " << std::acos(cosT) * 180.0 / kPi
+              << " deg: its bend of " << radius << " m would have an inner side of " << innerSide
+              << " m, below what the weld can tell apart (" << 3.0 * Precision::Confusion() << " m), and stands "
+              << radius * (1.0 / std::cos(0.5 * std::acos(cosT)) - 1.0) << " m off the corner";
+            std::cerr << "[ConductorBuilder] FINDING: " << m.str() << "; it is drawn sharp (bisection mitre)\n";
+            continue;
+        }
+        if (std::getenv("MVB_LEAD_DIAG"))
+            std::fprintf(stderr, "[junction-fillet] %s: '%s' | '%s' bend %.6f mm, wire radius %.6f mm, turn %.5f deg, tangent %.6f mm, inner arc %.6f um\n",
+                         who.c_str(), a.label.c_str(), b.label.c_str(), radius * 1e3, wireRadius * 1e3, std::acos(cosT) * 180.0 / kPi,
+                         tanLen * 1e3, (radius - wireRadius) * std::acos(cosT) * 1e6);
         const gp_Pnt vertex = a.seg.b;
         const gp_Pnt tA(vertex.XYZ() - da * tanLen);
         const gp_Pnt tB(vertex.XYZ() + db * tanLen);

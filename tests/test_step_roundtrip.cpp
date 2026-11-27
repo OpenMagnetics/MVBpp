@@ -175,7 +175,22 @@ std::pair<size_t, size_t> requireSoundSolids(const std::vector<mvb::NamedShape>&
             an.SmallEdgeMode() = Standard_False;
             an.SetRunParallel(Standard_True);
             an.Perform();
-            INFO("solid " << k << " of '" << ns.name << "'" << where.str());
+            // Where the analyser objects, so a failure names the place and not only the conductor.
+            std::ostringstream faulty;
+            for (const auto& result : an.GetCheckResult()) {
+                faulty << " [status " << static_cast<int>(result.GetCheckStatus()) << ":";
+                for (const auto& sub : result.GetFaultyShapes1()) {
+                    Bnd_Box box;
+                    BRepBndLib::AddOptimal(sub, box, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+                    double x0, y0, z0, x1, y1, z1;
+                    box.Get(x0, y0, z0, x1, y1, z1);
+                    faulty << " type " << static_cast<int>(sub.ShapeType()) << " x(" << x0 * 1e3 << ", " << x1 * 1e3 << ") y("
+                           << y0 * 1e3 << ", " << y1 * 1e3 << ") z(" << z0 * 1e3 << ", " << z1 * 1e3 << ") mm tol "
+                           << BRep_Tool::MaxTolerance(sub, TopAbs_VERTEX) * 1e6 << " um;";
+                }
+                faulty << "]";
+            }
+            INFO("solid " << k << " of '" << ns.name << "'" << where.str() << faulty.str());
             CHECK(nonManifold == 0);
             CHECK_FALSE(an.HasFaulty());
         }
