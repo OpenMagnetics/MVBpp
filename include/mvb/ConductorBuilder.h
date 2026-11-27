@@ -115,10 +115,15 @@ public:
     // rotation gives the same total) the tie is broken by the windings: the first winding's
     // centroid goes to the LEFT (-X), so a 2-winding CMC shows one winding on each side with the
     // gaps top and bottom. A part with neither a terminal side nor a winding side throws.
-    // `windingOrder` is coil.functionalDescription order; `turns` is coil.turnsDescription.
+    // The terminals count as a side only when their sum exceeds the widest end turn's own width of arc; that width
+    // is the turn's footprint, or its wire's where the turn carries none (a hand-built turn), so every winding's
+    // wire comes along.
+    // `windingOrder` is coil.functionalDescription order; `turns` is coil.turnsDescription; `wires` is each
+    // winding's wire by the winding's name.
     static ToroidMountingFrame resolveToroidMountingFrame(ToroidMounting mounting,
                                                           const std::vector<MAS::Turn>& turns,
-                                                          const std::vector<std::string>& windingOrder);
+                                                          const std::vector<std::string>& windingOrder,
+                                                          const std::map<std::string, MAS::Wire>& wires);
 
     struct Options {
         Options() {

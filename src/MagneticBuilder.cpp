@@ -1996,6 +1996,21 @@ static std::vector<std::string> windingOrderOf(const FunctionalDescriptionT& fd)
     return order;
 }
 
+// Each winding's wire by the winding's name; a wire given by name is looked up in MKF's catalogue.
+template<typename FunctionalDescriptionT>
+static std::map<std::string, MAS::Wire> windingWiresOf(const FunctionalDescriptionT& fd) {
+    std::map<std::string, MAS::Wire> wires;
+    for (const auto& w : fd) {
+        std::visit([&](const auto& wire) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(wire)>, std::string>)
+                wires[w.get_name()] = OpenMagnetics::find_wire_by_name(wire);
+            else
+                wires[w.get_name()] = wire;
+        }, w.get_wire());
+    }
+    return wires;
+}
+
 ConductorBuilder::ToroidMountingFrame MagneticBuilder::toroidMountingFrameOf(
     const OpenMagnetics::Magnetic& magnetic) {
     const auto mounting = toroidMountingOf(magnetic);
@@ -2003,7 +2018,7 @@ ConductorBuilder::ToroidMountingFrame MagneticBuilder::toroidMountingFrameOf(
     const auto turns = coil.get_turns_description();
     return ConductorBuilder::resolveToroidMountingFrame(
         mounting, turns ? *turns : std::vector<MAS::Turn>{},
-        windingOrderOf(coil.get_functional_description()));
+        windingOrderOf(coil.get_functional_description()), windingWiresOf(coil.get_functional_description()));
 }
 
 ConductorBuilder::ToroidMountingFrame MagneticBuilder::toroidMountingFrameOf(
@@ -2013,7 +2028,7 @@ ConductorBuilder::ToroidMountingFrame MagneticBuilder::toroidMountingFrameOf(
     const auto turns = coil.get_turns_description();
     return ConductorBuilder::resolveToroidMountingFrame(
         mounting, turns ? *turns : std::vector<MAS::Turn>{},
-        windingOrderOf(coil.get_functional_description()));
+        windingOrderOf(coil.get_functional_description()), windingWiresOf(coil.get_functional_description()));
 }
 
 } // namespace mvb

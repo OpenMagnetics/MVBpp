@@ -22018,7 +22018,7 @@ ConductorBuilder::measureTerminalLeadLengths(const OpenMagnetics::Coil& coil,
 
 ConductorBuilder::ToroidMountingFrame ConductorBuilder::resolveToroidMountingFrame(
     ToroidMounting mounting, const std::vector<MAS::Turn>& turns,
-    const std::vector<std::string>& windingOrder) {
+    const std::vector<std::string>& windingOrder, const std::map<std::string, MAS::Wire>& wires) {
     ToroidMountingFrame frame;
     frame.mounting = mounting;
     if (mounting == ToroidMounting::Horizontal) {
@@ -22046,11 +22046,30 @@ ConductorBuilder::ToroidMountingFrame ConductorBuilder::resolveToroidMountingFra
         auto [it, inserted] = ends.try_emplace({t.get_winding(), t.get_parallel()}, &t, &t);
         if (!inserted) it->second.second = &t;
     }
+    // The terminals turn the ring only when together they pull one way by more than a wire's own
+    // width of arc. Below that they cancel: where exactly each end turn sits is the winding's
+    // packing, not a direction. A two-winding choke's four terminals cancel to 0.003 (its end
+    // turns are 0.19 degrees off perfect symmetry), and against the 1e-9 this used to compare
+    // with, that leftover turned the whole part a quarter turn: one winding on top of the other
+    // instead of one on each side (ABT #1248's contract, ABT #2527 item 10).
     gp_XY sum(0.0, 0.0);
-    for (const auto& [key, fl] : ends) sum += unitOf(*fl.first) + unitOf(*fl.second);
-    const double terminals = 2.0 * static_cast<double>(ends.size());
+    double ownArc = 0.0;   // the widest end turn's wire, as an angle at its own radius
+    for (const auto& [key, fl] : ends) {
+        for (const MAS::Turn* t : {fl.first, fl.second}) {
+            sum += unitOf(*t);
+            // The turn's own footprint, or its wire's where the turn carries none (TurnBuilder's rule, the one
+            // the turn is drawn by).
+            const auto wire = wires.find(t->get_winding());
+            if (wire == wires.end())
+                throw std::runtime_error("resolveToroidMountingFrame: turn '" + t->get_name() + "' belongs to winding '" +
+                                         t->get_winding() + "', which has no wire, so its width of arc is unknown");
+            const auto [width, height] = TurnBuilder::wireDimensions(wire->second, *t, /*paintCoating=*/true);
+            const auto& c = t->get_coordinates();
+            ownArc = std::max(ownArc, std::max(width, height) / std::hypot(c[0], c[1]));
+        }
+    }
     gp_XY down;
-    if (sum.Modulus() > 1e-9 * terminals) {
+    if (sum.Modulus() > ownArc) {
         down = sum / sum.Modulus();
     }
     else {
