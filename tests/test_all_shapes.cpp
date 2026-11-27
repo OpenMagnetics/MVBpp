@@ -418,3 +418,80 @@ TEST_CASE("An EPC core is an E with a stadium pole centred on its axis", "[shape
     }
     CHECK(checked == 4);
 }
+
+// ABT #2587. The U builder sized both legs (A - E) / 2 and never read H, the leg width MKF sizes
+// the bobbin and the turns around. The two differ where a catalogue stores the window E as a
+// reference value or a minimum: U 25/16/12 (Magnetics 0P42530UC) has a leg of 6.45 mm and a
+// window of 12.7 mm "Ref.", so (A - E) / 2 drew the pre-2005 leg of 6.35 mm. With H the wound leg
+// is H wide about x = 0, the window is E wide from its face (where MKF winds), and the return leg
+// is what is left of A.
+TEST_CASE("A U core's wound leg is H when the record carries it", "[shapes][abt2587]") {
+    const double micron = 1e-6;
+    // A cut through the window: the wound leg stands on x = 0, the return leg on one side of it.
+    struct Section { double woundHalf; double farEdge; double woundArea; double windowArea; double returnArea; };
+    const auto cut = [&](const json& record, double wound, double window) {
+        const auto dims = dimensions_of(record);
+        const double a = dims.at("A"), c = dims.at("C"), d = dims.at("D");
+        const TopoDS_Shape piece = piece_of(record);
+        const double slab = d / 10;
+        const auto band = [&](double x0, double x1) {
+            const TopoDS_Shape room =
+                BRepPrimAPI_MakeBox(gp_Pnt(std::min(x0, x1), -d / 2 - slab / 2, -c), std::abs(x1 - x0), slab, 2 * c).Shape();
+            BRepAlgoAPI_Common common(piece, room);
+            REQUIRE(common.IsDone());
+            return common.Shape();
+        };
+        const TopoDS_Shape all = band(-2 * a, 2 * a);
+        Bnd_Box box;
+        BRepBndLib::AddOptimal(all, box, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+        double x0, y0, z0, x1, y1, z1;
+        box.Get(x0, y0, z0, x1, y1, z1);
+        const double side = std::abs(x0) > std::abs(x1) ? -1.0 : 1.0;   // where the return leg is
+        Section s;
+        s.woundHalf = std::min(std::abs(x0), std::abs(x1));
+        s.farEdge = std::max(std::abs(x0), std::abs(x1));
+        s.woundArea = volume_of(band(-wound / 2, wound / 2)) / slab;
+        s.windowArea = volume_of(band(side * (wound / 2 + micron), side * (wound / 2 + window - micron))) / slab;
+        s.returnArea = volume_of(band(side * (wound / 2 + window), side * 2 * a)) / slab;
+        return s;
+    };
+
+    size_t withH = 0;
+    for (const std::string name : {"U 25/16/12", "U 22/21/6", "U 11/4/6", "U 93/76/32"}) {
+        INFO(name);
+        const json record = catalogue_shape(name);
+        REQUIRE(record["dimensions"].contains("H"));
+        const auto dims = dimensions_of(record);
+        const double a = dims.at("A"), c = dims.at("C"), e = dims.at("E"), h = dims.at("H");
+        const Section s = cut(record, h, e);
+        CHECK(s.woundHalf == Catch::Approx(h / 2).margin(micron));
+        CHECK(s.farEdge == Catch::Approx(a - h / 2).margin(micron));          // the outer width is A
+        CHECK(s.woundArea == Catch::Approx(h * c).epsilon(1e-6));
+        CHECK(s.windowArea == Catch::Approx(0.0).margin(1e-12));              // nothing in MKF's window
+        CHECK(s.returnArea == Catch::Approx((a - e - h) * c).epsilon(1e-6));
+        ++withH;
+    }
+    CHECK(withH == 4);
+
+    SECTION("the leg the letters disagree on") {
+        // U 25/16/12: H 6.45 mm against (A - E) / 2 = 6.35 mm.
+        const auto dims = dimensions_of(catalogue_shape("U 25/16/12"));
+        CHECK(std::abs(dims.at("H") - (dims.at("A") - dims.at("E")) / 2) > 50 * micron);
+    }
+    SECTION("without H both legs are (A - E) / 2") {
+        json record = catalogue_shape("U 25/16/12");
+        record["dimensions"].erase("H");
+        const auto dims = dimensions_of(record);
+        const double a = dims.at("A"), c = dims.at("C"), e = dims.at("E");
+        const Section s = cut(record, (a - e) / 2, e);
+        CHECK(s.woundHalf == Catch::Approx((a - e) / 4).margin(micron));
+        CHECK(s.woundArea == Catch::Approx((a - e) / 2 * c).epsilon(1e-6));
+        CHECK(s.returnArea == Catch::Approx((a - e) / 2 * c).epsilon(1e-6));
+    }
+    SECTION("an H that leaves no return leg is refused") {
+        json record = catalogue_shape("U 25/16/12");
+        const auto dims = dimensions_of(record);
+        record["dimensions"]["H"] = {{"nominal", dims.at("A") - dims.at("E")}};
+        CHECK_THROWS_AS(piece_of(record), std::runtime_error);
+    }
+}
