@@ -62,7 +62,12 @@ TEST_CASE("E core with bobbin and turns builds complete assembly", "[integration
     MAS::CoreBobbinProcessedDescription bobbinPd;
     bobbinPd.set_column_width(0.0035);
     bobbinPd.set_column_depth(0.003);
-    bobbinPd.set_column_thickness(0.006);
+    // The wall of the column tube. It was 0.006: by the MAS schema columnWidth and columnDepth
+    // are the column wall "including thickness" (here 0.003 + 0.0005 and 0.0025 + 0.0005), so a
+    // 6 mm wall contradicted the 3.5 x 3.0 mm half-dimensions beside it, and MKF, which carries
+    // the wall out to the corner the wire bends on, got a 6 mm corner on a 7 x 6 mm column
+    // (fixture change after reviewing the schema, as Alf asked, 2026-11-27).
+    bobbinPd.set_column_thickness(0.0005);
     bobbinPd.set_wall_thickness(0.0005);
     bobbinPd.set_column_shape(MAS::ColumnShape::RECTANGULAR);
 

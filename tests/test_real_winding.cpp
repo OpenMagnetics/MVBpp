@@ -1650,27 +1650,6 @@ TEST_CASE("TMP failing-case export and overlap location", "[tmpfail]") {
     }
 }
 
-TEST_CASE("TMP fixture probe", "[tmpfix]") {
-    const char* name = std::getenv("MVB_FIXTURE");
-    REQUIRE(name != nullptr);
-    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/" + name);
-    REQUIRE(f.good());
-    json j = json::parse(f);
-    auto magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
-    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
-    mvb::MagneticBuilder builder;
-    try {
-        auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
-                                           mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/false, false, false,
-                                           0.0, true);
-        std::fprintf(stderr, "[fix] %s BUILT ok\n", name);
-        const char* out = std::getenv("MVB_STEP_OUT");
-        if (out) REQUIRE(mvb::exportSTEP(named, out));
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "[fix] %s THROW: %s\n", name, e.what());
-    }
-}
-
 // ABT #353 -- NO ROUTED COPPER IN THE FLANGE. The WE-TI 7447720470 drum is the design the ticket
 // was filed on: its winding groove runs y = [-3.2488, +3.2488] mm and its flanges fill the bands
 // beyond that (the bottom one out to r = 3.898 mm, the top one to r = 2.498 mm), so anything a
