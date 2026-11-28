@@ -3,10 +3,11 @@
 //   - test_all_subtractive_distributed_gapped_cores_generated
 //   - test_all_additive_gapped_cores_generated
 //
-// For each shape in MAS/data/core_shapes.ndjson (excluding ui/ut/pqi/t —
-// same exclusions as MVB Python), build a minimal Magnetic with the
-// requested gapping spec, let MKF compute geometricalDescription/machining,
-// then build the core via MagneticBuilder and verify a positive volume.
+// For each shape in MAS/data/core_shapes.ndjson (excluding ui/ut/pqi/t and the plain drums), build a core of the
+// type MKF assigns the shape's family, with the requested gapping sized from the shape's own winding column, let
+// MKF compute geometricalDescription/machining, then build the core via MagneticBuilder and verify a positive
+// volume. (ABT #1444: the sweeps used to call every shape a two-piece set and ask every column for 0.5, 1 and
+// 2 mm of gap.)
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -44,7 +45,10 @@ using json = nlohmann::json;
 // its mind, and it swallows every OTHER way a shape of that family can fail. So the refusal is
 // recognised below by the exception MKF throws -- its type and the identity of its message -- and
 // this list is reserved for families this test never even attempts.
-static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t"};
+//
+// "drum" (Alf, 2026-11-28: "Take drums out of the gapping sweeps"): a drum is an open shape, with no mating faces
+// to grind or to space apart. It stays covered ungapped by the all-shapes test.
+static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t", "drum"};
 
 // ABT #1191: is this MKF's deliberate "this family cannot carry user gapping at all" refusal?
 //
@@ -90,18 +94,75 @@ struct GappingResult {
 
 // Build just the core with the given gapping spec — bypasses the coil to
 // match MVB Python's PyMKF.calculate_core_data flow (which is core-only).
-GappingResult build_with_gapping(const json& shape, const json& gapping,
+// The core type MKF says the shape's family is (a two-piece set, a piece and a plate, ...): a type that contradicts
+// the family is refused by MKF (ABT #2372), so the sweep states the right one instead of "two-piece set" for all.
+json core_type_of(const json& shape) {
+    MAS::CoreShapeFamily family{};
+    MAS::from_json(shape.at("family"), family);
+    json type;
+    MAS::to_json(type, OpenMagnetics::core_type_for_shape_family(family));
+    return type;
+}
+
+bool is_two_piece_set(const json& shape) {
+    MAS::CoreShapeFamily family{};
+    MAS::from_json(shape.at("family"), family);
+    return OpenMagnetics::core_type_for_shape_family(family) == MAS::CoreType::TWO_PIECE_SET;
+}
+
+// The height of the shape's winding column, as MKF processes the ungapped core.
+double column_height_of(const json& shape, int numberStacks) {
+    json coreJson;
+    coreJson["functionalDescription"] = {
+        {"name", "dummy"}, {"type", core_type_of(shape)}, {"material", "N97"}, {"shape", shape},
+        {"gapping", json::array()}, {"numberStacks", numberStacks},
+    };
+    OpenMagnetics::Core core(coreJson);
+    const auto columns = core.get_columns();
+    if (columns.empty()) throw std::runtime_error("the core has no column");
+    return columns.front().get_height();
+}
+
+// A gapping template gives a subtractive gap as a FRACTION of the winding column's height ("columnFraction"), so
+// every shape is asked for gaps that fit it (Alf, 2026-11-28: "Size the gaps from each column"). Fixed lengths of
+// 0.5, 1 and 2 mm overlapped or overran the column of every small core (RM 4/8: 4.5 mm), which MKF rightly
+// refuses. A gap given as a "length" (residual, additive) is kept as it is.
+json gapping_for(const json& gappingTemplate, double columnHeight, bool twoPieceSet) {
+    json gapping = json::array();
+    for (const auto& gap : gappingTemplate) {
+        // A subtractive gap of length zero is a two-piece set's ungapped halves mating; MKF refuses it on any other
+        // core ("give the gap its ground length, or remove it"), so it is left out there.
+        if (!twoPieceSet && gap.at("type") == "subtractive" && gap.contains("length") && gap.at("length").get<double>() == 0.0)
+            continue;
+        json sized = {{"type", gap.at("type")}};
+        sized["length"] = gap.contains("columnFraction") ? gap.at("columnFraction").get<double>() * columnHeight
+                                                         : gap.at("length").get<double>();
+        gapping.push_back(sized);
+    }
+    return gapping;
+}
+
+GappingResult build_with_gapping(const json& shape, const json& gappingTemplate,
                                   int numberStacks = 1) {
     GappingResult r;
     json coreJson;
-    coreJson["functionalDescription"] = {
-        {"name", "dummy"},
-        {"type", "two-piece set"},
-        {"material", "N97"},
-        {"shape", shape},
-        {"gapping", gapping},
-        {"numberStacks", numberStacks},
-    };
+    try {
+        coreJson["functionalDescription"] = {
+            {"name", "dummy"},
+            {"type", core_type_of(shape)},
+            {"material", "N97"},
+            {"shape", shape},
+            {"gapping", gapping_for(gappingTemplate, column_height_of(shape, numberStacks), is_two_piece_set(shape))},
+            {"numberStacks", numberStacks},
+        };
+    } catch (const OpenMagnetics::GapException& e) {
+        r.error = e.what();
+        r.refusedByConstruction = is_construction_gap_refusal(e);
+        return r;
+    } catch (const std::exception& e) {
+        r.error = std::string("ungapped core: ") + e.what();
+        return r;
+    }
 
     try {
         // Constructing OpenMagnetics::Core triggers gap processing and
@@ -179,9 +240,10 @@ void run_gap_test(const std::string& label, const json& gappingTemplate,
 TEST_CASE("All shapes build with subtractive gapping",
           "[shapes][gapping][subtractive]") {
     json gapping = json::array({
-        {{"length", 0.001}, {"type", "subtractive"}},
-        {{"length", 0.002}, {"type", "subtractive"}},
-        {{"length", 0.0},   {"type", "subtractive"}},
+        // 1 mm and 2 mm on the median column of the swept shapes (20.1 mm), kept as proportions
+        {{"columnFraction", 0.05}, {"type", "subtractive"}},
+        {{"columnFraction", 0.10}, {"type", "subtractive"}},
+        {{"length", 0.0},          {"type", "subtractive"}},
     });
     run_gap_test("subtractive_gapping", gapping, 3);
 }
@@ -189,9 +251,10 @@ TEST_CASE("All shapes build with subtractive gapping",
 TEST_CASE("All shapes build with subtractive distributed gapping",
           "[shapes][gapping][distributed]") {
     json gapping = json::array({
-        {{"length", 0.001},   {"type", "subtractive"}},
-        {{"length", 0.0005},  {"type", "subtractive"}},
-        {{"length", 0.002},   {"type", "subtractive"}},
+        // 1 mm, 0.5 mm and 2 mm on the median column of the swept shapes (20.1 mm), kept as proportions
+        {{"columnFraction", 0.05},  {"type", "subtractive"}},
+        {{"columnFraction", 0.025}, {"type", "subtractive"}},
+        {{"columnFraction", 0.10},  {"type", "subtractive"}},
         {{"length", 0.00005}, {"type", "residual"}},
         {{"length", 0.00005}, {"type", "residual"}},
     });
